@@ -2705,7 +2705,7 @@ E_TMP, E_VPMQ, E_AV, E_T8 = 24, 25, 26, 27
 E_CADR = 28
 E_T9, E_T10, E_T11 = 29, 30, 31
 
-def build_ew(op, depth=2):
+def build_ew(op, depth=2, nvec=16):
     """out[i] = f(a[i], b[i]); one group = 16 vectors = 256 floats per QPU
     iteration, stored with the verified 4-chunk VPM->DMA sequence (stride 0,
     step 256 bytes so the 16 rows land contiguously)."""
@@ -2718,11 +2718,20 @@ def build_ew(op, depth=2):
     b.read_uni(E_CNT)                                    # u3 groups
     b.read_uni(E_TMP)                                    # u4 qpu index
     b.read_uni(E_T9)                                     # u5 nqpu
-    b.e(add_(ADD_SHL, B_K['STEP'], ws=1, a=areg(E_T9), b=imm(10)))  # nqpu*1024
-    # per-iteration gap: after the 16 vectors of a group have advanced the TMU
-    # address by 1024, QPU i's next group is i+nqpu, so add (nqpu-1)*1024.
+    # a group is nvec vectors of 64 B: 16 (1024 B) for the cheap ops, 4
+    # (256 B) for the long transcendental bodies that would not fit the 16 KiB
+    # code slot.
+    _gshift = 10 if nvec == 16 else 8
+    b.e(add_(ADD_SHL, B_K['STEP'], ws=1, a=areg(E_T9), b=imm(_gshift)))
+    # per-iteration gap: after the nvec vectors of a group have advanced the
+    # TMU address by nvec*64, QPU i's next group is i+nqpu, so add
+    # (nqpu-1)*nvec*64.
     b.e(add_(ADD_ADD, E_T8, areg(E_T9), (REGB, B_K['C4INT'])))
-    b.e(add_(ADD_SHL, B_K['GAP'], ws=1, a=areg(E_T8), b=imm(10)))
+    b.e(add_(ADD_SHL, B_K['GAP'], ws=1, a=areg(E_T8), b=imm(_gshift)))
+    if nvec != 16:
+        # the 4-vector store (_store4) needs 4*q and q<<9 in the B file
+        b.e(add_(ADD_OR, B_K['VPMQ7'], ws=1, a=areg(E_VPMQ), b=areg(E_VPMQ)))
+        b.e(add_(ADD_SHL, B_K['CSTEP'], ws=1, a=areg(E_TMP), b=imm(9)))
     b.e(add_or(E_LANE, areg(R_ELEM_NUM), areg(R_ELEM_NUM)), nop())
     b.e(add_or(E_VPMQ, breg(R_QPU_NUM), breg(R_QPU_NUM)), nop())
     b.e(add_(ADD_SHL, E_VPMQ, areg(E_VPMQ), imm(2)), nop())            # 4*qpu
@@ -2752,6 +2761,12 @@ def build_ew(op, depth=2):
         b.e(ldi(0x3FC00000, 1, ws=1))      # B1: 1.5
         b.e(ldi(0x3F000000, 2, ws=1))      # B2: 0.5
         b.e(nop(), nop())
+    if op >= 100:
+        # generic unary from kops.py: the op loads its own constants and its
+        # body replaces _ew_compute below; the harness stays byte-identical to
+        # the verified elementwise kernel.
+        import kops
+        kops.ew_consts(sys.modules[__name__], b, op - 100)
     if op in (OP_SIGMOID, OP_SILU):
         for name, val in (('NLOG2E', 0xBFB8AA3B), ('MAGIC', 0x4B400000),
                           ('CLAMP_LO', 0xC2B40000), ('CLAMP_HI', 0x42B40000),
@@ -2774,8 +2789,8 @@ def build_ew(op, depth=2):
         b.e(add_(ADD_ADD, E_AA, areg(E_AA), (REGB, B_K['C16'])))
         b.e(add_(ADD_ADD, E_AB2, areg(E_AB2), (REGB, B_K['C16'])))
         b.e(nop(), nop())
-    for j in range(16):
-        if j + depth < 16:
+    for j in range(nvec):
+        if j + depth < nvec:
             b.e(add_or(W_TMU0_S, areg(E_AA), areg(E_AA), ws=1))
             b.e(add_or(W_TMU1_S, areg(E_AB2), areg(E_AB2), ws=1))
             b.e(nop(), nop())
@@ -2788,7 +2803,10 @@ def build_ew(op, depth=2):
         b.e(add_or(B_VB, ws=1, a=acc(4), b=acc(4)), nop())
         _ew_compute(b, op, j)
     b.check = False
-    emit_store16(p, 0)
+    if nvec == 16:
+        emit_store16(p, 0)
+    else:
+        _store4(b, B_K['VPMQ7'], B_K['CSTEP'], E_CADR, 0)
     b.check = True
     b.e(add_(ADD_ADD, E_AO, areg(E_AO), (REGB, B_K['STEP'])))
     b.e(add_(ADD_ADD, E_AA, areg(E_AA), (REGB, B_K['GAP'])))
@@ -2803,6 +2821,10 @@ def build_ew(op, depth=2):
 
 def _ew_compute(b, op, j):
     """Vector j -> r(j).  Operands: r26 (a) and b8 (b)."""
+    if op >= 100:
+        import kops
+        kops.ew_body(sys.modules[__name__], b, op - 100, j)
+        return
     aa = areg(E_AV)
     bb = breg(B_VB)
     K = B_K
@@ -3358,6 +3380,10 @@ def main(argv):
     elif kind == 'softmax':
         pr = opts.get('probe')
         p = build_softmax(probe=None if pr in (None, 'full') else pr)
+    elif kind in ('uop', 'sel3', 'gather', 'reduce', 'cumsum', 'blit'):
+        # generic kernels for the numeric op long tail (kops.py)
+        import kops
+        p = kops.build(sys.modules[__name__], kind, opts)
     else:
         print("unknown kernel kind %r" % kind, file=sys.stderr)
         return 2

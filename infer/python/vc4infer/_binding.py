@@ -78,6 +78,14 @@ _STATUS = {
 OP_MATMUL, OP_CONV2D, OP_ADD, OP_MUL, OP_RELU, OP_SIGMOID, OP_SILU = range(7)
 LAYOUT_ROW_MAJOR = 0
 
+# vc4_uop (mirrors infer/include/vc4infer.h)
+(UOP_ABS, UOP_NEG, UOP_IDENTITY, UOP_CLIP, UOP_LEAKYRELU, UOP_FLOOR,
+ UOP_CEIL, UOP_ROUND, UOP_SIGN, UOP_EXP, UOP_LOG, UOP_SQRT, UOP_RECIPROCAL,
+ UOP_TANH, UOP_ERF, UOP_ELU, UOP_SELU, UOP_SOFTPLUS, UOP_SOFTSIGN, UOP_GELU,
+ UOP_GELU_ERF, UOP_HARDSIGMOID, UOP_HARDSWISH, UOP_SIN, UOP_COS) = range(25)
+SEL_WHERE, SEL_CLIP3, SEL_PRELU = range(3)
+RED_SUM, RED_MEAN, RED_MAX, RED_MIN, RED_ARGMAX, RED_ARGMIN = range(6)
+
 
 class Buf(ctypes.Structure):
     _fields_ = [("off", ctypes.c_uint32), ("bytes", ctypes.c_size_t)]
@@ -190,6 +198,30 @@ class Engine:
                                   ctypes.POINTER(ctypes.c_int),
                                   ctypes.POINTER(ctypes.c_int)]
         L.vc4_upsample2x_nhwc.restype = ctypes.c_int
+        L.vc4_unary.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                ctypes.POINTER(Buf), ctypes.POINTER(Buf),
+                                ctypes.c_size_t] + [ctypes.c_float] * 3
+        L.vc4_unary.restype = ctypes.c_int
+        L.vc4_select3.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                  ctypes.POINTER(Buf), ctypes.POINTER(Buf),
+                                  ctypes.POINTER(Buf), ctypes.POINTER(Buf),
+                                  ctypes.c_size_t]
+        L.vc4_select3.restype = ctypes.c_int
+        L.vc4_gather.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
+                                 ctypes.POINTER(Buf), ctypes.c_size_t,
+                                 ctypes.c_float]
+        L.vc4_gather.restype = ctypes.c_int
+        L.vc4_blit.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
+                               ctypes.POINTER(Buf), ctypes.c_size_t]
+        L.vc4_blit.restype = ctypes.c_int
+        L.vc4_reduce.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
+                                 ctypes.POINTER(Buf), ctypes.c_uint32,
+                                 ctypes.c_uint32, ctypes.c_int]
+        L.vc4_reduce.restype = ctypes.c_int
+        L.vc4_cumsum.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
+                                 ctypes.POINTER(Buf), ctypes.c_uint32,
+                                 ctypes.c_uint32]
+        L.vc4_cumsum.restype = ctypes.c_int
         L.vc4_get_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(Stats)]
         L.vc4_get_stats.restype = None
         L.vc4_supported_ops.argtypes = [ctypes.POINTER(ctypes.c_size_t)]
@@ -310,6 +342,37 @@ class Engine:
         self._check(self.lib.vc4_softmax_fwd(
             self.ctx, ctypes.byref(x), rows, cols, ctypes.byref(out)),
             "softmax_fwd")
+
+    # ---- generic kernels (vc4_gen.c)
+    def unary(self, op, a, out, n, p0=0.0, p1=0.0, p2=0.0):
+        self._check(self.lib.vc4_unary(self.ctx, int(op), ctypes.byref(a),
+                                       ctypes.byref(out), int(n),
+                                       float(p0), float(p1), float(p2)),
+                    "unary")
+
+    def select3(self, op, a, b, c, out, n):
+        self._check(self.lib.vc4_select3(self.ctx, int(op), ctypes.byref(a),
+                                         ctypes.byref(b), ctypes.byref(c),
+                                         ctypes.byref(out), int(n)), "select3")
+
+    def gather(self, tab, out, n, fill=0.0):
+        self._check(self.lib.vc4_gather(self.ctx, ctypes.byref(tab),
+                                        ctypes.byref(out), int(n), float(fill)),
+                    "gather")
+
+    def blit(self, a, out, nbytes):
+        self._check(self.lib.vc4_blit(self.ctx, ctypes.byref(a),
+                                      ctypes.byref(out), int(nbytes)), "blit")
+
+    def reduce(self, a, out, outer, red, op):
+        self._check(self.lib.vc4_reduce(self.ctx, ctypes.byref(a),
+                                        ctypes.byref(out), int(outer), int(red),
+                                        int(op)), "reduce")
+
+    def cumsum(self, a, out, rows, cols):
+        self._check(self.lib.vc4_cumsum(self.ctx, ctypes.byref(a),
+                                        ctypes.byref(out), int(rows),
+                                        int(cols)), "cumsum")
 
     # ---- NHWC (the YOLO plane)
     def conv_nhwc_wpanel_bytes(self, Cin, Cout, KH, KW, bias=True):

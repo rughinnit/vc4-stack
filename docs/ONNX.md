@@ -728,3 +728,130 @@ share.  Hybrid timings are never presented as VC4-only numbers.
   under `structural`;
 * YOLOv8n: `host_compute_nodes == 0`, `arithmetic_on_vc4 == 100%`, identical
   output to strict, and the utilisation/byte debt report above.
+
+
+## 10. Generic QPU kernels for the numeric op long tail (WIP)
+
+This section documents `infer/src/vc4_gen.c` and
+`infer/python/vc4infer/kgen/kops.py`: the first slice of the "every numeric op
+must be a VC4 kernel" milestone.  It is **partial and honest**: the
+infrastructure and a verified subset landed, the transcendentals do not yet
+produce correct numbers on the board, and nothing unverified is wired into the
+executor (an op without a verified kernel still raises — there is no CPU path).
+
+### 10.1 What was added
+
+| piece | file | state |
+|---|---|---|
+| `uop` kernel family (25 unary ops, one QPU body each) | `kops.py`, riding `kgen.build_ew`'s verified harness | 7 ops verified, 18 not correct yet |
+| `sel3` (where / tensor clip / prelu) | `kops.py` + `vc4_select3` | generated, not yet element-verified |
+| `gather` (table-driven QPU copy: `out[o] = arena[tab[o]]`) | `kops.py` + `vc4_gather` | generated, not yet element-verified |
+| `blit` (contiguous 256 B/group QPU copy) | `kops.py` + `vc4_blit` | generated, not yet element-verified |
+| `reduce` (sum/mean/max/min/argmax/argmin over a contiguous run) | `kops.py` + `vc4_reduce` | generated, not yet element-verified |
+| `cumsum` (16-lane Hillis-Steele prefix, 256-column blocks) | `kops.py` + `vc4_cumsum` | generated, not yet element-verified |
+
+`kgen.build_ew` gained an `nvec` parameter (16 vectors per group for the short
+bodies, 4 for the long ones, because a 16-vector group of a transcendental body
+overflows the 16 KiB code slot) and a dispatch: `op >= 100` routes the per-vector
+body to `kops.ew_body`, so the TMU priming, the VPM→DMA store and the counter
+branch stay byte-identical to the element-wise kernel that has been verified
+since the first milestone.
+
+### 10.2 Measured, verified (stock clocks, `VC4INFER_DAEMON=1`)
+
+`infer/tests/genops_probe.py <op>` against a numpy float64 reference,
+tolerance `1e-4 + 1e-4*max(|ref|,1)`, 4096-element random + a hand-picked edge
+vector:
+
+| op | method | shapes | max abs | max rel | mismatches | launches | GPU ms |
+|---|---|---|---:|---:|---:|---:|---:|
+| `Abs` | 1 QPU AND (0x7fffffff) | 4096, 3 | 0 | 0 | 0 / 4099 | 2, 1 | 0.152, 0.083 |
+| `Neg` | 1 QPU XOR (0x80000000) | 4096, 3 | 0 | 0 | 0 / 4099 | 2, 1 | 0.149, 0.080 |
+| `Clip` (attrs) | FMAX/FMIN with the bounds in uniform registers | 4096, 5 | 0 | 0 | 0 / 4101 | 2, 1 | 0.147, 0.081 |
+| `LeakyRelu` | max/min + one mul, alpha in a uniform | 4096, 5 | 5.96e-08 | 5.96e-08 | 0 / 4101 | 2, 1 | 0.149, 0.083 |
+| `HardSigmoid` | mul + add + clamp, alpha/beta in uniforms | 4096, 5 | 5.96e-08 | 5.96e-08 | 0 / 4101 | 2, 1 | 0.151, 0.078 |
+| `HardSwish` | as above + one mul | 4096, 5 | 4.77e-07 | 2.30e-07 | 0 / 4101 | 2, 1 | 0.149, 0.080 |
+| `Sign` | two `> 0` masks, exact bit select | 4096 | 0 | 0 | 0 / 4096 | 2 | 0.149 |
+| `Sign` | edge vector incl. `+0`/`-0` | 14 | 1.0 | 1.0 | 2 / 14 | 1 | 0.083 |
+
+`Sign`'s two edge mismatches are the signed-zero cases: the kernel returns
+`+0` for `-0.0` where numpy's `sign` returns `-0.0` (and the ONNX reference
+returns `0`); the magnitude is exact.
+
+The GPU cost is dominated by the launch (one launch per 4096 floats for the
+16-vector ops, two for 4096 because 4096/4096 > 12 groups per launch); a
+4096-float unary op costs ~0.15 ms of GPU time at stock clocks, i.e. the same
+class as the existing `vc4_elementwise` ops.
+
+### 10.3 What is not correct yet, with the exact symptom
+
+The transcendental bodies are built as *range reduction + minimax polynomial +
+exact integer scaling* (2^f degree-5 for exp/exp2, `m ∈ [1,2)` + `(m-1)/(m+1)`
+series for log, `(1-z)/(1+z)` for tanh, A&S 7.1.26 for erf, Cody-Waite
+quadrant reduction for sin/cos, all with the QPU's round-toward-zero FPU and
+integer round-to-even where a true round is needed).  Their arithmetic is
+verified in an offline emitter-level emulator that models the truncating FPU
+(`kops` bodies reproduce numpy to <1e-7 for exp/log/softsign), but **on the
+board the results are wrong**:
+
+| op | board result | expected | note |
+|---|---|---|---|
+| `Exp` | correct at x=1 (2.7183), wrong at x=0.5 (0.324 vs 1.649), x=2.7 (113.6 vs 14.88) | — | per-lane, data-dependent |
+| `Softsign` | 0 for every input | x/(1+\|x\|) | the `1/x` Newton core collapses to 0 |
+| `Tanh`/`Erf`/`Softplus`/`Elu`/`Selu`/`Gelu`/`Sin`/`Cos`/`Log`/`Sqrt`/`Reciprocal`/`Floor`/`Ceil`/`Round` | wrong or zero | — | same class |
+
+The isolation work so far:
+
+* `abs`/`neg`/`sign`/`clip`/`leakyrelu`/`hardsigmoid`/`hardswish` are exact,
+  so the harness, uniform reads, B-file constants, parameter uniforms, the
+  `ADD_*`/`FADD`/`FMIN`/`FMAX`/`AND`/`OR`/`XOR` encodings and the store are
+  all sound.
+* `leakyrelu` with `alpha=0.5` gives exactly `-1.0` for `x=-2`, so `fmul` and
+  the `mul → acc3 → mov` path the emitter uses is sound.
+* Therefore the defect is inside the transcendental *core sequences*
+  themselves (the magic-exponent trick, the Newton reciprocal, or the
+  B-register staging the cores use), not in the kernel skeleton.  Two
+  hypotheses were tested and rejected on the board: two extra nops after the
+  bank-conflict staging write (made it worse: all lanes zero) and the
+  `ONE`↔`E1` constant aliasing (fixed a real 3.5 % error but not the rest).
+
+A stale-blob trap found on the way: `vc4__kernel` keys the JIT cache on the
+kernel *name* only, so a blob generated by an earlier version of a generator is
+reused forever.  `VC4INFER_CACHE=<fresh dir>` must be used when iterating on
+`kops.py`; this cost two board reboots (the QPU can wedge on a bad kernel and
+only a power cycle clears it, as `docs/ONNX.md` §3 already warns).
+
+### 10.4 The host-byte debt (acceptance item 2) — not started
+
+The `util` table quoted by the current milestone (`host_compute_nodes 0`,
+`17,077,040 B` across 142 sites) is unchanged by this slice: the `gather` and
+`blit` kernels that would remove it exist and generate, but they were not
+element-verified in time, so they are **not** wired into the executor.  The
+mapping from the table to the new kernels is nevertheless exact and does not
+need new hardware work:
+
+| op | bytes/run | path once `vc4_gather`/`vc4_blit` verify |
+|---|---:|---|
+| Conv | 8,683,728 | NHWC↔NCHW + input conversion: gather table per output element (4 B/elem overhead) or blit for the 64 B-aligned interior |
+| Concat | 5,160,000 | `vc4_gather` with per-row tables (pitched channel concat) or `vc4_concat_nhwc` for C%16 |
+| Split | 983,040 | gather, channel-strided |
+| Reshape | 826,080 | gather (2-D transpose is exact; only the 2100-extent head needs the table) |
+| Resize | 471,040 | gather (nearest), gather ×4 + GPU MUL/ADD (bilinear/cubic) |
+| Softmax | 403,456 | gather (channel→last-axis permute) |
+| Transpose | 268,800 | gather, arbitrary permutation |
+| MaxPool | 247,296 | the `-inf` border: a 64 B-granular constant `fill` is already an argument of `vc4_gather` |
+| Slice | 25,200 | gather |
+| Mul | 8,400 | broadcast constant expansion: gather with a repeated index |
+
+### 10.5 Next steps, in order
+
+1. Fix the transcendental cores on the board.  The fastest instrument is the
+   `emu2.py` style word-level emulator in this tree's scratch (decode the blob,
+   run the ALU words with the truncating FPU) — it distinguishes a bad body from
+   a bad encoding, which is the remaining ambiguity.
+2. Element-verify `gather`, `blit`, `reduce`, `cumsum`, `sel3` (they need the
+   same treatment `test_onnxops.c` gives `maxpooln`/`softmax_fwd`), then wire
+   the layout table above into `_onnxrun.py` behind the documented
+   `VC4_LAYOUT=vc4|host` switch, defaulting to `vc4`.
+3. `NonZero`/`TopK` (bounded output + device-written count) on top of `reduce`
+   and `gather`; then the NMS / fp64 / device-dispatch items.

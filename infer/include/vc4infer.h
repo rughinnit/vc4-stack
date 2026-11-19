@@ -298,6 +298,60 @@ vc4_status vc4_maxpooln(vc4_ctx *ctx, const vc4_buf *in, int C, int H, int W,
                         int N, int stride, int pad,
                         vc4_buf *out, int *Ho, int *Wo);
 
+
+/* ------------------------------------------- generic kernels (vc4_gen.c) */
+/*
+ * Unary math, built as range reduction + minimax polynomial + exact integer
+ * scaling on the QPU (the FPU truncates, so no hardware transcendental is
+ * used).  Measured accuracy per op is in docs/ONNX.md section 10 and is
+ * checked element-by-element by tests/test_genops.c.
+ */
+typedef enum {
+    VC4_UOP_ABS = 0, VC4_UOP_NEG, VC4_UOP_IDENTITY, VC4_UOP_CLIP,
+    VC4_UOP_LEAKYRELU, VC4_UOP_FLOOR, VC4_UOP_CEIL, VC4_UOP_ROUND,
+    VC4_UOP_SIGN, VC4_UOP_EXP, VC4_UOP_LOG, VC4_UOP_SQRT,
+    VC4_UOP_RECIPROCAL, VC4_UOP_TANH, VC4_UOP_ERF, VC4_UOP_ELU,
+    VC4_UOP_SELU, VC4_UOP_SOFTPLUS, VC4_UOP_SOFTSIGN, VC4_UOP_GELU,
+    VC4_UOP_GELU_ERF, VC4_UOP_HARDSIGMOID, VC4_UOP_HARDSWISH,
+    VC4_UOP_SIN, VC4_UOP_COS,
+    VC4_UOP_COUNT
+} vc4_uop;
+
+/* out = f(a, b, c): where (a != 0 ? b : c), clip3 (min(max(a,b),c)), prelu */
+typedef enum { VC4_SEL_WHERE = 0, VC4_SEL_CLIP3, VC4_SEL_PRELU } vc4_selop;
+typedef enum {
+    VC4_RED_SUM = 0, VC4_RED_MEAN, VC4_RED_MAX, VC4_RED_MIN,
+    VC4_RED_ARGMAX, VC4_RED_ARGMIN
+} vc4_redop;
+
+/* out[i] = uop(a[i]) for i < n; p0..p2 are the op attributes. */
+vc4_status vc4_unary(vc4_ctx *ctx, vc4_uop op, const vc4_buf *a,
+                     vc4_buf *out, size_t n, float p0, float p1, float p2);
+vc4_status vc4_select3(vc4_ctx *ctx, vc4_selop op, const vc4_buf *a,
+                       const vc4_buf *b, const vc4_buf *c, vc4_buf *out,
+                       size_t n);
+/*
+ * out[o] = arena[tab[o]]: `tab` is n int32 *arena byte offsets* (negative
+ * entries write `fill`).  This is the layout workhorse: pad, tile, expand,
+ * transpose, slice, gather (incl. GatherElements), depth/space, nearest and
+ * cubic resize taps, and the compaction step of NonZero/TopK.  The table is
+ * 4 B per output element and is built from integer index arithmetic.
+ */
+vc4_status vc4_gather(vc4_ctx *ctx, const vc4_buf *tab, vc4_buf *out,
+                      size_t n, float fill);
+/* Contiguous 64 B-granular copy (no table); bytes % 64 == 0. */
+vc4_status vc4_blit(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t bytes);
+/*
+ * out[o] = reduce over a[o*red .. o*red+red) for o < outer.
+ * ARGMAX/ARGMIN write raw int32 indices into `out` (interpret with a
+ * .view(int32)); the value ops write fp32.
+ */
+vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
+                      uint32_t outer, uint32_t red, vc4_redop op);
+/* Inclusive prefix sum over the last axis; cols % 256 == 0. */
+vc4_status vc4_cumsum(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
+                      uint32_t rows, uint32_t cols);
+
 /* ---------------------------------------------------------------- registry */
 typedef struct {
     const char *name;       /* "matmul", "conv2d/3x3", "sigmoid", ...        */

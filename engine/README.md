@@ -232,11 +232,17 @@ source of truth.  Supported: `matmul`, `conv2d/3x3`, `conv2d/1x1`, `add`,
 `mul`, `relu`, `sigmoid`, `silu`, `relu_bwd`, `rsqrt`, `transpose`,
 `matmul_bt` (C = A*B^T), `softmax_ce_bwd` (fused softmax + cross-entropy
 gradient), `softmax`, `im2col`, `col2im`, `conv2d/bwd_dx`, `conv2d/bwd_dw`,
-`maxpool/2x2s2`, `maxpool_bwd` (21 of 34 rows).  Explicitly unsupported (and listed as such, so the
-table is an honest coverage statement): `conv2d/5x5`, `conv2d/stride2`,
-`conv2d/depthwise`, `conv2d/grouped`, `matmul/f16`, `batched-matmul`,
-`maxpool/3x3`, `avgpool`, `layernorm`, `concat/slice`, arbitrary `permute`,
-`upsample`, `quantize/dequantize`.
+`maxpool/2x2s2`, `maxpool/NxNsS` (any window/stride/pad), `maxpool_bwd`,
+`softmax_fwd` (the `softmax` row; <=16 classes) (22 of 34 entries).
+Explicitly unsupported (and listed as such, so the table is an honest
+coverage statement): `conv2d/5x5`, `conv2d/stride2`, `conv2d/depthwise`,
+`conv2d/grouped`, `matmul/f16`, `batched-matmul`, `avgpool`, `layernorm`,
+`concat/slice`, arbitrary `permute`, `upsample`, `quantize/dequantize`.
+
+The ONNX graph path (`../onnx/`, documented in `../docs/ONNX.md`) composes
+the supported ops into stride-2 and depthwise convolutions and uses host byte
+copies for concat/nearest-resize.  It is a graph-level layer; the engine
+dispatch above remains strict.
 
 ## Training path
 

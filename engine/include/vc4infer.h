@@ -57,7 +57,7 @@ typedef enum {
 
 typedef enum {
     VC4_OP_MATMUL = 0,
-    VC4_OP_CONV2D,          /* 3x3 and 1x1, stride 1/2, zero padding      */
+    VC4_OP_CONV2D,          /* 3x3 and 1x1, stride 1, zero padding        */
     VC4_OP_ADD,
     VC4_OP_MUL,
     VC4_OP_RELU,
@@ -115,7 +115,9 @@ vc4_status vc4_matmul(vc4_ctx *ctx,
  *   in  [Cin][H][W]      wt [Cout][Cin][KH][KW]      out [Cout][HO][WO]
  * HO = (H + 2*pad - KH)/stride + 1, WO likewise.
  * Implemented as im2col (QPU gather kernel) -> vc4_matmul.  Supported:
- * KH=KW in {1,3}, stride in {1,2}, any pad >= 0, Cin % 16 == 0 for 3x3.
+ * KH=KW in {1,3}, stride == 1, any pad >= 0, Cin % 16 == 0, Cout % 16 == 0.
+ * (The ONNX runner composes stride 2 and depthwise from this op; see
+ * docs/ONNX.md.)
  */
 vc4_status vc4_conv2d(vc4_ctx *ctx,
                       const vc4_buf *in, int Cin, int H, int W,
@@ -153,6 +155,17 @@ vc4_status vc4_matmul_bt(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
 vc4_status vc4_softmax_ce(vc4_ctx *ctx, const vc4_buf *logits,
                           const vc4_buf *labels, vc4_buf *dlogits,
                           vc4_buf *partial, uint32_t rows, float inv_batch);
+
+/*
+ * Forward softmax over rows of at most 16 classes (the fused kernel's lane
+ * width).  logits/out are rows x cols f32; internally each row is copied to
+ * the kernel's 16-column padded form with -1e30 in the padding, and the
+ * probability rows are copied back.  rows % 8 == 0.  The exponential and the
+ * reciprocal run on the QPU (the same degree-5 2^f polynomial and 3x Newton
+ * reciprocal as vc4_softmax_ce); the CPU only pads and compacts bytes.
+ */
+vc4_status vc4_softmax_fwd(vc4_ctx *ctx, const vc4_buf *logits,
+                           uint32_t rows, uint32_t cols, vc4_buf *out);
 
 /* ---------------------------------------------- conv / pool backward */
 /*
@@ -201,6 +214,18 @@ vc4_status vc4_maxpool2x2(vc4_ctx *ctx, const vc4_buf *in, int C, int H, int W,
 vc4_status vc4_maxpool2x2_backward(vc4_ctx *ctx, const vc4_buf *in,
                                    const vc4_buf *dy, int C, int H, int W,
                                    int dy_pitch, vc4_buf *dx);
+
+/*
+ * Generic NxN / stride-S max pool over [C][H][W].
+ *   out has align4(Ho) rows of pitch align16(Wo); only [..][Ho][Wo] is
+ *   meaningful.  The host pads the border with -inf (bytes only), so any
+ *   pad >= 0, N >= 1 and stride >= 1 are supported; all arithmetic is on the
+ *   QPU.  ho/wo are the ONNX output dimensions:
+ *   Ho = (H + 2*pad - N)/stride + 1, Wo likewise.
+ */
+vc4_status vc4_maxpooln(vc4_ctx *ctx, const vc4_buf *in, int C, int H, int W,
+                        int N, int stride, int pad,
+                        vc4_buf *out, int *Ho, int *Wo);
 
 /* ---------------------------------------------------------------- registry */
 typedef struct {

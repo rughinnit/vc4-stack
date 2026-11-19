@@ -46,9 +46,9 @@ library; the .deb provides it.  In a venv:
 ```sh
 sudo apt install vc4infer
 python3 -m venv ~/venvs/vc4 && . ~/venvs/vc4/bin/activate
-pip install https://rughinnit.github.io/vc4top/pip/vc4infer-1.1.2-py3-none-any.whl
-# or as an extra index:
-pip install --extra-index-url https://rughinnit.github.io/vc4top/pip/simple/ vc4infer
+pip install https://rughinnit.github.io/vc4-apt/pip/vc4infer-1.1.2-py3-none-any.whl
+# or from the PEP 503 index (--index-url works too):
+pip install --extra-index-url https://rughinnit.github.io/vc4-apt/pip/simple/ vc4infer
 ```
 
 pip dependencies: `numpy`, `onnx>=1.14`, `pillow`.  `vc4d` must be running

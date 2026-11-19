@@ -46,4 +46,4 @@ The module uses `ioread32()` per register, which is what `drm/vc4` itself does.
 ## Package
 
 vc4top 1.0.3, `vc4top_1.0.3_arm64.deb`, sha256 `d6548b0c...fcd866`, signed apt repo at
-https://rughinnit.github.io/vc4top, installed on the Pi.
+https://rughinnit.github.io/vc4-apt, installed on the Pi.

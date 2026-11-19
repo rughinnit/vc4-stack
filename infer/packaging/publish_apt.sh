@@ -1,11 +1,12 @@
 #!/bin/sh
-# Publish vc4infer into the signed vc4top apt repository on gh-pages.
+# Publish vc4infer into the signed vc4-apt repository.
 #
 #   infer/packaging/publish_apt.sh [DEB] [VERSION] [WHEEL]
 #
-# The repository is the gh-pages branch of github.com:rughinnit/vc4top, served
-# at https://rughinnit.github.io/vc4top, signed with the vc4top archive key
-# (~/.gnupg-vc4top).  vc4infer is added next to vc4top:
+# The repository is the main branch (root) of github.com:rughinnit/vc4-apt,
+# served at https://rughinnit.github.io/vc4-apt, signed with the vc4top archive
+# key (~/.gnupg-vc4top, fingerprint E4CB3BA0...).  It is the single source for
+# every VideoCore IV package; vc4infer is added next to vc4top:
 #
 #   pool/main/v/vc4top/...                  (untouched)
 #   pool/main/v/vc4infer/....deb            (this package)
@@ -14,12 +15,17 @@
 #
 # Packages/Release/InRelease are regenerated over the *whole* pool, so adding a
 # package never drops an existing one.
+#
+# The old gh-pages tree of github.com:rughinnit/vc4top (served at
+# https://rughinnit.github.io/vc4top) is deprecated and deliberately no longer
+# updated; it stays online as a frozen fallback for existing installs.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
-wt=${VC4TOP_GH_PAGES:-$HOME/vc4top-gh-pages}
-src=${VC4TOP_REPO:-$HOME/vc4top}
+wt=${VC4APT_DIR:-$HOME/vc4-apt}
+src=${VC4APT_REPO:-git@github.com:rughinnit/vc4-apt.git}
+branch=main
 arch=arm64
 suite=stable
 
@@ -32,12 +38,12 @@ wheel=${3:-$(ls "$root"/../dist/vc4infer-"$ver"-py3-none-any.whl 2>/dev/null | t
 : "${GNUPGHOME:=$HOME/.gnupg-vc4top}"
 export GNUPGHOME
 
-# ---- gh-pages worktree ------------------------------------------------------
+# ---- vc4-apt checkout -------------------------------------------------------
 if [ -e "$wt/.git" ]; then
-	git -C "$wt" checkout -q gh-pages
-	git -C "$wt" pull -q --ff-only origin gh-pages
+	git -C "$wt" checkout -q "$branch"
+	git -C "$wt" pull -q --ff-only origin "$branch"
 else
-	git -C "$src" worktree add -q "$wt" gh-pages
+	git clone -q "$src" "$wt"
 fi
 
 install -d "$wt/pool/main/v/vc4infer" "$wt/pip/simple/vc4infer"
@@ -67,9 +73,9 @@ apt package.</p>
 <h2>Install</h2>
 <pre>
 sudo apt install vc4infer
-pip install https://rughinnit.github.io/vc4top/pip/$whl
+pip install https://rughinnit.github.io/vc4-apt/pip/$whl
 # or as a pip index:
-pip install --extra-index-url https://rughinnit.github.io/vc4top/pip/simple/ vc4infer
+pip install --extra-index-url https://rughinnit.github.io/vc4-apt/pip/simple/ vc4infer
 </pre>
 <p>sha256: <code>$sha</code></p>
 </body></html>
@@ -116,9 +122,9 @@ if git diff --quiet --cached; then
 	echo "repository already contains vc4infer $ver (nothing to commit)"
 else
 	git commit -q -m "publish: vc4infer $ver (deb + wheel)"
-	git push -q origin gh-pages
-	echo "pushed gh-pages: vc4infer $ver"
+	git push -q origin "$branch"
+	echo "pushed $branch: vc4infer $ver"
 fi
-echo "deb:   https://rughinnit.github.io/vc4top/pool/main/v/vc4infer/vc4infer_${ver}_${arch}.deb"
-echo "wheel: https://rughinnit.github.io/vc4top/pip/$whl"
-echo "index: https://rughinnit.github.io/vc4top/pip/simple/"
+echo "deb:   https://rughinnit.github.io/vc4-apt/pool/main/v/vc4infer/vc4infer_${ver}_${arch}.deb"
+echo "wheel: https://rughinnit.github.io/vc4-apt/pip/$whl"
+echo "index: https://rughinnit.github.io/vc4-apt/pip/simple/"

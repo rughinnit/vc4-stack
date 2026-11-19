@@ -246,6 +246,7 @@ vc4_status vc4_col2im(vc4_ctx *ctx, const vc4_buf *dA, int Cin, int K,
 
     vc4__scratch_reset(ctx);
     memset(ctx->arena + dXpad->off, 0, (size_t)Cin * hp * wp * 4 + 64);
+    vc4__mark_dirty(ctx, dXpad->off, (size_t)Cin * hp * wp * 4 + 64);
     int hp2, wp2;
     vc4_status st = col2im_run(ctx, vc4_bus_addr(ctx, dA), Cin, K, KH, KW,
                                HO, WO, vc4_bus_addr(ctx, dXpad), &hp2, &wp2);
@@ -380,6 +381,7 @@ vc4_status vc4_conv2d_backward(vc4_ctx *ctx,
                 memcpy(dst + ((size_t)c * H + (size_t)y) * W,
                        DXp + ((size_t)c * hp + (size_t)(y + pad)) * wp + pad,
                        (size_t)W * 4);
+        vc4__mark_dirty(ctx, dX->off, (size_t)Cin * H * W * 4);
     }
 
     /* ---- dWp = dY^T * Acol   (transpose + pack + gemm3 bmode=0) ------ */
@@ -407,6 +409,7 @@ vc4_status vc4_conv2d_backward(vc4_ctx *ctx,
                 for (int t = 0; t < taps; ++t)
                     dst[((size_t)co * Cin + ci) * taps + t] =
                         dWp[(size_t)co * K + (size_t)t * Cin + ci];
+        vc4__mark_dirty(ctx, dW->off, (size_t)Cout * K * 4);
     }
 
 out:

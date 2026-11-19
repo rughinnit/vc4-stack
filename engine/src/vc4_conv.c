@@ -152,6 +152,7 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
             for (int l = 0; l < 16; ++l)
                 blk[l] = 1.0f;
         }
+        vc4__mark_dirty(ctx, pb.off, (size_t)M * nk * 4);
     }
 
     /* ---- 3. weights -> k-major B panel ---------------------------------- */
@@ -196,6 +197,7 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
                 float *brow = wpanel + ((size_t)cb * nk + Kp) * 16u;
                 memcpy(brow, bsrc + (size_t)cb * 16u, 16u * 4u);
             }
+            vc4__mark_dirty(ctx, wb.off, (size_t)Cout * nk * 4);
         }
     }
 
@@ -225,6 +227,7 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
                 dst[x] = src[(size_t)x * Cout];
         }
     }
+    vc4__mark_dirty(ctx, out->off, (size_t)Cout * ho * wo * 4);
     *HO = ho;
     *WO = wo;
     vc4__scratch_reset(ctx);

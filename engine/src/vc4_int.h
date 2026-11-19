@@ -41,7 +41,9 @@ struct vc4_ctx {
     size_t   arena_bytes;
     size_t   arena_top;      /* persistent bump cursor                 */
     size_t   scratch;        /* scratch bump cursor, reset per op      */
+    size_t   dirty_top;      /* remote: high-water of CPU-written bytes */
     int      dead;
+    void    *remote;         /* struct vc4_remote * when VC4INFER_DAEMON=1 */
     uint32_t errstat_base;   /* bits that read as set even on an idle GPU */
     char     err[256];
 
@@ -63,6 +65,24 @@ void       vc4__l2_flush(vc4_ctx *ctx);
 void       vc4__write(vc4_ctx *ctx, uint32_t off, const void *src, size_t bytes);
 void      *vc4__scratch_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out);
 void       vc4__scratch_reset(vc4_ctx *ctx);
+
+/* ---- vc4_dev_remote.c (VC4INFER_DAEMON=1) -------------------------------- */
+vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
+                            size_t arena_bytes);
+void       vc4__remote_shutdown(vc4_ctx *ctx);
+vc4_status vc4__remote_load(vc4_ctx *ctx, const char *name,
+                            const uint8_t *words, size_t bytes,
+                            int nqpu, vc4_kernel **out);
+vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
+                              uint64_t *wall_ns);
+vc4_status vc4__remote_upload(vc4_ctx *ctx, vc4_buf *b, const void *src,
+                              size_t bytes);
+vc4_status vc4__remote_download(vc4_ctx *ctx, const vc4_buf *b, void *dst,
+                                size_t bytes);
+void       vc4__remote_l2_flush(vc4_ctx *ctx);
+void       vc4__remote_mark(vc4_ctx *ctx, uint32_t off, size_t bytes);
+void       vc4__remote_scratch_reset(vc4_ctx *ctx);
+void       vc4__mark_dirty(vc4_ctx *ctx, uint32_t off, size_t bytes);
 
 /* ---- vc4_kern.c --------------------------------------------------------- */
 /* gen_argv[0] is the kernel kind, the rest are the kgen.py flags. */

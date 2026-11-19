@@ -1,0 +1,67 @@
+== Thu Nov 19 09:07:57 AM UTC 2026
+clocks: frequency(1)=400000000 frequency(46)=300000000 throttled=0x0
+-- round 1 size 128 daemon
+backend=vc4d (unprivileged) arena=64.0 MiB  128x128x128 reps=5
+  rep0: mismatches=0/16384  gpu 0.984 ms  wall 3703.354 ms  (gpu 4.26, wall 0.00 GFLOP/s)
+  rep1: mismatches=0/16384  gpu 0.901 ms  wall 1.383 ms  (gpu 4.66, wall 3.03 GFLOP/s)
+  rep2: mismatches=0/16384  gpu 0.888 ms  wall 1.253 ms  (gpu 4.72, wall 3.35 GFLOP/s)
+  rep3: mismatches=0/16384  gpu 1.043 ms  wall 3.915 ms  (gpu 4.02, wall 1.07 GFLOP/s)
+  rep4: mismatches=0/16384  gpu 2.798 ms  wall 5.628 ms  (gpu 1.50, wall 0.75 GFLOP/s)
+RESULT 128x128x128 vc4d: mismatches=0  gpu 0.888 ms = 4.72 GFLOP/s  wall 1.253 ms = 3.35 GFLOP/s
+-- round 1 size 128 direct
+backend=direct (/dev/mem, root) arena=64.0 MiB  128x128x128 reps=5
+  rep0: mismatches=0/16384  gpu 0.708 ms  wall 0.954 ms  (gpu 5.92, wall 4.40 GFLOP/s)
+  rep1: mismatches=0/16384  gpu 0.714 ms  wall 0.725 ms  (gpu 5.87, wall 5.79 GFLOP/s)
+  rep2: mismatches=0/16384  gpu 0.725 ms  wall 0.734 ms  (gpu 5.79, wall 5.71 GFLOP/s)
+  rep3: mismatches=0/16384  gpu 0.723 ms  wall 0.732 ms  (gpu 5.80, wall 5.73 GFLOP/s)
+  rep4: mismatches=0/16384  gpu 0.715 ms  wall 0.723 ms  (gpu 5.87, wall 5.80 GFLOP/s)
+RESULT 128x128x128 direct: mismatches=0  gpu 0.708 ms = 5.92 GFLOP/s  wall 0.723 ms = 5.80 GFLOP/s
+-- round 1 size 256 daemon
+backend=vc4d (unprivileged) arena=64.0 MiB  256x256x256 reps=5
+  rep0: mismatches=0/65536  gpu 4.030 ms  wall 6.856 ms  (gpu 8.33, wall 4.89 GFLOP/s)
+  rep1: mismatches=0/65536  gpu 4.026 ms  wall 4.311 ms  (gpu 8.33, wall 7.78 GFLOP/s)
+  rep2: mismatches=0/65536  gpu 3.989 ms  wall 4.319 ms  (gpu 8.41, wall 7.77 GFLOP/s)
+  rep3: mismatches=0/65536  gpu 4.009 ms  wall 4.297 ms  (gpu 8.37, wall 7.81 GFLOP/s)
+  rep4: mismatches=0/65536  gpu 3.988 ms  wall 4.271 ms  (gpu 8.41, wall 7.86 GFLOP/s)
+RESULT 256x256x256 vc4d: mismatches=0  gpu 3.988 ms = 8.41 GFLOP/s  wall 4.271 ms = 7.86 GFLOP/s
+-- round 1 size 256 direct
+backend=direct (/dev/mem, root) arena=64.0 MiB  256x256x256 reps=5
+  rep0: mismatches=0/65536  gpu 3.949 ms  wall 4.251 ms  (gpu 8.50, wall 7.89 GFLOP/s)
+  rep1: mismatches=0/65536  gpu 3.963 ms  wall 3.979 ms  (gpu 8.47, wall 8.43 GFLOP/s)
+  rep2: mismatches=0/65536  gpu 3.962 ms  wall 3.976 ms  (gpu 8.47, wall 8.44 GFLOP/s)
+  rep3: mismatches=0/65536  gpu 3.965 ms  wall 3.979 ms  (gpu 8.46, wall 8.43 GFLOP/s)
+  rep4: mismatches=0/65536  gpu 3.965 ms  wall 3.980 ms  (gpu 8.46, wall 8.43 GFLOP/s)
+RESULT 256x256x256 direct: mismatches=0  gpu 3.949 ms = 8.50 GFLOP/s  wall 3.976 ms = 8.44 GFLOP/s
+-- round 2 size 128 daemon
+backend=vc4d (unprivileged) arena=64.0 MiB  128x128x128 reps=5
+  rep0: mismatches=0/16384  gpu 0.796 ms  wall 1.717 ms  (gpu 5.27, wall 2.44 GFLOP/s)
+  rep1: mismatches=0/16384  gpu 0.772 ms  wall 0.946 ms  (gpu 5.44, wall 4.44 GFLOP/s)
+  rep2: mismatches=0/16384  gpu 0.770 ms  wall 0.941 ms  (gpu 5.45, wall 4.46 GFLOP/s)
+  rep3: mismatches=0/16384  gpu 0.813 ms  wall 0.988 ms  (gpu 5.16, wall 4.25 GFLOP/s)
+  rep4: mismatches=0/16384  gpu 0.770 ms  wall 0.943 ms  (gpu 5.44, wall 4.45 GFLOP/s)
+RESULT 128x128x128 vc4d: mismatches=0  gpu 0.770 ms = 5.45 GFLOP/s  wall 0.941 ms = 4.46 GFLOP/s
+-- round 2 size 128 direct
+backend=direct (/dev/mem, root) arena=64.0 MiB  128x128x128 reps=5
+  rep0: mismatches=0/16384  gpu 0.709 ms  wall 0.954 ms  (gpu 5.92, wall 4.39 GFLOP/s)
+  rep1: mismatches=0/16384  gpu 0.714 ms  wall 0.725 ms  (gpu 5.88, wall 5.79 GFLOP/s)
+  rep2: mismatches=0/16384  gpu 0.714 ms  wall 0.723 ms  (gpu 5.87, wall 5.80 GFLOP/s)
+  rep3: mismatches=0/16384  gpu 0.715 ms  wall 0.724 ms  (gpu 5.87, wall 5.80 GFLOP/s)
+  rep4: mismatches=0/16384  gpu 0.714 ms  wall 0.723 ms  (gpu 5.87, wall 5.80 GFLOP/s)
+RESULT 128x128x128 direct: mismatches=0  gpu 0.709 ms = 5.92 GFLOP/s  wall 0.723 ms = 5.80 GFLOP/s
+-- round 2 size 256 daemon
+backend=vc4d (unprivileged) arena=64.0 MiB  256x256x256 reps=5
+  rep0: mismatches=0/65536  gpu 3.985 ms  wall 5.155 ms  (gpu 8.42, wall 6.51 GFLOP/s)
+  rep1: mismatches=0/65536  gpu 4.001 ms  wall 4.293 ms  (gpu 8.39, wall 7.82 GFLOP/s)
+  rep2: mismatches=0/65536  gpu 3.999 ms  wall 4.289 ms  (gpu 8.39, wall 7.82 GFLOP/s)
+  rep3: mismatches=0/65536  gpu 3.986 ms  wall 4.275 ms  (gpu 8.42, wall 7.85 GFLOP/s)
+  rep4: mismatches=0/65536  gpu 4.019 ms  wall 4.312 ms  (gpu 8.35, wall 7.78 GFLOP/s)
+RESULT 256x256x256 vc4d: mismatches=0  gpu 3.985 ms = 8.42 GFLOP/s  wall 4.275 ms = 7.85 GFLOP/s
+-- round 2 size 256 direct
+backend=direct (/dev/mem, root) arena=64.0 MiB  256x256x256 reps=5
+  rep0: mismatches=0/65536  gpu 3.958 ms  wall 4.206 ms  (gpu 8.48, wall 7.98 GFLOP/s)
+  rep1: mismatches=0/65536  gpu 3.961 ms  wall 3.980 ms  (gpu 8.47, wall 8.43 GFLOP/s)
+  rep2: mismatches=0/65536  gpu 3.961 ms  wall 3.976 ms  (gpu 8.47, wall 8.44 GFLOP/s)
+  rep3: mismatches=0/65536  gpu 3.968 ms  wall 3.983 ms  (gpu 8.46, wall 8.43 GFLOP/s)
+  rep4: mismatches=0/65536  gpu 3.965 ms  wall 3.979 ms  (gpu 8.46, wall 8.43 GFLOP/s)
+RESULT 256x256x256 direct: mismatches=0  gpu 3.958 ms = 8.48 GFLOP/s  wall 3.976 ms = 8.44 GFLOP/s
+clocks: frequency(1)=400000000 frequency(46)=300000000 throttled=0x0

@@ -45,4 +45,4 @@ All external sources (Broadcom guide, reverse-engineering wikis, V3DLib, anholt/
 
 ## Documentation
 
-Full index: [docs/README.md](docs/README.md). Includes references, decoder cross-validation, numerics, clock variance, training and conv results, the vc4d security model, and the V3DLib report.
+Full index: [docs/README.md](docs/README.md). Includes references, decoder cross-validation, numerics, clock variance, training and conv results, the vc4d security model, the read-only vc4mon kernel interface, and the V3DLib report.

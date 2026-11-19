@@ -63,6 +63,8 @@ typedef enum {
     VC4_OP_RELU,
     VC4_OP_SIGMOID,
     VC4_OP_SILU,
+    VC4_OP_RELU_BWD,        /* out = b if a > 0 else 0 (masked copy)         */
+    VC4_OP_RSQRT,           /* out = 1/sqrt(a), a > 0 (Adam)                 */
     VC4_OP_COUNT
 } vc4_op;
 
@@ -124,6 +126,28 @@ vc4_status vc4_elementwise(vc4_ctx *ctx, vc4_op op,
 vc4_status vc4_relu(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t n);
 vc4_status vc4_sigmoid(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t n);
 vc4_status vc4_silu(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t n);
+vc4_status vc4_rsqrt(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t n);
+/* out = dy if a > 0 else 0 (relu backward mask; a = the forward input) */
+vc4_status vc4_relu_backward(vc4_ctx *ctx, const vc4_buf *a,
+                             const vc4_buf *dy, vc4_buf *out, size_t n);
+
+/* ------------------------------------------------------- training primitives */
+/* Y = X^T (dense transpose, 16x16 tiles; both dims multiple of 16) */
+vc4_status vc4_transpose(vc4_ctx *ctx, const vc4_buf *in, vc4_buf *out,
+                         uint32_t rows, uint32_t cols);
+/* C = A * B^T, A MxK, B NxK, all row-major; M,N,K multiples of 16 */
+vc4_status vc4_matmul_bt(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
+                         vc4_buf *C, uint32_t M, uint32_t N, uint32_t K);
+/*
+ * dlogits[r][c] = (softmax(logits[r])[c] - onehot(labels[r])[c]) * inv_batch
+ * plus per-QPU (loss, correct) totals in partial[] (lane 0 / lane 1 of a
+ * 64 B slot per QPU).  logits/dlogits are rows x 16 floats.  The logits
+ * padding columns must hold a very negative bias (-1e30) so they contribute
+ * exp = 0.  See vc4_train.c for the exact buffer slack requirements.
+ */
+vc4_status vc4_softmax_ce(vc4_ctx *ctx, const vc4_buf *logits,
+                          const vc4_buf *labels, vc4_buf *dlogits,
+                          vc4_buf *partial, uint32_t rows, float inv_batch);
 
 /* ---------------------------------------------------------------- registry */
 typedef struct {

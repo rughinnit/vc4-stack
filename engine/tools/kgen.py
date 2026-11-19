@@ -1410,12 +1410,19 @@ def build_gemm10(M, N, K, nqpu=12, probe=None, single=False):
 
 
 # =============================================================== pack/transpose
-def build_pack(kblocks, vpitch=1):
+def build_pack(kblocks, vpitch=1, dstride=0):
     """K-major panel builder: PANEL[(rb*K + k)*16 + r] = SRC[rb*16 + r][k].
 
     The asm3 packer (VDR + vertical VDW, no ALU data movement) with the source
     and destination strides as uniforms, so the same blob builds the A panel
     and a k-major B panel from a [Cout][K] weight matrix.
+
+    dstride != 0 turns the 1 KB transposed block into a strided store: each of
+    the 16 rows of the transposed block is written dstride bytes further into
+    memory than the previous one (the field is *additional* to the 64 B a row
+    writes; emit_store16 uses the same field).  With dstride = dst_row_pitch-64
+    and the per-kblock/per-rowblock strides set by the caller, the same kernel
+    is a dense 16x16 block transpose (vc4__tpose_run).
     """
     A = dict(RL=17, SRCB=18, PB=19, SRCP=20, DSTP=21, SRC=22, DST=23,
              CNT=24, KB=25, VDRW=26, VDWW=27, TMP=28, VDRS=29, VDWS=30, PITCH=31)
@@ -1445,7 +1452,7 @@ def build_pack(kblocks, vpitch=1):
     b.e(add_(ADD_ADD, A['VDWW'], areg(A['VDWW']), (REGB, B['RBT'])), nop(), nop())
     b.e(ldi(V.vdr_stride(0) & ~0xFFF, A['TMP']), nop(), nop())
     b.e(add_(ADD_ADD, A['VDRS'], areg(A['TMP']), (REGB, A['PITCH'])), nop())
-    b.e(ldi(V.vdw_stride(0), A['VDWS']), nop())
+    b.e(ldi(V.vdw_stride(dstride), A['VDWS']), nop())
     b.e(add_(ADD_ADD, A['SRCP'], areg(A['SRCB']), (REGB, B['OFF'])), nop())
     # destination row blocks can have a different stride than the source
     # (the conv weight panel includes the folded bias k-block)
@@ -1715,7 +1722,7 @@ def build_im2col(Cin, K, KH, KW, vpitch=1):
 
 
 # =============================================================== elementwise
-OP_ADD, OP_MUL, OP_RELU, OP_SIGMOID, OP_SILU = 0, 1, 2, 3, 4
+OP_ADD, OP_MUL, OP_RELU, OP_SIGMOID, OP_SILU, OP_RELU_BWD, OP_RSQRT = 0, 1, 2, 3, 4, 5, 6
 
 E_AB, E_BB, E_OB = 16, 17, 18
 E_CNT, E_LANE = 19, 20
@@ -1773,6 +1780,11 @@ def build_ew(op, depth=2):
         for name, val in (('M', 0xFFFFF000), ('A', 0x7FFFFFFF),
                           ('H', 0x0C000000), ('X', 0x7F800000)):
             b.e(ldi(val, {'M': 9, 'A': 10, 'H': 11, 'X': 15}[name], ws=1), nop())
+    if op == OP_RSQRT:
+        b.e(ldi(0x5F3759DF, 0, ws=1))      # B0: rsqrt magic seed
+        b.e(ldi(0x3FC00000, 1, ws=1))      # B1: 1.5
+        b.e(ldi(0x3F000000, 2, ws=1))      # B2: 0.5
+        b.e(nop(), nop())
     if op in (OP_SIGMOID, OP_SILU):
         for name, val in (('NLOG2E', 0xBFB8AA3B), ('MAGIC', 0x4B400000),
                           ('CLAMP_LO', 0xC2B40000), ('CLAMP_HI', 0x42B40000),
@@ -1910,6 +1922,27 @@ def _ew_compute(b, op, j):
                  add_b=areg(T_INC)))                # bits(p) + inc
     elif op == OP_RELU:
         b.e(_ops(add_op=ADD_FMAX, add_out=j, add_a=aa, add_b=imm(0)))
+    elif op == OP_RSQRT:
+        # y = 1/sqrt(a) for a > 0: bit-trick seed, then y = y*(1.5 - 0.5*a*y*y)
+        b.e(_ops(add_op=ADD_SHR, add_out=32 + 1, add_a=aa, add_b=imm(1)))
+        b.e(_ops(add_op=ADD_SUB, add_out=32 + 1, add_a=breg(0), add_b=acc(1)))
+        for _ in range(4):
+            b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 2, ws=0, mul_a=aa, mul_b=acc(1)))
+            b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 2, ws=0, mul_a=acc(2), mul_b=acc(1)))
+            b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 2, ws=0, mul_a=acc(2), mul_b=breg(2)))
+            b.e(_ops(add_op=ADD_FSUB, add_out=32 + 2, add_a=breg(1), add_b=acc(2)))
+            b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 1, ws=0, mul_a=acc(1), mul_b=acc(2)))
+        b.e(add_or(j, acc(1), acc(1)))
+    elif op == OP_RELU_BWD:
+        # out = b if a > 0 else 0.  Integer mask on the bits of relu(a):
+        # +0 -> 0, any positive float has a positive int pattern, a negative
+        # float (sign bit set) is a negative int -> (bits-1)>>31 == -1.  The
+        # mask is then all-ones or 0, so the product is a bit copy (exact).
+        b.e(_ops(add_op=ADD_FMAX, add_out=32 + 0, add_a=aa, add_b=imm(0)))
+        b.e(_ops(add_op=ADD_SUB, add_out=32 + 0, add_a=acc(0), add_b=imm(1)))
+        b.e(_ops(add_op=ADD_ASR, add_out=32 + 0, add_a=acc(0), add_b=imm(31)))
+        b.e(_ops(add_op=ADD_NOT, add_out=32 + 1, add_a=acc(0), add_b=acc(0)))
+        b.e(_ops(add_op=ADD_AND, add_out=j, add_a=acc(1), add_b=bb))
     elif op in (OP_SIGMOID, OP_SILU):
         b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 0, ws=0, mul_a=aa,
                  mul_b=breg(K['NLOG2E'])))
@@ -1970,6 +2003,335 @@ def _ew_compute(b, op, j):
         raise ValueError("bad ew op %r" % (op,))
 
 
+# =============================================================== softmax+CE
+def build_softmax(depth=2, probe=None):
+    """Fused row softmax + cross-entropy backward, ONE 8-row group per launch.
+
+    Each QPU owns exactly one group of 8 rows, so the kernel has no loop and
+    no branch: the group count is the launch's QPU count (the host launches
+    ceil(rows/8/12) times).  A row is one 16-lane vector (the model output is
+    padded to 16 columns with a very negative bias, which contributes exp=0).
+
+      max  = horizontal max over 16 lanes (rotate + fmax, 4 steps)
+      e    = 2^((z-max)*log2e)  (degree-5 2^f polynomial + magic exponent,
+                                 the constants proven in build_ew)
+      S    = horizontal sum (rotate + fadd, 4 steps)
+      p    = e * (1/S)          (bit-trick reciprocal + 3 Newton steps)
+      dl   = (p - onehot(label)) * (1/B)
+
+    plus, per row, loss = (max - z_y) + ln2*log2(S) and
+    correct = (z_y == max).  Each QPU writes its totals (lane 0 loss, lane 1
+    correct rows) as one 64 B slot; the host reduces the slots with a GPU
+    GEMM (ones^T * partial), never on the CPU.
+
+    KERNEL ABI (uniforms u0..u5, 64 B block per QPU)
+      u0 logits group bus (8 rows x 16 floats = 512 B)
+      u1 dlogits group bus
+      u2 labels group bus (8 x int32 = 32 B)
+      u3 partial slot bus (64 B)
+      u4 QPU index (VPM row base = 4*q)
+      u5 1/B as float bits
+    """
+    # A file
+    A_LOG, A_DL, A_LB, A_PART = 16, 17, 18, 19
+    A_INV, A_LN2, A_L2E, A_QID = 20, 21, 22, 23
+    A_LANE, A_SADDR, A_M0, A_M1 = 24, 25, 26, 27
+    A_EXP = 28
+    # B file: constants and running totals
+    B_HALF, B_MAGIC, B_RCPM, B_ONE, B_TWO, B_MANT = 0, 1, 2, 3, 4, 5
+    B_C64, B_C256, B_ABS, B_CLAMP = 6, 7, 8, 9
+    B_LOSS, B_CORR = 10, 11
+    B_L0, B_L1, B_L2, B_L3, B_L4, B_L5, B_L6 = 12, 13, 14, 15, 16, 17, 18
+    EXPC = (19, 20, 21, 22, 23)
+    B_T0, B_T1, B_T2, B_T3 = 24, 25, 26, 27
+    B_Q4, B_Q9 = 28, 29
+    # exp polynomial (same constants as build_ew: 2^f on [-0.5, 0.5])
+    EXP = (0x3AAEC3FF, 0x3C1D955B, 0x3D635847, 0x3E75FDF0, 0x3F317218)
+    # log2(1+f) on [0,1], degree 6 (max |err| = 2.1e-6, fitted offline)
+    LOG2 = (0x360E8598, 0x3FB8A308, 0xBF37B1DF, 0x3EE93AD9,
+            0xBE8C9B6B, 0x3DF452A2, 0xBCCDCF2D)
+    RPG = 8
+
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))                    # tmu_noswap
+    b.read_uni(A_LOG)                                  # u0
+    b.read_uni(A_DL)                                   # u1
+    b.read_uni(A_LB)                                   # u2
+    b.read_uni(A_PART)                                 # u3
+    b.read_uni(A_QID)                                  # u4
+    b.read_uni(A_INV)                                  # u5
+    b.e(ldi(0x3F000000, B_HALF, ws=1))
+    b.e(ldi(0x4B400000, B_MAGIC, ws=1))
+    b.e(ldi(0x7EF311C3, B_RCPM, ws=1))
+    b.e(ldi(0x3F800000, B_ONE, ws=1))
+    b.e(ldi(0x40000000, B_TWO, ws=1))
+    b.e(ldi(0x007FFFFF, B_MANT, ws=1))
+    b.e(ldi(64, B_C64, ws=1))
+    b.e(ldi(0x3727C5AC, B_C256, ws=1))          # 1e-5 (argmax tolerance)
+    b.e(ldi(0x7FFFFFFF, B_ABS, ws=1))
+    b.e(ldi(0xC2AE0000, B_CLAMP, ws=1))                # -87.0
+    b.e(ldi(0x3F317218, A_LN2))                        # ln(2)
+    b.e(ldi(0x3FB8AA3B, A_L2E))                        # log2(e)
+    b.e(ldi(0x00000000, B_LOSS, ws=1))
+    b.e(ldi(0x00000000, B_CORR, ws=1))
+    for i, v in enumerate(EXP):
+        b.e(ldi(v, EXPC[i], ws=1))
+    for i, v in enumerate(LOG2):
+        b.e(ldi(v, (B_L0, B_L1, B_L2, B_L3, B_L4, B_L5, B_L6)[i], ws=1))
+    b.e(add_(ADD_SHL, B_Q4, ws=1, a=areg(A_QID), b=imm(2)))     # 4q
+    b.e(add_(ADD_SHL, B_Q9, ws=1, a=areg(A_QID), b=imm(9)))     # q<<9
+    b.e(ldi(127, A_QID))                               # 127 does not fit the
+    b.e(nop(), nop())                                  # small-immediate field
+    b.e(add_or(A_LANE, areg(R_ELEM_NUM), areg(R_ELEM_NUM)))
+    b.e(_ops(add_op=ADD_SUB, add_out=32 + 0, add_a=areg(A_LANE), add_b=imm(1)))
+    b.e(_ops(add_op=ADD_ASR, add_out=32 + 0, add_a=acc(0), add_b=imm(31)))
+    b.e(_ops(add_op=ADD_AND, add_out=A_M0, add_a=acc(0), add_b=breg(B_ONE)))
+    b.e(_ops(add_op=ADD_XOR, add_out=32 + 1, add_a=areg(A_LANE), add_b=imm(1)))
+    b.e(_ops(add_op=ADD_SUB, add_out=32 + 1, add_a=acc(1), add_b=imm(1)))
+    b.e(_ops(add_op=ADD_ASR, add_out=32 + 1, add_a=acc(1), add_b=imm(31)))
+    b.e(_ops(add_op=ADD_AND, add_out=A_M1, add_a=acc(1), add_b=breg(B_ONE)))
+    b.e(nop(), nop())
+
+    p._builder = b
+    p.label('grp')
+
+    for j in range(RPG):
+        # label_j: one 64 B line at the group's label base, lane 0 is row j
+        b.e(add_or(W_TMU0_S, areg(A_LB), areg(A_LB), ws=1))
+        b.e(nop(), nop())
+        b.e(alu(sig=SIG_LOAD_TMU0, cond_add=COND_NEVER, cond_mul=COND_NEVER), nop())
+        b.e(add_or(37, acc(4), acc(4), ws=1))          # rep_all(label lane 0)
+        b.e(add_or(B_T0, ws=1, a=acc(5), b=acc(5)))
+        # z_y = logits[row][label]; all lanes read the same word (only lane 0
+        # matters), so the read is harmless even near the row end (the buffer
+        # carries 64 B of slack).
+        b.e(add_(ADD_SHL, 32 + 2, a=acc(5), b=imm(2)))
+        b.e(_ops(add_op=ADD_ADD, add_out=32 + 2, add_a=acc(2), add_b=areg(A_LOG)))
+        b.e(add_or(A_SADDR, acc(2), acc(2)))
+        b.e(nop(), nop())
+        b.e(add_or(W_TMU0_S, areg(A_SADDR), areg(A_SADDR), ws=1))
+        b.e(nop(), nop())
+        b.e(alu(sig=SIG_LOAD_TMU0, cond_add=COND_NEVER, cond_mul=COND_NEVER), nop())
+        b.e(add_or(37, acc(4), acc(4), ws=1))          # rep_all(z_y)
+        b.e(add_or(B_T1, ws=1, a=acc(5), b=acc(5)))
+        if probe == 'zy':
+            b.e(add_or(j, breg(B_T1), breg(B_T1)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LOG, add_a=areg(A_LOG), add_b=breg(B_C64)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LB, add_a=areg(A_LB), add_b=imm(4)))
+            b.e(nop())
+            continue
+        # x: the row's 16 logits, one per lane
+        b.e(_ops(add_op=ADD_SHL, add_out=32 + 2, add_a=areg(A_LANE), add_b=imm(2)))
+        b.e(_ops(add_op=ADD_ADD, add_out=32 + 2, add_a=acc(2), add_b=areg(A_LOG)))
+        b.e(add_or(A_SADDR, acc(2), acc(2)))
+        b.e(nop(), nop())
+        b.e(add_or(W_TMU0_S, areg(A_SADDR), areg(A_SADDR), ws=1))
+        b.e(nop(), nop())
+        b.e(alu(sig=SIG_LOAD_TMU0, cond_add=COND_NEVER, cond_mul=COND_NEVER), nop())
+        b.e(add_or(32 + 0, acc(4), acc(4)))            # x
+        b.e(add_or(B_T3, ws=1, a=acc(0), b=acc(0)))    # keep x
+        if probe and probe.startswith('rot'):
+            n = int(probe[3:])
+            if n:
+                b.e(mul_rot(1, 0, n))
+                b.e(add_or(j, acc(1), acc(1)))
+            else:
+                b.e(add_or(j, acc(0), acc(0)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LOG, add_a=areg(A_LOG), add_b=breg(B_C64)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LB, add_a=areg(A_LB), add_b=imm(4)))
+            b.e(nop())
+            continue
+        if probe == 'raw':
+            b.e(add_or(j, acc(0), acc(0)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LOG, add_a=areg(A_LOG), add_b=breg(B_C64)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LB, add_a=areg(A_LB), add_b=imm(4)))
+            b.e(nop())
+            continue
+        # max over lanes.  mul_rot(v,n) rotates right by n (asm3 convention:
+        # rep(rot(v,n)) == v[16-n]), so {8,12,14,15} covers all 16 offsets.
+        # An ADD-ALU accumulator result is not visible to the MUL ALU in the
+        # very next word on this board (measured), hence the 2-word gaps.
+        for s in (8, 4, 2, 1):
+            b.e(mul_rot(1, 0, (16 - s) & 15))
+            b.e(nop(), nop())
+            b.e(_ops(add_op=ADD_FMAX, add_out=32 + 0, add_a=acc(0), add_b=acc(1)))
+            b.e(nop(), nop())
+        b.e(add_or(B_T2, ws=1, a=acc(0), b=acc(0)))    # max
+        # t = (x - max) * log2e, clamped to [-87, 0]
+        b.e(_ops(add_op=ADD_FSUB, add_out=32 + 1, add_a=breg(B_T3), add_b=acc(0)))
+        b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 1, ws=0, mul_a=acc(1), mul_b=areg(A_L2E)))
+        b.e(_ops(add_op=ADD_FMAX, add_out=32 + 1, add_a=acc(1), add_b=breg(B_CLAMP)))
+        b.e(_ops(add_op=ADD_FMIN, add_out=32 + 1, add_a=acc(1), add_b=imm(0)))
+        # exp(t) = 2^n * poly(f)
+        b.e(_ops(add_op=ADD_FADD, add_out=32 + 2, add_a=acc(1), add_b=breg(B_HALF)))
+        b.e(_ops(add_op=ADD_FADD, add_out=32 + 3, add_a=acc(2), add_b=breg(B_MAGIC)))
+        b.e(_ops(add_op=ADD_FSUB, add_out=32 + 2, add_a=acc(3), add_b=breg(B_MAGIC)))
+        b.e(_ops(add_op=ADD_FSUB, add_out=32 + 1, add_a=acc(1), add_b=acc(2)))   # f
+        b.e(_ops(add_op=ADD_FTOI, add_out=32 + 3, add_a=acc(3), add_b=acc(3)))
+        b.e(_ops(add_op=ADD_SHL, add_out=32 + 3, add_a=acc(3), add_b=imm(8)))
+        b.e(_ops(add_op=ADD_SHL, add_out=32 + 3, add_a=acc(3), add_b=imm(15)))
+        b.e(_ops(add_op=ADD_ADD, add_out=32 + 3, add_a=acc(3), add_b=breg(B_ONE)))
+        b.e(add_or(32 + 2, breg(EXPC[0]), breg(EXPC[0])))
+        for c in (EXPC[1], EXPC[2], EXPC[3], EXPC[4]):
+            b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 2, ws=0, mul_a=acc(2), mul_b=acc(1)))
+            b.e(_ops(add_op=ADD_FADD, add_out=32 + 2, add_a=acc(2), add_b=breg(c)))
+        b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 2, ws=0, mul_a=acc(2), mul_b=acc(1)))
+        b.e(_ops(add_op=ADD_FADD, add_out=32 + 2, add_a=acc(2), add_b=breg(B_ONE)))
+        b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 2, ws=0, mul_a=acc(2), mul_b=acc(3)))
+        b.e(add_or(A_EXP, acc(2), acc(2)))             # keep exp
+        # sum over lanes
+        b.e(add_or(32 + 0, areg(A_EXP), areg(A_EXP)))
+        b.e(nop(), nop(), nop())
+        for s in (8, 4, 2, 1):
+            b.e(mul_rot(1, 0, (16 - s) & 15))
+            b.e(nop(), nop())
+            b.e(_ops(add_op=ADD_FADD, add_out=32 + 0, add_a=acc(0), add_b=acc(1)))
+            b.e(nop(), nop())
+        # S = acc0, exp = A_EXP; reciprocal
+        b.e(_ops(add_op=ADD_SUB, add_out=32 + 1, add_a=breg(B_RCPM), add_b=acc(0)))
+        for _ in range(3):
+            b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 2, ws=0, mul_a=acc(1), mul_b=acc(0)))
+            b.e(_ops(add_op=ADD_FSUB, add_out=32 + 2, add_a=breg(B_TWO), add_b=acc(2)))
+            b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 1, ws=0, mul_a=acc(1), mul_b=acc(2)))
+        b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 2, ws=0, mul_a=areg(A_EXP), mul_b=acc(1)))
+        if probe and probe.startswith('red'):
+            k = int(probe[3:])
+            b.e(add_or(32 + 0, areg(A_EXP), areg(A_EXP)))
+            b.e(nop(), nop(), nop())
+            for s in (8, 4, 2, 1)[:k]:
+                b.e(mul_rot(1, 0, (16 - s) & 15))
+                b.e(nop(), nop())
+                b.e(_ops(add_op=ADD_FADD, add_out=32 + 0, add_a=acc(0), add_b=acc(1)))
+                b.e(nop(), nop())
+            b.e(add_or(j, acc(0), acc(0)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LOG, add_a=areg(A_LOG), add_b=breg(B_C64)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LB, add_a=areg(A_LB), add_b=imm(4)))
+            b.e(nop())
+            continue
+        if probe in ('p', 'sum', 'max', 'exp'):
+            if probe == 'p':
+                b.e(add_or(j, acc(2), acc(2)))
+            elif probe == 'sum':
+                b.e(add_or(j, acc(0), acc(0)))
+            elif probe == 'max':
+                b.e(add_or(j, breg(B_T2), breg(B_T2)))
+            else:
+                b.e(add_or(j, areg(A_EXP), areg(A_EXP)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LOG, add_a=areg(A_LOG), add_b=breg(B_C64)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LB, add_a=areg(A_LB), add_b=imm(4)))
+            b.e(nop())
+            continue
+        # onehot(label) via integer lane equality
+        b.e(_ops(add_op=ADD_XOR, add_out=32 + 3, add_a=areg(A_LANE), add_b=breg(B_T0)))
+        b.e(_ops(add_op=ADD_SUB, add_out=32 + 3, add_a=acc(3), add_b=imm(1)))
+        b.e(_ops(add_op=ADD_ASR, add_out=32 + 3, add_a=acc(3), add_b=imm(31)))
+        b.e(_ops(add_op=ADD_AND, add_out=32 + 3, add_a=acc(3), add_b=breg(B_ONE)))
+        b.e(_ops(add_op=ADD_FSUB, add_out=32 + 2, add_a=acc(2), add_b=acc(3)))
+        b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 2, ws=0, mul_a=acc(2), mul_b=areg(A_INV)))
+        b.e(add_or(j, acc(2), acc(2)))                 # dlogits row j -> A[j]
+        # log2(S): e2 = exponent-127, f = mantissa-1
+        b.e(_ops(add_op=ADD_SHR, add_out=32 + 3, add_a=acc(0), add_b=imm(23)))
+        b.e(nop(), nop())
+        b.e(_ops(add_op=ADD_SUB, add_out=32 + 3, add_a=acc(3), add_b=areg(A_QID)))
+        b.e(nop(), nop())
+        b.e(_ops(add_op=ADD_ITOF, add_out=32 + 3, add_a=acc(3), add_b=acc(3)))
+        b.e(nop(), nop())
+        b.e(_ops(add_op=ADD_AND, add_out=32 + 1, add_a=acc(0), add_b=breg(B_MANT)))
+        b.e(nop(), nop())
+        b.e(_ops(add_op=ADD_OR, add_out=32 + 1, add_a=acc(1), add_b=breg(B_ONE)))
+        b.e(nop(), nop())
+        b.e(_ops(add_op=ADD_FSUB, add_out=32 + 1, add_a=acc(1), add_b=breg(B_ONE)))
+        b.e(nop(), nop())
+        b.e(add_or(32 + 2, breg(B_L6), breg(B_L6)))
+        b.e(nop(), nop())
+        for c in (B_L5, B_L4, B_L3, B_L2, B_L1, B_L0):
+            b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 2, ws=0, mul_a=acc(2), mul_b=acc(1)))
+            b.e(nop())
+            b.e(_ops(add_op=ADD_FADD, add_out=32 + 2, add_a=acc(2), add_b=breg(c)))
+            b.e(nop(), nop())
+        b.e(_ops(add_op=ADD_FADD, add_out=32 + 2, add_a=acc(2), add_b=acc(3)))
+        b.e(nop(), nop())
+        # lse = max + ln2*log2(S); loss = lse - z_y
+        b.e(add_or(32 + 0, breg(B_T2), breg(B_T2)))
+        b.e(_ops(add_op=ADD_FSUB, add_out=32 + 1, add_a=acc(0), add_b=breg(B_T1)))
+        b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 3, ws=0, mul_a=acc(2), mul_b=areg(A_LN2)))
+        b.e(_ops(add_op=ADD_FADD, add_out=32 + 1, add_a=acc(1), add_b=acc(3)))
+        b.e(_ops(add_op=ADD_FADD, add_out=32 + 1, add_a=acc(1), add_b=breg(B_LOSS)))
+        b.e(add_or(B_LOSS, ws=1, a=acc(1), b=acc(1)))
+        # correct += (z_y ~= max).  The hardware vector rotate used by the
+        # reduction is 1-ulp lossy on this board (measured), so the argmax is
+        # an absolute-tolerance test on the logit scale: |z_y - max| <= 1e-5.
+        # d >= 0, so the bit pattern of d is monotonic in d; compare
+        # bits(d) with bits(1e-5) as integers.
+        b.e(add_or(32 + 0, breg(B_T1), breg(B_T1)))
+        b.e(nop(), nop())
+        b.e(_ops(add_op=ADD_FSUB, add_out=32 + 1, add_a=acc(0), add_b=breg(B_T2)))
+        b.e(nop(), nop())
+        b.e(_ops(add_op=ADD_AND, add_out=32 + 1, add_a=acc(1), add_b=breg(B_ABS)))
+        b.e(nop(), nop())
+        b.e(_ops(add_op=ADD_SUB, add_out=32 + 1, add_a=acc(1), add_b=breg(B_C256)))
+        b.e(nop(), nop())
+        b.e(_ops(add_op=ADD_ASR, add_out=32 + 1, add_a=acc(1), add_b=imm(31)))
+        b.e(nop(), nop())
+        b.e(_ops(add_op=ADD_AND, add_out=32 + 1, add_a=acc(1), add_b=breg(B_ONE)))
+        b.e(nop(), nop())
+        if probe == 'cor':
+            b.e(add_or(j, acc(1), acc(1)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LOG, add_a=areg(A_LOG), add_b=breg(B_C64)))
+            b.e(_ops(add_op=ADD_ADD, add_out=A_LB, add_a=areg(A_LB), add_b=imm(4)))
+            b.e(nop())
+            continue
+        b.e(_ops(add_op=ADD_FADD, add_out=32 + 1, add_a=acc(1), add_b=breg(B_CORR)))
+        b.e(nop(), nop())
+        b.e(add_or(B_CORR, ws=1, a=acc(1), b=acc(1)))
+        b.e(_ops(add_op=ADD_ADD, add_out=A_LOG, add_a=areg(A_LOG), add_b=breg(B_C64)))
+        b.e(_ops(add_op=ADD_ADD, add_out=A_LB, add_a=areg(A_LB), add_b=imm(4)))
+        b.e(nop())
+
+    # ---- store the group's 8 dlogits rows (verified 2-chunk store) --------
+    b.e(ldi(256, B_C256, ws=1))                    # restore the store step
+    b.e(nop(), nop())
+    b.e(add_or(A_SADDR, areg(A_DL), areg(A_DL)))
+    for c in range(RPG // 4):
+        b.e(ldi(0x1A00, R5, ws=1))
+        b.e(_ops(add_op=ADD_ADD, add_out=W_VPW_SETUP, ws=1,
+                 add_a=acc(5), add_b=breg(B_Q4)))
+        for r in range(4):
+            b.e(add_or(W_VPM, areg(4 * c + r), areg(4 * c + r)))
+        b.e(ldi(0x82104000, R5, ws=1))
+        b.e(_ops(add_op=ADD_ADD, add_out=W_VPW_SETUP, ws=1,
+                 add_a=acc(5), add_b=breg(B_Q9)))
+        b.e(ldi(0xC0010000, W_VPW_SETUP, ws=1))
+        b.e(add_or(W_VPW_ADDR, areg(A_SADDR), areg(A_SADDR), ws=1))
+        b.e(_ops(add_op=ADD_OR, add_out=W_NOP,
+                 add_a=(REGB, R_VPW_WAIT), add_b=(REGB, R_VPW_WAIT)))
+        b.e(nop(), nop(), nop(), nop())
+        b.e(_ops(add_op=ADD_ADD, add_out=A_SADDR, add_a=areg(A_SADDR), add_b=breg(B_C256)))
+
+    # ---- this QPU's totals: lane0 = loss, lane1 = correct rows ------------
+    b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 0, ws=0, mul_a=breg(B_LOSS), mul_b=areg(A_M0)))
+    b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 1, ws=0, mul_a=breg(B_CORR), mul_b=areg(A_M1)))
+    b.e(_ops(add_op=ADD_FADD, add_out=32 + 0, add_a=acc(0), add_b=acc(1)))
+    b.e(add_or(0, acc(0), acc(0)))
+    b.e(ldi(0x1A00, R5, ws=1))
+    b.e(_ops(add_op=ADD_ADD, add_out=W_VPW_SETUP, ws=1,
+             add_a=acc(5), add_b=breg(B_Q4)))
+    b.e(add_or(W_VPM, areg(0), areg(0)))
+    b.e(ldi(0x80904000, R5, ws=1))
+    b.e(_ops(add_op=ADD_ADD, add_out=W_VPW_SETUP, ws=1,
+             add_a=acc(5), add_b=breg(B_Q9)))
+    b.e(ldi(0xC0010000, W_VPW_SETUP, ws=1))
+    b.e(add_or(W_VPW_ADDR, areg(A_PART), areg(A_PART), ws=1))
+    b.e(_ops(add_op=ADD_OR, add_out=W_NOP,
+             add_a=(REGB, R_VPW_WAIT), add_b=(REGB, R_VPW_WAIT)))
+    b.e(nop(), nop(), nop(), nop())
+
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
 # =============================================================== CLI
 def main(argv):
     if len(argv) < 3:
@@ -1996,11 +2358,14 @@ def main(argv):
     elif kind == 'pack':
         p = build_pack10(g('k'))
     elif kind == 'pack3':
-        p = build_pack(g('kblocks'), g('vpitch', 1))
+        p = build_pack(g('kblocks'), g('vpitch', 1), g('dstride', 0))
     elif kind == 'im2col':
         p = build_im2col(g('cin'), g('k'), g('kh'), g('kw'), g('vpitch', 1))
     elif kind == 'ew':
         p = build_ew(g('op'))
+    elif kind == 'softmax':
+        pr = opts.get('probe')
+        p = build_softmax(probe=None if pr in (None, 'full') else pr)
     else:
         print("unknown kernel kind %r" % kind, file=sys.stderr)
         return 2

@@ -25,6 +25,16 @@ static const vc4_op_info OPS[] = {
       "f32; 2^f degree-5 poly + 3x Newton rcp; |err| < 1e-6 (measured)" },
     { "silu", "qpu elementwise", 1,
       "f32; x*sigmoid(x); |err| < 1e-6 (measured)" },
+    { "relu_bwd", "qpu elementwise", 1,
+      "f32; bit-exact mask: out = dy if x>0 else 0" },
+    { "rsqrt", "qpu elementwise", 1,
+      "f32; 1/sqrt(x), bit-trick seed + 4 Newton (Adam); rel err < 2e-6" },
+    { "transpose", "qpu pack (VDW strided)", 1,
+      "dense NxM transpose; rows,cols % 16 == 0; col*4 <= 8191" },
+    { "matmul_bt", "qpu pack + qpu gemm3(bmode=1)", 1,
+      "C = A*B^T, f32; M,N,K % 16 == 0 (training dW / dX path)" },
+    { "softmax_ce_bwd", "qpu fused row kernel", 1,
+      "rows % 8 == 0; 16 padded classes; returns dlogits=(p-onehot)/B, loss, argmax count" },
     /* not implemented -- listed so the table is an honest coverage statement */
     { "conv2d/5x5", "-", 0, "no kernel; would need another im2col tap schedule" },
     { "conv2d/stride2", "-", 0,
@@ -35,10 +45,12 @@ static const vc4_op_info OPS[] = {
     { "matmul/f32x4-tile", "-", 0, "4-column register tile: the documented next speed step" },
     { "batched-matmul", "-", 0, "N launches; not yet fused" },
     { "maxpool", "-", 0, "not written" },
-    { "softmax", "-", 0, "needs a reduction (max+sum) kernel" },
+    { "softmax", "qpu fused row kernel", 1,
+      "forward probabilities are an intermediate of softmax_ce_bwd; 16 padded classes" },
     { "layernorm", "-", 0, "needs reduction + rsqrt kernel" },
     { "concat/slice", "-", 0, "pure data movement; no GPU kernel yet" },
-    { "transpose/permute", "-", 0, "the pack kernel does 8-row x k-major panels only" },
+    { "transpose/permute", "qpu pack (VDW strided)", 1,
+      "2-D dense transpose only; no arbitrary permutation" },
     { "upsample", "-", 0, "not written" },
     { "quantize/dequantize", "-", 0, "not written" },
 };
@@ -60,6 +72,8 @@ const char *vc4_op_name(vc4_op op)
     case VC4_OP_RELU:    return "relu";
     case VC4_OP_SIGMOID: return "sigmoid";
     case VC4_OP_SILU:    return "silu";
+    case VC4_OP_RELU_BWD:return "relu_bwd";
+    case VC4_OP_RSQRT:   return "rsqrt";
     default:             return "?";
     }
 }

@@ -16,7 +16,8 @@ src/vc4_dev.c           dma-buf arena, /dev/mem, V3D launch, L2/SLC handling
 src/vc4_kern.c          kernel blob cache + JIT, the asm3 two-launch rule
 src/vc4_gemm.c          vc4_matmul: QPU pack -> verified QPU GEMM
 src/vc4_conv.c          vc4_conv2d: QPU im2col -> GEMM (bias folded as a k term)
-src/vc4_ew.c            add/mul/relu/sigmoid/silu elementwise kernels
+src/vc4_ew.c            add/mul/relu/sigmoid/silu/relu_bwd/rsqrt kernels
+src/vc4_train.c         transpose, C=A*B^T, fused softmax+CE backward
 src/vc4_api.c           the op registry (strict dispatch) + coverage table
 tools/kgen.py           QPU kernel generator (reuses the asm3 encoder)
 tests/                  CPU-oracle verification, no fallback paths
@@ -118,11 +119,31 @@ over physical memory — see `RESULTS.md`.
 
 `vc4_print_supported_ops()` prints the table; `src/vc4_api.c` is the single
 source of truth.  Supported: `matmul`, `conv2d/3x3`, `conv2d/1x1`, `add`,
-`mul`, `relu`, `sigmoid`, `silu`.  Explicitly unsupported (and listed as such,
-so the table is an honest coverage statement): `conv2d/5x5`,
-`conv2d/stride2`, `conv2d/depthwise`, `conv2d/grouped`, `matmul/f16`,
-`batched-matmul`, `maxpool`, `softmax`, `layernorm`, `concat/slice`,
-`transpose/permute`, `upsample`, `quantize/dequantize`.
+`mul`, `relu`, `sigmoid`, `silu`, `relu_bwd`, `rsqrt`, `transpose`,
+`matmul_bt` (C = A*B^T), `softmax_ce_bwd` (fused softmax + cross-entropy
+gradient), `softmax`.  Explicitly unsupported (and listed as such, so the
+table is an honest coverage statement): `conv2d/5x5`, `conv2d/stride2`,
+`conv2d/depthwise`, `conv2d/grouped`, `matmul/f16`, `batched-matmul`,
+`maxpool`, `layernorm`, `concat/slice`, arbitrary `permute`, `upsample`,
+`quantize/dequantize`.
+
+## Training path
+
+`vc4_train.c` adds the backward-side primitives without touching the verified
+GEMM: a dense 16x16-tile transpose (the packer with a strided VDW
+destination), `vc4_matmul_bt` (the same packer on B plus the asm3 GEMM with
+`bmode=1`), the relu mask, `rsqrt`, and one fused softmax+cross-entropy
+backward kernel.  The kernel computes, per row, max (rotate+fmax), exp
+(degree-5 2^f polynomial), sum, 1/S (bit-trick + 3 Newton), `dlogits =
+(p - onehot)/B`, the row loss and the argmax==label flag.  All reductions are
+on the QPU; the host only reduces per-group (loss, correct) totals with a
+GPU GEMM.
+
+`tests/test_train.c` is a full-batch 64-32-10 MLP trainer (SGD or Adam) on a
+deterministic synthetic 10-class dataset.  `tests/test_grad.c` checks the
+matmul dA/dB, relu and softmax gradients against central finite differences
+(h = 0.1 / 0.02) with a CPU checker.  `RESULTS-train.md` has the measured
+numbers and the honest limits.
 
 ## conv2d
 

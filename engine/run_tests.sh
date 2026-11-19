@@ -11,22 +11,41 @@ cd "$(dirname "$0")"
 REPS=${REPS:-5}
 STATUS=${STATUS:-/home/raspi/vc4cl/tools/read_v3d_status}
 
-make -j4
-
-echo "=== maths (no GPU)"
-make check-math
-
-echo "=== test_dispatch (no GPU)"
-./build/test_dispatch | tail -5
-
-for t in test_ew test_matmul test_conv; do
-    echo "=== $t  (reps=$REPS)"
-    timeout -k 5 900 sudo -n env VC4INFER_TMO_MS=20000 ./build/$t "$REPS"
+board() {
     echo "--- board:"
     sudo -n "$STATUS" | grep -E "STATE|SRQCS|V3D_ERRORS"
     sudo -n "$STATUS" | grep -q "STATE: LIVE" || {
         echo "!!! board is not LIVE - power-cycle it before running again"
         exit 1
     }
+}
+
+make -j4
+
+echo "=== maths (no GPU)"
+make check-math
+
+echo "=== test_dispatch (no GPU)"
+./build/test_dispatch
+
+for t in test_ew test_matmul test_conv; do
+    echo "=== $t  (reps=$REPS)"
+    timeout -k 5 900 sudo -n env VC4INFER_TMO_MS=20000 ./build/$t "$REPS"
+    board
 done
+
+echo "=== test_train_ops (training primitives)"
+timeout -k 5 300 sudo -n env VC4INFER_TMO_MS=20000 ./build/test_train_ops
+board
+
+echo "=== test_grad (finite differences)"
+timeout -k 5 600 sudo -n env VC4INFER_TMO_MS=20000 ./build/test_grad 1
+board
+
+for o in sgd adam; do
+    echo "=== test_train --opt $o (300 steps)"
+    timeout -k 5 600 sudo -n env VC4INFER_TMO_MS=20000 ./build/test_train --opt $o --steps 300
+    board
+done
+
 echo "ALL TESTS PASSED"

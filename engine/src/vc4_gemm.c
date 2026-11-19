@@ -47,7 +47,9 @@ vc4_status vc4__pack_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen,
     snprintf(nk, sizeof(nk), "%u", K);
     snprintf(pname, sizeof(pname), "pack10_%u", K);
     vc4_kernel *k = NULL;
-    vc4_status st = vc4__kernel(ctx, pname, pargv, pnq, &k);
+    /* the blob is independent of nqpu; register it for the max of 4 so a
+       different M with the same K can reuse it (the cache key is K only) */
+    vc4_status st = vc4__kernel(ctx, pname, pargv, 4, &k);
     if (st != VC4_OK)
         return st;
 

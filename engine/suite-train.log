@@ -1,0 +1,327 @@
+make: Nothing to be done for 'all'.
+=== maths (no GPU)
+python3 tools/check_math.py
+sigmoid: max |err| 7.81e-07 over [-30,30], max rel 7.68e-06 -> PASS
+silu   : max |err| 4.23e-06 over [-20,20] -> PASS
+im2col : 0 mismatches over 27648 panel elements (M=192 K=144 wp=16, 6912 non-output, 0 unwritten) -> PASS
+im2col : 0 mismatches over 27648 panel elements (M=96 K=288 wp=16, 3456 non-output, 0 unwritten) -> PASS
+im2col : 0 mismatches over 2048 panel elements (M=128 K=16 wp=16, 0 non-output, 0 unwritten) -> PASS
+gemm   : M=128 N=128 K=128 q=8 -> 16/16 row blocks, PASS
+gemm   : M=16 N=64 K=16 q=2 -> 2/2 row blocks, PASS
+gemm   : M=256 N=64 K=288 q=12 -> 32/32 row blocks, PASS
+gemm   : M=32 N=64 K=48 q=4 -> 4/4 row blocks, PASS
+gemm   : M=80 N=128 K=32 q=10 -> 10/10 row blocks, PASS
+OVERALL: PASS
+=== test_dispatch (no GPU)
+registry: 27 entries, 15 supported, 12 unsupported
+  matmul       supported
+  conv2d/3x3   supported
+  add          supported
+  mul          supported
+  relu         supported
+  sigmoid      supported
+  silu         supported
+  relu_bwd     supported
+  rsqrt        supported
+  unknown op  -> UNSUPPORTED (correct)
+  conv2d/5x5       listed + unsupported
+  conv2d/stride2   listed + unsupported
+  layernorm        listed + unsupported
+  maxpool          listed + unsupported
+  matmul/f16       listed + unsupported
+
+libvc4infer 0.1.0 -- op registry (strict dispatch, no CPU fallback)
+op                   gpu    backend                  constraints / reason
+-------------------- ------ ------------------------ ------------------------------
+matmul               yes    qpu gemm(asm10) + qpu pack f32 row-major; M,N,K any size (8/64/16 tiles internally)
+conv2d/3x3           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0..; Cin%16==0; Cout%16==0; Hp*Wp*4<=8191
+conv2d/1x1           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0; Cin%16==0; Cout%16==0; H*Wp*4<=8191
+add                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+mul                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+relu                 yes    qpu elementwise          f32, exact IEEE
+sigmoid              yes    qpu elementwise          f32; 2^f degree-5 poly + 3x Newton rcp; |err| < 1e-6 (measured)
+silu                 yes    qpu elementwise          f32; x*sigmoid(x); |err| < 1e-6 (measured)
+relu_bwd             yes    qpu elementwise          f32; bit-exact mask: out = dy if x>0 else 0
+rsqrt                yes    qpu elementwise          f32; 1/sqrt(x), bit-trick seed + 4 Newton (Adam); rel err < 2e-6
+transpose            yes    qpu pack (VDW strided)   dense NxM transpose; rows,cols % 16 == 0; col*4 <= 8191
+matmul_bt            yes    qpu pack + qpu gemm3(bmode=1) C = A*B^T, f32; M,N,K % 16 == 0 (training dW / dX path)
+softmax_ce_bwd       yes    qpu fused row kernel     rows % 8 == 0; 16 padded classes; returns dlogits=(p-onehot)/B, loss, argmax count
+conv2d/5x5           NO     -                        no kernel; would need another im2col tap schedule
+conv2d/stride2       NO     -                        the VDR loads 16 consecutive pixels; stride 2 needs a decimation pass
+conv2d/depthwise     NO     -                        needs a per-channel schedule, not a GEMM
+conv2d/grouped       NO     -                        needs one GEMM per group (trivial extension)
+matmul/f16           NO     -                        kernels are fp32 only
+matmul/f32x4-tile    NO     -                        4-column register tile: the documented next speed step
+batched-matmul       NO     -                        N launches; not yet fused
+maxpool              NO     -                        not written
+softmax              yes    qpu fused row kernel     forward probabilities are an intermediate of softmax_ce_bwd; 16 padded classes
+layernorm            NO     -                        needs reduction + rsqrt kernel
+concat/slice         NO     -                        pure data movement; no GPU kernel yet
+transpose/permute    yes    qpu pack (VDW strided)   2-D dense transpose only; no arbitrary permutation
+upsample             NO     -                        not written
+quantize/dequantize  NO     -                        not written
+-- 15 of 27 entries dispatchable on the GPU
+PASS dispatch
+=== test_ew  (reps=1)
+libvc4infer 0.1.0 elementwise  arena 64.0 MiB  reps=1
+  add      n=4096 rep0: mismatches=0/4096 maxabs=0 (bit-exact)
+PASS add      n=4096: 1/1 clean, worst |err| = 0 (must be 0 for bit-exact ops)
+  mul      n=4096 rep0: mismatches=0/4096 maxabs=1.91e-06 (bit-exact)
+PASS mul      n=4096: 1/1 clean, worst |err| = 1.91e-06 (must be 0 for bit-exact ops)
+  relu     n=4096 rep0: mismatches=0/4096 maxabs=0 (bit-exact)
+PASS relu     n=4096: 1/1 clean, worst |err| = 0 (must be 0 for bit-exact ops)
+  add+tail n=1000 rep0: mismatches=0/1000 maxabs=0 (bit-exact)
+PASS add+tail n=1000: 1/1 clean, worst |err| = 0 (must be 0 for bit-exact ops)
+  sigmoid  n=4096 rep0: mismatches=0/4096 maxabs=7.62e-07
+PASS sigmoid  n=4096: 1/1 clean, worst |err| = 7.62e-07
+  silu     n=4096 rep0: mismatches=0/4096 maxabs=1.24e-06
+PASS silu     n=4096: 1/1 clean, worst |err| = 1.24e-06
+
+libvc4infer 0.1.0 -- op registry (strict dispatch, no CPU fallback)
+op                   gpu    backend                  constraints / reason
+-------------------- ------ ------------------------ ------------------------------
+matmul               yes    qpu gemm(asm10) + qpu pack f32 row-major; M,N,K any size (8/64/16 tiles internally)
+conv2d/3x3           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0..; Cin%16==0; Cout%16==0; Hp*Wp*4<=8191
+conv2d/1x1           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0; Cin%16==0; Cout%16==0; H*Wp*4<=8191
+add                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+mul                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+relu                 yes    qpu elementwise          f32, exact IEEE
+sigmoid              yes    qpu elementwise          f32; 2^f degree-5 poly + 3x Newton rcp; |err| < 1e-6 (measured)
+silu                 yes    qpu elementwise          f32; x*sigmoid(x); |err| < 1e-6 (measured)
+relu_bwd             yes    qpu elementwise          f32; bit-exact mask: out = dy if x>0 else 0
+rsqrt                yes    qpu elementwise          f32; 1/sqrt(x), bit-trick seed + 4 Newton (Adam); rel err < 2e-6
+transpose            yes    qpu pack (VDW strided)   dense NxM transpose; rows,cols % 16 == 0; col*4 <= 8191
+matmul_bt            yes    qpu pack + qpu gemm3(bmode=1) C = A*B^T, f32; M,N,K % 16 == 0 (training dW / dX path)
+softmax_ce_bwd       yes    qpu fused row kernel     rows % 8 == 0; 16 padded classes; returns dlogits=(p-onehot)/B, loss, argmax count
+conv2d/5x5           NO     -                        no kernel; would need another im2col tap schedule
+conv2d/stride2       NO     -                        the VDR loads 16 consecutive pixels; stride 2 needs a decimation pass
+conv2d/depthwise     NO     -                        needs a per-channel schedule, not a GEMM
+conv2d/grouped       NO     -                        needs one GEMM per group (trivial extension)
+matmul/f16           NO     -                        kernels are fp32 only
+matmul/f32x4-tile    NO     -                        4-column register tile: the documented next speed step
+batched-matmul       NO     -                        N launches; not yet fused
+maxpool              NO     -                        not written
+softmax              yes    qpu fused row kernel     forward probabilities are an intermediate of softmax_ce_bwd; 16 padded classes
+layernorm            NO     -                        needs reduction + rsqrt kernel
+concat/slice         NO     -                        pure data movement; no GPU kernel yet
+transpose/permute    yes    qpu pack (VDW strided)   2-D dense transpose only; no arbitrary permutation
+upsample             NO     -                        not written
+quantize/dequantize  NO     -                        not written
+-- 15 of 27 entries dispatchable on the GPU
+--- board:
+SRQCS     = 0x00040400  (queue_len=0 queue_full=0 requests=4 completed=4 error=0)
+V3D_ERRORS= 0x00001000
+STATE: LIVE
+=== test_matmul  (reps=1)
+libvc4infer 0.1.0  arena 64.0 MiB  reps=1
+  M=128 N=128 K=128 rep0: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.708 ms = pack 0.099 + gemm 0.609  5.92 GFLOP/s (gemm-only 6.89, wall 0.947 ms)
+PASS 128x128x128: 1/1 clean, best 0.708 ms = 5.92 GFLOP/s
+  M=256 N=256 K=256 rep0: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 3.972 ms = pack 0.414 + gemm 3.558  8.45 GFLOP/s (gemm-only 9.43, wall 4.190 ms)
+PASS 256x256x256: 1/1 clean, best 3.972 ms = 8.45 GFLOP/s
+  M= 64 N= 48 K= 32 rep0: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.070 ms = pack 0.013 + gemm 0.057  2.83 GFLOP/s (gemm-only 3.47, wall 0.384 ms)
+PASS 64x48x32: 1/1 clean, best 0.070 ms = 2.83 GFLOP/s
+  M= 20 N= 36 K= 44 rep0: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.068 ms = pack 0.009 + gemm 0.059  0.93 GFLOP/s (gemm-only 1.07, wall 0.271 ms)
+PASS 20x36x44: 1/1 clean, best 0.068 ms = 0.93 GFLOP/s
+  M= 16 N= 16 K= 16 rep0: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.037 ms = pack 0.004 + gemm 0.034  0.22 GFLOP/s (gemm-only 0.24, wall 0.160 ms)
+PASS 16x16x16: 1/1 clean, best 0.037 ms = 0.22 GFLOP/s
+  M=512 N= 64 K=288 rep0: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.457 ms = pack 0.929 + gemm 1.528  7.68 GFLOP/s (gemm-only 12.35, wall 2.676 ms)
+PASS 512x64x288: 1/1 clean, best 2.457 ms = 7.68 GFLOP/s
+stats: launches=12 pack=1.47 ms kernel=5.85 ms flops=0.057 GFLOP
+
+libvc4infer 0.1.0 -- op registry (strict dispatch, no CPU fallback)
+op                   gpu    backend                  constraints / reason
+-------------------- ------ ------------------------ ------------------------------
+matmul               yes    qpu gemm(asm10) + qpu pack f32 row-major; M,N,K any size (8/64/16 tiles internally)
+conv2d/3x3           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0..; Cin%16==0; Cout%16==0; Hp*Wp*4<=8191
+conv2d/1x1           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0; Cin%16==0; Cout%16==0; H*Wp*4<=8191
+add                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+mul                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+relu                 yes    qpu elementwise          f32, exact IEEE
+sigmoid              yes    qpu elementwise          f32; 2^f degree-5 poly + 3x Newton rcp; |err| < 1e-6 (measured)
+silu                 yes    qpu elementwise          f32; x*sigmoid(x); |err| < 1e-6 (measured)
+relu_bwd             yes    qpu elementwise          f32; bit-exact mask: out = dy if x>0 else 0
+rsqrt                yes    qpu elementwise          f32; 1/sqrt(x), bit-trick seed + 4 Newton (Adam); rel err < 2e-6
+transpose            yes    qpu pack (VDW strided)   dense NxM transpose; rows,cols % 16 == 0; col*4 <= 8191
+matmul_bt            yes    qpu pack + qpu gemm3(bmode=1) C = A*B^T, f32; M,N,K % 16 == 0 (training dW / dX path)
+softmax_ce_bwd       yes    qpu fused row kernel     rows % 8 == 0; 16 padded classes; returns dlogits=(p-onehot)/B, loss, argmax count
+conv2d/5x5           NO     -                        no kernel; would need another im2col tap schedule
+conv2d/stride2       NO     -                        the VDR loads 16 consecutive pixels; stride 2 needs a decimation pass
+conv2d/depthwise     NO     -                        needs a per-channel schedule, not a GEMM
+conv2d/grouped       NO     -                        needs one GEMM per group (trivial extension)
+matmul/f16           NO     -                        kernels are fp32 only
+matmul/f32x4-tile    NO     -                        4-column register tile: the documented next speed step
+batched-matmul       NO     -                        N launches; not yet fused
+maxpool              NO     -                        not written
+softmax              yes    qpu fused row kernel     forward probabilities are an intermediate of softmax_ce_bwd; 16 padded classes
+layernorm            NO     -                        needs reduction + rsqrt kernel
+concat/slice         NO     -                        pure data movement; no GPU kernel yet
+transpose/permute    yes    qpu pack (VDW strided)   2-D dense transpose only; no arbitrary permutation
+upsample             NO     -                        not written
+quantize/dequantize  NO     -                        not written
+-- 15 of 27 entries dispatchable on the GPU
+--- board:
+SRQCS     = 0x000c0c00  (queue_len=0 queue_full=0 requests=12 completed=12 error=0)
+V3D_ERRORS= 0x00001000
+STATE: LIVE
+=== test_conv  (reps=1)
+libvc4infer 0.1.0 conv2d  arena 64.0 MiB  reps=1
+  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep0: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.734 ms 1.61 GFLOP/s (wall 2.176 ms)
+PASS conv 16x16x16->16x16x16 k3 pad1+bias: 1/1 clean, best 0.734 ms 1.61 GFLOP/s
+  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep0: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.695 ms 3.50 GFLOP/s (wall 7.042 ms)
+PASS conv 32x16x32->32x16x32 k3 pad1+bias: 1/1 clean, best 2.695 ms 3.50 GFLOP/s
+  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep0: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.044 ms 1.48 GFLOP/s (wall 0.497 ms)
+PASS conv 16x8x16->16x8x16 k1 pad0: 1/1 clean, best 0.044 ms 1.48 GFLOP/s
+  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep0: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.132 ms 1.48 GFLOP/s (wall 0.802 ms)
+PASS conv 32x8x24->16x8x24 k1 pad0+bias: 1/1 clean, best 0.132 ms 1.48 GFLOP/s
+  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep0: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.257 ms 1.80 GFLOP/s (wall 0.916 ms)
+PASS conv 16x12x12->16x10x10 k3 pad0+bias: 1/1 clean, best 0.257 ms 1.80 GFLOP/s
+  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep0: mismatches=0/4096 maxabs=0.000104 | gpu 2.233 ms 2.11 GFLOP/s (wall 5.784 ms)
+PASS conv 64x8x16->32x8x16 k3 pad1+bias: 1/1 clean, best 2.233 ms 2.11 GFLOP/s
+PASS unsupported 5x5 -> unsupported by the GPU backend (strict dispatch)
+PASS unsupported stride 2 -> unsupported by the GPU backend (strict dispatch)
+
+libvc4infer 0.1.0 -- op registry (strict dispatch, no CPU fallback)
+op                   gpu    backend                  constraints / reason
+-------------------- ------ ------------------------ ------------------------------
+matmul               yes    qpu gemm(asm10) + qpu pack f32 row-major; M,N,K any size (8/64/16 tiles internally)
+conv2d/3x3           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0..; Cin%16==0; Cout%16==0; Hp*Wp*4<=8191
+conv2d/1x1           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0; Cin%16==0; Cout%16==0; H*Wp*4<=8191
+add                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+mul                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+relu                 yes    qpu elementwise          f32, exact IEEE
+sigmoid              yes    qpu elementwise          f32; 2^f degree-5 poly + 3x Newton rcp; |err| < 1e-6 (measured)
+silu                 yes    qpu elementwise          f32; x*sigmoid(x); |err| < 1e-6 (measured)
+relu_bwd             yes    qpu elementwise          f32; bit-exact mask: out = dy if x>0 else 0
+rsqrt                yes    qpu elementwise          f32; 1/sqrt(x), bit-trick seed + 4 Newton (Adam); rel err < 2e-6
+transpose            yes    qpu pack (VDW strided)   dense NxM transpose; rows,cols % 16 == 0; col*4 <= 8191
+matmul_bt            yes    qpu pack + qpu gemm3(bmode=1) C = A*B^T, f32; M,N,K % 16 == 0 (training dW / dX path)
+softmax_ce_bwd       yes    qpu fused row kernel     rows % 8 == 0; 16 padded classes; returns dlogits=(p-onehot)/B, loss, argmax count
+conv2d/5x5           NO     -                        no kernel; would need another im2col tap schedule
+conv2d/stride2       NO     -                        the VDR loads 16 consecutive pixels; stride 2 needs a decimation pass
+conv2d/depthwise     NO     -                        needs a per-channel schedule, not a GEMM
+conv2d/grouped       NO     -                        needs one GEMM per group (trivial extension)
+matmul/f16           NO     -                        kernels are fp32 only
+matmul/f32x4-tile    NO     -                        4-column register tile: the documented next speed step
+batched-matmul       NO     -                        N launches; not yet fused
+maxpool              NO     -                        not written
+softmax              yes    qpu fused row kernel     forward probabilities are an intermediate of softmax_ce_bwd; 16 padded classes
+layernorm            NO     -                        needs reduction + rsqrt kernel
+concat/slice         NO     -                        pure data movement; no GPU kernel yet
+transpose/permute    yes    qpu pack (VDW strided)   2-D dense transpose only; no arbitrary permutation
+upsample             NO     -                        not written
+quantize/dequantize  NO     -                        not written
+-- 15 of 27 entries dispatchable on the GPU
+--- board:
+SRQCS     = 0x000c0c00  (queue_len=0 queue_full=0 requests=12 completed=12 error=0)
+V3D_ERRORS= 0x00001000
+STATE: LIVE
+=== test_train_ops (training primitives)
+libvc4infer 0.1.0 training primitives, arena 64.0 MiB
+PASS transpose 64x48: max_abs=0 mismatches=0
+PASS transpose 32x64: max_abs=0 mismatches=0
+PASS relu_bwd n=4096: mismatches=0 (bit-exact)
+PASS rsqrt n=4096: worst_rel=8.83e-08 mismatches=0 (tol 1e-5)
+PASS matmul_bt 32x16x64: max_rel=4.96e-06 mismatches=0
+PASS matmul_bt 16x16x16: max_rel=9.84e-07 mismatches=0
+PASS softmax_ce rows=64 pad=0: dlogits_max_abs=5.16e-09 sum(p)_err=0 loss=236.440641 ref=236.440694 rel=2.21e-07 correct=6/6
+PASS softmax_ce rows=512 pad=1: dlogits_max_abs=1.26e-09 sum(p)_err=0 loss=1752.958370 ref=1752.958942 rel=3.26e-07 correct=55/55
+
+libvc4infer 0.1.0 -- op registry (strict dispatch, no CPU fallback)
+op                   gpu    backend                  constraints / reason
+-------------------- ------ ------------------------ ------------------------------
+matmul               yes    qpu gemm(asm10) + qpu pack f32 row-major; M,N,K any size (8/64/16 tiles internally)
+conv2d/3x3           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0..; Cin%16==0; Cout%16==0; Hp*Wp*4<=8191
+conv2d/1x1           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0; Cin%16==0; Cout%16==0; H*Wp*4<=8191
+add                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+mul                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+relu                 yes    qpu elementwise          f32, exact IEEE
+sigmoid              yes    qpu elementwise          f32; 2^f degree-5 poly + 3x Newton rcp; |err| < 1e-6 (measured)
+silu                 yes    qpu elementwise          f32; x*sigmoid(x); |err| < 1e-6 (measured)
+relu_bwd             yes    qpu elementwise          f32; bit-exact mask: out = dy if x>0 else 0
+rsqrt                yes    qpu elementwise          f32; 1/sqrt(x), bit-trick seed + 4 Newton (Adam); rel err < 2e-6
+transpose            yes    qpu pack (VDW strided)   dense NxM transpose; rows,cols % 16 == 0; col*4 <= 8191
+matmul_bt            yes    qpu pack + qpu gemm3(bmode=1) C = A*B^T, f32; M,N,K % 16 == 0 (training dW / dX path)
+softmax_ce_bwd       yes    qpu fused row kernel     rows % 8 == 0; 16 padded classes; returns dlogits=(p-onehot)/B, loss, argmax count
+conv2d/5x5           NO     -                        no kernel; would need another im2col tap schedule
+conv2d/stride2       NO     -                        the VDR loads 16 consecutive pixels; stride 2 needs a decimation pass
+conv2d/depthwise     NO     -                        needs a per-channel schedule, not a GEMM
+conv2d/grouped       NO     -                        needs one GEMM per group (trivial extension)
+matmul/f16           NO     -                        kernels are fp32 only
+matmul/f32x4-tile    NO     -                        4-column register tile: the documented next speed step
+batched-matmul       NO     -                        N launches; not yet fused
+maxpool              NO     -                        not written
+softmax              yes    qpu fused row kernel     forward probabilities are an intermediate of softmax_ce_bwd; 16 padded classes
+layernorm            NO     -                        needs reduction + rsqrt kernel
+concat/slice         NO     -                        pure data movement; no GPU kernel yet
+transpose/permute    yes    qpu pack (VDW strided)   2-D dense transpose only; no arbitrary permutation
+upsample             NO     -                        not written
+quantize/dequantize  NO     -                        not written
+-- 15 of 27 entries dispatchable on the GPU
+TRAIN OPS PASSED
+--- board:
+SRQCS     = 0x00040400  (queue_len=0 queue_full=0 requests=4 completed=4 error=0)
+V3D_ERRORS= 0x00001000
+STATE: LIVE
+=== test_grad (finite differences)
+libvc4infer 0.1.0 gradient checks (finite differences, h=1e-2, tol=1e-3)
+PASS dA 16x16x16            n=256 rel_L2=7.54e-07 max_rel=3.13e-05 max_abs=2.62e-05 over_tol=0  worst: g=0.115923 fd=0.115919
+PASS dB (A^T dC) 16x16x16   n=256 rel_L2=6.82e-07 max_rel=0.000181 max_abs=8.72e-06 over_tol=0  worst: g=-0.0138458 fd=-0.0138483
+PASS dA 32x32x16            n=512 rel_L2=9.63e-07 max_rel=0.000225 max_abs=4.54e-05 over_tol=0  worst: g=0.0264388 fd=0.0264328
+PASS dB (A^T dC) 32x32x16   n=512 rel_L2=7.71e-07 max_rel=0.000311 max_abs=1.98e-05 over_tol=0  worst: g=-0.0268592 fd=-0.0268508
+PASS relu_bwd               n=32 rel_L2=9.12e-07 max_rel=9.54e-07 max_abs=9.22e-07 over_tol=0  worst: g=0.830812 fd=0.830812
+PASS softmax_ce dlogits     n=128 rel_L2=9.08e-05 max_rel=0.00217 max_abs=7.65e-05 over_tol=0  worst: g=0.0117048 fd=0.0117302
+PASS softmax_ce dlogits     n=1024 rel_L2=8.34e-05 max_rel=0.00342 max_abs=8.91e-05 over_tol=0  worst: g=0.0122967 fd=0.0122547
+GRADCHECK PASSED
+--- board:
+SRQCS     = 0x00080800  (queue_len=0 queue_full=0 requests=8 completed=8 error=0)
+V3D_ERRORS= 0x00001000
+STATE: LIVE
+=== test_train --opt sgd (300 steps)
+libvc4infer 0.1.0 toy trainer: 64-32-10, opt=sgd, seed=12345, arena 64.0 MiB
+PASS optimizer step (sgd) vs CPU oracle: worst_rel=6.88e-08
+initial: train loss=2.321555 acc=12.03%  test loss=2.319536 acc=10.00%
+step    1: loss=2.321555138 acc=12.03%
+step   25: loss=0.025709569 acc=100.00%
+step   50: loss=0.008870122 acc=100.00%
+step   75: loss=0.005126707 acc=100.00%
+step  100: loss=0.003541021 acc=100.00%
+step  125: loss=0.002678449 acc=100.00%
+step  150: loss=0.002140896 acc=100.00%
+step  175: loss=0.001775802 acc=100.00%
+step  200: loss=0.001512642 acc=100.00%
+step  225: loss=0.001314514 acc=100.00%
+step  250: loss=0.001160292 acc=100.00%
+step  275: loss=0.001037055 acc=100.00%
+step  300: loss=0.000936466 acc=100.00%
+final: train loss=0.000932827 acc=100.00%  test loss=0.000884346 acc=100.00%
+time 2.859 s for 300 steps, 104.95 steps/s, 67166 samples/s
+TRAIN PASSED
+--- board:
+SRQCS     = 0x00010100  (queue_len=0 queue_full=0 requests=1 completed=1 error=0)
+V3D_ERRORS= 0x00001000
+STATE: LIVE
+=== test_train --opt adam (300 steps)
+libvc4infer 0.1.0 toy trainer: 64-32-10, opt=adam, seed=12345, arena 64.0 MiB
+PASS optimizer step (adam) vs CPU oracle: worst_rel=8.12e-08
+initial: train loss=2.321555 acc=12.03%  test loss=2.319536 acc=10.00%
+step    1: loss=2.321555138 acc=12.03%
+step   25: loss=0.000759746 acc=100.00%
+step   50: loss=0.000070491 acc=100.00%
+step   75: loss=0.000051264 acc=100.00%
+step  100: loss=0.000046447 acc=100.00%
+step  125: loss=0.000043221 acc=100.00%
+step  150: loss=0.000040530 acc=100.00%
+step  175: loss=0.000038187 acc=100.00%
+step  200: loss=0.000036096 acc=100.00%
+step  225: loss=0.000034242 acc=100.00%
+step  250: loss=0.000032582 acc=100.00%
+step  275: loss=0.000031035 acc=100.00%
+step  300: loss=0.000029679 acc=100.00%
+final: train loss=0.000029624 acc=100.00%  test loss=0.000028298 acc=100.00%
+time 3.213 s for 300 steps, 93.36 steps/s, 59751 samples/s
+TRAIN PASSED
+--- board:
+SRQCS     = 0x00010100  (queue_len=0 queue_full=0 requests=1 completed=1 error=0)
+V3D_ERRORS= 0x00001000
+STATE: LIVE
+ALL TESTS PASSED

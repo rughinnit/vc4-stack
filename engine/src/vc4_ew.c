@@ -31,13 +31,15 @@ static int ew_kgen_op(vc4_op op)
     case VC4_OP_RELU:    return 2;
     case VC4_OP_SIGMOID: return 3;
     case VC4_OP_SILU:    return 4;
+    case VC4_OP_RELU_BWD:return 5;
+    case VC4_OP_RSQRT:   return 6;
     default:             return -1;
     }
 }
 
 static int ew_is_binary(vc4_op op)
 {
-    return op == VC4_OP_ADD || op == VC4_OP_MUL;
+    return op == VC4_OP_ADD || op == VC4_OP_MUL || op == VC4_OP_RELU_BWD;
 }
 
 static int ew_op_ok(vc4_op op)
@@ -48,6 +50,8 @@ static int ew_op_ok(vc4_op op)
     case VC4_OP_RELU:
     case VC4_OP_SIGMOID:
     case VC4_OP_SILU:
+    case VC4_OP_RELU_BWD:
+    case VC4_OP_RSQRT:
         return 1;
     default:
         return 0;
@@ -176,4 +180,15 @@ vc4_status vc4_sigmoid(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t n)
 vc4_status vc4_silu(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t n)
 {
     return vc4_elementwise(ctx, VC4_OP_SILU, a, NULL, out, n);
+}
+
+vc4_status vc4_rsqrt(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t n)
+{
+    return vc4_elementwise(ctx, VC4_OP_RSQRT, a, NULL, out, n);
+}
+
+vc4_status vc4_relu_backward(vc4_ctx *ctx, const vc4_buf *a,
+                             const vc4_buf *dy, vc4_buf *out, size_t n)
+{
+    return vc4_elementwise(ctx, VC4_OP_RELU_BWD, a, dy, out, n);
 }

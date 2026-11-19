@@ -42,7 +42,7 @@ def main(argv):
     x = np.load(args.input).astype(np.float32)
     ref = np.load(args.ref).astype(np.float32)
 
-    eng = vc4infer.Engine(cache_dir=args.cache)
+    eng = vc4infer._binding.Engine(cache_dir=args.cache)
     try:
         r = Runner(args.model, eng)
         feed = {r.float_inputs[0][0]: x}

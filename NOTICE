@@ -1,0 +1,66 @@
+NOTICE — vc4-stack
+==================
+
+vc4-stack is Copyright (C) 2026 rughinnit and is released under the GNU General
+Public License, version 3 or later.  See LICENSE.
+
+This file records third-party material and the sources the encodings in this
+tree were derived from.  No third-party source code is vendored except where
+stated below.
+
+1. Vendored material with its own licence
+-----------------------------------------
+
+infer/packaging/vc4infer/data/models/yolov8n_160.onnx
+    The official Ultralytics YOLOv8n COCO checkpoint (yolov8n.pt), exported to
+    ONNX with ultralytics' own exporter and included unmodified as the
+    real-model selftest case.
+    Copyright (C) 2023 Ultralytics.  Licence: AGPL-3.0.
+    https://github.com/ultralytics/ultralytics
+    The stored input and reference tensors next to it are generated locally by
+    this project.
+
+2. Encodings derived from hardware documentation
+------------------------------------------------
+
+The QPU instruction encoder and disassembler (infer/tools/qenc.py,
+infer/tools/kgen.py, tools/qpu_disasm.py) and the field tables in
+infer/tools/vpmwords.py are written out from the Broadcom VideoCore IV 3D
+Architecture Reference Guide (AG100-R) and from the Broadcom-copyright
+register/opcode definitions published in:
+
+    anholt/vc4-gpu-tools             https://github.com/anholt/vc4-gpu-tools
+        vc4_qpu_defines.h, vc4_packet.h, vc4_qpu_disasm.c (MIT)
+    hermanhermitage/videocoreiv-qpu  https://github.com/hermanhermitage/videocoreiv-qpu
+
+No header from those trees is copied verbatim; the enums and field maps are
+re-expressed in Python and C.
+
+3. Independent implementations used as validation oracles (not linked)
+----------------------------------------------------------------------
+
+    maazl/vc4asm            independent macro assembler/disassembler;
+                            encoder cross-check (licence: see upstream)
+    Idein/py-videocore      fourth independent encoder, MIT;
+                            encoder cross-check
+    mn416/QPULib            predecessor of V3DLib; historical reference
+                            (licence: see upstream)
+    wimrijnders/V3DLib,     MIT; reference and benchmark
+    axizo-pi/V3DLib
+    jetpacapp/qpu-asm       ancestor of vc4asm; encoder lineage
+    doe300/VC4C,            separate repositories, compared against and
+    doe300/VC4CL,           patched in their own trees, not vendored here
+    doe300/VC4CLStdLib
+    Mesa vc4 gallium,       design references for the UAPI and the launch path
+    Linux drm/vc4, drm/v3d
+
+4. Runtime dependencies (declared, not distributed here)
+--------------------------------------------------------
+
+    numpy (BSD-3-Clause), onnx (Apache-2.0), Pillow (MIT-CMU), Python (PSF)
+
+The .deb declares them as Depends; the wheel declares them in
+infer/pyproject.toml.
+
+Every source above is also listed, with URL, purpose and verification status, in
+docs/REFERENCES.md.

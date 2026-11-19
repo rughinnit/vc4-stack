@@ -89,11 +89,11 @@ Blobs checked (raw words, byte counts / 8):
 | `asm10/gemm6_128.bin` (full kernel) | 653 | 0 | 0 | 0 | 60 |
 | `gemm6` loop body, words 116..418 | 303 | 0 | 0 | 0 | 45 |
 | `asm10/pack10_128_k16_single_vp1_us.bin` | 67 | 0 | 0 | 0 | 0 |
-| `engine/kcache/col2im_16_144_3_3_16_8.bin` | 1196 | 0 | 0 | 0 | 0 |
-| `engine/kcache/col2im_16_144_3_3_32_18.bin` | 1196 | 0 | 0 | 0 | 0 |
-| `engine/kcache/pool_16_16_16_c16_fwd.bin` | 337 | 0 | 0 | 0 | 0 |
-| `engine/kcache/pool_16_16_16_c16_bwd.bin` | 560 | 0 | 0 | 0 | 0 |
-| `engine/kcache/ew_1_q12.bin` (elementwise) | 1320 | 0 | 0 | 0 | 0 |
+| `infer/kcache/col2im_16_144_3_3_16_8.bin` | 1196 | 0 | 0 | 0 | 0 |
+| `infer/kcache/col2im_16_144_3_3_32_18.bin` | 1196 | 0 | 0 | 0 | 0 |
+| `infer/kcache/pool_16_16_16_c16_fwd.bin` | 337 | 0 | 0 | 0 | 0 |
+| `infer/kcache/pool_16_16_16_c16_bwd.bin` | 560 | 0 | 0 | 0 | 0 |
+| `infer/kcache/ew_1_q12.bin` (elementwise) | 1320 | 0 | 0 | 0 | 0 |
 
 "Unknown" means Anholt printed `???` for an add/mul opcode name, or
 videocoreiv printed one of its `addopN`/`mulopN` placeholders, or `vc4dis -V`
@@ -290,7 +290,7 @@ Consequences:
 * The comment in `gemm6.py` — "small immediate 48 is 1.0f, not 'rotate by
   0'" — **was wrong on both counts**: 1.0f is code 32, and 48 is
   rotate-by-r5. Fixed on 2026-11-19 in `asm10/gemm6.py`, `gemm4.py`,
-  `gemm5.py`, `patch_rot0.py` and `engine/tools/kgen.py`; the emitted words
+  `gemm5.py`, `patch_rot0.py` and `infer/tools/kgen.py`; the emitted words
   were right (rotate 0 is already the plain move). The full map is now in the
   encoder docstring and here: **48 = rotate by r5 (dynamic), 49..63 = rotate
   1..15, rotate 0 = plain move, 1.0f = 32, 48..63 also alias the constants
@@ -384,7 +384,7 @@ discard the state):
 4. Keep `hang-*.bin`; the dump is the only record of the queue/PC state.
 
 Caveat: `vc4_dump_parse` expects the driver's dump format, not a raw kernel
-blob. To inspect a raw `.bin` from `engine/kcache/` or `qenc`, use
+blob. To inspect a raw `.bin` from `infer/kcache/` or `qenc`, use
 `tools/qpu_disasm.py` instead.
 
 ## 6. Regression tool
@@ -748,13 +748,13 @@ instruction, so the three word classes cover everything in the tree.
 |---|---:|
 | `asm10/gemm6_64.bin`, `gemm6_128.bin`, `gemm6_256.bin` | 2,161 |
 | `asm10/pack10_{64,128,256}_k16_single_vp1_us.bin` | 201 |
-| `engine/kcache/col2im_*.bin` (3 variants) | 3,588 |
-| `engine/kcache/pool_*_fwd/bwd.bin` | 897 |
-| `engine/kcache/ew_*.bin` (26 variants) | 20,265 |
+| `infer/kcache/col2im_*.bin` (3 variants) | 3,588 |
+| `infer/kcache/pool_*_fwd/bwd.bin` | 897 |
+| `infer/kcache/ew_*.bin` (26 variants) | 20,265 |
 | **total, 37 blobs** | **27,112 words, 0 mismatches** |
 
 (More than the 5,329 words of §2 because that count covered one build of each
-kernel; this covers every parameter variant in `engine/kcache` as well.)
+kernel; this covers every parameter variant in `infer/kcache` as well.)
 
 Every field position is exercised: `sig`, `unpack` 3 bits @57, `pm` 1 bit @56,
 `pack` 4 bits @52, both conditions, `sf`, `ws`, both write addresses, both

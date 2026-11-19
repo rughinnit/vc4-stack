@@ -16,7 +16,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 ver=${1:-$(python3 - "$root" <<'EOF'
 import re, sys
-s = open(sys.argv[1] + "/vc4infer/__init__.py").read()
+s = open(sys.argv[1] + "/python/vc4infer/__init__.py").read()
 print(re.search(r'__version__ = "([^"]+)"', s).group(1))
 EOF
 )}

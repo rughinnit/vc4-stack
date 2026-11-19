@@ -159,5 +159,5 @@ in the blob):
   the constants -16..-1.
 
 `rot_inst` now lives in `qenc.py` and is shared by `gemm6.py` and
-`engine/tools/kgen.py`, so the two kernel trees cannot drift. The canonical
+`infer/tools/kgen.py`, so the two kernel trees cannot drift. The canonical
 blobs were re-run on hardware (RESULTS10, "Encoder correction").

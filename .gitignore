@@ -1,8 +1,30 @@
-__pycache__/
-*.pyc
-engine/kcache/
-onnx/models/
+# Build output
 /build/
 /dist/
-*.whl
-vc4infer.egg-info/
+infer/build/
+infer.egg-info/
+*.egg-info/
+*.o
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Kernel blob cache (regenerable) and generated ONNX models
+infer/kcache/
+infer/tools/onnx/models/
+
+# Generated artefacts.  Tracked evidence blobs stay tracked; use "git add -f"
+# for a new kernel blob that must be kept.
+*.bin
+*.asm
+
+# Logs (docs/logs/ holds the committed run logs behind the numbers)
+/logs/
+*.log
+!docs/logs/*.log

@@ -192,7 +192,7 @@ def main(argv):
 
     # ---- dynamic: actually try to run it on the GPU ----------------------
     print("\ndynamic run on the VC4 engine:")
-    eng = vc4infer.Engine(cache_dir=os.environ.get(
+    eng = vc4infer._binding.Engine(cache_dir=os.environ.get(
         "VC4INFER_CACHE", os.path.join(ENGINE, "kcache")))
     try:
         r = Runner(path, eng)

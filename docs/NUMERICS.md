@@ -63,3 +63,29 @@ softmax kernel looks the way it does.
   (64x16), 1.3e-9 (512x16 with -1e30 padding columns); total loss relative
   2.2e-7 / 3.3e-7; argmax count exact.  Gradcheck against central differences:
   global relative L2 9e-5 (softmax), 7e-7 (matmul dA/dB), 9e-7 (relu).
+
+## conv backward / pooling (added 2026-11-19, train-conv)
+
+- **col2im accumulates in fixed tap order.**  A destination 16x16 tile is owned
+  by one task; the 16 channel rows are summed over the taps in the order
+  (ky,kx) = (0,0),(0,1),... in registers and stored once, so the result is
+  independent of QPU scheduling and reproducible byte-for-byte (two runs
+  compare equal).  The sum itself is a chain of 9 QPU `fadd`s, which truncate
+  toward zero: it is not the IEEE-ordered sum a CPU would produce.  Measured
+  against a float64 oracle the relative L2 error is ~1e-7 (input O(1)); the
+  gradient check tolerance is 1e-3, dominated by the finite-difference noise
+  floor, not by this.
+- **A destination tile must not be written by two tasks.**  The kernel is
+  organised as dst-tile-owns-gather (dX[d] = sum_tap dA[d-tap]), never as a
+  scatter, which is what makes the no-read-modify-write scheme possible.
+  Source blocks outside [0, M) land in zeroed guard row blocks of the packed
+  panel (the same trick the packer uses for the A panel).
+- **maxpool backward ties:** every element equal to the 2x2 maximum receives
+  dy (a valid subgradient).  Random gradient checks never hit a tie.
+- **4-row DMA shape:** both pool kernels compute four 64 B rows per task and
+  use the GEMM's verified `units=4, depth=16` VPM->DMA store.  A single-row
+  `units=1` store is *not* a proven shape on this board.
+- One task per QPU, no branches: the host enumerates tasks.  A missing uniform
+  word in an early pool wrapper produced a wild TMU address and killed the
+  V3D queue (board LIVE, `SRQCS` done never increments, reboot required);
+  every address is now checked in `asmq/vsim.py` before hardware runs.

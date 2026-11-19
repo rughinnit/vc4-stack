@@ -25,11 +25,11 @@ The vc4infer package is published in the same signed apt repository as vc4top:
 
 ```sh
 # one-time, if the repository is not configured yet
-curl -fsSL https://rughinnit.github.io/vc4top/key.asc \
+curl -fsSL https://rughinnit.github.io/vc4-apt/key.asc \
   | sudo gpg --dearmor -o /usr/share/keyrings/vc4top-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/vc4top-archive-keyring.gpg] \
-https://rughinnit.github.io/vc4top stable main" \
-  | sudo tee /etc/apt/sources.list.d/vc4top.list
+https://rughinnit.github.io/vc4-apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/vc4-apt.list
 
 sudo apt update
 sudo apt install vc4infer
@@ -43,8 +43,9 @@ wheel is pure Python and uses the engine library the .deb installs:
 
 ```sh
 sudo apt install vc4infer
-pip install https://rughinnit.github.io/vc4top/pip/vc4infer-1.1.2-py3-none-any.whl
-# or: pip install --extra-index-url https://rughinnit.github.io/vc4top/pip/simple/ vc4infer
+pip install https://rughinnit.github.io/vc4-apt/pip/vc4infer-1.1.2-py3-none-any.whl
+# or: pip install --extra-index-url https://rughinnit.github.io/vc4-apt/pip/simple/ vc4infer
+# (the older https://rughinnit.github.io/vc4top apt/pip location is deprecated)
 ```
 
 See [PYTHON-API.md](PYTHON-API.md) for the `Engine` / `Detector` API.

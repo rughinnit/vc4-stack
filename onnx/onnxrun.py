@@ -27,7 +27,8 @@ Elementwise ops are layout-agnostic (they touch every element); every op that
 depends on the channel axis converts on the host first (a byte gather).
 
 Supported nodes
-    Conv          NHWC 3x3/1x1 stride 1/2, group=1 or depthwise (dense
+    Conv          NHWC 1x1/3x3/5x5, stride 1/2, dilation 1..8, group=1,
+                  grouped (per-group Cin/Cout/K %16) or depthwise (dense
                   block-diagonal weight); NCHW fallback for the rest
     Relu, Sigmoid
     Add, Mul      same shape, or broadcast from a graph constant (host expand)
@@ -38,10 +39,14 @@ Supported nodes
     Div, Sub      lowered to GPU Mul / Mul+Add (constant operand for Div)
     Softmax       any axis (host permute to the last, <= 16 classes, rows%8)
     Transpose     host permute
-    Resize        nearest, asymmetric or half_pixel
+    Resize        nearest, asymmetric or half_pixel (bilinear raises)
     MatMul, Gemm  2-D
     Flatten, Reshape, Squeeze, Unsqueeze, Cast, Identity, Constant
     Shape, Gather int64 host tensors (static shapes)
+
+Batch N is supported for the NHWC conv path, pool, upsample, concat,
+elementwise and softmax; the NCHW fallback, Gemm and GlobalAveragePool are
+batch 1 and raise otherwise.
 """
 import os
 import sys
@@ -401,46 +406,101 @@ class Runner:
         return self.upload(p)
 
     # ------------------------------------------------------------ conv (NHWC)
-    def _conv_nhwc(self, node, x, wa, ba, kh, kw, sh, pad, Cout):
+    def _conv_nhwc(self, node, x, wa, ba, kh, kw, sh, pad, dil=1, groups=1):
+        """NHWC conv, native: batch, dilation and grouped channel blocks.
+
+        x is [N][H][pitch][Cin] and wa is the ONNX [Cout][Cin/g][kh][kw].
+        groups == 1 uses one im2col + GEMM; groups > 1 runs one im2col + GEMM
+        per group but pads the input once and reuses the activation panel, and
+        each group's GEMM writes straight into its channel range of the single
+        output (the GEMM C stride is Cout).  No host interleave, no wasted
+        MACs.
+        """
+        N = x.shape[0]
         Cin = x.shape[1]
         H, W = x.shape[2], x.shape[3]
-        if Cin % 16 or Cout % 16 or (Cin * kh * kw) % 16:
-            raise UnsupportedNode("Conv %s: NHWC needs Cin,Cout,K %% 16 "
-                                  "(%d,%d,%d)" % (node.name, Cin, Cout,
-                                                  Cin * kh * kw))
+        Cout = wa.shape[0]
         if sh * Cin * 4 > 8191:
             raise UnsupportedNode("Conv %s: stride*Cin*4 = %d B > 8191 B"
                                   % (node.name, sh * Cin * 4))
-        if wa.shape[1] != Cin:
-            w2 = np.zeros((wa.shape[0], Cin) + wa.shape[2:], np.float32)
-            w2[:, :wa.shape[1]] = wa
-            wa = w2
-        if wa.shape[0] != Cout:
-            w3 = np.zeros((Cout,) + wa.shape[1:], np.float32)
-            w3[:wa.shape[0]] = wa
-            wa = w3
-        if ba.size != Cout:
-            b2 = np.zeros(Cout, np.float32)
-            b2[:ba.size] = ba
-            ba = b2
-        key = ("panel", node.name, Cin, Cout, kh, kw)
-        wp = self._panels.get(key)
-        if wp is None:
-            wt = self.upload(np.ascontiguousarray(wa, np.float32))
-            bb = self.upload(np.ascontiguousarray(ba, np.float32))
-            wp = self.pool.alloc(self.eng.conv_nhwc_wpanel_bytes(
-                Cin, Cout, kh, kw, True))
-            self.eng.conv_nhwc_pack_w(wt.buf, Cin, Cout, kh, kw, bb.buf, wp)
-            self._panels[key] = wp
-            self._free(wt)
-            self._free(bb)
-        ho = (H + 2 * pad - kh) // sh + 1
-        wo = (W + 2 * pad - kw) // sh + 1
+        ho = (H + 2 * pad - dil * (kh - 1) - 1) // sh + 1
+        wo = (W + 2 * pad - dil * (kw - 1) - 1) // sh + 1
+        if ho <= 0 or wo <= 0:
+            raise UnsupportedNode("Conv %s: empty %dx%d output" % (node.name,
+                                                                    ho, wo))
         op = _align16(wo)
-        out = self.pool.alloc(ho * op * Cout * 4 + 64)
-        h, w, o = self.eng.conv_nhwc(x.buf, 1, Cin, H, W, x.pitch, wp, Cout,
-                                     kh, kw, sh, pad, out)
-        return Tensor(out, (1, Cout, h, w), "nhwc", pitch=o)
+
+        if groups == 1:
+            # Cout is zero-padded to 16 (the GEMM N): the DFL head's 1-channel
+            # conv computes 16 and the caller slices back.
+            Cout = _align16(Cout)
+            if Cin % 16 or (Cin * kh * kw) % 16:
+                raise UnsupportedNode("Conv %s: NHWC needs Cin,K %% 16 "
+                                      "(%d,%d)" % (node.name, Cin,
+                                                   Cin * kh * kw))
+            out = self.pool.alloc(N * ho * op * Cout * 4 + 64)
+            if wa.shape[1] != Cin:
+                w2 = np.zeros((wa.shape[0], Cin) + wa.shape[2:], np.float32)
+                w2[:, :wa.shape[1]] = wa
+                wa = w2
+            if wa.shape[0] != Cout:
+                w3 = np.zeros((Cout,) + wa.shape[1:], np.float32)
+                w3[:wa.shape[0]] = wa
+                wa = w3
+            if ba.size != Cout:
+                b2 = np.zeros(Cout, np.float32)
+                b2[:ba.size] = ba
+                ba = b2
+            key = ("panel", node.name, Cin, Cout, kh, kw, dil)
+            wp = self._panels.get(key)
+            if wp is None:
+                wt = self.upload(np.ascontiguousarray(wa, np.float32))
+                bb = self.upload(np.ascontiguousarray(ba, np.float32))
+                wp = self.pool.alloc(self.eng.conv_nhwc_wpanel_bytes(
+                    Cin, Cout, kh, kw, True))
+                self.eng.conv_nhwc_pack_w(wt.buf, Cin, Cout, kh, kw, bb.buf,
+                                          wp)
+                self._panels[key] = wp
+                self._free(wt)
+                self._free(bb)
+            h, w, o = self.eng.conv_nhwc_dil(
+                x.buf, N, Cin, H, W, x.pitch, wp, Cout, kh, kw, sh, pad, dil,
+                out)
+            return Tensor(out, (N, Cout, h, w), "nhwc", pitch=o)
+
+        # grouped conv: per-group panels, one shared padded input/panel
+        if Cin % groups or Cout % groups:
+            raise UnsupportedNode("Conv %s: groups %d does not divide %d/%d"
+                                  % (node.name, groups, Cin, Cout))
+        cg, og = Cin // groups, Cout // groups
+        if cg % 16 or og % 16 or (cg * kh * kw) % 16:
+            raise UnsupportedNode(
+                "Conv %s: grouped NHWC needs per-group Cin,Cout,K %% 16 "
+                "(%d,%d,%d)" % (node.name, cg, og, cg * kh * kw))
+        if wa.shape[1] != cg:
+            raise UnsupportedNode("Conv %s: weight has %d channels per group, "
+                                  "expected %d" % (node.name, wa.shape[1], cg))
+        out = self.pool.alloc(N * ho * op * Cout * 4 + 64)
+        panels = []
+        for g in range(groups):
+            key = ("panelg", node.name, g, cg, og, kh, kw, dil)
+            wp = self._panels.get(key)
+            if wp is None:
+                wg = np.ascontiguousarray(wa[g * og:(g + 1) * og], np.float32)
+                bg = np.ascontiguousarray(ba[g * og:(g + 1) * og], np.float32)
+                wt = self.upload(wg)
+                bb = self.upload(bg)
+                wp = self.pool.alloc(self.eng.conv_nhwc_wpanel_bytes(
+                    cg, og, kh, kw, True))
+                self.eng.conv_nhwc_pack_w(wt.buf, cg, og, kh, kw, bb.buf, wp)
+                self._panels[key] = wp
+                self._free(wt)
+                self._free(bb)
+            panels.append(wp)
+        h, w, o = self.eng.conv_nhwc_group(
+            x.buf, N, Cin, H, W, x.pitch, panels, Cout, groups, kh, kw, sh,
+            pad, dil, out)
+        return Tensor(out, (N, Cout, h, w), "nhwc", pitch=o)
 
     def _conv(self, node):
         x = self._float(node.input[0])
@@ -448,8 +508,7 @@ class Runner:
         b = self._float(node.input[2]) if len(node.input) > 2 and node.input[2] else None
         if len(x.shape) != 4:
             raise UnsupportedNode("Conv %s: expected NCHW input" % node.name)
-        if x.shape[0] != 1:
-            raise UnsupportedNode("Conv %s: batch != 1" % node.name)
+        N = int(x.shape[0])
 
         group = int(_attr(node, "group", 1))
         ks = _attr(node, "kernel_shape", list(w.shape[2:]))
@@ -458,8 +517,9 @@ class Runner:
         sh, sw = int(strides[0]), int(strides[1])
         pads = _attr(node, "pads", [0, 0, 0, 0])
         dil = _attr(node, "dilations", [1, 1])
-        if list(dil) != [1, 1]:
-            raise UnsupportedNode("Conv %s: dilations" % node.name)
+        if int(dil[0]) != int(dil[1]):
+            raise UnsupportedNode("Conv %s: non-square dilation" % node.name)
+        dilv = int(dil[0])
         if sh != sw:
             raise UnsupportedNode("Conv %s: non-square stride" % node.name)
 
@@ -468,32 +528,51 @@ class Runner:
         wa = self.download(w)
         ba = self.download(b) if b is not None else np.zeros(Cout, np.float32)
 
-        nhwc_ok = (group in (1, Cin) and kh == kw and kh in (1, 3)
-                   and sh in (1, 2) and list(pads) == [pads[0]] * 4
-                   and (group == 1 or sh == 1))
+        grouped = (group > 1 and group != Cin and Cin % group == 0
+                   and Cout % group == 0)
+        depthwise = (group == Cin)
+        if depthwise and Cout != Cin:
+            raise UnsupportedNode("Conv %s: depthwise Cout %d != Cin %d "
+                                  "(channel multiplier is not implemented)"
+                                  % (node.name, Cout, Cin))
+        native_group = (grouped and (Cin // group) % 16 == 0
+                        and (Cout // group) % 16 == 0)
+        nhwc_ok = (kh in (1, 3, 5) and kw in (1, 3, 5) and sh in (1, 2)
+                   and list(pads) == [pads[0]] * 4 and 1 <= dilv <= 8
+                   and (group == 1 or native_group or depthwise))
         if nhwc_ok:
             xn = self.to_nhwc(x, _align16(Cin))
             if xn is not x:
                 self._tmp(xn)
-            if group == Cin:
-                if Cout != Cin:
-                    raise UnsupportedNode("Conv %s: depthwise Cout != Cin"
+            if depthwise:
+                # The dedicated depthwise kernel is not shipped (it wedges
+                # the QPU); the verified block-diagonal dense expansion is
+                # used instead.  It costs Cin x the real MACs.
+                if kh != kw:
+                    raise UnsupportedNode("Conv %s: non-square depthwise"
                                           % node.name)
                 cp = xn.shape[1]
                 dense = np.zeros((cp, cp, kh, kw), np.float32)
                 for c in range(Cout):
                     dense[c, c] = wa[c, 0]
                 wa = dense
+                Cout = cp
             t = self._conv_nhwc(node, xn, wa, ba, kh, kw, sh, int(pads[0]),
-                                _align16(Cout))
-            if t.shape[1] != Cout:
-                a = self.download_nhwc(t)[:, :, :, :Cout]
+                                dilv, 1 if depthwise else group)
+            if t.shape[1] != w.shape[0]:
+                a = self.download_nhwc(t)[:, :, :, :w.shape[0]]
                 t = self.upload_nhwc(np.ascontiguousarray(a),
-                                     (1, Cout, t.shape[2], t.shape[3]))
+                                     (N, w.shape[0], t.shape[2], t.shape[3]))
             return t
 
         # ---------------- legacy NCHW path (non-square kernels, etc.) -------
+        if N != 1:
+            raise UnsupportedNode("Conv %s: batch %d needs the NHWC path"
+                                  % (node.name, N))
         H, W = x.shape[2], x.shape[3]
+        if dilv != 1:
+            raise UnsupportedNode("Conv %s: NCHW path has no dilation"
+                                  % node.name)
         if list(pads) == [pads[0]] * 4:
             p = pads[0]
             if sh == 1:
@@ -509,8 +588,9 @@ class Runner:
                     "(NCHW im2col VDR pitch limit)" % (node.name, hp, wp_,
                                                        hp * wp_ * 4))
         if group not in (1, Cin):
-            raise UnsupportedNode("Conv %s: groups=%d (only 1 or depthwise)"
-                                  % (node.name, group))
+            raise UnsupportedNode("Conv %s: groups=%d (only 1, depthwise or "
+                                  "a 16-aligned group block)" % (node.name,
+                                                                 group))
         cpad = _align16(Cin)
         opad = _align16(Cout)
         if x.layout == "nhwc":
@@ -713,8 +793,6 @@ class Runner:
         if _attr(node, "dilations", [1, 1]) != [1, 1]:
             raise UnsupportedNode("MaxPool %s: dilations" % node.name)
         N, C, H, W = x.shape
-        if N != 1:
-            raise UnsupportedNode("MaxPool %s: batch != 1" % node.name)
         n, s = int(ks[0]), int(strides[0])
         if ks[0] != ks[1] or strides[0] != strides[1]:
             raise UnsupportedNode("MaxPool %s: non-square window" % node.name)
@@ -728,17 +806,17 @@ class Runner:
                     a = np.pad(a, ((0, 0), (pad, pad), (pad, pad), (0, 0)),
                                constant_values=-np.inf)
                     x = self.upload_nhwc(np.ascontiguousarray(a),
-                                         (1, C, H + 2 * pad, W + 2 * pad))
+                                         (N, C, H + 2 * pad, W + 2 * pad))
                     self._tmp(x)
                     H += 2 * pad
                     W += 2 * pad
                     pad = 0
                 ho, wo = H - n + 1, W - n + 1
                 op = _align16(wo)
-                out = self.pool.alloc(ho * op * C * 4 + 64)
-                h, w, o = self.eng.maxpool_nhwc(x.buf, 1, C, H, W, x.pitch,
+                out = self.pool.alloc(N * ho * op * C * 4 + 64)
+                h, w, o = self.eng.maxpool_nhwc(x.buf, N, C, H, W, x.pitch,
                                                 n, pad, out)
-                return Tensor(out, (1, C, h, w), "nhwc", pitch=o)
+                return Tensor(out, (N, C, h, w), "nhwc", pitch=o)
             x = self.upload(self.nchw(x))
             N, C, H, W = x.shape
         pad = int(pads[0])
@@ -749,11 +827,23 @@ class Runner:
         wo = (W + 2 * pad - n) // s + 1
         op = _align16(wo)
         hop = (ho + 3) & ~3
-        out = self._alloc(C * hop * op)
-        h, w = self.eng.maxpooln(x.buf, out, C, H, W, n, s, pad)
-        t = Tensor(out, (1, C, hop, op))
-        a = self.download(t)[:, :, :h, :w]
-        return self.upload(np.ascontiguousarray(a))
+        if N == 1:
+            out = self._alloc(C * hop * op)
+            h, w = self.eng.maxpooln(x.buf, out, C, H, W, n, s, pad)
+            t = Tensor(out, (1, C, hop, op))
+            a = self.download(t)[:, :, :h, :w]
+            return self.upload(np.ascontiguousarray(a))
+        # vc4_maxpooln is a single-image op: one launch per image, still all
+        # arithmetic on the QPU.
+        out = self._alloc(N * C * hop * op)
+        parts = []
+        for k in range(N):
+            sb = vc4infer.Buf(x.buf.off + k * C * H * W * 4, C * H * W * 4)
+            ob = vc4infer.Buf(out.off + k * C * hop * op * 4, C * hop * op * 4)
+            h, w = self.eng.maxpooln(sb, ob, C, H, W, n, s, pad)
+            t = Tensor(ob, (1, C, hop, op))
+            parts.append(self.download(t)[0, :, :h, :w])
+        return self.upload(np.ascontiguousarray(np.stack(parts)))
 
     def _concat(self, node):
         axis = int(_attr(node, "axis", 0))
@@ -770,7 +860,8 @@ class Runner:
                                               % node.name)
                 a = np.concatenate([self.download_nhwc(t) for t in ts], axis=3)
                 return self.upload_nhwc(np.ascontiguousarray(a),
-                                        (1, a.shape[3], shape[2], shape[3]))
+                                        (a.shape[0], a.shape[3], shape[2],
+                                         shape[3]))
             a = np.concatenate([self.nchw(t) for t in ts], axis=1)
             return self.upload(np.ascontiguousarray(a))
         if rank == 3 and axis in (1, 2):
@@ -809,7 +900,7 @@ class Runner:
             off = 0
             for s in sizes:
                 part = np.ascontiguousarray(full[:, :, :, off:off + s])
-                outs.append(self.upload_pitched(part, (1, s, h, w), x.pitch))
+                outs.append(self.upload_pitched(part, (n, s, h, w), x.pitch))
                 off += s
         else:
             a = self.download(x)
@@ -858,7 +949,7 @@ class Runner:
         ix = np.clip(ix, 0, w - 1)
         if nhwc:
             y = np.ascontiguousarray(a[:, iy][:, :, ix])
-            return self.upload_nhwc(y, (1, x.shape[1], Ho, Wo))
+            return self.upload_nhwc(y, (a.shape[0], x.shape[1], Ho, Wo))
         y = np.ascontiguousarray(a[:, :, iy][:, :, :, ix])
         return self.upload(y)
 

@@ -119,6 +119,18 @@ class Engine:
             [ctypes.POINTER(Buf), ctypes.POINTER(ctypes.c_int),
              ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
         L.vc4_conv_nhwc.restype = ctypes.c_int
+        L.vc4_conv_nhwc_dil.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 5 + [ctypes.POINTER(Buf)] + [ctypes.c_int] * 6 + \
+            [ctypes.POINTER(Buf), ctypes.POINTER(ctypes.c_int),
+             ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        L.vc4_conv_nhwc_dil.restype = ctypes.c_int
+        L.vc4_conv_nhwc_group.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 5 + [ctypes.POINTER(ctypes.POINTER(Buf))] + \
+            [ctypes.c_int] * 7 + [ctypes.POINTER(Buf),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int)]
+        L.vc4_conv_nhwc_group.restype = ctypes.c_int
         L.vc4_maxpool_nhwc.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
             [ctypes.c_int] * 7 + [ctypes.POINTER(Buf),
                                   ctypes.POINTER(ctypes.c_int),
@@ -126,7 +138,7 @@ class Engine:
                                   ctypes.POINTER(ctypes.c_int)]
         L.vc4_maxpool_nhwc.restype = ctypes.c_int
         L.vc4_upsample2x_nhwc.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
-            [ctypes.c_int] * 6 + [ctypes.POINTER(Buf),
+            [ctypes.c_int] * 5 + [ctypes.POINTER(Buf),
                                   ctypes.POINTER(ctypes.c_int),
                                   ctypes.POINTER(ctypes.c_int),
                                   ctypes.POINTER(ctypes.c_int)]
@@ -140,6 +152,14 @@ class Engine:
         L.vc4_arena_bytes.restype = ctypes.c_size_t
 
         self.ctx = ctypes.c_void_p()
+        if not arena_bytes:
+            # A 320x320 YOLO needs ~91 MiB (activations + weights + the
+            # per-conv im2col scratch); the daemon's default 72 MiB is too
+            # small.  The client region is what the engine can see, so make
+            # it settable without touching the daemon launch line.
+            mb = int(os.environ.get("VC4INFER_ARENA_MB", "0"))
+            if mb > 0:
+                arena_bytes = mb << 20
         st = L.vc4_init(ctypes.byref(self.ctx),
                         cache_dir.encode() if cache_dir else None, arena_bytes)
         if st != VC4_OK:
@@ -256,6 +276,33 @@ class Engine:
             ctypes.byref(wpanel), Cout, KH, KW, stride, pad,
             ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo),
             ctypes.byref(op)), "conv_nhwc")
+        return ho.value, wo.value, op.value
+
+    def conv_nhwc_dil(self, x, nimg, Cin, H, W, in_pitch, wpanel, Cout, KH, KW,
+                      stride, pad, dil, out):
+        ho = ctypes.c_int(0)
+        wo = ctypes.c_int(0)
+        op = ctypes.c_int(0)
+        self._check(self.lib.vc4_conv_nhwc_dil(
+            self.ctx, ctypes.byref(x), nimg, Cin, H, W, in_pitch,
+            ctypes.byref(wpanel), Cout, KH, KW, stride, pad, dil,
+            ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo),
+            ctypes.byref(op)), "conv_nhwc_dil")
+        return ho.value, wo.value, op.value
+
+    def conv_nhwc_group(self, x, nimg, Cin, H, W, in_pitch, wpanels, Cout,
+                        groups, KH, KW, stride, pad, dil, out):
+        ho = ctypes.c_int(0)
+        wo = ctypes.c_int(0)
+        op = ctypes.c_int(0)
+        arr = (ctypes.POINTER(Buf) * len(wpanels))()
+        for i, w in enumerate(wpanels):
+            arr[i] = ctypes.pointer(w)
+        self._check(self.lib.vc4_conv_nhwc_group(
+            self.ctx, ctypes.byref(x), nimg, Cin, H, W, in_pitch, arr, Cout,
+            groups, KH, KW, stride, pad, dil, ctypes.byref(out),
+            ctypes.byref(ho), ctypes.byref(wo), ctypes.byref(op)),
+            "conv_nhwc_group")
         return ho.value, wo.value, op.value
 
     def maxpool_nhwc(self, x, nimg, C, H, W, in_pitch, k, pad, out):

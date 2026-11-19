@@ -122,3 +122,8 @@ vc4_status vc4__pack3_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen_floats
 vc4_status vc4__gemm3_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                           int bmode, uint32_t b_bus, uint32_t c_bus,
                           uint32_t panel_bus);
+/* same, with C's row pitch (floats) independent of N; a grouped conv passes
+ * the full output channel count so every group writes into one image */
+vc4_status vc4__gemm3_run_c(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
+                            int bmode, uint32_t b_bus, uint32_t c_bus,
+                            uint32_t panel_bus, uint32_t cstride);

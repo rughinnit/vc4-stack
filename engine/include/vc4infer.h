@@ -156,13 +156,39 @@ vc4_status vc4_conv_nhwc_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int Cin,
 /*
  * out = conv(in) + bias, NHWC.  in [nimg][H][W][Cin] (row pitch in_pitch),
  * out [nimg][ho][Wg][Cout] with Wg = align16(wo); the columns [wo, Wg) are
- * junk (never read back).  stride in {1,2}, KH=KW in {1,3}, Cin/Cout % 16 == 0,
- * stride*Cin*4 <= 8191 (VDR pitch).
+ * junk (never read back).  stride in {1,2}, KH,KW in {1,3,5}, Cin/Cout % 16 ==
+ * 0, stride*Cin*4 <= 8191 (VDR pitch).  The stride-2 decimation happens in
+ * the im2col gather (the VDR reads pixels `stride` apart), not by phase
+ * images, so a stride-2 conv runs the same MAC count as stride 1.
+ *
+ * vc4_conv_nhwc_dil is the same op with an explicit dilation (1..8); the
+ * output size is (H + 2p - dil*(K-1) - 1)/stride + 1.
  */
 vc4_status vc4_conv_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
                          int H, int W, int in_pitch, const vc4_buf *wpanel,
                          int Cout, int KH, int KW, int stride, int pad,
                          vc4_buf *out, int *ho, int *wo, int *opitch);
+vc4_status vc4_conv_nhwc_dil(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
+                             int H, int W, int in_pitch,
+                             const vc4_buf *wpanel, int Cout, int KH, int KW,
+                             int stride, int pad, int dilation, vc4_buf *out,
+                             int *ho, int *wo, int *opitch);
+/*
+ * Grouped conv: `groups` independent convs over channel blocks of Cin/groups
+ * and Cout/groups.  wpanel[g] is the packed panel of group g (call
+ * vc4_conv_nhwc_pack_w with the group's [Cout/groups][Cin/groups][KH][KW]
+ * slice).  Cin/groups and Cout/groups must each be multiples of 16; the input
+ * is padded once and the activation panel is reused, and each group's GEMM
+ * writes straight into its channel range of the single NHWC output (the GEMM
+ * C row stride is set to Cout), so no host interleave is needed.  MACs are
+ * the real grouped MACs, not a block-diagonal expansion.
+ */
+vc4_status vc4_conv_nhwc_group(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                               int Cin, int H, int W, int in_pitch,
+                               const vc4_buf *const *wpanel, int Cout,
+                               int groups, int KH, int KW, int stride, int pad,
+                               int dilation, vc4_buf *out, int *ho, int *wo,
+                               int *opitch);
 /* depthwise 3x3 pad 1: wt [C][1][3][3] -> WP[tap][C] */
 size_t vc4_depthwise_wpanel_bytes(int C);
 vc4_status vc4_depthwise_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int C,

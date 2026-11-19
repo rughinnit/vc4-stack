@@ -73,7 +73,7 @@ static const char *uop_name(vc4_uop op)
 typedef void (*uni_fill)(uint32_t *u, uint32_t group, uint32_t nq,
                          const uint32_t *base);
 
-static vc4_status launch_groups(vc4_ctx *ctx, const char *kname,
+static vc4_status launch_groups(vc4_ctx *ctx, const char *prefix,
                                 char *const argv[], uint32_t ngroups,
                                 uni_fill fill, const uint32_t *base)
 {
@@ -84,6 +84,11 @@ static vc4_status launch_groups(vc4_ctx *ctx, const char *kname,
         uint32_t left = ngroups - b;
         int nq = left < (uint32_t)VC4_MAX_QPU ? (int)left : VC4_MAX_QPU;
         vc4_kernel *k = NULL;
+        /* the blob cache keys on the name and a cached kernel is rejected if a
+         * later launch needs more QPUs than it was generated for, exactly like
+         * the elementwise path's ew_<op>_q<nq> */
+        char kname[80];
+        snprintf(kname, sizeof(kname), "%s_q%d", prefix, nq);
         st = vc4__kernel(ctx, kname, argv, nq, &k);
         if (st != VC4_OK)
             break;

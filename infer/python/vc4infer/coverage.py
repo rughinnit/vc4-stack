@@ -43,6 +43,13 @@ from onnx import TensorProto, numpy_helper
 OPS = {
     "Conv": "QPU conv: NHWC 1x1/3x3/5x5 s1/s2, dilation 1..8, groups",
     "Relu": "QPU elementwise",
+    "Abs": "QPU unary (vc4_unary UOP_ABS, exact)",
+    "Neg": "QPU unary (UOP_NEG, exact)",
+    "Sign": "QPU unary (UOP_SIGN, exact)",
+    "Clip": "QPU unary (UOP_CLIP, scalar limits in uniforms)",
+    "LeakyRelu": "QPU unary (UOP_LEAKYRELU, alpha in a uniform)",
+    "HardSigmoid": "QPU unary (UOP_HARDSIGMOID, alpha/beta)",
+    "HardSwish": "QPU unary (UOP_HARDSWISH)",
     "Sigmoid": "QPU elementwise",
     "Silu": "QPU elementwise (fused)",
     "Add": "QPU elementwise",
@@ -323,8 +330,26 @@ def _check_split(node, shapes, inits):
     return "supported", "axis 1"
 
 
+def _check_clip(node, shapes, inits):
+    for i, nm in ((1, "min"), (2, "max")):
+        if len(node.input) > i and node.input[i]:
+            if node.input[i] not in inits:
+                return "unsupported", ("runtime tensor limit %s (scalar "
+                                       "constant limits only)"
+                                       % node.input[i])
+            v = inits[node.input[i]]
+            if getattr(v, "size", 1) != 1:
+                return "unsupported", "limit %s has %d elements" % (nm, v.size)
+    lo = _attr(node, "min", None)
+    hi = _attr(node, "max", None)
+    if lo is not None and hi is not None and float(lo) > float(hi):
+        return "unsupported", "min > max"
+    return "supported", "scalar limits"
+
+
 _CHECKS = {
     "Conv": _check_conv,
+    "Clip": _check_clip,
     "MaxPool": _check_maxpool,
     "Softmax": _check_softmax,
     "Resize": _check_resize,

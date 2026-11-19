@@ -1047,6 +1047,69 @@ class Runner:
         self.eng.elementwise(vc4infer.OP_SILU, x.buf, out, x.size)
         return Tensor(out, x.shape, x.layout, x.pitch)
 
+    # ------------------------------------------------- generic QPU unary ops
+    def _unary_uop(self, node, uop, p0=0.0, p1=0.0, p2=0.0):
+        """One QPU unary kernel over every stored element (layout-agnostic,
+        exactly like Relu: the op touches all bytes it is handed, padding
+        included, and keeps the operand's layout and pitch)."""
+        x = self._float(node.input[0])
+        out = self.pool.alloc(x.size * 4 + 64)
+        self.eng.unary(uop, x.buf, out, x.size, p0, p1, p2)
+        return Tensor(out, x.shape, x.layout, x.pitch)
+
+    def _abs(self, node):
+        return self._unary_uop(node, vc4infer.UOP_ABS)
+
+    def _neg(self, node):
+        return self._unary_uop(node, vc4infer.UOP_NEG)
+
+    def _sign(self, node):
+        return self._unary_uop(node, vc4infer.UOP_SIGN)
+
+    def _leakyrelu(self, node):
+        return self._unary_uop(node, vc4infer.UOP_LEAKYRELU,
+                               float(_attr(node, "alpha", 0.01)))
+
+    def _hardsigmoid(self, node):
+        return self._unary_uop(node, vc4infer.UOP_HARDSIGMOID,
+                               float(_attr(node, "alpha", 0.2)),
+                               float(_attr(node, "beta", 0.5)))
+
+    def _hardswish(self, node):
+        # ONNX HardSwish (opset 14) has no attributes: x * clip(x/6 + 0.5, 0, 1)
+        return self._unary_uop(node, vc4infer.UOP_HARDSWISH, 1.0 / 6.0, 0.5)
+
+    def _clip(self, node):
+        """Clip with attribute (opset < 11) or constant-tensor limits."""
+        lo = _attr(node, "min", None)
+        hi = _attr(node, "max", None)
+        for idx, which in ((1, "min"), (2, "max")):
+            if len(node.input) <= idx or not node.input[idx]:
+                continue
+            name = node.input[idx]
+            c = self._hostconst(name)
+            if c is None:
+                raise UnsupportedNode(
+                    node.name, "Clip",
+                    "runtime tensor limit %s: the QPU kernel takes scalar "
+                    "limits in uniform registers (vc4_select3 clip3 exists but "
+                    "is not element-verified yet)" % name)
+            arr = np.asarray(c)
+            if arr.size != 1:
+                raise UnsupportedNode(
+                    node.name, "Clip",
+                    "limit %s has %d elements; scalar limits only" %
+                    (name, arr.size))
+            if which == "min":
+                lo = float(arr.reshape(-1)[0])
+            else:
+                hi = float(arr.reshape(-1)[0])
+        lo = -np.inf if lo is None else float(lo)
+        hi = np.inf if hi is None else float(hi)
+        if not (lo <= hi):
+            raise UnsupportedNode(node.name, "Clip", "min %g > max %g" % (lo, hi))
+        return self._unary_uop(node, vc4infer.UOP_CLIP, lo, hi)
+
     def _maxpool(self, node):
         x = self._float(node.input[0])
         if len(x.shape) != 4:
@@ -1611,6 +1674,13 @@ class Runner:
         fn = {
             "Conv": self._conv,
             "Relu": self._relu,
+            "Abs": self._abs,
+            "Neg": self._neg,
+            "Sign": self._sign,
+            "Clip": self._clip,
+            "LeakyRelu": self._leakyrelu,
+            "HardSigmoid": self._hardsigmoid,
+            "HardSwish": self._hardswish,
             "Sigmoid": self._sigmoid,
             "Silu": lambda node: self._silu(self._float(node.input[0])),
             "Add": self._add,

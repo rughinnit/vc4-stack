@@ -58,6 +58,8 @@ static int nhwc_pad_image(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
     if (!p)
         return 0;
     memset((uint8_t *)p, 0, per * (size_t)nimg + NHWC_SLACK);
+    if (nimg)
+        vc4__invalidate_off(ctx, in->off, (size_t)nimg * H * in_pitch * C * 4u);
     for (int n = 0; n < nimg; ++n) {
         const uint8_t *src = ctx->arena + in->off +
                              (size_t)n * H * in_pitch * C * 4u;
@@ -106,6 +108,7 @@ vc4_status vc4_conv_nhwc_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int Cin,
     }
     /* wt is [Cout][Cin][KH][KW] (ci-major); the panel k order is tap-major */
     {
+        vc4__invalidate_off(ctx, wt->off, (size_t)Cout * K * 4);
         const float *src = (const float *)(ctx->arena + wt->off);
         const int taps = KH * KW;
         for (int co = 0; co < Cout; ++co)
@@ -114,6 +117,7 @@ vc4_status vc4_conv_nhwc_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int Cin,
                     wr[(size_t)co * K + (size_t)t * Cin + ci] =
                         src[(size_t)co * K + (size_t)ci * taps + t];
     }
+    vc4__invalidate_off(ctx, wpanel->off, (size_t)Cout * nk * 4);
     memset(ctx->arena + wpanel->off, 0, (size_t)Cout * nk * 4);
     /* wpanel is a caller-owned (persistent) buffer, and the CPU has just
      * written it.  Through vc4d the range has to be flushed to DRAM before
@@ -125,6 +129,7 @@ vc4_status vc4_conv_nhwc_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int Cin,
                                   vc4_bus_addr(ctx, wpanel), 64u * nk,
                                   (uint32_t)Cout / 16u);
     if (st == VC4_OK && bias) {
+        vc4__invalidate_off(ctx, bias->off, (size_t)Cout * 4);
         const float *bsrc = (const float *)(ctx->arena + bias->off);
         float *wp = (float *)(ctx->arena + wpanel->off);
         for (uint32_t cb = 0; cb < (uint32_t)Cout / 16u; ++cb)
@@ -417,6 +422,7 @@ vc4_status vc4_depthwise_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int C,
         return VC4_ERR_NOMEM;
     }
     memset(w, 0, (size_t)C * K * 4u);
+    vc4__invalidate_off(ctx, wt->off, (size_t)C * al16(K) * 4u);
     const float *src = (const float *)(ctx->arena + wt->off);
     for (int co = 0; co < C; ++co)
         for (int t = 0; t < 9; ++t)

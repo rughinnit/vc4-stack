@@ -115,8 +115,13 @@ static vc4_status pad_stream(vc4_ctx *ctx, const vc4_buf *b, size_t n,
     float *t = vc4__scratch_alloc(ctx, np * 4, NULL);
     if (!t)
         return VC4_ERR_NOMEM;
-    memcpy((uint8_t *)t, ctx->arena + b->off, n * 4);
+    /* the source is arena data the QPU may have written: drop our cached
+     * copies before reading it, exactly like vc4_download does */
+    vc4__invalidate_off(ctx, b->off, n * 4);
+    vc4__write(ctx, (uint32_t)((uint8_t *)t - ctx->arena),
+               ctx->arena + b->off, n * 4);
     memset((uint8_t *)t + n * 4, 0, (np - n) * 4);
+    vc4__mark_dirty(ctx, (uint32_t)((uint8_t *)t - ctx->arena), np * 4);
     *bus = ctx->gpu_bus + (uint32_t)((uint8_t *)t - ctx->arena);
     return VC4_OK;
 }
@@ -196,8 +201,7 @@ vc4_status vc4_unary(vc4_ctx *ctx, vc4_uop op, const vc4_buf *a, vc4_buf *out,
         ctx->st.flops += (uint64_t)n * 4;
         if (o_tmp) {
             vc4__l2_flush(ctx);
-            memcpy(ctx->arena + out->off, (uint8_t *)o_tmp, n * 4);
-            vc4__mark_dirty(ctx, out->off, n * 4);
+            vc4__write(ctx, out->off, o_tmp, n * 4);
         }
     }
     vc4__scratch_reset(ctx);
@@ -270,8 +274,7 @@ vc4_status vc4_select3(vc4_ctx *ctx, vc4_selop op, const vc4_buf *a,
         ctx->st.flops += (uint64_t)n * 2;
         if (o_tmp) {
             vc4__l2_flush(ctx);
-            memcpy(ctx->arena + out->off, (uint8_t *)o_tmp, n * 4);
-            vc4__mark_dirty(ctx, out->off, n * 4);
+            vc4__write(ctx, out->off, o_tmp, n * 4);
         }
     }
     vc4__scratch_reset(ctx);
@@ -319,7 +322,9 @@ vc4_status vc4_gather(vc4_ctx *ctx, const vc4_buf *tab, vc4_buf *out,
             vc4__scratch_reset(ctx);
             return VC4_ERR_NOMEM;
         }
-        memcpy((uint8_t *)t, ctx->arena + tab->off, n * 4);
+        vc4__invalidate_off(ctx, tab->off, n * 4);
+        vc4__write(ctx, (uint32_t)((uint8_t *)t - ctx->arena),
+                   ctx->arena + tab->off, n * 4);
         for (size_t i = n; i < np; ++i)
             t[i] = -1;
         x.tab = ctx->gpu_bus + (uint32_t)((uint8_t *)t - ctx->arena);
@@ -346,8 +351,7 @@ vc4_status vc4_gather(vc4_ctx *ctx, const vc4_buf *tab, vc4_buf *out,
         ctx->st.flops += n;
         if (o_tmp) {
             vc4__l2_flush(ctx);
-            memcpy(ctx->arena + out->off, (uint8_t *)o_tmp, n * 4);
-            vc4__mark_dirty(ctx, out->off, n * 4);
+            vc4__write(ctx, out->off, o_tmp, n * 4);
         }
     }
     vc4__scratch_reset(ctx);
@@ -676,9 +680,7 @@ vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
         ctx->st.flops += (uint64_t)outer * red;
         if (o_tmp) {
             vc4__l2_flush(ctx);
-            memcpy(ctx->arena + out->off, (uint8_t *)o_tmp,
-                   (size_t)outer * 4);
-            vc4__mark_dirty(ctx, out->off, (size_t)outer * 4);
+            vc4__write(ctx, out->off, o_tmp, (size_t)outer * 4);
         }
     }
     vc4__scratch_reset(ctx);

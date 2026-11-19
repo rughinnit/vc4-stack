@@ -79,7 +79,10 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
         vc4__set_err(ctx, "conv2d: no room for a %dx%dx%d padded image", Cin, hp, wp);
         return VC4_ERR_NOMEM;
     }
+    vc4__invalidate_off(ctx, (uint32_t)((uint8_t *)pad_img - ctx->arena),
+                        (size_t)Cin * hp * wp * 4 + 64);
     memset((uint8_t *)pad_img, 0, (size_t)Cin * hp * wp * 4 + 64);
+    vc4__invalidate_off(ctx, in->off, (size_t)Cin * H * W * 4);
     for (int c = 0; c < Cin; ++c) {
         for (int y = 0; y < H; ++y) {
             memcpy((uint8_t *)pad_img + ((size_t)c * hp * wp + (size_t)(y + pad) * wp + pad) * 4,
@@ -96,6 +99,8 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
         vc4__set_err(ctx, "conv2d: no room for a %ux%u panel", M, nk);
         return VC4_ERR_NOMEM;
     }
+    vc4__invalidate_off(ctx, (uint32_t)((uint8_t *)panel - ctx->arena),
+                        (size_t)M * nk * 4);
     memset((uint8_t *)panel, 0, (size_t)M * nk * 4);
 
     {
@@ -162,6 +167,7 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
         vc4__scratch_reset(ctx);
         return VC4_ERR_NOMEM;
     }
+    vc4__invalidate_off(ctx, wb.off, (size_t)Cout * nk * 4);
     memset((uint8_t *)wpanel, 0, (size_t)Cout * nk * 4);
     {
         /* The im2col kernel writes k blocks in tap-major order
@@ -172,6 +178,7 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
         if (KH * KW > 1) {
             float *wr = vc4__scratch_alloc(ctx, (size_t)Cout * K * 4, NULL);
             if (!wr) { vc4__scratch_reset(ctx); return VC4_ERR_NOMEM; }
+            vc4__invalidate_off(ctx, wt->off, (size_t)Cout * K * 4);
             const float *src = (const float *)(ctx->arena + wt->off);
             const int taps = KH * KW;
             for (int co = 0; co < Cout; ++co)
@@ -192,6 +199,7 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
             return st;
         }
         if (bias) {
+            vc4__invalidate_off(ctx, bias->off, (size_t)Cout * 4);
             const float *bsrc = (const float *)(ctx->arena + bias->off);
             for (uint32_t cb = 0; cb < (uint32_t)Cout / 16u; ++cb) {
                 float *brow = wpanel + ((size_t)cb * nk + Kp) * 16u;
@@ -218,6 +226,7 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
 
     /* ---- 5. NCHW store (byte gather, no arithmetic) ---------------------- */
     vc4__l2_flush(ctx);
+    vc4__invalidate_off(ctx, out->off, (size_t)Cout * ho * wo * 4);
     for (int co = 0; co < Cout; ++co) {
         for (int y = 0; y < ho; ++y) {
             const float *src = cmat + ((size_t)y * wp) * Cout + co;

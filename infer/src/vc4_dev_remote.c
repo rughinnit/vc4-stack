@@ -88,6 +88,32 @@ static void cache_civac(void *p, size_t n)
 #endif
 }
 
+/* Drop the client's cached copies of [p, p+n) *before* the CPU writes them.
+ *
+ * The dma-buf mapping is cacheable, so a stale line left behind by an earlier
+ * read would be written back by the clean that precedes the next launch, and
+ * would overlay whatever the QPU has since put there (a partial-line write
+ * modifies only its words; the rest of the line comes from the cache).  ARM
+ * has no cross-process invalidate and the daemon cannot reach another
+ * process's D-cache, so this is the one place it can be done: the client that
+ * owns the mapping.  DC IVAC is undefined at EL0, so this is the same CIVAC
+ * the launch path uses, and it is safe here because it runs *before* the
+ * write: it may only write back the client's own earlier data, which the
+ * memcpy is about to replace. */
+void vc4__invalidate(void *p, size_t n)
+{
+    cache_civac(p, n);
+}
+
+/* Same, by arena offset, for the C code that fills a persistent buffer with
+ * memset + partial memcpys before a launch (weight panels, padded images,
+ * scratch, split-K C rows). */
+void vc4__invalidate_off(vc4_ctx *ctx, uint32_t off, size_t n)
+{
+    if (ctx && ctx->arena)
+        cache_civac(ctx->arena + off, n);
+}
+
 /* Remember a CPU-written [off, off+bytes) interval; merged on insertion so a
  * fill + a copy over the same buffer costs one clean. */
 static void remote_mark(vc4_ctx *ctx, uint32_t off, size_t bytes)
@@ -448,6 +474,9 @@ vc4_status vc4__remote_upload(vc4_ctx *ctx, vc4_buf *b, const void *src,
         return VC4_ERR_INVAL;
     if (bytes > b->bytes)
         return VC4_ERR_INVAL;
+    /* no stale line of ours may survive into the range we are writing: the
+     * clean before the next launch writes whole lines back */
+    cache_civac(ctx->arena + b->off, bytes);
     memcpy(ctx->arena + b->off, src, bytes);
     if (ctx->dirty_top < (size_t)b->off + bytes)
         ctx->dirty_top = (size_t)b->off + bytes;

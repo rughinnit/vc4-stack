@@ -213,3 +213,89 @@ vc4_status vc4_softmax_ce(vc4_ctx *ctx, const vc4_buf *logits,
     }
     return st;
 }
+
+/* Forward softmax: the same fused kernel with its 'p' probe, which stores
+ * p = softmax(row) instead of dlogits.  The label path still executes (the
+ * kernel is one straight-line block), so the dummy label buffer holds zeros
+ * and the probe discards the one-hot term.  The host pads each row to 16
+ * classes with -1e30 and compacts the probabilities back to `cols`. */
+vc4_status vc4_softmax_fwd(vc4_ctx *ctx, const vc4_buf *logits,
+                           uint32_t rows, uint32_t cols, vc4_buf *out)
+{
+    if (!ctx || !logits || !out || !rows || !cols)
+        return VC4_ERR_INVAL;
+    if (ctx->dead)
+        return VC4_ERR_TIMEOUT;
+    if (cols > 16 || rows % 8)
+        return VC4_ERR_UNSUPPORTED;
+    if (logits->bytes < (size_t)rows * cols * 4 ||
+        out->bytes < (size_t)rows * cols * 4)
+        return VC4_ERR_INVAL;
+
+    const uint32_t groups = rows / 8u;
+    vc4__scratch_reset(ctx);
+
+    vc4_buf lb, ob, pb, partb;
+    float *lp = vc4__scratch_alloc(ctx, (size_t)rows * 64 + 64, &lb);
+    float *op = vc4__scratch_alloc(ctx, (size_t)rows * 64 + 64, &ob);
+    int32_t *labels = vc4__scratch_alloc(ctx, (size_t)rows * 4 + 64, &pb);
+    float *partial = vc4__scratch_alloc(ctx, (size_t)groups * 64, &partb);
+    if (!lp || !op || !labels || !partial) {
+        vc4__scratch_reset(ctx);
+        return VC4_ERR_NOMEM;
+    }
+    /* logits padding must contribute exp = 0; the labels are never used by
+       the probe path but the load must be a valid in-arena address */
+    for (uint32_t i = 0; i < rows * 16u + 16u; ++i)
+        lp[i] = -1e30f;
+    memset(labels, 0, (size_t)rows * 4 + 64);
+    memset(op, 0, (size_t)rows * 64 + 64);
+    for (uint32_t r = 0; r < rows; ++r)
+        memcpy(lp + (size_t)r * 16u,
+               ctx->arena + logits->off + (size_t)r * cols * 4,
+               (size_t)cols * 4);
+    vc4__mark_dirty(ctx, lb.off, (size_t)rows * 64 + 64);
+    vc4__mark_dirty(ctx, pb.off, (size_t)rows * 4 + 64);
+
+    char name[48];
+    char *argv[] = { (char *)"softmax", (char *)"--probe", (char *)"p", NULL };
+    uint32_t one_bits;
+    {
+        float one = 1.0f;
+        memcpy(&one_bits, &one, 4);
+    }
+    vc4_status st = VC4_OK;
+    for (uint32_t base = 0; base < groups && st == VC4_OK; base += VC4_MAX_QPU) {
+        uint32_t left = groups - base;
+        int nq = left < (uint32_t)VC4_MAX_QPU ? (int)left : VC4_MAX_QPU;
+        snprintf(name, sizeof(name), "softmax8_p_q%d", nq);
+        vc4_kernel *k = NULL;
+        st = vc4__kernel(ctx, name, argv, nq, &k);
+        if (st != VC4_OK)
+            break;
+        for (int i = 0; i < nq; ++i) {
+            uint32_t g = base + (uint32_t)i;
+            uint32_t *u = vc4__uni(ctx, k, i);
+            u[0] = ctx->gpu_bus + lb.off + g * 512u;
+            u[1] = ctx->gpu_bus + ob.off + g * 512u;
+            u[2] = ctx->gpu_bus + pb.off + g * 32u;
+            u[3] = ctx->gpu_bus + partb.off + g * 64u;
+            u[4] = (uint32_t)i;
+            u[5] = one_bits;
+        }
+        uint64_t ns = 0;
+        st = vc4__launch(ctx, k, nq, &ns);
+        ctx->st.kernel_ns += ns;
+        if (st == VC4_OK)
+            ctx->st.flops += (uint64_t)nq * 8u * 16u * 40u;
+    }
+    if (st == VC4_OK) {
+        vc4__l2_flush(ctx);
+        for (uint32_t r = 0; r < rows; ++r)
+            memcpy(ctx->arena + out->off + (size_t)r * cols * 4,
+                   op + (size_t)r * 16u, (size_t)cols * 4);
+        vc4__mark_dirty(ctx, out->off, (size_t)rows * cols * 4);
+    }
+    vc4__scratch_reset(ctx);
+    return st;
+}

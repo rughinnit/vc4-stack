@@ -45,6 +45,12 @@ class OpInfo(ctypes.Structure):
                 ("supported", ctypes.c_int), ("note", ctypes.c_char_p)]
 
 
+class Stats(ctypes.Structure):
+    _fields_ = [("launches", ctypes.c_uint64), ("pack_ns", ctypes.c_uint64),
+                ("kernel_ns", ctypes.c_uint64), ("gpu_cycles", ctypes.c_uint64),
+                ("flops", ctypes.c_uint64)]
+
+
 class Error(RuntimeError):
     pass
 
@@ -79,14 +85,32 @@ class Engine:
                                  ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
                                  ctypes.c_int]
         L.vc4_matmul.restype = ctypes.c_int
-        L.vc4_conv2d.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(Buf)] * 3 + [
-            ctypes.c_int] * 9 + [ctypes.POINTER(Buf), ctypes.POINTER(ctypes.c_int),
-                                 ctypes.POINTER(ctypes.c_int)]
+        # ctx, in, Cin, H, W, wt, Cout, KH, KW, bias, stride, pad, out, HO, WO
+        L.vc4_conv2d.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(Buf),
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(Buf),
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(Buf),
+            ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(Buf),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
         L.vc4_conv2d.restype = ctypes.c_int
         L.vc4_elementwise.argtypes = [ctypes.c_void_p, ctypes.c_int,
                                       ctypes.POINTER(Buf), ctypes.POINTER(Buf),
                                       ctypes.POINTER(Buf), ctypes.c_size_t]
         L.vc4_elementwise.restype = ctypes.c_int
+        L.vc4_maxpooln.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + [
+            ctypes.c_int] * 6 + [ctypes.POINTER(Buf),
+                                 ctypes.POINTER(ctypes.c_int),
+                                 ctypes.POINTER(ctypes.c_int)]
+        L.vc4_maxpooln.restype = ctypes.c_int
+        L.vc4_softmax_fwd.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
+                                      ctypes.c_uint32, ctypes.c_uint32,
+                                      ctypes.POINTER(Buf)]
+        L.vc4_softmax_fwd.restype = ctypes.c_int
+        L.vc4_get_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(Stats)]
+        L.vc4_get_stats.restype = None
         L.vc4_supported_ops.argtypes = [ctypes.POINTER(ctypes.c_size_t)]
         L.vc4_supported_ops.restype = ctypes.POINTER(OpInfo)
         L.vc4_print_supported_ops.argtypes = [ctypes.c_void_p]
@@ -175,6 +199,25 @@ class Engine:
             self.ctx, op, ctypes.byref(a),
             ctypes.byref(b) if b is not None else None, ctypes.byref(out), n),
             "elementwise")
+
+    def maxpooln(self, x, out, C, H, W, N, stride, pad):
+        ho = ctypes.c_int(0)
+        wo = ctypes.c_int(0)
+        self._check(self.lib.vc4_maxpooln(
+            self.ctx, ctypes.byref(x), C, H, W, N, stride, pad,
+            ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo)), "maxpooln")
+        return ho.value, wo.value
+
+    def softmax_fwd(self, x, out, rows, cols):
+        self._check(self.lib.vc4_softmax_fwd(
+            self.ctx, ctypes.byref(x), rows, cols, ctypes.byref(out)),
+            "softmax_fwd")
+
+    @property
+    def stats(self):
+        s = Stats()
+        self.lib.vc4_get_stats(self.ctx, ctypes.byref(s))
+        return s
 
     # ---- registry
     def supported_ops(self):

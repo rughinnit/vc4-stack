@@ -13,6 +13,9 @@ plane only (framework, allocation, I/O); there is no CPU compute fallback.
               matmul, conv2d (im2col), elementwise. Unsupported ops raise.
               `VC4INFER_DAEMON=1` runs it unprivileged through `vc4d`
               (`VC4INFER_DAEMON=1`, see `docs/DAEMON.md`).
+- `onnx/`     ONNX graph path: fixed-shape exporter, executor (onnx + ctypes),
+              three-model verification; supported nodes, measured numbers and
+              the YOLOv8n coverage gap in `docs/ONNX.md`
 - `training/` forward+backward kernels and a toy trainer (MLP/conv) demonstrating
               gradient computation on the VC4 data plane
 - `docs/`     measurements, ceilings, coverage tables, per-track results

@@ -1877,6 +1877,85 @@ def build_col2im(Cin, K, KH, KW, Wp, Hp):
     return p
 
 
+# ================================================= maxpool NxN / stride S (generic)
+def build_pooln(N, S, Wp, op):
+    """NxN max pool, stride S, on a host-padded [C][Hp][Wp] image.
+
+    One task = 4 output rows x 16 output columns, so the store can reuse the
+    verified 4-row VPM->DMA sequence.  The host builds the border (pad) with
+    -inf, which is a byte-level copy: the kernel then has no bounds check, no
+    loop and no branch.
+
+    Lane L of a task is output column chunk*16+L; its window is
+        rows 4*ry*S + j*S + ky,  columns chunk*16*S + L*S + kx.
+    Four output rows share one task so `_store4`'s 4x64 B shape is used.
+
+    ABI: u0 input base (row 4*ry*S, col chunk*16*S)
+         u1 output base (row 4*ry, col chunk*16)
+         u2 QPU index, u3 chunk
+    compile-time: N, S, Wp (input row pitch in floats), op (output pitch)
+    """
+    assert N >= 1 and S >= 1 and op % 16 == 0
+
+    b = Builder()
+    p = b.p
+    A_IN, A_OUT, A_Q, A_CHUNK = 17, 18, 19, 20
+    A_LANE, A_ADDR, A_KY, A_TMP, A_SADR = 21, 22, 23, 24, 25
+    A_V0 = 0
+
+    B_W4, B_S4, B_OFF, B_V4, B_V9 = 0, 1, 2, 6, 7
+
+    b.e(add_or(36, imm(1), imm(1)))                    # tmu_noswap
+    b.read_uni(A_IN)
+    b.read_uni(A_OUT)
+    b.read_uni(A_Q)
+    b.read_uni(A_CHUNK)
+    b.e(add_or(A_LANE, areg(R_ELEM_NUM), areg(R_ELEM_NUM)), nop())
+    b.e(ldi(Wp * 4, B_W4, ws=1))
+    b.e(ldi(S * 4, B_S4, ws=1))
+    b.e(add_(ADD_SHL, B_V4, ws=1, a=areg(A_Q), b=imm(2)))       # 4q
+    b.e(add_(ADD_SHL, B_V9, ws=1, a=areg(A_Q), b=imm(9)))       # 4q<<7
+    b.e(add_(ADD_SHL, 32 + 0, areg(A_CHUNK), imm(6 + (S.bit_length() - 1))))
+    #                                                   chunk*S*16*4 = chunk*S*64
+    b.e(add_(ADD_ADD, A_ADDR, areg(A_IN), acc(0)))
+    b.e(add_(ADD_SHL, 32 + 0, areg(A_LANE), imm(2 + (S.bit_length() - 1))))
+    #                                                   lane*S*4
+    b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), acc(0)), nop(), nop())
+
+    p._builder = b
+    for j in range(4):
+        if j:
+            # one output row = S input rows (A_ADDR advances cumulatively)
+            b.e(ldi(S * Wp * 4, B_OFF, ws=1))
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_OFF)), nop(), nop())
+        for ky in range(N):
+            # A_KY = A_ADDR + ky*Wp*4
+            if ky == 0:
+                b.e(add_or(A_KY, areg(A_ADDR), areg(A_ADDR)), nop(), nop())
+            else:
+                b.e(ldi(ky * Wp * 4, B_OFF, ws=1))
+                b.e(add_(ADD_ADD, A_KY, areg(A_ADDR), breg(B_OFF)), nop(), nop())
+            b.e(add_or(A_TMP, areg(A_KY), areg(A_KY)), nop(), nop())
+            for kx in range(N):
+                # first load of the row seeds the running max
+                _tmu_load(b, 0, A_TMP, 0 if (ky == 0 and kx == 0) else 1)
+                if kx == 0 and ky == 0:
+                    pass
+                else:
+                    b.e(add_(ADD_FMAX, 32 + 0, acc(0), acc(1)))
+                if kx != N - 1:
+                    b.e(add_(ADD_ADD, A_TMP, areg(A_TMP), imm(4)))
+                    b.e(nop(), nop())
+        b.e(add_or(A_V0 + j, acc(0), acc(0)), nop(), nop())
+
+    b.e(add_or(A_SADR, areg(A_OUT), areg(A_OUT)))
+    _store4(b, B_V4, B_V9, A_SADR, op * 4 - 64)
+
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
 # =============================================================== maxpool 2x2/2
 def build_pool(H, W, op, mode):
     """2x2 stride-2 max pool ('fwd') and its argmax-mask backward ('bwd').
@@ -2679,6 +2758,8 @@ def main(argv):
                          g('wp'), g('hp'))
     elif kind == 'pool':
         p = build_pool(g('h'), g('w'), g('op'), opts.get('mode', 'fwd'))
+    elif kind == 'pooln':
+        p = build_pooln(g('n'), g('s'), g('wp'), g('op'))
     elif kind == 'ew':
         p = build_ew(g('op'))
     elif kind == 'softmax':

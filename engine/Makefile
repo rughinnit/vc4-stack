@@ -13,7 +13,7 @@ SRC   = src/vc4_dev.c src/vc4_dev_remote.c src/vc4_kern.c src/vc4_gemm.c \
         src/vc4_train.c
 OBJ   = $(SRC:src/%.c=$(BUILD)/%.o)
 
-TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_train_ops $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_grad $(BUILD)/test_train $(BUILD)/test_convgrad $(BUILD)/test_convnet $(BUILD)/bench_matmul
+TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_train_ops $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_grad $(BUILD)/test_train $(BUILD)/test_convgrad $(BUILD)/test_convnet $(BUILD)/test_onnxops $(BUILD)/bench_matmul
 
 all: $(LIB) $(BUILD)/libvc4infer.so $(TESTS)
 

@@ -488,6 +488,110 @@ vc4_status vc4_maxpool2x2(vc4_ctx *ctx, const vc4_buf *in, int C, int H, int W,
     return st;
 }
 
+/* ------------------------------------------------------------------
+ * Generic NxN / stride-S max pool.
+ *
+ * The border is materialised on the host as -inf (byte fill + row copy), so
+ * the QPU kernel is a straight-line 4-output-row x 16-column task with no
+ * bounds checks, no loop and no branch.  The output row pitch is
+ * align16(wo) and the output has align4(ho) rows, because the verified
+ * 4-row VPM->DMA store writes whole rows.  Callers that need a compact
+ * [C][ho][wo] tensor copy the valid lanes (byte gather, no arithmetic).
+ * ------------------------------------------------------------------ */
+vc4_status vc4_maxpooln(vc4_ctx *ctx, const vc4_buf *in, int C, int H, int W,
+                        int N, int stride, int pad,
+                        vc4_buf *out, int *Ho, int *Wo)
+{
+    if (!ctx || !in || !out || !Ho || !Wo)
+        return VC4_ERR_INVAL;
+    if (ctx->dead)
+        return VC4_ERR_TIMEOUT;
+    if (C <= 0 || H <= 0 || W <= 0 || N <= 0 || stride <= 0 || pad < 0)
+        return VC4_ERR_INVAL;
+    const int ho = (H + 2 * pad - N) / stride + 1;
+    const int wo = (W + 2 * pad - N) / stride + 1;
+    if (ho <= 0 || wo <= 0)
+        return VC4_ERR_UNSUPPORTED;
+    const int ho_pad = (ho + 3) & ~3;
+    const int op = (wo + 15) & ~15;
+    /* the kernel reads the full padded pitch, including the lanes past wo */
+    int hp = H + 2 * pad;
+    int wp = W + 2 * pad;
+    if (hp < (ho_pad - 1) * stride + N)
+        hp = (ho_pad - 1) * stride + N;
+    if (wp < (op - 1) * stride + N)
+        wp = (op - 1) * stride + N;
+    if (in->bytes < (size_t)C * H * W * 4 ||
+        out->bytes < (size_t)C * ho_pad * op * 4)
+        return VC4_ERR_INVAL;
+
+    vc4__scratch_reset(ctx);
+    vc4_buf pb;
+    float *pimg = vc4__scratch_alloc(ctx, (size_t)C * hp * wp * 4 + 64, &pb);
+    if (!pimg) {
+        vc4__set_err(ctx, "maxpooln: no room for a %dx%dx%d padded image",
+                     C, hp, wp);
+        return VC4_ERR_NOMEM;
+    }
+    /* -inf border: a window that includes padding must never win over a real
+       value (zeros would change the max of an all-negative window) */
+    for (size_t i = 0; i < (size_t)C * hp * wp + 16; ++i)
+        ((uint32_t *)pimg)[i] = 0xFF800000u;
+    for (int c = 0; c < C; ++c)
+        for (int y = 0; y < H; ++y)
+            memcpy((uint8_t *)pimg +
+                   ((size_t)c * hp * wp + (size_t)(y + pad) * wp + pad) * 4,
+                   ctx->arena + in->off + ((size_t)c * H + (size_t)y) * W * 4,
+                   (size_t)W * 4);
+    vc4__mark_dirty(ctx, pb.off, (size_t)C * hp * wp * 4);
+    const uint32_t pbus = ctx->gpu_bus + pb.off;
+
+    char name[72], nn[16], ns[16], nw[16], no[16];
+    char *argv[] = { (char *)"pooln", (char *)"--n", nn, (char *)"--s", ns,
+                     (char *)"--wp", nw, (char *)"--op", no, NULL };
+    snprintf(nn, sizeof(nn), "%d", N);
+    snprintf(ns, sizeof(ns), "%d", stride);
+    snprintf(nw, sizeof(nw), "%d", wp);
+    snprintf(no, sizeof(no), "%d", op);
+    snprintf(name, sizeof(name), "pooln_%d_%d_%d_%d", N, stride, wp, op);
+
+    vc4_kernel *k = NULL;
+    vc4_status st = vc4__kernel(ctx, name, argv, VC4_MAX_QPU, &k);
+    if (st != VC4_OK) { vc4__scratch_reset(ctx); return st; }
+    const uint32_t nch = (uint32_t)op / 16u;
+    const uint32_t ng = (uint32_t)ho_pad / 4u;
+    const uint32_t tasks = (uint32_t)C * ng * nch;
+    const uint32_t out_bus = vc4_bus_addr(ctx, out);
+    for (uint32_t base = 0; base < tasks && st == VC4_OK;
+         base += VC4_MAX_QPU) {
+        uint32_t left = tasks - base;
+        int nq = left < (uint32_t)VC4_MAX_QPU ? (int)left : VC4_MAX_QPU;
+        for (int i = 0; i < nq; ++i) {
+            uint32_t t = base + (uint32_t)i;
+            uint32_t chunk = t % nch;
+            uint32_t ry = (t / nch) % ng;
+            uint32_t c = t / (nch * ng);
+            uint32_t *u = vc4__uni(ctx, k, i);
+            u[0] = pbus + c * (uint32_t)hp * (uint32_t)wp * 4u +
+                   ry * 4u * (uint32_t)stride * (uint32_t)wp * 4u +
+                   chunk * (uint32_t)stride * 64u;
+            u[1] = out_bus + c * (uint32_t)ho_pad * (uint32_t)op * 4u +
+                   4u * ry * (uint32_t)op * 4u + chunk * 64u;
+            u[2] = (uint32_t)i;
+            u[3] = chunk;
+        }
+        uint64_t ns2 = 0;
+        st = vc4__launch(ctx, k, nq, &ns2);
+        ctx->st.kernel_ns += ns2;
+        if (st == VC4_OK)
+            ctx->st.flops += (uint64_t)nq * 16u * 4u * (uint64_t)(N * N);
+    }
+    vc4__l2_flush(ctx);
+    vc4__scratch_reset(ctx);
+    if (st == VC4_OK) { *Ho = ho; *Wo = wo; }
+    return st;
+}
+
 vc4_status vc4_maxpool2x2_backward(vc4_ctx *ctx, const vc4_buf *in,
                                    const vc4_buf *dy, int C, int H, int W,
                                    int dy_pitch, vc4_buf *dx)

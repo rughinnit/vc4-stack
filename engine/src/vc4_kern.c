@@ -101,6 +101,8 @@ vc4_status vc4__kernel_load_file(vc4_ctx *ctx, const char *name,
                                  const uint8_t *words, size_t bytes,
                                  int nqpu, vc4_kernel **out)
 {
+    if (ctx->remote)
+        return vc4__remote_load(ctx, name, words, bytes, nqpu, out);
     if (ctx->nkern >= VC4_MAX_KERNELS) {
         vc4__set_err(ctx, "kernel cache full (%d entries)", VC4_MAX_KERNELS);
         return VC4_ERR_NOMEM;

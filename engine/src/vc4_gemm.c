@@ -200,6 +200,7 @@ vc4_status vc4_matmul(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
         for (uint32_t r = 0; r < M; ++r)
             memcpy(ctx->arena + C->off + (size_t)r * N * 4,
                    (uint8_t *)c_tmp + (size_t)r * Np * 4, (size_t)N * 4);
+        vc4__mark_dirty(ctx, C->off, (size_t)M * N * 4);
     }
     vc4__scratch_reset(ctx);
     return st;

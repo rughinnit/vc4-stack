@@ -44,9 +44,17 @@ UTIL_UNUSED static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-/* One GPU user at a time: the whole board hangs if two workloads race. */
+/* One GPU user at a time: the whole board hangs if two workloads race.
+ * With VC4INFER_DAEMON=1 every launch goes through vc4d, which takes this
+ * same lock for the duration of each launch itself; holding it here for the
+ * whole test would make the daemon's bounded flock() wait fail (E_BUSY). */
 static int gpu_lock(void)
 {
+    const char *dm = getenv("VC4INFER_DAEMON");
+    if (dm && *dm && strcmp(dm, "0") != 0) {
+        int fd = open("/dev/null", O_RDONLY);
+        return fd >= 0 ? fd : -1;
+    }
     /* fs.protected_regular refuses O_CREAT on a /tmp file owned by another
        user, so fall back to O_RDONLY (flock does not need write access) */
     int fd = open("/tmp/vc4-gpu.lock", O_RDWR | O_CREAT, 0666);

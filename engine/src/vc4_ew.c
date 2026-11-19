@@ -161,6 +161,7 @@ vc4_status vc4_elementwise(vc4_ctx *ctx, vc4_op op,
         if (o_tmp) {
             vc4__l2_flush(ctx);
             memcpy(ctx->arena + out->off, (uint8_t *)o_tmp, n * 4);
+            vc4__mark_dirty(ctx, out->off, n * 4);
         }
     }
     vc4__scratch_reset(ctx);

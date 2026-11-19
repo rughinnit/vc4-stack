@@ -133,21 +133,51 @@ static void srq_state(vc4_ctx *ctx, char *buf, size_t n)
 
 int vc4__health(vc4_ctx *ctx)
 {
-    if (!ctx || !ctx->v3d)
+    if (!ctx)
+        return 0;
+    if (ctx->remote)
+        return !ctx->dead;         /* the daemon owns V3D health */
+    if (!ctx->v3d)
         return 0;
     return ctx->v3d[V3D_IDENT0] != 0xdeadbeefu;
 }
 
 void vc4__l2_flush(vc4_ctx *ctx)
 {
+    if (!ctx)
+        return;
+    if (ctx->remote) {
+        /* Invalidate the CPU cache lines for everything the GPU may have
+         * written; they were cleaned before the launch, so this only drops
+         * stale copies. */
+        vc4__remote_l2_flush(ctx);
+        return;
+    }
+    if (!ctx->v3d)
+        return;
     ctx->v3d[V3D_L2CACTL] = 1u << 2;   /* write back + invalidate */
     barrier();
 }
 
+void vc4__mark_dirty(vc4_ctx *ctx, uint32_t off, size_t bytes)
+{
+    if (ctx && ctx->remote)
+        vc4__remote_mark(ctx, off, bytes);
+}
+
 /* CPU write into the arena: flush first so no stale dirty L2 line can be
-   written back over the fresh data afterwards. */
+   written back over the fresh data afterwards.  The remote mapping is
+   cacheable, so the range is remembered and cleaned before the next launch. */
 void vc4__write(vc4_ctx *ctx, uint32_t off, const void *src, size_t bytes)
 {
+    if (!ctx || (!src && bytes))
+        return;
+    if (!ctx->v3d) {
+        memcpy(ctx->arena + off, src, bytes);
+        vc4__mark_dirty(ctx, off, bytes);
+        __sync_synchronize();
+        return;
+    }
     vc4__l2_flush(ctx);
     memcpy(ctx->arena + off, src, bytes);
     __sync_synchronize();
@@ -157,6 +187,8 @@ vc4_status vc4__wait_idle(vc4_ctx *ctx)
 {
     if (!ctx)
         return VC4_ERR_INVAL;
+    if (ctx->remote)
+        return VC4_OK;             /* one launch in flight, WAIT is synchronous */
     if (!srq_reset(ctx))
         return VC4_ERR_GPU;
     return VC4_OK;
@@ -174,6 +206,8 @@ vc4_status vc4__launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
     char st[96];
     if (!ctx || !k)
         return VC4_ERR_INVAL;
+    if (ctx->remote)
+        return vc4__remote_launch(ctx, k, nqpu, wall_ns);
     if (ctx->dead) {
         vc4__set_err(ctx, "context is dead after a previous timeout; reboot the board");
         return VC4_ERR_TIMEOUT;
@@ -387,11 +421,21 @@ static size_t env_arena(void)
     return (size_t)mb << 20;
 }
 
+/* VC4INFER_DAEMON=1 selects the vc4d backend; unset or "0" keeps the direct
+ * root path bit-for-bit. */
+static int daemon_mode(void)
+{
+    const char *e = getenv("VC4INFER_DAEMON");
+    return e && *e && strcmp(e, "0") != 0;
+}
+
 vc4_status vc4_init(vc4_ctx **out, const char *cache_dir, size_t arena_bytes)
 {
     if (!out)
         return VC4_ERR_INVAL;
     *out = NULL;
+    if (daemon_mode())
+        return vc4__remote_init(out, cache_dir, arena_bytes);
     vc4_ctx *ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
         return VC4_ERR_NOMEM;
@@ -443,6 +487,10 @@ void vc4_shutdown(vc4_ctx *ctx)
 {
     if (!ctx)
         return;
+    if (ctx->remote) {
+        vc4__remote_shutdown(ctx);
+        return;
+    }
     if (ctx->arena && ctx->arena_bytes)
         munmap(ctx->arena, ctx->arena_bytes);
     if (ctx->v3d)
@@ -472,6 +520,8 @@ vc4_status vc4_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out)
     ctx->arena_top = off + bytes;
     if (ctx->scratch < ctx->arena_top)
         ctx->scratch = ctx->arena_top;
+    if (ctx->dirty_top < ctx->arena_top)
+        ctx->dirty_top = ctx->arena_top;
     return VC4_OK;
 }
 
@@ -487,13 +537,18 @@ void *vc4__scratch_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out)
         out->bytes = bytes;
     }
     ctx->scratch = off + bytes;
+    if (ctx->dirty_top < ctx->scratch)
+        ctx->dirty_top = ctx->scratch;
     return ctx->arena + off;
 }
 
 void vc4__scratch_reset(vc4_ctx *ctx)
 {
-    if (ctx)
+    if (ctx) {
         ctx->scratch = ctx->arena_top;
+        if (ctx->remote)
+            vc4__remote_scratch_reset(ctx);
+    }
 }
 
 vc4_status vc4_upload(vc4_ctx *ctx, vc4_buf *b, const void *src, size_t bytes)
@@ -502,6 +557,8 @@ vc4_status vc4_upload(vc4_ctx *ctx, vc4_buf *b, const void *src, size_t bytes)
         return VC4_ERR_INVAL;
     if (bytes > b->bytes)
         return VC4_ERR_INVAL;
+    if (ctx->remote)
+        return vc4__remote_upload(ctx, b, src, bytes);
     if (ctx->v3d)
         vc4__write(ctx, b->off, src, bytes);
     else
@@ -515,6 +572,8 @@ vc4_status vc4_download(vc4_ctx *ctx, const vc4_buf *b, void *dst, size_t bytes)
         return VC4_ERR_INVAL;
     if (bytes > b->bytes)
         return VC4_ERR_INVAL;
+    if (ctx->remote)
+        return vc4__remote_download(ctx, b, dst, bytes);
     if (ctx->v3d)
         vc4__l2_flush(ctx);       /* write the GPU result back to DRAM */
     barrier();

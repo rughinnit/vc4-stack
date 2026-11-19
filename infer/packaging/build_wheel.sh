@@ -25,7 +25,7 @@ install -d "$out"
 rm -f "$out"/vc4infer-*-py3-none-any.whl
 
 cd "$root"
-python3 tools/check_kgen_sync.py || {
+python3 ../tools/check_kgen_sync.py || {
 	echo "refusing to build: generator copies have drifted" >&2
 	exit 1
 }

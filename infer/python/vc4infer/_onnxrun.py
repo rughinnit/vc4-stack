@@ -1644,9 +1644,22 @@ class Runner:
                     4 if rows % 4 == 0 else (2 if rows % 2 == 0 else 1), 16)
             self.eng.softmax_fwd(inb.buf, out.buf, rp, c)
             return out
+        if x.layout == "nchw" and axis == rank - 1:
+            # already compact [rows][classes]: the layout the kernel wants, for
+            # any class count <= 16 (its scratch pads the row with -1e30).  The
+            # row count must still be a multiple of 8, and the padded rows are
+            # read from the arena, so the logits are copied into a padded
+            # buffer first.
+            rows = x.logical // c
+            rp = (rows + 7) & ~7
+            inb = self._alloc_t(x.shape, extra=(rp - rows) * c)
+            self._runs(x.buf, inb.buf, 1, rows * c, 0, 0)
+            out = self._alloc_t(x.shape, extra=(rp - rows) * c)
+            self.eng.softmax_fwd(inb.buf, out.buf, rp, c)
+            return out
         if c != 16:
             raise UnsupportedNode("Softmax %s: axis %d of %d classes needs the "
-                                  "NHWC layout (16 classes)"
+                                  "last axis or the NHWC layout (16 classes)"
                                   % (node.name, axis, c))
         # NCHW -> NHWC on the QPUs, one vector per pixel, then the kernel
         n, _, h, w = x.shape

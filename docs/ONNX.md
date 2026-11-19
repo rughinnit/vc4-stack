@@ -855,3 +855,89 @@ need new hardware work:
    `VC4_LAYOUT=vc4|host` switch, defaulting to `vc4`.
 3. `NonZero`/`TopK` (bounded output + device-written count) on top of `reduce`
    and `gather`; then the NMS / fp64 / device-dispatch items.
+
+
+## 11. Transcendentals: second method, probes, and where it still fails
+
+Section 10 recorded that the magic-exponent method produced wrong numbers on the
+board while an emitter-level emulator said the formula was right.  Following the
+probe-first plan, the method was replaced and the FPU was characterised
+directly.
+
+### 11.1 The FPU flushes denormals (measured)
+
+One input vector, one launch, existing verified kernels only:
+
+| op | 1.4e-45 | -1.4e-45 | 1.1754944e-38 | -1.1754944e-38 | 0 / -0 |
+|---|---|---|---|---|---|
+| `Abs` (bit AND, no FPU) | 1.4e-45 | 1.4e-45 | 1.175e-38 | 1.175e-38 | 0 / 0 |
+| `LeakyRelu` alpha=1 (max/min + fmul + fadd) | **0** | **0** | 1.175e-38 | -1.175e-38 | 0 / 0 |
+
+So the datapath and the bitwise ALU ops preserve denormals, while the FPU
+(`fmax`/`fmin`/`fmul`/`fadd`) flushes them to zero, including denormal
+*operands* (the `max(x,0)`/`min(x,0)` pair already returns 0 for 1.4e-45).
+Any design that produces or consumes a denormal therefore diverges from an
+emulator that keeps them - this is one concrete cause of the section-10
+mismatch, and it rules out the magic-exponent trick (which builds `2^n` by
+integer bit insertion near the denormal boundary) for anything that can get
+close to zero.
+
+### 11.2 The methods now implemented (no floor, no magic, no denormals)
+
+| op | method | measured offline accuracy | on board |
+|---|---|---|---|
+| `Exp` | halve by 2^8, degree-6 minimax on [-0.35,0.344], square 8 times | 4.9e-9 poly, ~1.3e-6 after squaring | **still wrong** (see 11.3) |
+| `Tanh` | `sign(x)(1-t)/(1+t)`, `t = exp(-2|x|)` by the same halving scheme, reciprocal of `1+t` in [1,2] by a linear seed + 4 Newton steps | ~1e-7 | still wrong (zero) |
+| `Log` | exponent and mantissa read with integer bit ops (exact), degree-9 polynomial in `m-1` on [0,1] | 1.5e-8 | still wrong (-inf) |
+| `Sqrt` | exponent/mantissa split, odd-exponent fixup, degree-6 polynomial on [1,4], scale built by integer shift | 6.8e-5 rel | still wrong (zero) |
+| `Reciprocal` | exponent split + [1,2] reciprocal (linear seed + 4 Newton) + `2^-e` by integer shift | ~1e-9 | still wrong |
+
+Coefficients are Chebyshev fits rounded to fp32 (the hex bit patterns are in
+`kops.STD`), and every mul-after-add on an accumulator is padded by two words
+(the ADD→MUL forwarding gap this board has, see `build_softmax`'s note).
+
+### 11.3 What the board still does, and the one clue that matters
+
+`Exp` with 16 identical lanes and n=4:
+
+| x | 0 | 0.5 | 1 | 2 | 2.7 | 3 | 4 |
+|---|---|---|---|---|---|---|---|
+| got | 0 | 0.32436 | **2.7183** | 30.78 | 113.62 | 156.3 | 986.4 |
+| ref | 1 | 1.6487 | 2.7183 | 7.3891 | 14.880 | 20.086 | 54.598 |
+
+The result is identical - to the last printed digit - for the **old
+magic-exponent body and the new halving+squaring body**, and identical across
+all 16 lanes.  Since the two bodies share no instruction sequence (one uses
+`ftoi`/integer shifts on `2^23`, the other only polynomial mul/add and eight
+squarings), the number cannot be coming from the body.  Working backwards,
+`got = p^256` gives `p = 1.003914` at x=1 (exactly `exp(1/256)`) but
+`p = 1.013477` at x=2 (should be `1.007843`): the *core is exact at x=1 and
+wrong elsewhere*, which is not how either implementation can fail.
+
+The remaining suspects, in order, are (a) the operand the body actually reads
+is not `E_AV` for this op (the harness copy `E_AV = acc4` is shared with the
+TMU pop and the two-vector pipeline), and (b) `uop_nvec`'s group size and the
+kernel's `nvec` disagree for `exp` (the C table is a hand-kept mirror of
+`kops.HEAVY`; `exp` was added to `HEAVY` in this change, and a mismatch changes
+which 64/256-float window each group covers).  Both are cheap to test with the
+`probe_seq` instrument described in section 11.4: one 16-lane vector in, one
+launch, raw results out, compared bit-for-bit with the model for the 16
+boundary values (0, ±denormal, 1, 1±eps, 1e-30, 1e30, powers of two, the range
+edges), which is exactly what `infer/tests/genops_probe.py` does not do today.
+
+### 11.4 `probe_seq` (planned instrument)
+
+A `probe` kernel kind taking `--seq N` and one 16-lane vector, writing raw
+16-lane results, with `vc4_probe(ctx, seq, a, out, n)` in the engine.  Each
+sequence is one bisectable step of a core (scale, poly, one squaring, the
+exponent extract, the select).  Nothing is composed into a full op until the
+sequence matches the bit-exact model on the 16 boundary inputs.  This is the
+next concrete step; it did not fit in this change.
+
+### 11.5 What is registered in the executor
+
+Only the seven ops of section 10.2 plus the ONNX wiring of section 10 (now in
+`_dispatch` and `coverage.py`, `vc4infer nodes` reports 7/7 vc4, host debt
+none).  `Exp`/`Log`/`Sqrt`/`Tanh`/`Erf`/`Sin`/`Cos`/`Softplus`/`Gelu`/... keep
+their kernels in `kops.py` but remain **unregistered**: a graph node using them
+raises `UnsupportedNode`, never a wrong number and never a CPU path.

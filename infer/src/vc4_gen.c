@@ -31,7 +31,7 @@ static int uop_nvec(vc4_uop op)
     case VC4_UOP_SELU: case VC4_UOP_SOFTPLUS: case VC4_UOP_SOFTSIGN:
     case VC4_UOP_GELU: case VC4_UOP_GELU_ERF: case VC4_UOP_SIN:
     case VC4_UOP_COS: case VC4_UOP_ROUND: case VC4_UOP_SQRT:
-    case VC4_UOP_RECIPROCAL:
+    case VC4_UOP_RECIPROCAL: case VC4_UOP_EXP:
         return 4;
     default:
         return 16;

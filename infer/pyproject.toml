@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vc4infer"
+version = "1.1.2"
+description = "ONNX inference engine for the Raspberry Pi VideoCore IV (V3D) QPUs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "rughinnit", email = "rughinnit@users.noreply.github.com" }]
+keywords = ["onnx", "videocore", "raspberrypi", "qpu", "yolo", "inference"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy", "onnx>=1.14", "pillow"]
+
+[project.urls]
+Homepage = "https://github.com/rughinnit/vc4-stack"
+Documentation = "https://github.com/rughinnit/vc4-stack/blob/main/docs/VC4INFER.md"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+packages = ["vc4infer", "vc4infer.contrib"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+vc4infer = ["kgen/*.py"]

@@ -685,9 +685,10 @@ Remaining per-op debt (YOLOv8n 160, device policy):
 | op | bytes/run | missing capability |
 |---|---:|---|
 | Conv | 8,683,728 | NHWC inputs arrive NCHW; a QPU NHWC<->NCHW layout copy is not wired into the conv prologue (and the first graph input conversion) |
-| Concat | 5,344,320 | pitched channel concat: `vc4_concat_nhwc` exists but needs a per-row/pitch wrapper for W not a multiple of 4 |
+| Concat | 5,160,000 | pitched channel concat: `vc4_concat_nhwc` exists but needs a per-row/pitch wrapper for W not a multiple of 4 |
 | Split | 983,040 | channel-strided copy with `src pixel stride != Csrc*4` (split of a pitched tensor) |
 | Reshape | 826,080 | NHWC->NCHW logical reshape: QPU 2-D transpose exists but the head extents (e.g. 2100) are not multiples of 16 |
+| Resize | 471,040 | nearest neighbour is a host byte gather; `vc4_upsample2x_nhwc` fits only exact 2x NHWC and was measurably slower on the 2 YOLO resizes, so it is not enabled |
 | Softmax | 403,456 | channel-axis softmax needs a QPU layout copy to the last axis |
 | Transpose | 268,800 | arbitrary permutation (head `[0,2,1,3]`) |
 | MaxPool | 247,296 | -inf border is still a host fill; the pool kernel itself is QPU |

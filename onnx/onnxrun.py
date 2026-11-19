@@ -209,7 +209,11 @@ class Runner:
         self._panels = {}       # packed NHWC weight panels, by node name
         # One pool per engine: libvc4infer cannot free, and running several
         # Runner objects on one Engine at the same time is not supported.
-        need = max(eng.arena_bytes - (24 << 20), 8 << 20)
+        # The pool must leave room for the per-conv scratch (the padded image
+        # plus the im2col panel): 6 MB at 160x160, 23 MB at 320x320, so a
+        # bigger model wants a bigger reserve (VC4_POOL_RESERVE_MB).
+        reserve = int(os.environ.get("VC4_POOL_RESERVE_MB", "24")) << 20
+        need = max(eng.arena_bytes - reserve, 8 << 20)
         pool = getattr(eng, "_vc4_pool", None)
         if pool is None or pool.size < need:
             pool = Pool(eng, need)
@@ -235,6 +239,62 @@ class Runner:
                 self.float_inputs.append((inp.name, dims))
             else:
                 raise UnsupportedNode("graph input %s: only fp32 inputs" % inp.name)
+        self._find_silu()
+
+    # ------------------------------------------------------------- rewrites
+    def _find_silu(self):
+        """Collapse ``Mul(x, Sigmoid(x))`` into one fused SiLU.
+
+        YOLOv8 writes SiLU as two ONNX nodes, so the runner paid two
+        elementwise calls (two passes over the tensor, two daemon round trips
+        and two sets of launches) for every activation: 949 of the 1145
+        launches at 160x160 were these pairs.  The engine already has
+        ``VC4_OP_SILU`` (the same 2^f polynomial and 3x Newton reciprocal as
+        sigmoid, with the final multiply folded into the epilogue), so the
+        graph is rewritten here: the ``Sigmoid`` node is skipped and its
+        consumer ``Mul`` becomes a single silu launch.
+
+        The rewrite is only taken when the sigmoid output has exactly one
+        consumer, i.e. when the fused kernel is guaranteed to compute the same
+        value the graph would have (``sigmoid(x)*x``), and never for a graph
+        output.
+        """
+        # keyed by node *index*: node names are optional in ONNX and empty
+        # names must not make two nodes alias
+        self._silu_skip = set()             # indices never dispatched
+        self._silu_src = {}                 # Mul index -> x tensor name
+        self._node_idx = None
+        if os.environ.get("VC4_NO_SILU_FUSE"):
+            return                          # A/B switch (no rewrite)
+        producer = {}
+        for i, n in enumerate(self.graph.node):
+            for o in n.output:
+                if o:
+                    producer[o] = (i, n)
+        consumers = {}
+        for n in self.graph.node:
+            for inp in n.input:
+                if inp:
+                    consumers.setdefault(inp, []).append(n)
+        gouts = set(o.name for o in self.graph.output)
+        for idx, n in enumerate(self.graph.node):
+            if n.op_type != "Mul" or len(n.input) != 2:
+                continue
+            hit = None
+            for sig_name, x_name in ((n.input[0], n.input[1]),
+                                     (n.input[1], n.input[0])):
+                prod = producer.get(sig_name)
+                if prod is None or prod[1].op_type != "Sigmoid":
+                    continue
+                pn = prod[1]
+                if len(pn.input) != 1 or pn.input[0] != x_name:
+                    continue
+                if len(consumers.get(sig_name, [])) != 1 or sig_name in gouts:
+                    continue
+                hit = (prod[0], x_name)
+            if hit:
+                self._silu_skip.add(hit[0])
+                self._silu_src[idx] = hit[1]
 
     # ---------------------------------------------------------------- buffers
     def _alloc(self, n):
@@ -633,6 +693,12 @@ class Runner:
         x = self._float(node.input[0])
         out = self.pool.alloc(x.size * 4 + 64)
         self.eng.elementwise(vc4infer.OP_SIGMOID, x.buf, out, x.size)
+        return Tensor(out, x.shape, x.layout, x.pitch)
+
+    def _silu(self, x):
+        """x * sigmoid(x) in one QPU kernel (the fused SiLU rewrite)."""
+        out = self.pool.alloc(x.size * 4 + 64)
+        self.eng.elementwise(vc4infer.OP_SILU, x.buf, out, x.size)
         return Tensor(out, x.shape, x.layout, x.pitch)
 
     def _maxpool(self, node):
@@ -1051,6 +1117,9 @@ class Runner:
         return self._binary(node, vc4infer.OP_ADD)
 
     def _mul(self, node):
+        src = self._silu_src.get(self._node_idx)
+        if src is not None:                    # Mul(x, Sigmoid(x)) -> SiLU(x)
+            return self._silu(self._float(src))
         r = self._host_binop(node, np.multiply)
         if r is not None:
             return r
@@ -1101,6 +1170,7 @@ class Runner:
             "Conv": self._conv,
             "Relu": self._relu,
             "Sigmoid": self._sigmoid,
+            "Silu": lambda node: self._silu(self._float(node.input[0])),
             "Add": self._add,
             "Mul": self._mul,
             "MaxPool": self._maxpool,
@@ -1155,7 +1225,11 @@ class Runner:
         if not self._last_use:
             self._plan()
         self.profile = []
+        skip = getattr(self, "_silu_skip", None) or set()
         for idx, node in enumerate(self.graph.node):
+            if idx in skip:
+                continue                       # fused into the consumer Mul
+            self._node_idx = idx
             t0 = time.perf_counter()
             s0 = self.eng.stats
             out = self._dispatch(node)

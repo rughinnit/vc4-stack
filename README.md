@@ -35,3 +35,7 @@ Structural peak: 12 QPUs x 16 lanes x 2 ALU ops x 1/4 instruction per clock x 30
 - Not CUDA/ROCm parity: no tensor cores, no fp16, no cuBLAS/cuDNN, no autograd library.
 
 Every reported number must have a run log and a mismatch count.
+
+## References
+
+All external sources (Broadcom guide, reverse-engineering wikis, V3DLib, anholt/vc4-gpu-tools, VC4C/VC4CL upstream) are listed in [docs/REFERENCES.md](docs/REFERENCES.md).

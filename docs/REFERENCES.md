@@ -1,53 +1,65 @@
-# External references, and what they confirm
+# References
 
-## Broadcom VideoCore IV 3D Architecture Reference Guide (AG100-R, 2013)
+Every external source used by this work, with what it was used for and its status.
+"Confirmed" means a fact from it was checked against our measurements or code.
 
-- VPM: 16 words wide x 64 rows, horizontal/vertical vector access, VPM setup fields
-  (STRIDE, HORIZ, LANED, SIZE, ADDR), VDW store with UNITS/DEPTH/BLOCKMODE/STRIDE.
-- Vertical 32-bit vectors must start on a row multiple of 16.
-- V3D_VPMBASE reserves VPM for user programs in 256-byte units.
-- QPU register map (VPM_READ/WRITE, VPMVCD_RD/WR_SETUP, VPM_ST_BUSY/WAIT).
-Source: VC4C `doc/VideoCoreIV-AG100-R.pdf` (checked in).
+## Primary hardware documentation
 
-## hermanhermitage/videocoreiv (docs, tinyasm, IDA plugin, bare-metal samples)
+| source | URL | used for | status |
+|---|---|---|---|
+| Broadcom VideoCore IV 3D Architecture Reference Guide (AG100-R) | checked in at `VC4C/doc/VideoCoreIV-AG100-R.pdf` | VPM layout and setup fields, VDW store (UNITS/DEPTH/BLOCKMODE/STRIDE), V3D_VPMBASE, QPU register map | confirmed |
+| VideoCore IV Programmers Manual (wiki) | https://github.com/hermanhermitage/videocoreiv/wiki/VideoCore-IV-Programmers-Manual | instruction-set background | referenced |
+| MMIO Register map (wiki) | https://github.com/hermanhermitage/videocoreiv/wiki/MMIO-Register-map | register offsets for telemetry and the helper design | referenced |
+| Register Documentation (wiki) | https://github.com/hermanhermitage/videocoreiv/wiki/Register-Documentation | register semantics | referenced |
+| VideoCore IV kernels under Linux (wiki) | https://github.com/hermanhermitage/videocoreiv/wiki/VideoCore-IV-Kernels-under-Linux | how QPU kernels are launched from Linux without a driver | referenced |
+| BCM2835 Overview (wiki) | https://github.com/hermanhermitage/videocoreiv/wiki/VideoCore-IV---BCM2835-Overview | **24 GFLOP/s at 250 MHz (3x4x8x250)** confirms 1 instr / 4 clocks and dual issue; L2 is 128 KB, GPU-only, outside the ARM MMU; L1 7 ns / L2 68 ns / SDRAM 128-167 ns | confirmed |
+| Performance Considerations (wiki) | https://github.com/hermanhermitage/videocoreiv/wiki/VideoCore-IV-Performance-Considerations | FP pipeline over three cycles, stall if either of the next two instructions references the result; matches our 3-word dependent chains | confirmed |
 
-- Overview page: GPU "24 Gigaflops (3x4x8x250MHz)".
-  * CONFIRMS our structural model: 12 QPUs x 16 lanes x 2 ALU ops x 1/4 instr/clock.
-    250 MHz -> 24 GFLOP/s, 300 MHz -> 28.8 GFLOP/s, 500 MHz -> 48 GFLOP/s.
-  * Confirms 1 instruction per 4 clocks with dual-issue add+mul.
-- Memory hierarchy: L2 is 128 KB, 4-way, dedicated to the GPU, and OUTSIDE the ARM MMU;
-  ARM latencies L1 7 ns, L2 hit 68 ns, SDRAM 128 ns (page hit) / 167 ns (miss).
-  * Explains why DMA buffers must be addressed by bus/physical address (dma-buf + /dev/mem),
-    and why a stray DMA address can overwrite any page (the page-cache corruption incident).
-- Performance notes (VPU/patents): FP operations pipeline over three cycles, stall if either
-  of the two following instructions references the result.
-  * Matches the 3-word dependent-chain rule measured for QPU accumulators.
-- Tooling: `tinyasm`, IDA plugin, plus `itszor/vc4-toolchain` (GNU binutils with vc4).
-  * Use for bit-exact cross-validation of our encoder (`qenc.py`).
-- Wiki pages to mine: MMIO Register map, Register Documentation, Kernels under Linux,
-  Programmers Manual.
+## Repository and tooling sources
 
-## hermanhermitage/videocoreiv-qpu
+| source | URL | used for | status |
+|---|---|---|---|
+| hermanhermitage/videocoreiv | https://github.com/hermanhermitage/videocoreiv | `videocoreiv.arch`, `tinyasm`, IDA plugin, bare-metal samples; docs above | in use (xcheck) |
+| hermanhermitage/videocoreiv-qpu | https://github.com/hermanhermitage/videocoreiv-qpu | QPU instruction-set documentation (rotations, pack/unpack, small immediates) | in use (xcheck) |
+| itszor/vc4-toolchain | https://github.com/itszor/vc4-toolchain | GNU binutils port with a vc4 assembler/disassembler for byte-level cross-validation | in use (xcheck) |
+| anholt/vc4-gpu-tools | https://github.com/anholt/vc4-gpu-tools | Broadcom-copyrighted `vc4_qpu_defines.h` (opcode/register enums), `vc4_packet.h`, `vc4_qpu_disasm.c` disassembler, `vc4_dump_hang_state.c` hang parser | in use (xcheck) |
+| Raspberry Pi firmware/userland (`bcm_host`) | bookworm `libraspberrypi-dev` packages (see `README.debian13.md`) | required by VC4CL and V3DLib on Debian 13, which dropped it | in use |
+| Mesa `vc4` gallium driver | https://gitlab.freedesktop.org/mesa/mesa (`src/gallium/drivers/vc4`) | reference for the CL submission UAPI and QPU encoding | referenced |
+| Linux `drm/vc4` | https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/gpu/drm/vc4 | kernel-side reference for the read-only telemetry interface and a future compute UAPI | referenced (design) |
+| Linux `drm/v3d` | https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/gpu/drm/v3d | model for a BO/submit/fence UAPI (used by Pi 4/5) | referenced (design) |
 
-- QPU instruction-set documentation: rotations, pack/unpack, small immediates, signalling.
-  * Our empirical findings to check against it: rotate amounts are 49-63 (v8min imm 48 is not
-    a rotation); rep with ws=1 spans 16 lanes, ws=0 is per-quad; v8muld is lossy.
+## Alternative frameworks
 
-## axizo-pi/V3DLib (MIT, v0.9.2)
+| source | URL | used for | status |
+|---|---|---|---|
+| axizo-pi/V3DLib | https://github.com/axizo-pi/V3DLib | MIT C++ DSL/compiler/runtime for vc4/vc6/vc7; `Examples/Matrix`, `Examples/NN`; Debian 13 vc4 install notes | benchmarked |
+| wimrijnders/V3DLib (upstream author account) | https://github.com/wimrijnders/V3DLib | original project behind the axizo-pi re-upload | referenced |
+| mn416/QPULib | https://github.com/mn416/QPULib | predecessor of V3DLib; VC4 QPU programming | referenced |
+| mn416/py-videocore | https://github.com/mn416/py-videocore | Python QPU programming; considered for the hand-written path | referenced |
 
-- C++ DSL + compiler + runtime for vc4/vc6/vc7; examples Matrix, NN, HeatMap, Mandelbrot.
-- Requires headless execution and root (/dev/mem); needs bcm_host (Debian 13 workaround).
-- Documented vc4 issues: shared memory not freed on fatal error (power cycle required);
-  TMU-read + DMA-write to overlapping memory invalidates data.
+## Upstream runtime and compiler
 
-## doe300/VC4CL and doe300/VC4C
+| source | URL | used for | status |
+|---|---|---|---|
+| doe300/VC4CL | https://github.com/doe300/VC4CL | OpenCL 1.2 runtime for VideoCore IV; our fork carries the M21 report | forked / documented |
+| doe300/VC4C | https://github.com/doe300/VC4C | OpenCL C compiler for VC4; our accepted improvements live here | forked / patched |
+| doe300/VC4CLStdLib | https://github.com/doe300/VC4CLStdLib | GPU-side OpenCL standard library | used |
 
-- The OpenCL runtime and compiler this work extends; our accepted branches and the M21
-  report live in forks under rughinnit.
+## Our repositories
 
-## Open questions worth a second source
+| repo | branch | contents |
+|---|---|---|
+| https://github.com/rughinnit/vc4-stack | main | hand-written kernels (asm3-asm10), engine, training, docs |
+| https://github.com/rughinnit/VC4C | `perf/combined`, `perf/product-acc`, `perf/pipeline2/3/4`, `perf/spill-retry`, `perf/postra-pack`, `feat/lane-block-stores` | compiler improvements; accepted and rejected branches |
+| https://github.com/rughinnit/VC4CL | `docs/m21-gemm-findings` | M21 report, asm3 harness, measurements |
+| https://github.com/rughinnit/vc4top | `master`, `gh-pages` | TUI; `.deb` and signed apt repository |
 
-1. Rotate amount range and the meaning of v8min immediate 48.
-2. `rep` write-swap semantics (per-quad vs full lane).
-3. Whether the TMU truly allows only 2 outstanding requests per channel (measured 2).
-4. v8muld rounding rule (measured round(a*b/255), lossy).
+## Claims that cite these sources
+
+| claim | source |
+|---|---|
+| 28.8 GFLOP/s at 300 MHz (1 instr / 4 clocks, 2 ops/instruction, 12 QPUs x 16 lanes) | BCM2835 Overview (24 GFLOP/s at 250 MHz) + our measurement |
+| L2 128 KB, GPU-only, outside the ARM MMU, hence physical DMA addressing | BCM2835 Overview |
+| FP results take 3 cycles; two consumers must not follow immediately | Performance Considerations (patent quote) + our 3-word chains |
+| VPM/VDW store semantics (DEPTH=4, UNITS, stride as gap) | AG100-R + our probes |
+| Rotate range and `rep` ws semantics | under test in `docs/XCHECK.md` (anholt/vc4-gpu-tools + tinyasm) |

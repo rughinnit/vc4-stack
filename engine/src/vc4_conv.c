@@ -182,7 +182,7 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
         }
         /* one column block of the k-major B panel is nk*16 floats = 64*nk
            (nk includes the folded bias k-block) */
-        vc4_status st = vc4__pack_run(ctx, wt_bus, K, 64u * K,
+        vc4_status st = vc4__pack3_run(ctx, wt_bus, K, 64u * K,
                                       ctx->gpu_bus + wb.off, 64u * nk,
                                       (uint32_t)Cout / 16u);
         (void)Kp;
@@ -206,7 +206,7 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
         vc4__scratch_reset(ctx);
         return VC4_ERR_NOMEM;
     }
-    vc4_status st = vc4__gemm_run(ctx, M, (uint32_t)Cout, nk, 1,
+    vc4_status st = vc4__gemm3_run(ctx, M, (uint32_t)Cout, nk, 1,
                                   ctx->gpu_bus + wb.off, ctx->gpu_bus + cb.off,
                                   ctx->gpu_bus + pb.off);
     if (st != VC4_OK) {

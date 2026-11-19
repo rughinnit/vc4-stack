@@ -1,0 +1,241 @@
+make: Nothing to be done for 'all'.
+=== maths (no GPU)
+python3 tools/check_math.py
+sigmoid: max |err| 7.81e-07 over [-30,30], max rel 7.68e-06 -> PASS
+silu   : max |err| 4.23e-06 over [-20,20] -> PASS
+im2col : 0 mismatches over 27648 panel elements (M=192 K=144 wp=16, 6912 non-output, 0 unwritten) -> PASS
+im2col : 0 mismatches over 27648 panel elements (M=96 K=288 wp=16, 3456 non-output, 0 unwritten) -> PASS
+im2col : 0 mismatches over 2048 panel elements (M=128 K=16 wp=16, 0 non-output, 0 unwritten) -> PASS
+gemm   : M=128 N=128 K=128 q=8 -> 16/16 row blocks, PASS
+gemm   : M=16 N=64 K=16 q=2 -> 2/2 row blocks, PASS
+gemm   : M=256 N=64 K=288 q=12 -> 32/32 row blocks, PASS
+gemm   : M=32 N=64 K=48 q=4 -> 4/4 row blocks, PASS
+gemm   : M=80 N=128 K=32 q=10 -> 10/10 row blocks, PASS
+OVERALL: PASS
+=== test_dispatch (no GPU)
+transpose/permute    NO     -                        the pack kernel does 8-row x k-major panels only
+upsample             NO     -                        not written
+quantize/dequantize  NO     -                        not written
+-- 8 of 22 entries dispatchable on the GPU
+PASS dispatch
+=== test_ew  (reps=5)
+ew: 416 instructions -> kcache/ew_0_q12.bin
+ew: 416 instructions -> kcache/ew_0_q4.bin
+ew: 1320 instructions -> kcache/ew_1_q12.bin
+ew: 1320 instructions -> kcache/ew_1_q4.bin
+ew: 400 instructions -> kcache/ew_2_q12.bin
+ew: 400 instructions -> kcache/ew_2_q4.bin
+ew: 1194 instructions -> kcache/ew_3_q12.bin
+ew: 1194 instructions -> kcache/ew_3_q4.bin
+ew: 1210 instructions -> kcache/ew_4_q12.bin
+ew: 1210 instructions -> kcache/ew_4_q4.bin
+libvc4infer 0.1.0 elementwise  arena 64.0 MiB  reps=5
+  add      n=4096 rep0: mismatches=0/4096 maxabs=0 (bit-exact)
+  add      n=4096 rep1: mismatches=0/4096 maxabs=0 (bit-exact)
+  add      n=4096 rep2: mismatches=0/4096 maxabs=0 (bit-exact)
+  add      n=4096 rep3: mismatches=0/4096 maxabs=0 (bit-exact)
+  add      n=4096 rep4: mismatches=0/4096 maxabs=0 (bit-exact)
+PASS add      n=4096: 5/5 clean, worst |err| = 0 (must be 0 for bit-exact ops)
+  mul      n=4096 rep0: mismatches=0/4096 maxabs=1.91e-06 (bit-exact)
+  mul      n=4096 rep1: mismatches=0/4096 maxabs=1.91e-06 (bit-exact)
+  mul      n=4096 rep2: mismatches=0/4096 maxabs=1.91e-06 (bit-exact)
+  mul      n=4096 rep3: mismatches=0/4096 maxabs=1.91e-06 (bit-exact)
+  mul      n=4096 rep4: mismatches=0/4096 maxabs=1.91e-06 (bit-exact)
+PASS mul      n=4096: 5/5 clean, worst |err| = 1.91e-06 (must be 0 for bit-exact ops)
+  relu     n=4096 rep0: mismatches=0/4096 maxabs=0 (bit-exact)
+  relu     n=4096 rep1: mismatches=0/4096 maxabs=0 (bit-exact)
+  relu     n=4096 rep2: mismatches=0/4096 maxabs=0 (bit-exact)
+  relu     n=4096 rep3: mismatches=0/4096 maxabs=0 (bit-exact)
+  relu     n=4096 rep4: mismatches=0/4096 maxabs=0 (bit-exact)
+PASS relu     n=4096: 5/5 clean, worst |err| = 0 (must be 0 for bit-exact ops)
+  add+tail n=1000 rep0: mismatches=0/1000 maxabs=0 (bit-exact)
+  add+tail n=1000 rep1: mismatches=0/1000 maxabs=0 (bit-exact)
+  add+tail n=1000 rep2: mismatches=0/1000 maxabs=0 (bit-exact)
+  add+tail n=1000 rep3: mismatches=0/1000 maxabs=0 (bit-exact)
+  add+tail n=1000 rep4: mismatches=0/1000 maxabs=0 (bit-exact)
+PASS add+tail n=1000: 5/5 clean, worst |err| = 0 (must be 0 for bit-exact ops)
+  sigmoid  n=4096 rep0: mismatches=0/4096 maxabs=7.62e-07
+  sigmoid  n=4096 rep1: mismatches=0/4096 maxabs=7.62e-07
+  sigmoid  n=4096 rep2: mismatches=0/4096 maxabs=7.62e-07
+  sigmoid  n=4096 rep3: mismatches=0/4096 maxabs=7.62e-07
+  sigmoid  n=4096 rep4: mismatches=0/4096 maxabs=7.62e-07
+PASS sigmoid  n=4096: 5/5 clean, worst |err| = 7.62e-07
+  silu     n=4096 rep0: mismatches=0/4096 maxabs=1.24e-06
+  silu     n=4096 rep1: mismatches=0/4096 maxabs=1.24e-06
+  silu     n=4096 rep2: mismatches=0/4096 maxabs=1.24e-06
+  silu     n=4096 rep3: mismatches=0/4096 maxabs=1.24e-06
+  silu     n=4096 rep4: mismatches=0/4096 maxabs=1.24e-06
+PASS silu     n=4096: 5/5 clean, worst |err| = 1.24e-06
+
+libvc4infer 0.1.0 -- op registry (strict dispatch, no CPU fallback)
+op                   gpu    backend                  constraints / reason
+-------------------- ------ ------------------------ ------------------------------
+matmul               yes    qpu gemm(asm10) + qpu pack f32 row-major; M,N,K any size (8/64/16 tiles internally)
+conv2d/3x3           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0..; Cin%16==0; Cout%16==0; Hp*Wp*4<=8191
+conv2d/1x1           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0; Cin%16==0; Cout%16==0; H*Wp*4<=8191
+add                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+mul                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+relu                 yes    qpu elementwise          f32, exact IEEE
+sigmoid              yes    qpu elementwise          f32; 2^f degree-5 poly + 3x Newton rcp; |err| < 1e-6 (measured)
+silu                 yes    qpu elementwise          f32; x*sigmoid(x); |err| < 1e-6 (measured)
+conv2d/5x5           NO     -                        no kernel; would need another im2col tap schedule
+conv2d/stride2       NO     -                        the VDR loads 16 consecutive pixels; stride 2 needs a decimation pass
+conv2d/depthwise     NO     -                        needs a per-channel schedule, not a GEMM
+conv2d/grouped       NO     -                        needs one GEMM per group (trivial extension)
+matmul/f16           NO     -                        kernels are fp32 only
+matmul/f32x4-tile    NO     -                        4-column register tile: the documented next speed step
+batched-matmul       NO     -                        N launches; not yet fused
+maxpool              NO     -                        not written
+softmax              NO     -                        needs a reduction (max+sum) kernel
+layernorm            NO     -                        needs reduction + rsqrt kernel
+concat/slice         NO     -                        pure data movement; no GPU kernel yet
+transpose/permute    NO     -                        the pack kernel does 8-row x k-major panels only
+upsample             NO     -                        not written
+quantize/dequantize  NO     -                        not written
+-- 8 of 22 entries dispatchable on the GPU
+--- board:
+SRQCS     = 0x00040400  (queue_len=0 queue_full=0 requests=4 completed=4 error=0)
+V3D_ERRORS= 0x00001000
+STATE: LIVE
+=== test_matmul  (reps=5)
+libvc4infer 0.1.0  arena 64.0 MiB  reps=5
+  M=128 N=128 K=128 rep0: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.708 ms = pack 0.100 + gemm 0.608  5.93 GFLOP/s (gemm-only 6.90, wall 0.944 ms)
+  M=128 N=128 K=128 rep1: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.731 ms = pack 0.124 + gemm 0.608  5.73 GFLOP/s (gemm-only 6.90, wall 0.743 ms)
+  M=128 N=128 K=128 rep2: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.713 ms = pack 0.105 + gemm 0.608  5.88 GFLOP/s (gemm-only 6.89, wall 0.723 ms)
+  M=128 N=128 K=128 rep3: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.723 ms = pack 0.105 + gemm 0.618  5.80 GFLOP/s (gemm-only 6.78, wall 0.732 ms)
+  M=128 N=128 K=128 rep4: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.712 ms = pack 0.105 + gemm 0.607  5.89 GFLOP/s (gemm-only 6.91, wall 0.721 ms)
+PASS 128x128x128: 5/5 clean, best 0.708 ms = 5.93 GFLOP/s
+  M=256 N=256 K=256 rep0: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 3.948 ms = pack 0.414 + gemm 3.535  8.50 GFLOP/s (gemm-only 9.49, wall 4.167 ms)
+  M=256 N=256 K=256 rep1: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 3.952 ms = pack 0.415 + gemm 3.537  8.49 GFLOP/s (gemm-only 9.49, wall 3.976 ms)
+  M=256 N=256 K=256 rep2: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 3.952 ms = pack 0.416 + gemm 3.536  8.49 GFLOP/s (gemm-only 9.49, wall 3.968 ms)
+  M=256 N=256 K=256 rep3: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 3.951 ms = pack 0.415 + gemm 3.537  8.49 GFLOP/s (gemm-only 9.49, wall 3.967 ms)
+  M=256 N=256 K=256 rep4: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 3.952 ms = pack 0.415 + gemm 3.537  8.49 GFLOP/s (gemm-only 9.49, wall 3.968 ms)
+PASS 256x256x256: 5/5 clean, best 3.948 ms = 8.50 GFLOP/s
+  M= 64 N= 48 K= 32 rep0: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.069 ms = pack 0.013 + gemm 0.056  2.84 GFLOP/s (gemm-only 3.48, wall 0.390 ms)
+  M= 64 N= 48 K= 32 rep1: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.072 ms = pack 0.015 + gemm 0.057  2.74 GFLOP/s (gemm-only 3.46, wall 0.202 ms)
+  M= 64 N= 48 K= 32 rep2: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.072 ms = pack 0.015 + gemm 0.057  2.74 GFLOP/s (gemm-only 3.46, wall 0.202 ms)
+  M= 64 N= 48 K= 32 rep3: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.072 ms = pack 0.015 + gemm 0.057  2.73 GFLOP/s (gemm-only 3.45, wall 0.202 ms)
+  M= 64 N= 48 K= 32 rep4: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.072 ms = pack 0.015 + gemm 0.057  2.74 GFLOP/s (gemm-only 3.47, wall 0.240 ms)
+PASS 64x48x32: 5/5 clean, best 0.069 ms = 2.84 GFLOP/s
+  M= 20 N= 36 K= 44 rep0: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.068 ms = pack 0.009 + gemm 0.059  0.93 GFLOP/s (gemm-only 1.07, wall 0.272 ms)
+  M= 20 N= 36 K= 44 rep1: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.069 ms = pack 0.009 + gemm 0.059  0.92 GFLOP/s (gemm-only 1.07, wall 0.167 ms)
+  M= 20 N= 36 K= 44 rep2: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.069 ms = pack 0.009 + gemm 0.060  0.92 GFLOP/s (gemm-only 1.06, wall 0.164 ms)
+  M= 20 N= 36 K= 44 rep3: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.069 ms = pack 0.009 + gemm 0.059  0.92 GFLOP/s (gemm-only 1.07, wall 0.163 ms)
+  M= 20 N= 36 K= 44 rep4: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.069 ms = pack 0.009 + gemm 0.059  0.92 GFLOP/s (gemm-only 1.07, wall 0.163 ms)
+PASS 20x36x44: 5/5 clean, best 0.068 ms = 0.93 GFLOP/s
+  M= 16 N= 16 K= 16 rep0: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.037 ms = pack 0.004 + gemm 0.034  0.22 GFLOP/s (gemm-only 0.24, wall 0.160 ms)
+  M= 16 N= 16 K= 16 rep1: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.038 ms = pack 0.004 + gemm 0.034  0.22 GFLOP/s (gemm-only 0.24, wall 0.060 ms)
+  M= 16 N= 16 K= 16 rep2: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.038 ms = pack 0.004 + gemm 0.034  0.22 GFLOP/s (gemm-only 0.24, wall 0.059 ms)
+  M= 16 N= 16 K= 16 rep3: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.038 ms = pack 0.004 + gemm 0.034  0.22 GFLOP/s (gemm-only 0.24, wall 0.059 ms)
+  M= 16 N= 16 K= 16 rep4: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.037 ms = pack 0.004 + gemm 0.034  0.22 GFLOP/s (gemm-only 0.24, wall 0.060 ms)
+PASS 16x16x16: 5/5 clean, best 0.037 ms = 0.22 GFLOP/s
+  M=512 N= 64 K=288 rep0: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.456 ms = pack 0.929 + gemm 1.527  7.69 GFLOP/s (gemm-only 12.36, wall 2.696 ms)
+  M=512 N= 64 K=288 rep1: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.487 ms = pack 0.933 + gemm 1.554  7.59 GFLOP/s (gemm-only 12.14, wall 2.502 ms)
+  M=512 N= 64 K=288 rep2: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.492 ms = pack 0.932 + gemm 1.560  7.57 GFLOP/s (gemm-only 12.10, wall 2.504 ms)
+  M=512 N= 64 K=288 rep3: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.491 ms = pack 0.933 + gemm 1.558  7.58 GFLOP/s (gemm-only 12.11, wall 2.502 ms)
+  M=512 N= 64 K=288 rep4: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.485 ms = pack 0.933 + gemm 1.552  7.59 GFLOP/s (gemm-only 12.16, wall 2.496 ms)
+PASS 512x64x288: 5/5 clean, best 2.456 ms = 7.69 GFLOP/s
+stats: launches=60 pack=7.41 ms kernel=29.23 ms flops=0.285 GFLOP
+
+libvc4infer 0.1.0 -- op registry (strict dispatch, no CPU fallback)
+op                   gpu    backend                  constraints / reason
+-------------------- ------ ------------------------ ------------------------------
+matmul               yes    qpu gemm(asm10) + qpu pack f32 row-major; M,N,K any size (8/64/16 tiles internally)
+conv2d/3x3           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0..; Cin%16==0; Cout%16==0; Hp*Wp*4<=8191
+conv2d/1x1           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0; Cin%16==0; Cout%16==0; H*Wp*4<=8191
+add                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+mul                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+relu                 yes    qpu elementwise          f32, exact IEEE
+sigmoid              yes    qpu elementwise          f32; 2^f degree-5 poly + 3x Newton rcp; |err| < 1e-6 (measured)
+silu                 yes    qpu elementwise          f32; x*sigmoid(x); |err| < 1e-6 (measured)
+conv2d/5x5           NO     -                        no kernel; would need another im2col tap schedule
+conv2d/stride2       NO     -                        the VDR loads 16 consecutive pixels; stride 2 needs a decimation pass
+conv2d/depthwise     NO     -                        needs a per-channel schedule, not a GEMM
+conv2d/grouped       NO     -                        needs one GEMM per group (trivial extension)
+matmul/f16           NO     -                        kernels are fp32 only
+matmul/f32x4-tile    NO     -                        4-column register tile: the documented next speed step
+batched-matmul       NO     -                        N launches; not yet fused
+maxpool              NO     -                        not written
+softmax              NO     -                        needs a reduction (max+sum) kernel
+layernorm            NO     -                        needs reduction + rsqrt kernel
+concat/slice         NO     -                        pure data movement; no GPU kernel yet
+transpose/permute    NO     -                        the pack kernel does 8-row x k-major panels only
+upsample             NO     -                        not written
+quantize/dequantize  NO     -                        not written
+-- 8 of 22 entries dispatchable on the GPU
+--- board:
+SRQCS     = 0x000c0c00  (queue_len=0 queue_full=0 requests=12 completed=12 error=0)
+V3D_ERRORS= 0x00001000
+STATE: LIVE
+=== test_conv  (reps=5)
+libvc4infer 0.1.0 conv2d  arena 64.0 MiB  reps=5
+  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep0: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.730 ms 1.62 GFLOP/s (wall 2.092 ms)
+  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep1: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.731 ms 1.61 GFLOP/s (wall 1.788 ms)
+  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep2: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.738 ms 1.60 GFLOP/s (wall 1.804 ms)
+  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep3: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.732 ms 1.61 GFLOP/s (wall 1.788 ms)
+  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep4: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.735 ms 1.61 GFLOP/s (wall 1.790 ms)
+PASS conv 16x16x16->16x16x16 k3 pad1+bias: 5/5 clean, best 0.730 ms 1.62 GFLOP/s
+  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep0: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.693 ms 3.50 GFLOP/s (wall 7.030 ms)
+  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep1: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.689 ms 3.51 GFLOP/s (wall 6.737 ms)
+  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep2: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.685 ms 3.51 GFLOP/s (wall 6.620 ms)
+  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep3: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.687 ms 3.51 GFLOP/s (wall 6.599 ms)
+  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep4: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.684 ms 3.52 GFLOP/s (wall 6.604 ms)
+PASS conv 32x16x32->32x16x32 k3 pad1+bias: 5/5 clean, best 2.684 ms 3.52 GFLOP/s
+  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep0: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.044 ms 1.51 GFLOP/s (wall 0.558 ms)
+  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep1: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.045 ms 1.47 GFLOP/s (wall 0.344 ms)
+  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep2: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.044 ms 1.47 GFLOP/s (wall 0.340 ms)
+  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep3: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.045 ms 1.46 GFLOP/s (wall 0.340 ms)
+  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep4: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.045 ms 1.45 GFLOP/s (wall 0.341 ms)
+PASS conv 16x8x16->16x8x16 k1 pad0: 5/5 clean, best 0.044 ms 1.51 GFLOP/s
+  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep0: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.132 ms 1.49 GFLOP/s (wall 0.801 ms)
+  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep1: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.132 ms 1.49 GFLOP/s (wall 0.658 ms)
+  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep2: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.132 ms 1.49 GFLOP/s (wall 0.654 ms)
+  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep3: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.132 ms 1.49 GFLOP/s (wall 0.657 ms)
+  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep4: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.132 ms 1.49 GFLOP/s (wall 0.671 ms)
+PASS conv 32x8x24->16x8x24 k1 pad0+bias: 5/5 clean, best 0.132 ms 1.49 GFLOP/s
+  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep0: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.257 ms 1.79 GFLOP/s (wall 0.932 ms)
+  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep1: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.258 ms 1.79 GFLOP/s (wall 0.866 ms)
+  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep2: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.259 ms 1.78 GFLOP/s (wall 0.865 ms)
+  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep3: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.259 ms 1.78 GFLOP/s (wall 0.863 ms)
+  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep4: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.257 ms 1.79 GFLOP/s (wall 0.880 ms)
+PASS conv 16x12x12->16x10x10 k3 pad0+bias: 5/5 clean, best 0.257 ms 1.79 GFLOP/s
+  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep0: mismatches=0/4096 maxabs=0.000104 | gpu 2.229 ms 2.12 GFLOP/s (wall 5.794 ms)
+  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep1: mismatches=0/4096 maxabs=0.000104 | gpu 2.233 ms 2.11 GFLOP/s (wall 5.595 ms)
+  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep2: mismatches=0/4096 maxabs=0.000104 | gpu 2.229 ms 2.12 GFLOP/s (wall 5.577 ms)
+  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep3: mismatches=0/4096 maxabs=0.000104 | gpu 2.232 ms 2.11 GFLOP/s (wall 5.600 ms)
+  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep4: mismatches=0/4096 maxabs=0.000104 | gpu 2.229 ms 2.12 GFLOP/s (wall 5.571 ms)
+PASS conv 64x8x16->32x8x16 k3 pad1+bias: 5/5 clean, best 2.229 ms 2.12 GFLOP/s
+PASS unsupported 5x5 -> unsupported by the GPU backend (strict dispatch)
+PASS unsupported stride 2 -> unsupported by the GPU backend (strict dispatch)
+
+libvc4infer 0.1.0 -- op registry (strict dispatch, no CPU fallback)
+op                   gpu    backend                  constraints / reason
+-------------------- ------ ------------------------ ------------------------------
+matmul               yes    qpu gemm(asm10) + qpu pack f32 row-major; M,N,K any size (8/64/16 tiles internally)
+conv2d/3x3           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0..; Cin%16==0; Cout%16==0; Hp*Wp*4<=8191
+conv2d/1x1           yes    qpu im2col + qpu gemm(asm3) f32 NCHW; stride 1; pad 0; Cin%16==0; Cout%16==0; H*Wp*4<=8191
+add                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+mul                  yes    qpu elementwise          f32, exact IEEE; n rounded to 256 internally
+relu                 yes    qpu elementwise          f32, exact IEEE
+sigmoid              yes    qpu elementwise          f32; 2^f degree-5 poly + 3x Newton rcp; |err| < 1e-6 (measured)
+silu                 yes    qpu elementwise          f32; x*sigmoid(x); |err| < 1e-6 (measured)
+conv2d/5x5           NO     -                        no kernel; would need another im2col tap schedule
+conv2d/stride2       NO     -                        the VDR loads 16 consecutive pixels; stride 2 needs a decimation pass
+conv2d/depthwise     NO     -                        needs a per-channel schedule, not a GEMM
+conv2d/grouped       NO     -                        needs one GEMM per group (trivial extension)
+matmul/f16           NO     -                        kernels are fp32 only
+matmul/f32x4-tile    NO     -                        4-column register tile: the documented next speed step
+batched-matmul       NO     -                        N launches; not yet fused
+maxpool              NO     -                        not written
+softmax              NO     -                        needs a reduction (max+sum) kernel
+layernorm            NO     -                        needs reduction + rsqrt kernel
+concat/slice         NO     -                        pure data movement; no GPU kernel yet
+transpose/permute    NO     -                        the pack kernel does 8-row x k-major panels only
+upsample             NO     -                        not written
+quantize/dequantize  NO     -                        not written
+-- 8 of 22 entries dispatchable on the GPU
+--- board:
+SRQCS     = 0x000c0c00  (queue_len=0 queue_full=0 requests=12 completed=12 error=0)
+V3D_ERRORS= 0x00001000
+STATE: LIVE
+ALL TESTS PASSED

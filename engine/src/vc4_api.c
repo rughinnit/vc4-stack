@@ -12,11 +12,11 @@
 
 static const vc4_op_info OPS[] = {
     /* implemented */
-    { "matmul", "qpu gemm + qpu pack",
-      1, "f32 row-major; M,N,K any size (rounded to 16 internally)" },
-    { "conv2d/3x3", "qpu im2col + qpu gemm",
+    { "matmul", "qpu gemm(asm10) + qpu pack",
+      1, "f32 row-major; M,N,K any size (8/64/16 tiles internally)" },
+    { "conv2d/3x3", "qpu im2col + qpu gemm(asm3)",
       1, "f32 NCHW; stride 1; pad 0..; Cin%16==0; Cout%16==0; Hp*Wp*4<=8191" },
-    { "conv2d/1x1", "qpu im2col + qpu gemm",
+    { "conv2d/1x1", "qpu im2col + qpu gemm(asm3)",
       1, "f32 NCHW; stride 1; pad 0; Cin%16==0; Cout%16==0; H*Wp*4<=8191" },
     { "add", "qpu elementwise", 1, "f32, exact IEEE; n rounded to 256 internally" },
     { "mul", "qpu elementwise", 1, "f32, exact IEEE; n rounded to 256 internally" },
@@ -38,7 +38,7 @@ static const vc4_op_info OPS[] = {
     { "softmax", "-", 0, "needs a reduction (max+sum) kernel" },
     { "layernorm", "-", 0, "needs reduction + rsqrt kernel" },
     { "concat/slice", "-", 0, "pure data movement; no GPU kernel yet" },
-    { "transpose/permute", "-", 0, "the pack kernel does 16x16 blocks only" },
+    { "transpose/permute", "-", 0, "the pack kernel does 8-row x k-major panels only" },
     { "upsample", "-", 0, "not written" },
     { "quantize/dequantize", "-", 0, "not written" },
 };

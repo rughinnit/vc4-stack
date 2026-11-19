@@ -60,7 +60,9 @@ static int one_shape(vc4_ctx *ctx, int M, int N, int K, int reps)
             check_elem(&ck, C[i], R[i], TOL, i < 8);
 
         double ms = (double)(t1 - t0) / 1e6;
-        double gpu_ms = (double)((s1.pack_ns - s0.pack_ns) + (s1.kernel_ns - s0.kernel_ns)) / 1e6;
+        double pack_ms = (double)(s1.pack_ns - s0.pack_ns) / 1e6;
+        double kern_ms = (double)(s1.kernel_ns - s0.kernel_ns) / 1e6;
+        double gpu_ms = pack_ms + kern_ms;
         double gf = 2.0 * M * N * K / (gpu_ms * 1e6);
         if (gf > best_gflops) {
             best_gflops = gf;
@@ -69,9 +71,11 @@ static int one_shape(vc4_ctx *ctx, int M, int N, int K, int reps)
         if (ck.mismatches == 0)
             clean++;
         printf("  M=%3d N=%3d K=%3d rep%d: mismatches=%ld/%zu maxabs=%.3g maxrel=%.2g "
-               "| gpu %.3f ms  %.2f GFLOP/s (wall %.3f ms)\n",
+               "| gpu %.3f ms = pack %.3f + gemm %.3f  %.2f GFLOP/s "
+               "(gemm-only %.2f, wall %.3f ms)\n",
                M, N, K, rep, ck.mismatches, nc, ck.max_abs, ck.max_rel,
-               gpu_ms, gf, ms);
+               gpu_ms, pack_ms, kern_ms, gf,
+               kern_ms > 0 ? 2.0 * M * N * K / (kern_ms * 1e6) : 0.0, ms);
     }
     printf("%s %dx%dx%d: %d/%d clean, best %.3f ms = %.2f GFLOP/s\n",
            clean == reps ? "PASS" : "FAIL", M, N, K, clean, reps, best_ms,

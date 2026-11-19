@@ -73,18 +73,28 @@ vc4_status vc4__kernel_load_file(vc4_ctx *ctx, const char *name,
                                  int nqpu, vc4_kernel **out);
 
 /* ---- vc4_gemm.c --------------------------------------------------------- */
+/* one work unit = 8 rows x rowlen floats; grid-strided over 4 QPUs */
 vc4_status vc4__pack_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen_floats,
-                         uint32_t src_rb_stride, uint32_t dst_bus,
-                         uint32_t dst_rb_stride, uint32_t rowblocks);
+                         uint32_t dst_bus, uint32_t rowblocks);
+/* 8x64 tiles: M 8-aligned, N 64-aligned, K 16-aligned, B row-major */
 vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
-                         int bmode, uint32_t b_bus, uint32_t c_bus,
-                         uint32_t panel_bus);
+                         uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus);
 
 /* ---- vc4_ew.c ----------------------------------------------------------- */
 vc4_status vc4__ew_run(vc4_ctx *ctx, vc4_op op, uint64_t n,
                        uint32_t a_bus, uint32_t b_bus, uint32_t o_bus);
 
 /* ---- helpers ------------------------------------------------------------ */
+static inline uint32_t vc4__align8(uint32_t v)  { return (v + 7u) & ~7u; }
 static inline uint32_t vc4__align16(uint32_t v) { return (v + 15u) & ~15u; }
+static inline uint32_t vc4__align64(uint32_t v) { return (v + 63u) & ~63u; }
 
 #endif
+
+/* the asm3 packer/GEMM (conv path) */
+vc4_status vc4__pack3_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen_floats,
+                          uint32_t src_rb_stride, uint32_t dst_bus,
+                          uint32_t dst_rb_stride, uint32_t rowblocks);
+vc4_status vc4__gemm3_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
+                          int bmode, uint32_t b_bus, uint32_t c_bus,
+                          uint32_t panel_bus);

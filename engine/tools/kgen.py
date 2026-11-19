@@ -44,6 +44,7 @@ KERNEL ABI (uniforms read in order u0..; 64 B block per QPU = 16 words)
          a group is 16 vectors = 256 floats = one verified VPM->DMA store
 """
 import os
+import struct
 import sys
 
 ASM3 = os.environ.get("ASM3_DIR", "/home/raspi/work/asm3")
@@ -465,6 +466,949 @@ def build_gemm(M, N, K, nqpu, bmode=0, depth=3):
     return p
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =============================================================== GEMM (asm10)
+#
+# The asm10 kernel (asm10/gemm6.py): 8 rows x 64 columns of C per tile, three B
+# vector sets, a 6-phase (3 k pair) k loop, 12 QPUs.  Its record on this board
+# is 13.745 GFLOP/s GEMM-only / 0 mismatches / 19-of-19 clean launches, and the
+# instruction schedule below is *verbatim* from it (same SETV sets, same
+# FORDER/BORDER issue rows, same POP/COPY words, same prime, same store).
+# Only the addressing was generalised so the engine can use it for any M,N,K:
+#
+#   * a tile is one 8-row block x one 64-column block, iterated as a nested
+#     (row block, column block) loop with a compile-time iteration bound plus
+#     an in-loop `rb < TR` guard -- the same pattern as the old asm3 kernel, so
+#     a corrupted register still cannot turn the tile loop into an unbounded
+#     DMA march;
+#   * the A and C row-block offsets and strides come from uniforms u3..u6,
+#     so no geometry has to be a power of two (asm10 shifted a tile index);
+#   * K/2 % 3 == 0 (K a multiple of 48 -- the conv shapes 144/288/576, and
+#     K=48) gets a *drain* group: the last 3 k pairs are emitted after the loop
+#     with the last two phases' B issues and the final A pop suppressed, so
+#     every TMU pop has a matching issue and nothing is left in flight.
+#     asm10 asserted K/2 % 3 != 0 and had no path for it;
+#   * B is row-major (bmode=1, the im2col weight panel, is gone: the conv path
+#     now transposes its weights on the ARM -- a byte copy, no arithmetic --
+#     and every GEMM reads B row-major).
+#
+# KERNEL ABI (unchanged from the asm3 kernel)
+#   u0 panel bus          u1 C bus            u2 B bus
+#   u3 A row-block byte offset  u4 A row-block byte stride   (re-derived
+#   u5 C row-block byte offset  u6 C row-block byte stride    from M/N/K)
+#   u7 first row block this QPU owns
+#
+# A panel (pack10 layout): PANEL[(rb*K + k)*8 + r] = A[rb*8 + r][k]
+# B row-major with row stride N*4; C row-major with row stride N*4.
+
+G10_MUL_V8MIN = 4
+G10_NROWS = 8
+G10_NCOLS = 64
+
+G10_RA_AADR, G10_RA_CADR, G10_RA_CADR2, G10_RA_KCNT = 20, 21, 22, 23
+G10_RA_ARB, G10_RA_RBIDX, G10_RA_TMP, G10_RA_CBOFF = 24, 25, 26, 27
+G10_RA_CTMP, G10_RA_CBCNT = 30, 31
+G10_RB_BST, G10_RB_NEGTR, G10_RB_RBCNT, G10_RB_CARB = 20, 21, 22, 23
+G10_RB_O64, G10_RB_O128, G10_RB_O192, G10_RB_BLANE = 24, 25, 26, 27
+G10_RB_TMP, G10_RB_O256 = 30, 31
+
+# Three B vector sets.  C(j0),C(j1) live in the A file, C(j2),C(j3) in the B
+# file, so v(j2),v(j3) must be B-file and v(j1) A-file; v(j0) must be A-file
+# because the B issues ride on the w1 word whose fmul reads v(j0) with raddr_a.
+G10_SETV = (
+    {0: (0, 16), 1: (0, 17), 2: (1, 16), 3: (1, 17)},
+    {0: (0, 18), 1: (0, 19), 2: (1, 18), 3: (1, 19)},
+    {0: (0, 28), 1: (0, 29), 2: (1, 28), 3: (1, 29)},
+)   # (file, address); file 0 = A file, 1 = B file
+
+G10_ACC_AVEC, G10_ACC_ROT, G10_ACC_TMP, G10_ACC_BADR = 0, 1, 2, 3
+G10_ACC_TMU, G10_ACC_BCAST = 4, 5
+G10_ACC_TMP2 = G10_ACC_TMP
+G10_ACC_SCR = 3             # same register as BADR (bumped after its last use)
+
+G10_FORDER = (0, 2, 1, 3)      # v(j0) is A-file: w1 can host a raddr_b add op
+G10_BORDER = (2, 0, 3, 1)      # v(j2) is B-file: w1 can host a raddr_a add op
+G10_ISSUE_ROW = {0: 0, 2: 1, 1: 2, 3: 3}     # w1 of which row carries the issue
+G10_TMU_OF = {0: 0, 2: 1, 1: 0, 3: 1}
+G10_POP_RW = {0: (1, 4), 2: (3, 4), 1: (5, 4), 3: (6, 4)}
+G10_COPY_RW = {0: (1, 5, 'mul'), 2: (4, 1, 'add'), 1: (5, 5, 'mul'),
+               3: (7, 1, 'add')}
+G10_BUMP_RW = (5, 1)
+G10_APOP_RW = (7, 4)
+
+
+class G10Asm:
+    """Word-list assembler with an explicit-schedule hazard checker.
+
+    This is asm10/gemm6.py's Asm class: emit_phase/emit_boundary below put two
+    instructions in one word and rely on a schedule that a generic nop-padder
+    would destroy, so the schedule is written out and then *verified* (check()
+    for per-word legality, verify() for the RAW/TMU rules) before the blob is
+    written.
+    """
+
+    def __init__(self):
+        self.w = []
+        self.labels = {}
+
+    def word(self, mul=None, add=None, sig=SIG_NONE, ws=0, note=''):
+        self.w.append(dict(mul=mul, add=add, sig=sig, ws=ws, note=note))
+        return len(self.w) - 1
+
+    def nop(self, note=''):
+        return self.word(note=note)
+
+    def ldi(self, value, out_reg, ws=0, note=''):
+        self.w.append(dict(ldi=(value, out_reg, ws), note=note))
+        return len(self.w) - 1
+
+    def label(self, name):
+        self.labels[name] = len(self.w)
+
+    def branch_to(self, name, cond=BR_ALWAYS, note=''):
+        idx = len(self.w)
+        self.w.append(dict(branch=cond, target=name, note=note))
+        return idx
+
+    def put(self, idx, slot, op, ws=None, sig=None):
+        d = self.w[idx]
+        if d.get(slot) is not None:
+            raise AssertionError('word %d (%s): %s slot already used'
+                                 % (idx, d['note'], slot))
+        d[slot] = op
+        if ws is not None:
+            if d['ws'] != ws:
+                raise AssertionError('word %d (%s): ws %d != %d'
+                                     % (idx, d['note'], d['ws'], ws))
+            d['ws'] = ws
+        if sig is not None:
+            d['sig'] = sig
+
+    def pop(self, idx, tmu, note):
+        d = self.w[idx]
+        if d['sig'] != SIG_NONE:
+            raise AssertionError('two pops in word %d' % idx)
+        if d.get('add') is not None and d['add'].get('add_b') is not None \
+                and d['add']['add_b'][0] == IMM:
+            raise AssertionError('pop on small-immediate word %d' % idx)
+        d['sig'] = SIG_LOAD_TMU1 if tmu else SIG_LOAD_TMU0
+        d['note'] += ' POP ' + note
+
+    def words(self):
+        idx = {id(d): i for i, d in enumerate(self.w)}
+        out = []
+        for d in self.w:
+            if 'ldi' in d:
+                v, o, ws = d['ldi']
+                out.append(ldi(v, o, ws=ws))
+                continue
+            if 'branch' in d:
+                o = (self.labels[d['target']] - (idx[id(d)] + 4)) * 8
+                out.append(branch(o, cond=d['branch']))
+                continue
+            kw = dict(sig=d['sig'], ws=d['ws'])
+            if d['mul']:
+                kw.update(d['mul'])
+            else:
+                kw.update(mul_op=MUL_NOP, mul_out=W_NOP, cond_mul=COND_NEVER)
+            if d['add']:
+                kw.update(d['add'])
+            else:
+                kw.update(add_op=ADD_NOP, add_out=W_NOP, cond_add=COND_NEVER)
+            try:
+                out.append(_ops(**kw))
+            except ValueError as ex:
+                raise ValueError('word %d (%s): %s | mul=%s add=%s'
+                                 % (len(out), d['note'], ex, d['mul'], d['add']))
+        return out
+
+    # ---- static checks ----------------------------------------------------
+    def check(self):
+        for i, d in enumerate(self.w):
+            if 'branch' in d or 'ldi' in d:
+                continue
+            ops = [o for o in (d['mul'], d['add']) if o]
+            if d['sig'] in (SIG_LOAD_TMU0, SIG_LOAD_TMU1):
+                for o in ops:
+                    if o.get('add_out') in (W_TMU0_S, W_TMU1_S) or \
+                       o.get('mul_out') in (W_TMU0_S, W_TMU1_S):
+                        raise AssertionError('word %d (%s): issue+pop' % (i, d['note']))
+            if sum(1 for o in ops if o.get('add_out') in (W_TMU0_S, W_TMU1_S)) > 1:
+                raise AssertionError('word %d: two issues' % i)
+            if d['sig'] != SIG_NONE:
+                for o in ops:
+                    for k in ('add_b', 'mul_b'):
+                        if o.get(k) is not None and o[k][0] == IMM:
+                            raise AssertionError('word %d (%s): pop+imm' % (i, d['note']))
+            wss = [o['ws'] for o in ops if 'ws' in o]
+            if len(set(wss)) > 1:
+                raise AssertionError('word %d (%s): ws conflict %s'
+                                     % (i, d['note'], wss))
+        return True
+
+    # ---- schedule simulator ----------------------------------------------
+    def verify(self):
+        """Walk the program and assert every hazard rule on the schedule."""
+        GP_A, GP_B, ACC = 0, 1, 2
+        W = []
+        for i, d in enumerate(self.w):
+            rec = dict(wr=[], rd=set(), mul_wr=[], iss=None, pop=None,
+                       note=d.get('note', ''))
+            if 'branch' in d:
+                W.append(rec)
+                continue
+            if 'ldi' in d:
+                v, o, wsb = d['ldi']
+                if 32 <= o <= 37:
+                    rec['wr'].append((ACC, o - 32, 'ldi'))
+                elif o < 32:
+                    rec['wr'].append((GP_B if wsb else GP_A, o, 'ldi'))
+                W.append(rec)
+                continue
+            ops = []
+            if d['mul']:
+                ops.append(('mul', d['mul']))
+            if d['add']:
+                ops.append(('add', d['add']))
+            add_ws = d['add'].get('ws') if d['add'] else None
+            mul_ws = d['mul'].get('ws') if d['mul'] else None
+            eff = add_ws if add_ws is not None else (mul_ws if mul_ws is not None
+                                                     else d['ws'])
+            ports = {}
+            for kind, o in ops:
+                for slot in ('add_a', 'add_b', 'mul_a', 'mul_b'):
+                    if o.get(slot) is not None:
+                        mux, addr = o[slot]
+                        if mux == IMM:
+                            p, key, rd = 'rb', ('imm', addr), None
+                        elif mux == REGA:
+                            p, key, rd = 'ra', addr, (GP_A, addr)
+                        elif mux == REGB:
+                            p, key, rd = 'rb', addr, (GP_B, addr)
+                        else:
+                            p, key, rd = None, ('acc', mux), (ACC, mux)
+                        if rd:
+                            rec['rd'].add(rd)
+                        if p:
+                            if p in ports and ports[p] != key:
+                                rec.setdefault('perr', []).append(
+                                    '%s: %s vs %s' % (p, ports[p], key))
+                            ports[p] = key
+                out = o.get('add_out') if kind == 'add' else o.get('mul_out')
+                if out is None or out == W_NOP:
+                    continue
+                if out == W_TMU0_S:
+                    rec['iss'] = 0
+                    continue
+                if out == W_TMU1_S:
+                    rec['iss'] = 1
+                    continue
+                if out >= 38:
+                    continue
+                if out <= 37:
+                    ent = (ACC, out - 32, kind)
+                elif kind == 'add':
+                    ent = (GP_A if eff == 0 else GP_B, out, kind)
+                else:
+                    ent = (GP_B if eff == 0 else GP_A, out, kind)
+                rec['wr'].append(ent)
+                if kind == 'mul':
+                    rec['mul_wr'].append(ent)
+            if d['sig'] in (SIG_LOAD_TMU0, SIG_LOAD_TMU1):
+                rec['pop'] = 0 if d['sig'] == SIG_LOAD_TMU0 else 1
+            W.append(rec)
+
+        n = len(W)
+        errs = []
+
+        # -- 0. one A-side and one B-side register port per word
+        for i, rec in enumerate(W):
+            if rec.get('perr'):
+                errs.append('word %d (%s): raddr port conflict %s'
+                            % (i, rec['note'], rec['perr']))
+
+        # -- 1. accumulator temps: fmul write -> fadd read, 1..3 words later
+        for i, rec in enumerate(W):
+            for (f, a, kind) in rec['mul_wr']:
+                if f != ACC or a not in (G10_ACC_TMP, G10_ACC_TMP2):
+                    continue
+                found = None
+                for k in range(i + 1, min(i + 4, n)):
+                    if (ACC, a) in W[k]['rd']:
+                        found = k
+                        break
+                    if any(w[0] == ACC and w[1] == a for w in W[k]['wr']):
+                        break
+                if found is None:
+                    errs.append('word %d (%s): temp r%d never consumed'
+                                % (i, rec['note'], a))
+
+        # -- 2. broadcast: rep (acc r5) write -> fmul read >= 1
+        last_rep = None
+        for i, rec in enumerate(W):
+            if (ACC, G10_ACC_BCAST) in [w[:2] for w in rec['wr']]:
+                last_rep = i
+            if (ACC, G10_ACC_BCAST) in rec['rd']:
+                if last_rep is None:
+                    errs.append('word %d (%s): broadcast read before rep'
+                                % (i, rec['note']))
+                elif i - last_rep < 1:
+                    errs.append('word %d (%s): broadcast read %d words after rep'
+                                % (i, rec['note'], i - last_rep))
+
+        # -- 3. rot write (acc r1) -> rep read >= 2
+        for i, rec in enumerate(W):
+            if (ACC, G10_ACC_ROT) in [w[:2] for w in rec['wr']]:
+                for k in range(i + 1, min(i + 8, n)):
+                    if (ACC, G10_ACC_ROT) in W[k]['rd']:
+                        if k - i < 2:
+                            errs.append('word %d: rot->rep only %d words'
+                                        % (i, k - i))
+                        break
+                    if any(w[0] == ACC and w[1] == G10_ACC_ROT for w in W[k]['wr']):
+                        break
+
+        # -- 3b. A vector (acc r0) write -> v8min read >= 2
+        for i, rec in enumerate(W):
+            if (ACC, G10_ACC_AVEC) in [w[:2] for w in rec['wr']]:
+                for k in range(i + 1, min(i + 8, n)):
+                    if (ACC, G10_ACC_AVEC) in W[k]['rd']:
+                        if k - i < 2:
+                            errs.append('word %d: A copy->rot only %d words'
+                                        % (i, k - i))
+                        break
+                    if any(w[0] == ACC and w[1] == G10_ACC_AVEC for w in W[k]['wr']):
+                        break
+
+        # -- 4. GP RAW gaps (A and B file) >= 2 words
+        last = {}
+        for i, rec in enumerate(W):
+            for (f, a) in rec['rd']:
+                if f == ACC:
+                    continue
+                if (f, a) in last and i - last[(f, a)] < 2:
+                    errs.append('word %d (%s): GP %s%d RAW only %d words'
+                                % (i, rec['note'], 'A' if f == GP_A else 'B', a,
+                                   i - last[(f, a)]))
+            for (f, a, kind) in rec['wr']:
+                if f == ACC:
+                    continue
+                last[(f, a)] = i
+
+        # -- 5. TMU: per TMU FIFO order, issue->pop >= 8, depth <= 4
+        for t in (0, 1):
+            q = []
+            for i, rec in enumerate(W):
+                if rec['iss'] == t:
+                    q.append(i)
+                    if len(q) > 4:
+                        errs.append('word %d: %d in flight on TMU%d'
+                                    % (i, len(q), t))
+                if rec['pop'] == t:
+                    if not q:
+                        errs.append('word %d (%s): pop with empty TMU%d FIFO'
+                                    % (i, rec['note'], t))
+                        continue
+                    a = q.pop(0)
+                    if i - a < 8:
+                        errs.append('word %d (%s): issue->pop only %d words'
+                                    % (i, rec['note'], i - a))
+            if q:
+                errs.append('TMU%d left %d in flight' % (t, len(q)))
+
+        # -- 6. every pop lands in r4: each pop's value must be copied to a GP
+        #       register before the next pop on either TMU
+        pops = [i for i, rec in enumerate(W) if rec['pop'] is not None]
+        for k, i in enumerate(pops):
+            nxt = pops[k + 1] if k + 1 < len(pops) else n
+            ok = False
+            for j in range(i + 1, nxt):
+                if (ACC, G10_ACC_TMU) in W[j]['rd']:
+                    ok = True
+                    break
+            if not ok:
+                errs.append('word %d (%s): pop not copied before the next pop '
+                            '(r4 aliasing)' % (i, W[i]['note']))
+
+        if errs:
+            raise AssertionError('schedule verify failed:\n  ' + '\n  '.join(errs))
+        return True
+
+    def write(self, path):
+        ws = self.words()
+        with open(path, 'wb') as f:
+            for w in ws:
+                f.write(struct.pack('<Q', w))
+        return ws
+
+    def listing(self):
+        return '\n'.join('%3d: %s' % (i, disasm(w)) for i, w in enumerate(self.words()))
+
+
+def g10_acc_addr(row, j):
+    """(file, address) of C accumulator (row, j); file 0 = A file, 1 = B file."""
+    return (0, 2 * row + j) if j < 2 else (1, 2 * row + (j - 2))
+
+
+def g10_ref(f, addr):
+    return areg(addr) if f == 0 else breg(addr)
+
+
+def g10_or(out, x, y, ws=0):
+    return dict(add_op=ADD_OR, add_out=out, ws=ws, add_a=x, add_b=y)
+
+
+def g10_addi(op, out, x, y, ws=0, sf=0):
+    return dict(add_op=op, add_out=out, ws=ws, add_a=x, add_b=y, sf=sf)
+
+
+def g10_fmul(j, vec, t):
+    f, addr = vec
+    return dict(mul_op=MUL_FMUL, mul_out=32 + t, mul_a=acc(G10_ACC_BCAST),
+                mul_b=g10_ref(f, addr))
+
+
+def g10_rot(n):
+    if n == 0:
+        # small immediate 48 is 1.0f, not "rotate by 0" (only 49..63 are the
+        # rotate amounts), so row 0 of the k-even half needs an exact copy.
+        return dict(mul_op=MUL_V8MIN, mul_out=32 + G10_ACC_ROT,
+                    mul_a=acc(G10_ACC_AVEC), mul_b=acc(G10_ACC_AVEC))
+    return dict(mul_op=MUL_V8MIN, mul_out=32 + G10_ACC_ROT,
+                mul_a=acc(G10_ACC_AVEC), mul_b=imm(48 + n))
+
+
+def g10_fadd(r, j, t):
+    f, addr = g10_acc_addr(r, j)
+    return dict(add_op=ADD_FADD, add_out=addr, ws=f, add_a=g10_ref(f, addr),
+                add_b=acc(t))
+
+
+def g10_rep(ws=1):
+    return dict(add_op=ADD_OR, add_out=37, ws=ws, add_a=acc(G10_ACC_ROT),
+                add_b=acc(G10_ACC_ROT))
+
+
+def g10_copy_add(f, addr):
+    return dict(add_op=ADD_OR, add_out=addr, ws=f, add_a=acc(G10_ACC_TMU),
+                add_b=acc(G10_ACC_TMU))
+
+
+def g10_copy_mul(f, addr):
+    """copy ACC_TMU -> GP register addr in file f, on the mul ALU (ws is
+    inverted for the mul ALU)."""
+    return dict(mul_op=MUL_V8MIN, mul_out=addr, ws=1 - f,
+                mul_a=acc(G10_ACC_TMU), mul_b=acc(G10_ACC_TMU))
+
+
+def g10_issue_b(j, tmu, ws=0):
+    """issue the B request for column block j at BADR + 64j on TMU0/TMU1."""
+    reg = W_TMU1_S if tmu else W_TMU0_S
+    if j == 0:
+        return g10_or(reg, acc(G10_ACC_BADR), acc(G10_ACC_BADR), ws=ws)
+    return g10_addi(ADD_ADD, reg, acc(G10_ACC_BADR),
+                    (REGB, [None, G10_RB_O64, G10_RB_O128, G10_RB_O192][j]),
+                    ws=ws)
+
+
+def g10_issue_a(ws=0):
+    return g10_or(W_TMU0_S, areg(G10_RA_AADR), areg(G10_RA_AADR), ws=ws)
+
+
+def g10_bump_badr(ws=0):
+    return g10_addi(ADD_ADD, 32 + G10_ACC_BADR, acc(G10_ACC_BADR),
+                    (REGB, G10_RB_BST), ws=ws)
+
+
+def g10_rot_for(h, r):
+    return (16 - (r + (8 if h else 0))) & 15
+
+
+def g10_prime_issue(a, tag):
+    for j in G10_FORDER:
+        a.word(add=g10_issue_b(j, G10_TMU_OF[j]), note='%s issue j%d' % (tag, j))
+    a.word(add=g10_bump_badr(), note='%s BADR bump' % tag)
+
+
+def g10_prime_pop(a, s, tag):
+    for j in G10_FORDER:
+        a.word(sig=SIG_LOAD_TMU1 if G10_TMU_OF[j] else SIG_LOAD_TMU0,
+               note='%s POP j%d' % (tag, j))
+        f, addr = s[j]
+        a.word(add=g10_copy_add(f, addr), note='%s copy j%d' % (tag, j))
+
+
+def g10_phase(a, p, h, tag, do_pop=True, do_issue=True, a_pop=False,
+              rot_next=False, a_issue=False):
+    """Emit one 48-word half: 8 rows x 6 words, set (p mod 3) in use."""
+    su = G10_SETV[p % 3]
+    sp = G10_SETV[(p + 1) % 3]
+    si = G10_SETV[(p + 2) % 3]
+    idx = {}
+    orders = [G10_FORDER] * G10_NROWS
+    if a_issue:
+        # row 6 carries the A issue: its w1 mul must read a B-file vector so
+        # that raddr_a stays free for the issue
+        orders[6] = G10_BORDER
+    for r in range(G10_NROWS):
+        o = orders[r]
+        idx[(r, 0)] = a.word(add=g10_rep(ws=1), ws=1,
+                             note='%s r%d w0 rep' % (tag, r))
+        idx[(r, 1)] = a.word(mul=g10_fmul(o[0], su[o[0]], G10_ACC_TMP),
+                             note='%s r%d w1 fmul j%d' % (tag, r, o[0]))
+        idx[(r, 2)] = a.word(mul=g10_fmul(o[1], su[o[1]], G10_ACC_TMP2),
+                             add=g10_fadd(r, o[0], G10_ACC_TMP),
+                             note='%s r%d w2 fmul j%d|fadd j%d'
+                                  % (tag, r, o[1], o[0]))
+        idx[(r, 3)] = a.word(mul=g10_fmul(o[2], su[o[2]], G10_ACC_TMP),
+                             add=g10_fadd(r, o[1], G10_ACC_TMP2),
+                             note='%s r%d w3 fmul j%d|fadd j%d'
+                                  % (tag, r, o[2], o[1]))
+        idx[(r, 4)] = a.word(mul=g10_fmul(o[3], su[o[3]], G10_ACC_TMP2),
+                             add=g10_fadd(r, o[2], G10_ACC_TMP),
+                             note='%s r%d w4 fmul j%d|fadd j%d'
+                                  % (tag, r, o[3], o[2]))
+        idx[(r, 5)] = a.word(add=g10_fadd(r, o[3], G10_ACC_TMP2), ws=1,
+                             note='%s r%d w5 fadd j%d' % (tag, r, o[3]))
+    # rot(row i) -> mul slot of w0 of row i-1 (same word as that row's rep)
+    for i in range(1, G10_NROWS):
+        a.put(idx[(i - 1, 0)], 'mul', g10_rot(g10_rot_for(h, i)))
+    if rot_next:
+        # A vector does not change at this phase boundary
+        a.put(idx[(G10_NROWS - 1, 0)], 'mul', g10_rot(g10_rot_for(1 - h, 0)))
+    if do_issue:
+        for j in G10_FORDER:
+            a.put(idx[(G10_ISSUE_ROW[j], 1)], 'add', g10_issue_b(j, G10_TMU_OF[j]))
+        a.put(idx[G10_BUMP_RW], 'add', g10_bump_badr())
+    if a_issue:
+        a.put(idx[(6, 1)], 'add', g10_issue_a())
+    if do_pop:
+        # every pop lands in r4: pop and copy in an order where each copy
+        # precedes the next pop (j0 w4r1, j2 w4r3, j1 w4r5, j3 w4r6)
+        for j in G10_FORDER:
+            r, w = G10_POP_RW[j]
+            a.pop(idx[(r, w)], G10_TMU_OF[j], '%s j%d' % (tag, j))
+        for j in G10_FORDER:
+            r, w, slot = G10_COPY_RW[j]
+            f, addr = sp[j]
+            op = g10_copy_add(f, addr) if slot == 'add' else g10_copy_mul(f, addr)
+            a.put(idx[(r, w)], slot, op)
+    if a_pop:
+        a.pop(idx[G10_APOP_RW], 0, '%s A' % tag)
+    return idx
+
+
+def g10_boundary(a, p, counter=False):
+    """A-vector change before phase p+1: pop, copy, rot, issue for k pair +2."""
+    a.word(sig=SIG_LOAD_TMU0,
+           add=g10_addi(ADD_ADD, G10_RA_AADR, areg(G10_RA_AADR),
+                        (REGB, G10_RB_O64)),
+           note='B%d: A pop + AADR += 64' % p)
+    a.word(mul=g10_copy_mul(0, 32 + G10_ACC_AVEC),
+           note='B%d: r0 = A vector' % p)
+    a.nop(note='B%d: copy->rot gap' % p)
+    a.word(mul=g10_rot(g10_rot_for(0, 0)), note='B%d: rot(p%d row 0)' % (p, p + 1))
+    if counter:
+        a.word(add=g10_addi(ADD_SUB, G10_RA_KCNT, areg(G10_RA_KCNT), imm(1), sf=1),
+               note='k counter')
+    else:
+        a.nop(note='B%d: rot->rep gap' % p)
+
+
+def g10_kloop_body(a, label):
+    """One 6-phase group: 3 k pairs, 303 words."""
+    a.label(label)
+    a.nop(note='prologue (keeps rot->rep >= 2 across the back edge)')
+    for p in range(6):
+        g10_phase(a, p, p & 1, 'p%d' % p, do_pop=True, do_issue=True,
+                  a_pop=(p == 5), rot_next=(p in (0, 2, 4)),
+                  a_issue=(p in (0, 2, 4)))
+        if p in (1, 3):
+            g10_boundary(a, p, counter=(p == 3))
+
+
+def g10_store(a, stride):
+    """VPM->DMA store of the whole 8x64 C tile: 4 column chunks x 2 row halves.
+
+    The VPM row base is 4*qpu, the VDW row field is that * 128 and the memory
+    stride of a 16-word C row is (N-16)*4.
+    """
+    dma = (2 << 30) | (4 << 23) | (16 << 16) | (1 << 14)
+    # r3 = 4*qpu*128 for the VDW row field, RA_TMP = 4*qpu for the vpw row
+    a.word(add=g10_or(G10_RA_TMP, breg(R_QPU_NUM), breg(R_QPU_NUM)),
+           note='qpu')
+    a.nop(), a.nop()
+    a.word(add=g10_addi(ADD_SHL, G10_RA_TMP, areg(G10_RA_TMP), imm(2)),
+           note='4*qpu')
+    a.nop(), a.nop()
+    a.word(add=g10_addi(ADD_SHL, 32 + G10_ACC_SCR, areg(G10_RA_TMP), imm(7)),
+           note='r3 = 4*qpu*128')
+    a.nop()
+    for j in range(4):
+        for c in range(2):
+            a.ldi(0x1A00, R5, ws=1, note='vpw generic row 4q')
+            a.word(add=g10_addi(ADD_ADD, W_VPW_SETUP, acc(5), areg(G10_RA_TMP),
+                                ws=1))
+            for r in range(4):
+                f, addr = g10_acc_addr(4 * c + r, j)
+                a.word(add=g10_or(W_VPM, g10_ref(f, addr), g10_ref(f, addr)))
+            a.ldi(dma, R5, ws=1, note='vdw 4 rows x 16 words')
+            a.word(add=g10_addi(ADD_ADD, W_VPW_SETUP, acc(5), acc(G10_ACC_SCR),
+                                ws=1))
+            a.ldi(0xC0010000 | stride, W_VPW_SETUP, ws=1, note='stride (N-16)*4')
+            base = G10_RA_CADR if c == 0 else G10_RA_CADR2
+            a.word(add=g10_or(W_VPW_ADDR, areg(base), areg(base), ws=1))
+            a.word(add=g10_or(W_NOP, (REGB, R_VPW_WAIT), (REGB, R_VPW_WAIT)))
+            a.nop(), a.nop(), a.nop(), a.nop()
+        if j != 3:
+            a.word(add=g10_addi(ADD_ADD, G10_RA_CADR, areg(G10_RA_CADR),
+                                (REGB, G10_RB_O64)), note='next 16 columns')
+            a.word(add=g10_addi(ADD_ADD, G10_RA_CADR2, areg(G10_RA_CADR2),
+                                (REGB, G10_RB_O64)), note='next 16 columns')
+
+
+def g10_dump_avec(a, base_reg):
+    """Store the 16 lanes of acc0 (the A vector) to memory at base_reg.
+
+    Uses the same VPM->DMA path as the real store: 1 chunk of 4 identical rows
+    of 16 words, stride 0, VPM row 0 (single-QPU probe only).
+    """
+    dma = (2 << 30) | (4 << 23) | (16 << 16) | (1 << 14)
+    a.ldi(0x1A00, R5, ws=1, note='probe vpw')
+    a.word(add=g10_addi(ADD_ADD, W_VPW_SETUP, acc(5), acc(5), ws=1))
+    for _ in range(4):
+        a.word(add=g10_or(W_VPM, acc(G10_ACC_AVEC), acc(G10_ACC_AVEC)))
+    a.ldi(dma, R5, ws=1, note='probe vdw 4 rows x 16 words')
+    a.word(add=g10_addi(ADD_ADD, W_VPW_SETUP, acc(5), acc(5), ws=1))
+    a.ldi(0xC0010000, W_VPW_SETUP, ws=1)
+    a.word(add=g10_or(W_VPW_ADDR, areg(base_reg), areg(base_reg), ws=1))
+    a.word(add=g10_or(W_NOP, (REGB, R_VPW_WAIT), (REGB, R_VPW_WAIT)))
+    a.nop(), a.nop(), a.nop(), a.nop()
+
+
+def build_gemm10(M, N, K, nqpu=12, probe=None, single=False):
+    """The asm10 GEMM for arbitrary M (8-aligned), N (64-aligned), K (16-aligned)."""
+    assert M % G10_NROWS == 0 and N % G10_NCOLS == 0 and K % 16 == 0, \
+        "gemm10 needs M%%8==0, N%%64==0, K%%16==0 (got %d,%d,%d)" % (M, N, K)
+    TR, NCB = M // G10_NROWS, N // G10_NCOLS
+    NQ = min(nqpu, TR)
+    KPAIRS = K // 2
+    NBODY, REM = divmod(KPAIRS, 3)
+    drain = (REM == 0)
+    nloop = NBODY - 1 if drain else NBODY
+    assert nloop >= 1, "gemm10 needs K >= 16"
+    assert REM in (0, 1, 2)
+    RBCNT = (TR + NQ - 1) // NQ
+    stride = (N - 16) * 4
+    astride = NQ * G10_NROWS * K * 4
+    cstride = NQ * G10_NROWS * N * 4
+
+    a = G10Asm()
+
+    if probe == 'lane':
+        # debug build: dump acc3 = elem_num<<2 through the (proven) store path
+        for i in range(8):
+            a.word(add=g10_or(i, areg(R_UNIF), areg(R_UNIF), ws=0),
+                   note='u%d' % i)
+        a.word(add=g10_addi(ADD_SHL, 32 + G10_ACC_SCR, areg(R_ELEM_NUM), imm(2)),
+               note='r3 = elem_num*4')
+        a.nop(), a.nop()
+        a.word(add=g10_or(0, acc(G10_ACC_SCR), acc(G10_ACC_SCR), ws=0),
+               note='A0 = lane*4')
+        a.word(add=g10_or(G10_RA_CADR, areg(1), areg(1)), note='C base = u1')
+        a.nop(), a.nop()
+        g10_store(a, stride)
+        a.label('tdone')
+        a.word(sig=SIG_END_PROGRAM)
+        a.nop(), a.nop(), a.nop()
+        a.check()
+        a.verify()
+        return a
+    if probe == 'unif':
+        # debug build: dump u0..u7 into C through the (proven) store path
+        for i in range(8):
+            a.word(add=g10_or(i, areg(R_UNIF), areg(R_UNIF), ws=0),
+                   note='dump u%d' % i)
+        a.word(add=g10_or(G10_RA_CADR, areg(1), areg(1)), note='C base = u1')
+        a.nop(), a.nop()
+        g10_store(a, stride)
+        a.label('tdone')
+        a.word(sig=SIG_END_PROGRAM)
+        a.nop(), a.nop(), a.nop()
+        a.check()
+        a.verify()
+        return a
+
+    # ---------------------------------------------------------------- setup
+    # The ALU reads one A-file and one B-file register per word, so the live
+    # values are split between the files to keep every address computation a
+    # single word: A file = A/C tile addresses + the column-block offset, B
+    # file = the C row-block base, the B base, the constants and the stride
+    # temporaries.
+    # Read all eight uniforms first and only then combine them.  A GP register
+    # written by a uniform read is NOT visible to the next instruction on this
+    # silicon (measured: u3 landed in B r30 and the very next word read B r30
+    # one instruction too early, so the A row-block base came out 255 bytes
+    # high and every A k-pair was read 8 k out of place).  asm10 kept >= 6
+    # words between each uniform read and its first use; do the same.
+    a.word(add=g10_or(36, imm(1), imm(1)), note='tmu_noswap')
+    a.word(add=g10_or(G10_RA_ARB, areg(R_UNIF), areg(R_UNIF)), note='u0 panel')
+    a.word(add=g10_or(G10_RB_CARB, areg(R_UNIF), areg(R_UNIF), ws=1), note='u1 C')
+    a.word(add=g10_or(G10_RB_BLANE, areg(R_UNIF), areg(R_UNIF), ws=1), note='u2 B')
+    a.word(add=g10_or(G10_RB_TMP, areg(R_UNIF), areg(R_UNIF), ws=1),
+           note='u3 A rb offset')
+    a.word(add=g10_or(G10_RB_O64, areg(R_UNIF), areg(R_UNIF), ws=1),
+           note='u4 A rb stride (re-derived, sink only)')
+    a.word(add=g10_or(G10_RA_CTMP, areg(R_UNIF), areg(R_UNIF)), note='u5 C rb offset')
+    a.word(add=g10_or(G10_RB_BST, areg(R_UNIF), areg(R_UNIF), ws=1),
+           note='u6 C rb stride (re-derived, sink only)')
+    a.word(add=g10_or(G10_RA_RBIDX, areg(R_UNIF), areg(R_UNIF)), note='u7 first rb')
+    a.nop(), a.nop(), a.nop()
+    a.word(add=g10_addi(ADD_ADD, G10_RA_ARB, areg(G10_RA_ARB), (REGB, G10_RB_TMP)),
+           note='A rb base')
+    a.word(add=g10_addi(ADD_ADD, G10_RB_CARB, breg(G10_RB_CARB), areg(G10_RA_CTMP),
+                        ws=1), note='C rb base')
+    a.nop(), a.nop()
+    a.ldi(N * 4, G10_RB_BST, ws=1, note='B row stride')
+    a.ldi(64, G10_RB_O64, ws=1)
+    a.ldi(128, G10_RB_O128, ws=1)
+    a.ldi(192, G10_RB_O192, ws=1)
+    a.ldi(256, G10_RB_O256, ws=1)
+    a.ldi((0 - TR) & 0xFFFFFFFF, G10_RB_NEGTR, ws=1, note='-TR')
+    a.ldi(RBCNT, G10_RB_RBCNT, ws=1, note='row-block bound')
+    a.ldi(0, G10_RA_CBOFF, note='column-block offset')
+    # asm10's exact spacing: the accumulator read must be 2 words after the
+    # write (measured: a 3-word gap reads a different rotation slot and puts
+    # the A base 255 bytes off).
+    a.word(add=g10_addi(ADD_SHL, 32 + G10_ACC_SCR, areg(R_ELEM_NUM), imm(2)),
+           note='r3 = lane*4')
+    a.nop()
+    a.word(add=g10_addi(ADD_ADD, G10_RA_ARB, areg(G10_RA_ARB),
+                        acc(G10_ACC_SCR)), note='A + lane*4')
+    a.word(add=g10_addi(ADD_ADD, G10_RB_BLANE, breg(G10_RB_BLANE),
+                        acc(G10_ACC_SCR), ws=1), note='B + lane*4')
+    a.nop(), a.nop()
+
+    # ------------------------------------------------------- row block loop
+    a.label('rb_top')
+    a.word(add=g10_addi(ADD_ADD, 32 + G10_ACC_SCR, areg(G10_RA_RBIDX),
+                        (REGB, G10_RB_NEGTR), sf=1), note='rb - TR')
+    a.nop(), a.nop()
+    a.branch_to('rb_body', cond=BR_ALL_N_SET)
+    a.nop(), a.nop(), a.nop()
+    a.branch_to('tdone', cond=BR_ALWAYS)
+    a.nop(), a.nop(), a.nop()
+    a.label('rb_body')
+    a.ldi(NCB, G10_RA_CBCNT, note='column blocks')
+    a.word(add=g10_or(G10_RA_CBOFF, imm(0), imm(0)), note='cb offset = 0')
+    a.nop(), a.nop()
+
+    # ------------------------------------------------------ column block loop
+    a.label('cb_top')
+    a.word(add=g10_or(G10_RA_AADR, areg(G10_RA_ARB), areg(G10_RA_ARB)),
+           note='A tile base')
+    a.word(add=g10_addi(ADD_ADD, G10_RA_CADR, areg(G10_RA_CBOFF),
+                        (REGB, G10_RB_CARB)), note='C tile base')
+    a.word(add=g10_addi(ADD_ADD, 32 + G10_ACC_BADR, areg(G10_RA_CBOFF),
+                        (REGB, G10_RB_BLANE)), note='B tile base')
+    a.ldi(4 * N * 4, G10_RB_TMP, ws=1, note='4 C rows')
+    a.nop(), a.nop()
+    a.word(add=g10_addi(ADD_ADD, G10_RA_CADR2, areg(G10_RA_CADR),
+                        (REGB, G10_RB_TMP)), note='+ 4 C rows')
+    a.nop(), a.nop()
+    if probe == 'addrs':
+        # dump AADR, CADR, CADR2, CBOFF, BLANE, C_ARB, A_ARB, RBIDX through the
+        # (proven) store, to the dump address in u8 (so the store does not
+        # depend on the very addresses being measured)
+        a.word(add=g10_or(G10_RA_CADR2, areg(R_UNIF), areg(R_UNIF)),
+               note='u8 dump address')
+        a.nop(), a.nop()
+        a.word(add=g10_or(G10_RA_CADR, areg(G10_RA_CADR2), areg(G10_RA_CADR2)),
+               note='CADR = u8')
+        a.nop(), a.nop()
+        for src, dst in ((G10_RA_AADR, 0), (G10_RA_AADR, 2), (G10_RA_CADR2, 4),
+                         (G10_RA_CBOFF, 6), (G10_RB_BLANE, 1), (G10_RB_CARB, 3),
+                         (G10_RA_ARB, 5), (G10_RA_RBIDX, 7)):
+            if src in (G10_RB_BLANE, G10_RB_CARB):
+                a.word(add=g10_or(dst, breg(src), breg(src), ws=0))
+            else:
+                a.word(add=g10_or(dst, areg(src), areg(src), ws=0))
+            a.nop(), a.nop()
+        a.branch_to('store_x', note='probe: dump addresses')
+        a.nop(), a.nop(), a.nop()
+    for r in range(G10_NROWS):
+        for j in range(4):
+            f, addr = g10_acc_addr(r, j)
+            a.word(add=g10_or(addr, imm(0), imm(0), ws=f))
+    a.nop()
+    a.word(add=g10_or(32 + G10_ACC_TMP, imm(0), imm(0)), note='r2 = 0 (mul temp)')
+    a.nop()
+    a.ldi(nloop, G10_RA_KCNT, note='k-loop iterations (3 k pairs each)')
+
+    # ---------------------------------------------------------- tile prime
+    a.word(add=g10_or(W_TMU0_S, areg(G10_RA_AADR), areg(G10_RA_AADR)),
+           note='prime issue A kp0')
+    a.word(add=g10_addi(ADD_ADD, G10_RA_AADR, areg(G10_RA_AADR),
+                        (REGB, G10_RB_O64)), note='AADR += 64')
+    g10_prime_issue(a, 'prime s0')
+    for _ in range(8):
+        a.nop()
+    a.word(sig=SIG_LOAD_TMU0, note='prime POP A')
+    a.word(add=g10_copy_add(0, 32 + G10_ACC_AVEC), note='prime r0 = A')
+    g10_prime_pop(a, G10_SETV[0], 'prime s0')
+    g10_prime_issue(a, 'prime s1 (left in flight)')
+    a.nop()
+    a.word(mul=g10_rot(g10_rot_for(0, 0)), note='prime rot(p0 row 0)')
+
+    if probe == 'const':
+        # debug build: dump a known constant to validate the dump path itself
+        a.word(add=g10_or(32 + G10_ACC_AVEC, imm(21), imm(21)))
+        a.nop(), a.nop()
+        g10_dump_avec(a, G10_RA_CADR)
+        for _ in range(2):
+            for t in (0, 1):
+                a.word(sig=SIG_LOAD_TMU1 if t else SIG_LOAD_TMU0, note='probe drain')
+                a.word(add=g10_copy_add(0, 32 + G10_ACC_AVEC))
+        a.label('tdone')
+        a.word(sig=SIG_END_PROGRAM)
+        a.nop(), a.nop(), a.nop()
+        a.check()
+        a.verify()
+        return a
+    if probe == 'prime_a':
+        # debug build: copy the A vector into the store's row-0 inputs and use
+        # the (proven) C store to report it
+        a.word(add=g10_or(0, acc(G10_ACC_AVEC), acc(G10_ACC_AVEC), ws=0),
+               note='A0 = A vector')
+        a.nop(), a.nop()
+        g10_store(a, stride)
+        # drain the four requests of set 1 so nothing is left in flight
+        for _ in range(2):
+            for t in (0, 1):
+                a.word(sig=SIG_LOAD_TMU1 if t else SIG_LOAD_TMU0, note='probe drain')
+                a.word(add=g10_copy_add(0, 32 + G10_ACC_AVEC))
+        a.label('tdone')
+        a.word(sig=SIG_END_PROGRAM)
+        a.nop(), a.nop(), a.nop()
+        a.check()
+        a.verify()
+        return a
+
+    # -------------------------------------------------------------- k loop
+    g10_kloop_body(a, 'kloop')
+    a.branch_to('kloop', cond=BR_ALL_Z_CLEAR, note='k loop')
+    a.word(mul=dict(mul_op=MUL_V8MIN, mul_out=32 + G10_ACC_AVEC, ws=1,
+                    mul_a=acc(G10_ACC_TMU), mul_b=acc(G10_ACC_TMU)),
+           note='delay1: r0 = A vector of the next k pair')
+    a.word(add=g10_addi(ADD_ADD, G10_RA_AADR, areg(G10_RA_AADR),
+                        (REGB, G10_RB_O64)), note='delay2: AADR += 64')
+    a.word(mul=g10_rot(g10_rot_for(0, 0)),
+           note='delay3: rot(row0) of the next k pair')
+
+    # ---------------------------------------------------- k-loop tail
+    # The last main-loop iteration prefetched set 0 (next k even) and set 1
+    # (next k odd); REM = 1 uses them as they are, REM = 2 also fills set 2.
+    a.nop(note='tail entry pad (rot->rep >= 2 on the loop-exit path)')
+    if drain:
+        # KPAIRS % 3 == 0: the last group is emitted here with the issues of
+        # its last two phases suppressed, so every pop has an issue and the
+        # TMUs are empty at the store.
+        for p in range(6):
+            g10_phase(a, p, p & 1, 'd%d' % p, do_pop=(p < 5), do_issue=(p < 4),
+                      rot_next=(p in (0, 2, 4)), a_issue=(p in (0, 2)))
+            if p in (1, 3):
+                g10_boundary(a, p, counter=False)
+    elif REM == 1:
+        g10_phase(a, 6, 0, 't0', do_pop=True, do_issue=False, rot_next=True)
+        g10_phase(a, 7, 1, 't1', do_pop=False, do_issue=False, rot_next=False)
+    else:
+        g10_phase(a, 6, 0, 't0', do_pop=True, do_issue=True, rot_next=True,
+                  a_issue=True)
+        g10_phase(a, 7, 1, 't1', do_pop=True, do_issue=True, rot_next=False)
+        g10_boundary(a, 7, counter=False)
+        g10_phase(a, 8, 0, 't2', do_pop=True, do_issue=False, rot_next=True)
+        g10_phase(a, 9, 1, 't3', do_pop=False, do_issue=False, rot_next=False)
+    a.nop()
+
+    # -------------------------------------------------------------- store
+    a.label('store_x')
+    if probe == 'regs':
+        # overwrite the accumulator inputs of the (proven) store with address
+        # registers so the store itself reports them
+        for src, dst in ((G10_RA_AADR, 0), (G10_RA_CADR, 2), (G10_RA_CADR2, 4),
+                         (G10_RA_CBOFF, 6), (G10_RA_ARB, 1), (G10_RA_RBIDX, 3),
+                         (G10_RB_BLANE, 5), (G10_RB_CARB, 7)):
+            if src in (G10_RB_BLANE, G10_RB_CARB):
+                a.word(add=g10_or(dst, breg(src), breg(src), ws=0))
+            else:
+                a.word(add=g10_or(dst, areg(src), areg(src), ws=0))
+            a.nop(), a.nop()
+    g10_store(a, stride)
+
+    if single:
+        # debug build: exactly one tile, no tile loop
+        a.branch_to('tdone', note='single tile')
+        a.nop(), a.nop(), a.nop()
+        a.label('tdone')
+        a.word(sig=SIG_END_PROGRAM)
+        a.nop(), a.nop(), a.nop()
+        a.check()
+        a.verify()
+        return a
+
+    # ------------------------------------------------- next column / row block
+    a.word(add=g10_addi(ADD_ADD, G10_RA_CBOFF, areg(G10_RA_CBOFF),
+                        (REGB, G10_RB_O256)), note='next column block')
+    a.word(add=g10_addi(ADD_SUB, G10_RA_CBCNT, areg(G10_RA_CBCNT), imm(1), sf=1),
+           note='cb counter')
+    a.branch_to('cb_top', cond=BR_ALL_Z_CLEAR)
+    a.nop(), a.nop(), a.nop()
+    a.ldi(astride, G10_RB_TMP, ws=1, note='A rb stride')
+    a.nop(), a.nop()
+    a.word(add=g10_addi(ADD_ADD, G10_RA_ARB, areg(G10_RA_ARB),
+                        (REGB, G10_RB_TMP)))
+    a.nop(), a.nop()
+    a.ldi(cstride, G10_RA_CTMP, ws=0, note='C rb stride')
+    a.nop(), a.nop()
+    a.word(add=g10_addi(ADD_ADD, G10_RB_CARB, breg(G10_RB_CARB),
+                        areg(G10_RA_CTMP), ws=1))
+    a.nop()
+    a.word(add=g10_addi(ADD_ADD, G10_RA_RBIDX, areg(G10_RA_RBIDX), imm(NQ)),
+           note='next row block')
+    # the B file cannot hold a register and a small immediate in one word, so
+    # the counter decrement borrows the A-file stride temporary
+    a.ldi(1, G10_RA_CTMP, note='1')
+    a.nop(), a.nop()
+    a.word(add=g10_addi(ADD_SUB, G10_RB_RBCNT, breg(G10_RB_RBCNT),
+                        areg(G10_RA_CTMP), sf=1, ws=1))
+    a.branch_to('rb_top', cond=BR_ALL_Z_CLEAR)
+    a.nop(), a.nop(), a.nop()
+
+    a.label('tdone')
+    a.word(sig=SIG_END_PROGRAM)
+    a.nop(), a.nop(), a.nop()
+
+    a.check()
+    a.verify()
+    return a
+
+
 # =============================================================== pack/transpose
 def build_pack(kblocks, vpitch=1):
     """K-major panel builder: PANEL[(rb*K + k)*16 + r] = SRC[rb*16 + r][k].
@@ -537,6 +1481,142 @@ def build_pack(kblocks, vpitch=1):
     b.e(nop(), nop(), nop())
     b.e(end_program())
     b.e(nop(), nop(), nop())
+    return p
+
+
+# =============================================================== pack (asm10)
+def build_pack10(K, vpitch=1):
+    """K-major panel builder: asm10's layout and work assignment.
+
+        PANEL[(rb*K + k)*8 + r] = SRC[rb*8 + r][k]
+
+    This is asm10/pack10.py in its adopted configuration (single mode: 8 A
+    rows and KL=16 words per VDR command, the one proven 8x8-word VDW shape per
+    256 B half, grid-stride work assignment) and it is *instruction-identical*
+    to asm10's `pack10_<K>_k16_single_vp1_us.bin`: at N=256 that kernel builds
+    the panel in 382 us instead of 458 us for the same bytes, and the panel is
+    bit-exact (asm10/RESULTS10.md).
+
+    KERNEL ABI (uniforms u0..u7, 64 B block per QPU)
+      u0 source row length in floats (K)
+      u1 this QPU's first work-unit byte offset (source and panel)
+      u2 source base bus
+      u3 one work-unit byte stride (32*K; the kernel re-derives it)
+      u4 panel base bus
+      u5 work units for this QPU
+      u6 QPU launch index (VPM row base = 8*q)
+      u7 work-unit byte step (grid stride = pnq * 32*K)
+
+    A work unit is 8 A rows x K: 32*K bytes of source and of panel, so the same
+    byte offset applies to both when the source is the padded A copy.
+    """
+    assert K % 16 == 0, "pack10 needs K % 16 == 0"
+    kl = 16
+    nrow = 8
+    kiter = K // kl
+    srcstep = kl * 4                # bytes per k strip (one A row)
+    dststep = kl * nrow * 4         # bytes per k strip in the panel
+    le1 = nrow.bit_length() - 1
+    vdws = [(g, c) for g in range(nrow // 8) for c in range(kl // 8)]
+
+    RA_D2, RA_A, RA_P = 16, 17, 18
+    RA_VD1, RA_VD2, RA_SRC, RA_DST = 19, 20, 21, 22
+    RA_KB, RA_CNT, RA_VDRW = 23, 24, 25
+    RA_VD0, RA_D3, RA_VDRS, RA_VDWS = 26, 27, 28, 29
+    RA_VD3, RA_D4 = 30, 31
+    RB_OFF, RB_ST, RB_KL = 16, 17, 18
+    RB_VECB, RB_NEG1, RB_UNIT = 19, 20, 22
+    RB_BLKB, RB_RO, RB_C = 23, 24, 26
+
+    vdwreg = [RA_VD0, RA_VD1, RA_VD2, RA_VD3][:len(vdws)]
+    dstreg = [RA_DST, RA_D2, RA_D3, RA_D4][:len(vdws)]
+    assert len(vdws) <= 4
+
+    p = Prog()
+
+    def e(*ws):
+        for w in ws:
+            p.emit(_ops(**w) if isinstance(w, dict) else w)
+
+    # ---------------- prologue -------------------------------------------
+    e(add_or(36, imm(1), imm(1)))                                # tmu_noswap
+    e(add_(ADD_SHL, RB_ST, ws=1, a=areg(R_UNIF), b=imm(2)))      # u0 -> K*4 pitch
+    e(add_or(RB_OFF, ws=1, a=areg(R_UNIF), b=areg(R_UNIF)))      # u1 = byte offset
+    e(add_or(RA_A, areg(R_UNIF), areg(R_UNIF)))                  # u2 = A base
+    e(add_or(RB_KL, ws=1, a=areg(R_UNIF), b=areg(R_UNIF)))       # u3 (unused)
+    e(add_or(RA_P, areg(R_UNIF), areg(R_UNIF)))                  # u4 = panel base
+    e(add_or(RA_CNT, areg(R_UNIF), areg(R_UNIF)))                # u5 = units
+    e(add_or(RA_D3, areg(R_UNIF), areg(R_UNIF)))                 # u6 = QPU index
+    e(add_or(RB_UNIT, ws=1, a=areg(R_UNIF), b=areg(R_UNIF)))     # u7 = unit step
+
+    # VDR basic: ID=1, row base nrow*q (row field at bit 4), nrow rows, KL words
+    e(add_(ADD_SHL, RB_RO, ws=1, a=areg(RA_D3), b=imm(le1 + 4)))
+    e(ldi(V.vdr_basic(0, vpitch, numrows=nrow, rowlen=kl), RA_VDRW))
+    e(nop(), nop())
+    e(add_(ADD_ADD, RA_VDRW, areg(RA_VDRW), (REGB, RB_RO)))
+    # VDW (one proven shape: depth 8 words = 32 B, units 8 = 256 B contiguous)
+    e(add_(ADD_SHL, RB_RO, ws=1, a=areg(RA_D3), b=imm(le1 + 7)))
+    e(ldi(V.vdw_basic(0, 8, 8, horizontal=0, col=0), RA_VD0))
+    e(nop(), nop())
+    e(add_(ADD_ADD, RA_VD0, areg(RA_VD0), (REGB, RB_RO)))
+    for i, (g, c) in enumerate(vdws):
+        if i == 0:
+            continue                     # RA_VD0 is the (0,0) setup already
+        e(ldi(g * 1024 + c * 64, RB_C, ws=1))    # +8 VPM rows / +8 words (col)
+        e(nop(), nop())
+        e(add_(ADD_ADD, vdwreg[i], areg(RA_VD0), (REGB, RB_C)))
+    # strides
+    e(ldi(V.vdr_stride(0) & ~0xFFF, RA_KB))                 # ID nibble only
+    e(nop(), nop())
+    e(add_(ADD_ADD, RA_VDRS, areg(RA_KB), (REGB, RB_ST)))   # ID=9 | pitch
+    e(ldi(V.vdw_stride(0), RA_VDWS))                        # ID=3, block mode
+    e(ldi(srcstep, RB_KL, ws=1))
+    e(ldi(dststep, RB_VECB, ws=1))
+    e(ldi(K * nrow * 4, RB_BLKB, ws=1))                     # one work unit
+    e(ldi(0xFFFFFFFF, RB_NEG1, ws=1))                       # -1
+    e(ldi(256, RB_C, ws=1))                                 # 8 k columns of panel
+    e(nop(), nop())
+
+    # ---------------- work-unit loop (an 8-row block) ---------------------
+    p.label('rb')
+    e(ldi(kiter, RA_KB))                                    # K/KL k strips
+    e(add_(ADD_ADD, RA_SRC, areg(RA_A), (REGB, RB_OFF)))
+    e(add_(ADD_ADD, RA_DST, areg(RA_P), (REGB, RB_OFF)))
+    e(nop(), nop())
+
+    # ---------------- KL-word strip loop ---------------------------------
+    p.label('kb')
+    e(add_or(W_VPR_SETUP, areg(RA_VDRW), areg(RA_VDRW), ws=0))
+    e(add_or(W_VPR_SETUP, areg(RA_VDRS), areg(RA_VDRS), ws=0))
+    e(add_or(W_VPR_ADDR, areg(RA_SRC), areg(RA_SRC), ws=0))
+    e(add_or(W_NOP, areg(50), areg(50)))                    # vpr_wait
+    # per-strip panel destinations (each VDW writes 256 B)
+    if len(vdws) > 1:
+        e(add_(ADD_ADD, RA_D2, areg(RA_DST), (REGB, RB_C)))     # +8 k
+        if len(vdws) > 2:
+            e(add_(ADD_ADD, RA_D3, areg(RA_DST), (REGB, RB_BLKB)))   # + one block
+            e(nop())
+            e(add_(ADD_ADD, RA_D4, areg(RA_D3), (REGB, RB_C)))
+    for i in range(len(vdws)):
+        e(add_or(W_VPW_SETUP, areg(vdwreg[i]), areg(vdwreg[i]), ws=1))
+        e(add_or(W_VPW_SETUP, areg(RA_VDWS), areg(RA_VDWS), ws=1))
+        e(add_or(W_VPW_ADDR, areg(dstreg[i]), areg(dstreg[i]), ws=1))
+        e(add_or(W_NOP, (REGB, R_VPW_WAIT), (REGB, R_VPW_WAIT)))   # vpw_wait
+    e(add_(ADD_ADD, RA_KB, (REGB, RB_NEG1), areg(RA_KB), sf=1))  # KB -= 1
+    p.branch_to('kb', cond=BR_ALL_Z_CLEAR)
+    e(add_(ADD_ADD, RA_SRC, areg(RA_SRC), (REGB, RB_KL)))       # delay 1
+    e(add_(ADD_ADD, RA_DST, areg(RA_DST), (REGB, RB_VECB)))     # delay 2
+    e(nop())                                                    # delay 3
+
+    # ---------------- next work unit -------------------------------------
+    e(add_(ADD_ADD, RA_CNT, (REGB, RB_NEG1), areg(RA_CNT), sf=1))   # CNT -= 1
+    p.branch_to('rb', cond=BR_ALL_Z_CLEAR)
+    e(add_(ADD_ADD, RA_A, areg(RA_A), (REGB, RB_UNIT)))          # delay 1
+    e(add_(ADD_ADD, RA_P, areg(RA_P), (REGB, RB_UNIT)))          # delay 2
+    e(nop())                                                     # delay 3
+
+    e(end_program())
+    e(nop(), nop(), nop())
     return p
 
 
@@ -906,9 +1986,16 @@ def main(argv):
         return int(opts[k]) if k in opts else d
 
     if kind == 'gemm':
+        # the asm10 kernel: 8x64 tiles, 3-phase k loop (build_gemm above is the
+        # asm3 16x16 generator, kept as 'gemm3' for A/B and reference)
+        p = build_gemm10(g('M'), g('N'), g('K'), g('nqpu', 12),
+                         opts.get('probe'), bool(g('single', 0)))
+    elif kind == 'gemm3':
         p = build_gemm(g('M'), g('N'), g('K'), g('nqpu', 12), g('bmode', 0),
                        g('depth', 3))
     elif kind == 'pack':
+        p = build_pack10(g('k'))
+    elif kind == 'pack3':
         p = build_pack(g('kblocks'), g('vpitch', 1))
     elif kind == 'im2col':
         p = build_im2col(g('cin'), g('k'), g('kh'), g('kw'), g('vpitch', 1))

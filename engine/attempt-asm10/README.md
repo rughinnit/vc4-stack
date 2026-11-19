@@ -1,54 +1,52 @@
-# attempt-asm10 - the asm10 GEMM/packer port (not shipped)
+# attempt-asm10 — diagnostics and notes for the asm10 GEMM port
 
-`../RESULTS-fast.md` has the full story.  Short version:
+**This port is now shipped** (`../RESULTS-fast2.md`): the generalised tile
+addressing is fixed, `REPS=5 ./run_tests.sh` is green 5/5 on every shape, and
+matmul at 256^3 is 8.50 GFLOP/s (engine-fix: 6.24) with the GEMM itself faster
+than asm10's own kernel through the same launcher (3.55 vs 4.12 ms).
 
-* **Works and is verified on hardware**: the asm10 *packer*
-  (`build_pack10` in `kgen.py.ported`) - byte-identical to
-  `asm10/pack10_<K>_k16_single_vp1_us.bin` for K = 64/128/256 and bit-exact
-  through the engine's launcher (`diag_pack10.c`: 0/256); the *drain-free*
-  parts of the GEMM (k loop, prime, store are byte-identical to asm10's
-  `gemm6.py`), the GPU-free models in `check_math.py.ported`, and the
-  simulator `g10sim.py`.
-* **Does not work**: the generalised tile addressing (`vc4_gemm.c.ported` +
-  `build_gemm10`) produces wrong C values on every shape, so the tree is
-  reverted to the asm3 engine.
+## What the two real bugs were
 
-## To pick this up
+1. `build_gemm10`'s prologue read a uniform into a GP register and used it in
+   the *next* instruction.  A GP register written by a uniform read is not
+   visible one instruction later on this silicon: the A row-block base came out
+   255 bytes high, which the TMU rounds to +256, i.e. exactly 8 k pairs into the
+   row block — the `C[r][c] = A[r][c+8]` symptom.  All eight uniforms are now
+   read first and combined >= 3 words later.
+2. The row-block guard had two nops between `add.setf` and `brr.4`; the branch
+   then saw cleared flags, the row-block body was never entered, and the kernel
+   fell through to the end-program path storing nothing (the ~30 us runs).  The
+   compare and the branch are now adjacent, as in asm10.
 
-```sh
-cd /home/raspi/work/engine-fast
-mkdir -p /tmp/port && cp attempt-asm10/kgen.py.ported tools/kgen.py
-cp attempt-asm10/vc4_gemm.c.ported src/vc4_gemm.c
-cp attempt-asm10/vc4_conv.c.ported src/vc4_conv.c
-cp attempt-asm10/vc4_int.h.ported src/vc4_int.h
-cp attempt-asm10/check_math.py.ported tools/check_math.py
-cp attempt-asm10/test_matmul.c.ported tests/test_matmul.c
-make clean && make -j4 && sudo -n rm -f kcache/*.bin
-# then the probes (build them by hand, they include ../src/vc4_int.h):
-gcc -O2 -std=gnu11 -Iinclude -Itests attempt-asm10/diag_g6.c build/libvc4infer.a -o build/diag_g6 -lm
-```
+The k loop, prime, store and tail were already byte-identical to
+`asm10/gemm6.py` (`diffbody.py`: 0 of 302 words differ).
 
-Useful probes, in the order that was informative:
+## Diagnostics kept here (they work on the fixed tree)
 
-| probe | what it proves |
+| tool | what it does |
 |---|---|
-| `diag_g6 N nq` | asm10's own `gemm6_<N>.bin` launched by this engine: 0 mismatches for nq = 1/4/12.  Run this first after any change - if it fails, the harness broke, not the port. |
-| `diag_pack10 K M` | the panel builder against the reference panel |
-| `diag_mm3 M N K` | `vc4_matmul` end to end against the CPU oracle |
-| `diag_gemm11 M N K` | `vc4__gemm_run` with a CPU-built panel (isolates the GEMM) |
-| `diag_probe M N K [r0]` | delta panels: which k / row reaches which C cell |
-| `diag_probe2`, `diag_probe3` | identity-B and B=k probes: column/row mapping |
-| `g6probe.py` + `diag_avec.c` | dumps the A vector a kernel *reads*, using the proven C store; validated against `gemm6_64.bin` (dumps `0 1000 2000 ... 7000 | 1 1001 ...`) |
-| `diffbody.py` | byte-diff of the emitted k-loop body against `asm10/gemm6.py` (currently 0 words differ) |
-| `g10sim.py` | scalar run of the generated GEMM: termination, uniform count, TMU/store address ranges |
+| `raw.c` | run any blob with a CPU-built panel/B/C and dump C as floats, hex words, raw bytes, or search the arena for a pattern. `raw <blob> M N K nq amode bmode rows [panoff]` — `rows` -1 = word map, -2 = pattern search, -3 = byte dump; `panoff` shifts u0 (used to prove the A base offset). |
+| `diag_conv.c` | `vc4_conv2d` against a CPU oracle for any Cin/H/W/Cout/KH/KW/pad/bias (the engine's own test_conv covers the accepted shapes). |
+| `patch_dumpreg.py`, `patch_dumparb.py` | rewrite the 32 accumulator-init words so the kernel's own store dumps any address register (`ra24` = panel row-block base, `ra20` = AADR, ...) — the only non-self-referential register probe found. |
+| `patch_bisect.py` | same, optionally neutering one prologue add, to bisect an address term. |
+| `probe_unif8.py` | dump u0..u7 (and constants) through a *correct* store; use this before trusting any probe that writes registers. |
+| `g6probe.py`, `diag_g6.c` | asm10's own kernel through this engine (harness control). |
+| `diffbody.py`, `g10sim.py`, `check_math.py.ported` | byte-diff against asm10, control-flow/address simulation, GPU-free models. |
 
-## The one open symptom
+Two important traps when using these:
 
-`diag_gemm11 8 64 16` (single 8x64 tile, one QPU, CPU panel):
-`C[r][c] = A[r][c+8]` with B = identity, and 8/9 instead of 1 with a delta
-panel, i.e. the A/B k pairing is off by 8 k (or the B base by 32 bytes) while
-every emitted word in the loop is identical to asm10's.  The address-register
-dumps were all self-referential (they store through the same CADR they are
-measuring), which is why they were inconclusive; dumping through a *fixed*
-address (u8) needs the uniform port to accept a 9th word, which was not
-confirmed.
+* **kernel names are the cache key.** A probe build written under a normal name
+  poisons `kcache/`; always `sudo -n rm -f kcache/*.bin` after changing
+  `tools/kgen.py`, and give probes their own names.
+* probes that store a *register* through `g10_store` must set every register the
+  store uses (CADR, CADR2 and B r24 = 64), otherwise the store's byte
+  alignment/column advance is wrong and the dump looks shifted by 1 byte.
+
+## Conv
+
+`src/vc4_conv.c` is back on the **asm3** path (asm3 im2col + asm3 16x16 GEMM +
+k-major B panel).  The 8-row im2col needs a `horizontal=1` VDM, which is only
+exact at 16x16 words on this silicon; the 8x8 `horizontal=1` shape silently
+ignores the VPM row/col offsets (measured), so the ported 4-VDM im2col was
+wrong for every conv shape.  Two workable routes and why (a) was chosen are in
+`../RESULTS-fast2.md` §6.

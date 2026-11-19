@@ -654,60 +654,54 @@ or `Engine.utilization(reps=3)`:
 | `launch_path_ms`, `launch_path_pct` | wall time minus QPU busy time, i.e. the ARM/daemon round-trip share |
 | `host_compute_nodes` | runtime host-compute nodes; must be 0 under `device` |
 
-Measured on YOLOv8n 160x160, stock clocks, `vc4infer util --reps 3`:
+Measured on YOLOv8n 160x160, stock clocks, `vc4infer util --reps 5` on a
+quiet board:
 
 | metric | value |
 |---|---:|
 | nodes | 233 vc4 + 30 folded |
 | `host_compute_nodes` | **0** |
 | `arithmetic_on_vc4` | **100.0%** (273,249,600 / 273,249,600 MACs) |
-| `bytes_copied_by_host` | **17,077,040 B** (outstanding; see 10.4) |
-| `qpu_duty` | **48.7%** (302.9 / 622.4 ms) |
-| launches | 678 (3.85 per dispatched node) |
-| launch path | 319.5 ms (**51.3%** of wall) |
+| `bytes_copied_by_host` | **0 B** (was 17,077,040; see 10.4) |
+| `qpu_duty` | **58.9%** (320.4 / 543.5 ms) |
+| launches | 784 (4.45 per dispatched node) |
+| launch path | 223.1 ms (**41.1%** of wall) |
 
-The duty cycle is limited by launches and layout traffic, **not by
+The duty cycle is limited by launches and the daemon round trip, **not by
 arithmetic**: the graph is 100% QPU arithmetic but the QPU is idle while the
 ARM issues the next launch.  The honest statement is "100% of MACs on VC4,
-~49% QPU duty at 160x160".
+59% QPU duty at 160x160"; moving the last 17 MB of layout work onto the QPUs
+moved 11 points of duty and 108 ms of wall time (10.4.3).
 
-### 10.4 Host byte debt: what was eliminated, what remains
+### 10.4 Host byte debt: what was eliminated
 
 Per-run host byte movement on YOLOv8n 160x160:
 
 | stage | bytes/run | note |
 |---|---:|---|
-| before this change | 38,410,632 | weight re-downloads + every layout copy |
+| before this work | 38,410,632 | weight re-downloads + every layout copy |
 | after caching weights/bias panels in host arrays | 17,077,040 | -21.3 MB/run |
+| after `vc4_copy2d` is wired into every site | **0** | 17.1 MB moved by the QPUs instead |
 
-Remaining per-op debt (YOLOv8n 160, device policy):
+For reference, the per-op debt that was eliminated (device policy, measured by
+removing each site from `vc4infer util`):
 
-| op | bytes/run | missing capability |
+| op | bytes/run removed | how |
 |---|---:|---|
-| Conv | 8,683,728 | NHWC inputs arrive NCHW; a QPU NHWC<->NCHW layout copy is not wired into the conv prologue (and the first graph input conversion) |
-| Concat | 5,160,000 | pitched channel concat: `vc4_concat_nhwc` exists but needs a per-row/pitch wrapper for W not a multiple of 4 |
-| Split | 983,040 | channel-strided copy with `src pixel stride != Csrc*4` (split of a pitched tensor) |
-| Reshape | 826,080 | NHWC->NCHW logical reshape: QPU 2-D transpose exists but the head extents (e.g. 2100) are not multiples of 16 |
-| Resize | 471,040 | nearest neighbour is a host byte gather; `vc4_upsample2x_nhwc` fits only exact 2x NHWC and was measurably slower on the 2 YOLO resizes, so it is not enabled |
-| Softmax | 403,456 | channel-axis softmax needs a QPU layout copy to the last axis |
-| Transpose | 268,800 | arbitrary permutation (head `[0,2,1,3]`) |
-| MaxPool | 247,296 | -inf border is still a host fill; the pool kernel itself is QPU |
-| Slice | 25,200 | head slice on a channel axis |
-| Mul | 8,400 | broadcast constant expansion on the host |
-
-**The device byte invariant is not yet satisfied for YOLOv8n**: the reported
-`bytes_copied_by_host` is 17.08 MB/run and is printed as debt, not hidden.  The
-runtime host-compute invariant *is* satisfied (0 nodes).  Reducing this to zero
-is emulation work on VC4 - pitched concat/split copies, an NHWC<->NCHW layout
-kernel, an arbitrary-permute kernel and a channel-axis softmax - not a policy
-exemption.
-
-YOLOv8n at 320x320 does not fit the board's 72 MiB daemon arena with the
-current graph pool, so no 320 utilisation table is claimed.
+| Conv | 8,683,728 | 6,325,760 was `to_nhwc` downloading an NHWC tensor and discarding the copy; 1,945,600 is the first conv's NCHW 3ch -> NHWC 16ch prologue (one `copy2d_x`, the channel padding is the fill value); 412,368 is the DFL conv's `Cout=1` channel slice |
+| Concat | 5,160,000 | pitched channel concat, one call per input, the block loop walks inputs wider than 16 channels per pixel |
+| Split | 983,040 | channel-strided copy that keeps the source pitch (the old path also never charged its own 245 KB download) |
+| Reshape | 826,080 | NHWC -> NCHW, compact and pitched forms, with the partial-word tail for 25/100/2100-wide extents |
+| Resize | 471,040 | exact-2x NHWC `vc4_upsample2x_nhwc` |
+| Softmax | 403,456 | the head's softmax consumes the transpose's NHWC output directly, so no layout copy is needed at all |
+| Transpose | 268,800 | `[0,2,1,3]` through the block loop |
+| MaxPool | 247,296 | `vc4_fill2d(-inf)` border + interior copy |
+| Slice | 25,200 | last-axis runs |
+| Mul | 8,400 | broadcast constant expanded once at plan time, cached like a weight panel |
 
 #### 10.4.1 `vc4_copy2d`: the layout copy kernel (landed, verified)
 
-The single primitive the debt above needs is now in the engine:
+The single primitive the debt needed is in the engine:
 `vc4_copy2d` / `vc4_copy2d_n` / `vc4_copy2d_x` (`infer/src/vc4_gen.c`,
 generated by `kops.build_copy2d`).  It is a 3-level affine copy:
 
@@ -724,64 +718,94 @@ border) and their source addresses are clamped to the vector base, so a
 short row never reads past its buffer.  `units=1, depth=k` stores a k-word
 tail exactly (the head's 525/2100/100-wide extents are not multiples of 16).
 The VDW row stride and the chunk step are runtime registers, so one blob
-serves every shape.
+serves every shape; the additional launch cost is reported in 10.4.3.
 
 `infer/tests/test_copyops.c` (wired into `run_tests.sh`) verifies it against
 independent CPU oracles written from the *semantics* of each layout op, and
 every case is byte-exact (0 mismatches): contiguous 1050-float run (65.6
 vectors, the head slice), pitched channel concat with W=5 and C=16+32+16 ->
 C=64, pitched split 64ch -> 4x16ch, NHWC->NCHW for (16,5,5,pitch16),
-(64,20,20,pitch20), (80,10,10,pitch16) and H=1/W=7 (25, 400, 100 and 7-word
-rows), channel slice of a [4][525] plane with 4-byte lanes, transpose
-[4][16][525] -> [16][4][525], nearest 2x resize via `vc4_upsample2x_nhwc`,
-the -inf MaxPool border, the first conv's NCHW 3ch -> NHWC 16ch prologue
-(with zero channel padding) and a 1 MiB bulk copy.  Throughput: 1 MiB in
-2.31 ms (units=4, 454 MB/s) / 4.08 ms (units=1).
+(64,20,20,pitch20), (80,10,10,pitch16) and H=1/W=7, channel slice of a
+[4][525] plane with 4-byte lanes, transpose [4][16][525] -> [16][4][525],
+nearest 2x, the -inf MaxPool border, the first conv's NCHW 3ch -> NHWC 16ch
+prologue and a 1 MiB bulk copy (1 MiB in 2.31 ms, 454 MB/s with units=4).
 
-The executor wiring of this kernel (conv prologue, concat, split, reshape,
-softmax layout, transpose, slice, maxpool border, broadcast expand, resize)
-was written and **does** reach the device invariant, but it is not committed:
-see 10.4.2.
+#### 10.4.2 The cacheable arena mapping, and the bug it caused
 
-#### 10.4.2 WIP: the wired runner reaches the invariant but not the output
+This is the mechanism behind every nondeterministic YOLOv8n output the layout
+work produced, and it is worth stating on its own because it is not a layout
+bug: **the client's arena mapping is cacheable**.  `vc4d` maps the arena
+through `/dev/mem` with `O_SYNC` (uncached) and hands the client a dma-buf
+from `/dev/dma_heap/linux,cma`; the client's mmmap of that dma-buf is a normal
+write-back mapping (`vc4_dev_remote.c:66`).  Two host access patterns were
+missing maintenance:
 
-With the wiring applied (device concat/split/reshape/softmax/transpose/slice/
-maxpool/resize/expand, `to_nhwc` returning an existing NHWC tensor instead of
-downloading it, and the DFL conv's channel slice on the QPU) the same
-YOLOv8n 160x160 model reports:
+* **host write into a line the QPU has written.**  The clean that precedes
+  every launch writes back *whole* cache lines, so the words of the line the
+  host did not touch reverted to the copy the ARM had cached before the
+  launch.  This needs no host read at all: a constant uploaded into a recycled
+  pool offset is enough.
+* **host read of arena bytes the QPU wrote.**  `pad_stream`, the
+  elementwise/softmax copies into scratch, the conv pad image and the weight
+  panel reads all `memcpy`d straight out of the arena and could serve a clean
+  stale line.
 
-| metric | before | wired |
+Both are fixed in the client (the daemon cannot maintain another process's
+D-cache, and its own `/dev/mem` view needs nothing): `vc4__write` and
+`vc4__remote_upload` invalidate the range before writing, every arena->host
+copy invalidates the source first (`vc4__invalidate_off`), `vc4_download`
+keeps its CIVAC, and `vc4_invalidate_buf()` is the public form for zero-copy
+users (`Engine.view()`).  `infer/tests/test_coherency.c` (in `run_tests.sh`)
+fails if any of them loses it.
+
+Measured before the fix, on the board (`/tmp/vc4t/coh*.c`):
+
+| test | result |
+|---|---|
+| ARM reads a range the QPU just wrote, no maintenance | 400-600 of 4096 words stale (the ARM's cached copy) |
+| the same read after 2 MiB of unrelated churn | 0-432 stale -> **it is the ARM D-cache**, not a late V3D L2 write-back |
+| the same read after `DC CIVAC` | 0 stale |
+| one host word + the pre-launch clean, then the QPU reads the line | the other 15 words came back as the *pre-QPU* values |
+
+#### 10.4.3 Measured result of the device-side layout copies
+
+YOLOv8n 1x3x160x160, stock clocks (core 400 MHz, V3D 300 MHz, `throttled=0`),
+`VC4INFER_DAEMON=1`, board otherwise quiet (load 0.7-0.9, no other GPU user),
+`vc4infer util --reps 5`:
+
+| metric | before (main) | wired |
 |---|---:|---:|
 | `bytes_copied_by_host` | 17,077,040 | **0** |
 | `host_compute_nodes` | 0 | **0** |
 | `arithmetic_on_vc4` | 100.0% | **100.0%** |
-| wall / FPS | 665.5 ms / 1.50 | **544.7 ms / 1.84** |
-| `qpu_duty` | 45.9% | **58.8%** |
+| wall / FPS | 651.1 ms / 1.54 | **543.5 ms / 1.84** |
+| `qpu_duty` | 46.6% (303.1 ms) | **58.9%** (320.4 ms) |
 | launches | 678 | 784 |
+| launch path | 348.0 ms (53.4%) | **223.1 ms (41.1%)** |
 
-The invariant is satisfied and the wall time *improves* (the removed host
-copies cost more than the ~106 added launches).  **But the output does not
-verify**: against `ref_onnx` the first run has 24-36 of 44,100 elements over
-5e-4 (all in the DFL box rows, a contiguous run of P4 anchors) and repeated
-runs in one process degrade to ~22,700, differing run to run.  Localisation
-so far:
+The device copies are not slower: they add 17.3 ms of QPU kernel time for
+17.1 MB (~1.1 GB/s of copy throughput) and give back 125 ms of ARM/daemon
+time, so the wall time improves by 108 ms (-17%) and FPS by 20%.
 
-* every node output is *identical* to the pre-change implementation when the
-  per-node check downloads each node's output (all 184 comparable nodes, max
-  diff 0), so the arithmetic is right;
-* without those intermediate downloads the final result differs, and the first
-  node whose output changes is the SPPF `MaxPool`, i.e. the effect depends on
-  the pool's recycled offsets rather than on a node's own math;
-* the graph output buffer itself is stable (three downloads, identical), no
-  allocation overlaps a live tensor or a cached panel, the kernel table is
-  under its 128-entry limit (114 blobs) and the code/uniform areas fit;
-* a fresh vc4d (zeroed arena) still shows it, and poisoning the free pool
-  changes the result, so something reads a buffer region that is written for
-  one allocation layout but not another.
+Output against `ref_onnx` (`|got-ref| <= 5e-4 + 5e-4*max(|ref|,1)`):
+**0/44100**, max abs 0.0204, in **20/20 fresh processes and 20/20 repeats in
+one process** (`/tmp/vc4t/det20.py`).  Before the coherency fix the same model
+reported 12-80 elements over tolerance on a first run and ~22,700 on repeats,
+varying per process.
 
-That is one bug, not a design problem, but it is not fixed, so the wiring is
-kept out of `main`: the executor still reports the 17.08 MB debt above.  The
-next step is to bisect the wiring per op with the pool layout pinned.
+#### 10.4.4 What the device paths refuse (named, never a host fallback)
+
+These raise `UnsupportedNode` with the invariant in the message; they are not
+widened to make a byte count smaller:
+
+| op | refused | invariant that blocks it |
+|---|---|---|
+| Resize | any nearest other than exact 2x NHWC | the source index of an output pixel is `floor(x*in/out)`, not affine in the vector index (a pixel repeats every `C/16` vectors while the row step is a different constant); it needs a per-output gather table or a `--dup N` kernel variant |
+| Transpose | any perm other than `[0,2,1,3]` on a 4-D NCHW tensor | the affine copy needs the vector to be 16 consecutive words of one stream and a single (row, block) decomposition; a general permute needs a rank-generic index table |
+| Slice | two sliced axes, or a sliced axis followed by a non-full axis | the output row must be one contiguous run of the source |
+| Concat | axes other than 1 on 4-D NHWC / 1 and -1 on 3-D | the destination vector is a pixel's 16-channel block |
+| Conv / to_nhwc | an NHWC tensor needing a *different* channel padding | the lane count is a uniform, not a permutation |
+| Softmax | more than 16 classes | the fused kernel's 16-lane rows (engine limit, unchanged) |
 
 ### 10.5 The per-node report and boundary copies
 

@@ -19,8 +19,24 @@ plane only (framework, allocation, I/O); there is no CPU compute fallback.
 - `vc4d/`     privileged helper daemon (protocol v2): /dev/mem and V3D
               dispatch in one small root process that drops capabilities, so
               the engine can run as an ordinary user (`docs/DAEMON.md`)
-- `tools/`    QPU encoder/launcher, verification harnesses, and
+- `tools/`    QPU encoder/launcher, verification harnesses,
               `qpu_disasm.py` (blob disassembler that fails on unknown opcodes)
+              and `build-fast.sh` (memory-aware parallel builds with ccache)
+
+## Building
+
+Builds on this board are memory-bound, not CPU-bound.  The engine is safe at
+`-j4` (171 MiB peak tree RSS, no swap); the VC4C compiler is not, because one
+LLVM-weight C++ translation unit peaks at ~400 MiB, so `-j4` pushes 800 MiB
+into swap and ends up *slower* than `-j2`.  `tools/build-fast.sh` picks the
+largest job count that fits in `MemAvailable`, enables ccache when it is
+installed, and prints the chosen jobs, memory, elapsed time and cache hit
+rate.  Full matrix and numbers: [docs/BUILD.md](docs/BUILD.md).
+
+```sh
+tools/build-fast.sh /home/raspi/work/engine-daemon --clean
+BUILD_FAST_TARGET=VC4CC tools/build-fast.sh /home/raspi/work/combined/build
+```
 
 ## Measured ceilings (stock 300/400 MHz, no overclock)
 

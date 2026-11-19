@@ -250,6 +250,8 @@ vc4_status vc4_softmax_fwd(vc4_ctx *ctx, const vc4_buf *logits,
         lp[i] = -1e30f;
     memset(labels, 0, (size_t)rows * 4 + 64);
     memset(op, 0, (size_t)rows * 64 + 64);
+    /* the logits are arena data the QPU wrote: drop our cached copies first */
+    vc4__invalidate_off(ctx, logits->off, (size_t)rows * cols * 4);
     for (uint32_t r = 0; r < rows; ++r)
         memcpy(lp + (size_t)r * 16u,
                ctx->arena + logits->off + (size_t)r * cols * 4,
@@ -291,6 +293,7 @@ vc4_status vc4_softmax_fwd(vc4_ctx *ctx, const vc4_buf *logits,
     }
     if (st == VC4_OK) {
         vc4__l2_flush(ctx);
+        vc4__invalidate_off(ctx, out->off, (size_t)rows * cols * 4);
         for (uint32_t r = 0; r < rows; ++r)
             memcpy(ctx->arena + out->off + (size_t)r * cols * 4,
                    op + (size_t)r * 16u, (size_t)cols * 4);

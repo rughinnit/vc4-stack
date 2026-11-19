@@ -138,15 +138,22 @@ vc4_status vc4_elementwise(vc4_ctx *ctx, vc4_op op,
         float *ap = vc4__scratch_alloc(ctx, np * 4, NULL);
         if (!ap)
             return VC4_ERR_NOMEM;
-        memcpy((uint8_t *)ap, ctx->arena + a->off, n * 4);
+        vc4__invalidate_off(ctx, a->off, n * 4);
+        vc4__write(ctx, (uint32_t)((uint8_t *)ap - ctx->arena),
+                   ctx->arena + a->off, n * 4);
         memset((uint8_t *)ap + n * 4, 0, (np - n) * 4);
+        vc4__mark_dirty(ctx, (uint32_t)((uint8_t *)ap - ctx->arena), np * 4);
         a_bus = ctx->gpu_bus + (uint32_t)((uint8_t *)ap - ctx->arena);
         if (ew_is_binary(op)) {
             float *bp = vc4__scratch_alloc(ctx, np * 4, NULL);
             if (!bp)
                 return VC4_ERR_NOMEM;
-            memcpy((uint8_t *)bp, ctx->arena + b->off, n * 4);
+            vc4__invalidate_off(ctx, b->off, n * 4);
+            vc4__write(ctx, (uint32_t)((uint8_t *)bp - ctx->arena),
+                       ctx->arena + b->off, n * 4);
             memset((uint8_t *)bp + n * 4, 0, (np - n) * 4);
+            vc4__mark_dirty(ctx, (uint32_t)((uint8_t *)bp - ctx->arena),
+                            np * 4);
             b_bus = ctx->gpu_bus + (uint32_t)((uint8_t *)bp - ctx->arena);
         }
         o_tmp = vc4__scratch_alloc(ctx, np * 4, NULL);
@@ -160,8 +167,7 @@ vc4_status vc4_elementwise(vc4_ctx *ctx, vc4_op op,
         ctx->st.flops += (uint64_t)n * (ew_is_binary(op) ? 1 : 4);
         if (o_tmp) {
             vc4__l2_flush(ctx);
-            memcpy(ctx->arena + out->off, (uint8_t *)o_tmp, n * 4);
-            vc4__mark_dirty(ctx, out->off, n * 4);
+            vc4__write(ctx, out->off, o_tmp, n * 4);
         }
     }
     vc4__scratch_reset(ctx);

@@ -63,6 +63,11 @@ uint32_t  *vc4__uni(vc4_ctx *ctx, const vc4_kernel *k, int qpu);
 int        vc4__health(vc4_ctx *ctx);
 void       vc4__l2_flush(vc4_ctx *ctx);
 void       vc4__write(vc4_ctx *ctx, uint32_t off, const void *src, size_t bytes);
+/* Drop the client cache lines for a range before the CPU writes it: the arena
+ * mapping is cacheable, so a surviving clean line would be written back by
+ * the pre-launch clean and would overlay what the QPU put there. */
+void       vc4__invalidate_off(vc4_ctx *ctx, uint32_t off, size_t bytes);
+void       vc4__invalidate(void *p, size_t bytes);
 void      *vc4__scratch_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out);
 void       vc4__scratch_reset(vc4_ctx *ctx);
 

@@ -130,6 +130,8 @@ class Engine:
         L.vc4_upload.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf), ctypes.c_void_p,
                                  ctypes.c_size_t]
         L.vc4_upload.restype = ctypes.c_int
+        L.vc4_invalidate_buf.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)]
+        L.vc4_invalidate_buf.restype = None
         L.vc4_download.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
                                    ctypes.c_void_p, ctypes.c_size_t]
         L.vc4_download.restype = ctypes.c_int
@@ -319,9 +321,19 @@ class Engine:
         return np.frombuffer(raw.raw, dtype=np.float32) if np is not None else raw.raw
 
     def view(self, buf, count):
-        """Zero-copy view of the uncached arena mapping (numpy required)."""
+        """Zero-copy view of the arena mapping (numpy required).
+
+        The mapping is cacheable, so the bytes the QPU wrote are only visible
+        after an invalidate: vc4_download does the same maintenance before it
+        copies, and this does it before handing out the pointer.  The view is
+        read-only in spirit -- writing through it needs the range invalidated
+        first (vc4infer.upload takes care of that), otherwise the clean that
+        precedes the next launch writes the whole cache line back and would
+        overlay whatever the QPU has put in the rest of it.
+        """
         if np is None:
             raise RuntimeError("numpy is not installed")
+        self.lib.vc4_invalidate_buf(self.ctx, ctypes.byref(buf))
         p = self.lib.vc4_host_ptr(self.ctx, ctypes.byref(buf))
         return np.ctypeslib.as_array((ctypes.c_float * count).from_address(p))
 

@@ -165,14 +165,19 @@ void vc4__mark_dirty(vc4_ctx *ctx, uint32_t off, size_t bytes)
         vc4__remote_mark(ctx, off, bytes);
 }
 
-/* CPU write into the arena: flush first so no stale dirty L2 line can be
-   written back over the fresh data afterwards.  The remote mapping is
-   cacheable, so the range is remembered and cleaned before the next launch. */
+/* CPU write into the arena.  Two requirements, both about the cacheable
+ * client mapping:
+ *   - stale lines of *ours* must not survive into the range (a later clean
+ *     would write them back over what the QPU has since written), so the
+ *     range is invalidated before the memcpy;
+ *   - the range is then marked dirty so the launch path cleans it, which is
+ *     what makes the QPU see the data at all. */
 void vc4__write(vc4_ctx *ctx, uint32_t off, const void *src, size_t bytes)
 {
     if (!ctx || (!src && bytes))
         return;
     if (!ctx->v3d) {
+        vc4__invalidate(ctx->arena + off, bytes);
         memcpy(ctx->arena + off, src, bytes);
         vc4__mark_dirty(ctx, off, bytes);
         __sync_synchronize();

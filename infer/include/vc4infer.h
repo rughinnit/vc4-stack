@@ -95,7 +95,16 @@ size_t vc4_arena_used(const vc4_ctx *ctx);
 vc4_status vc4_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out);      /* persistent */
 vc4_status vc4_upload(vc4_ctx *ctx, vc4_buf *b, const void *src, size_t bytes);
 vc4_status vc4_download(vc4_ctx *ctx, const vc4_buf *b, void *dst, size_t bytes);
-void      *vc4_host_ptr(vc4_ctx *ctx, const vc4_buf *b);   /* uncached mapping */
+void      *vc4_host_ptr(vc4_ctx *ctx, const vc4_buf *b);   /* cacheable mapping */
+/*
+ * Drop the client CPU's cached copies of a buffer.  The client's arena mapping
+ * is cacheable (the daemon's /dev/mem view is not), so a zero-copy reader must
+ * invalidate before touching GPU-written bytes, and a zero-copy writer must
+ * invalidate first or the clean that precedes the next launch writes the stale
+ * rest of a cache line back over the QPU's data.  vc4_upload and vc4_download
+ * already do this; use this only for vc4_host_ptr().
+ */
+void       vc4_invalidate_buf(vc4_ctx *ctx, const vc4_buf *b);
 uint32_t   vc4_bus_addr(const vc4_ctx *ctx, const vc4_buf *b);
 
 /* --------------------------------------------------------------------- ops */

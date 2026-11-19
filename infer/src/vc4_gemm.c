@@ -197,6 +197,7 @@ vc4_status vc4_matmul(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
                        ctx->gpu_bus + pb.off);
     if (st == VC4_OK && c_tmp) {
         vc4__l2_flush(ctx);
+        vc4__invalidate_off(ctx, C->off, (size_t)M * N * 4);
         for (uint32_t r = 0; r < M; ++r)
             memcpy(ctx->arena + C->off + (size_t)r * N * 4,
                    (uint8_t *)c_tmp + (size_t)r * Np * 4, (size_t)N * 4);

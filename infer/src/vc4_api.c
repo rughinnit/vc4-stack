@@ -79,6 +79,13 @@ static const vc4_op_info OPS[] = {
     { "quantize/dequantize", "-", 0, "not written" },
 };
 
+void vc4_invalidate_buf(vc4_ctx *ctx, const vc4_buf *b)
+{
+    if (!ctx || !b || !ctx->arena)
+        return;
+    vc4__invalidate(ctx->arena + b->off, b->bytes);
+}
+
 const vc4_op_info *vc4_supported_ops(size_t *count)
 {
     if (count)

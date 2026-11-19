@@ -1,0 +1,38 @@
+[Unit]
+Description=vc4d - VideoCore IV QPU helper daemon
+Documentation=file:/usr/local/share/doc/vc4d/README.md
+After=local-fs.target
+# the daemon needs /dev/mem for the V3D window and the dma-buf arena
+ConditionPathExists=/dev/mem
+
+[Service]
+Type=simple
+# Must start as root (CAP_SYS_RAWIO) to mmap /dev/mem once; vc4d then drops
+# to an unprivileged uid with an empty capability set before serving clients.
+ExecStart=/usr/local/sbin/vc4d --socket /run/vc4d.sock --arena-mb 72 \
+          --group vc4 --drop-user nobody --max-timeout-ms 10000
+Environment=VC4D_GPU_LOCK=1
+Restart=on-failure
+RestartSec=2
+StartLimitBurst=5
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ReadWritePaths=/run /tmp
+ProtectHome=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+LimitNOFILE=256
+DevicePolicy=closed
+DeviceAllow=/dev/null rw
+DeviceAllow=/dev/urandom r
+DeviceAllow=/dev/mem rw
+DeviceAllow=/dev/dma_heap/linux,cma rw
+DeviceAllow=/dev/vcio rw
+CapabilityBoundingSet=CAP_SYS_RAWIO CAP_CHOWN CAP_SETGID CAP_SETUID
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

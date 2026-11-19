@@ -235,8 +235,13 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
     /* The daemon hands out regions from its data heap only. */
     size_t max = info.arena_bytes > info.data_base
                      ? (size_t)(info.arena_bytes - info.data_base) : 0;
-    if (arena_bytes == 0)
-        arena_bytes = VC4_ARENA_DEFAULT;
+    if (arena_bytes == 0) {
+        /* same override as the direct path (vc4_dev.c env_arena), so a bigger
+           model can be run against a daemon that serves a bigger arena */
+        const char *e = getenv("VC4INFER_ARENA_MB");
+        long mb = e ? strtol(e, NULL, 10) : 0;
+        arena_bytes = mb > 0 ? (size_t)mb << 20 : VC4_ARENA_DEFAULT;
+    }
     size_t want = arena_bytes < max ? arena_bytes : max;
     want &= ~(size_t)4095;
     if (want < REMOTE_MIN_ARENA) {

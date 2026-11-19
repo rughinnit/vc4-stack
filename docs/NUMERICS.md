@@ -22,7 +22,13 @@ Consequences:
   r5 makes the DMA read garbage rows (V3D_ERRORS bit 5, VPM read range).
 - VPM fields that would be 16 are encoded as 0.
 - The dma-buf bus base is not stable across boots; take it from a runtime uniform.
-- One group per QPU per launch; long elementwise bodies hang with a second group.
+- One group per QPU per launch; long elementwise bodies hang with a second
+  group.  Re-measured 2026-11-19 while trying to batch the YOLO SiLU passes: at
+  two groups/QPU `sigmoid`/`silu` reliably time the V3D out (daemon dead, board
+  needs a reboot) and `add` corrupted the second group of every QPU on the first
+  launch.  Adding the VPM-DMA *read* wait (A-file r50) before the store did not
+  help; the store already waits for the VPM *store* (B-file r50) after each
+  chunk.
 - Unary elementwise kernels must still pass a valid second operand address: a TMU
   load from 0 wedges the QPU.
 - Pack/im2col must keep Q in an A-file register; a B-file read used as an A address

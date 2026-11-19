@@ -62,7 +62,7 @@ install -m 0755 "$so" "$stage/usr/lib/$triplet/libvc4infer.so.1"
 install -m 0644 "$root/include/vc4infer.h" "$stage/usr/include/vc4infer.h"
 
 # ---- kernel generator for C clients (the Python package has its own copy) ---
-for f in kgen.py qenc.py gen.py vpmwords.py; do
+for f in kgen.py kops.py qenc.py gen.py vpmwords.py; do
 	install -m 0644 "$root/tools/$f" "$stage/usr/lib/vc4infer/kgen/$f"
 done
 

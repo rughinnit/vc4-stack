@@ -3328,19 +3328,25 @@ def main(argv):
         return 2
     kind, out = argv[1], argv[2]
     opts = {}
+    used = set()
     i = 3
     while i < len(argv):
         opts[argv[i].lstrip('-')] = argv[i + 1]
         i += 2
 
     def g(k, d=None):
+        used.add(k)
         return int(opts[k]) if k in opts else d
+
+    def _opt(k, d=None):
+        used.add(k)
+        return _opt(k, d)
 
     if kind == 'gemm':
         # the asm10 kernel: 8x64 tiles, 3-phase k loop (build_gemm above is the
         # asm3 16x16 generator, kept as 'gemm3' for A/B and reference)
         p = build_gemm10(g('M'), g('N'), g('K'), g('nqpu', 12),
-                         opts.get('probe'), bool(g('single', 0)))
+                         _opt('probe'), bool(g('single', 0)))
     elif kind == 'gemm3':
         p = build_gemm(g('M'), g('N'), g('K'), g('nqpu', 12), g('bmode', 0),
                        g('depth', 3), g('cstride', None))
@@ -3350,12 +3356,12 @@ def main(argv):
         p = build_pack(g('kblocks'), g('vpitch', 1), g('dstride', 0))
     elif kind == 'im2col':
         p = build_im2col(g('cin'), g('k'), g('kh'), g('kw'), g('vpitch', 1),
-                         opts.get('vout', 'k'))
+                         _opt('vout', 'k'))
     elif kind == 'col2im':
         p = build_col2im(g('cin'), g('k'), g('kh'), g('kw'),
                          g('wp'), g('hp'))
     elif kind == 'pool':
-        p = build_pool(g('h'), g('w'), g('op'), opts.get('mode', 'fwd'))
+        p = build_pool(g('h'), g('w'), g('op'), _opt('mode', 'fwd'))
     elif kind == 'pooln':
         p = build_pooln(g('n'), g('s'), g('wp'), g('op'))
     elif kind == 'im2col_nhwc':
@@ -3377,8 +3383,14 @@ def main(argv):
         p = build_copy_nhwc(g('cin'), g('cout'))
     elif kind == 'ew':
         p = build_ew(g('op'))
+    elif kind in ('uop', 'sel3', 'gather', 'blit', 'reduce', 'cumsum'):
+        # generic kernels for the numeric op long tail (kops.py): they reuse
+        # build_ew's verified harness and only replace the body.
+        import kops
+        p = kops.build(sys.modules[__name__], kind, opts)
+        used.update(('op', 'nvec'))
     elif kind == 'softmax':
-        pr = opts.get('probe')
+        pr = _opt('probe')
         p = build_softmax(probe=None if pr in (None, 'full') else pr)
     elif kind in ('uop', 'sel3', 'gather', 'reduce', 'cumsum', 'blit'):
         # generic kernels for the numeric op long tail (kops.py)
@@ -3386,6 +3398,12 @@ def main(argv):
         p = kops.build(sys.modules[__name__], kind, opts)
     else:
         print("unknown kernel kind %r" % kind, file=sys.stderr)
+        return 2
+    unknown = set(opts) - used
+    if unknown:
+        print("kgen: %s: unknown option(s) %s: the caller expects a kernel this "
+              "generator cannot build, refusing to emit a silently different one"
+              % (kind, ", ".join(sorted(unknown))), file=sys.stderr)
         return 2
     if hasattr(p, '_builder'):
         n = p._builder.report(out)

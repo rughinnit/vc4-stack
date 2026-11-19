@@ -1,0 +1,1301 @@
+#!/usr/bin/env python3
+"""kops - generic QPU kernels for the numeric op long tail of the ONNX runner.
+
+`build(kgen_module, kind, opts)` is called from kgen.main().  Every kernel
+reuses the verified building blocks in kgen.py: the QPU encoder (qenc.py),
+the verified VPM->DMA stores (`emit_store16` / `_store4`), the TMU
+issue/pop rule and the Builder's no-forwarding checker.
+
+Kinds
+    uop     --op NAME      out = f(a)               unary math (UOPS)
+    sel3    --op NAME      out = f(a,b,c)           where / clip3 / prelu
+    gather                 out[o] = arena[tab[o]]   int32 byte-offset table
+    reduce  --op NAME      out[o] = reduce_r a[o*red + r]
+    cumsum                 out[r][c] = sum_{c'<=c} a[r][c']  (padded cols)
+
+Kernel ABI (one 64 B uniform block per QPU; all offsets are arena bytes)
+    uop     u0 a bus, u1 out bus, u2 groups, u3 qid, u4 nqpu,
+            u5,u6,u7 float parameters (op attributes)
+    sel3    u0 a, u1 b, u2 c, u3 out, u4 groups, u5 qid, u6 nqpu, u7 op
+    gather  u0 table bus, u1 out bus, u2 groups, u3 qid, u4 nqpu,
+            u5 arena bus base, u6 fill (float bits)
+    reduce  u0 a bus, u1 out bus, u2 groups for this QPU, u3 qid, u4 nqpu,
+            u5 red, u6 op, u7 in offset, u8 in gap, u9 in step,
+            u10 out offset, u11 out step, u12 out gap, u13 1/red,
+            u14 lanestride (red*4)
+    cumsum  u0 a bus, u1 out bus, u2 groups, u3 qid, u4 nqpu, u5 cols
+
+A "group" is NVEC vectors of 16 lanes; QPU q runs groups q, q+nqpu, ...
+Each vector produces 16 consecutive output floats.  The QPU FPU truncates
+(round toward zero) on both fadd and fmul, so every transcendental here is
+range reduction + minimax polynomial + exact integer scaling.
+"""
+import struct
+
+# ---------------------------------------------------------------- registers
+A_VPMQ, A_CADR = 25, 28                     # reserved: the store sequences
+B_STEP, B_CSTEP, B_VPMQ7 = 22, 24, 23
+A_AB, A_OB, A_CNT, A_QID, A_NQ = 16, 17, 18, 19, 20
+A_IB, A_OB2, A_P0, A_P1, A_P2 = 21, 22, 23, 24, 26
+A_T0, A_T1, A_T2, A_T3 = 27, 29, 30, 31
+# reduce kernel loop state (distinct from the ctx A temps, which reduce does
+# not use)
+A_RA, A_RIDX, A_NR, A_BESTI = 23, 24, 31, 26
+A_INBASE, A_OUTBASE = 30, 29
+B_C64, B_GAP, B_NEG1, B_V4, B_V9 = 21, 17, 20, 19, 18
+
+M32 = 0xFFFFFFFF
+ACC0, ACC1, ACC2, ACC3 = 100, 101, 102, 103
+
+
+def _fb(x):
+    return struct.unpack('<I', struct.pack('<f', x))[0]
+
+
+def _d(reg):
+    if reg >= 200:
+        return reg - 200, 1
+    if reg >= 100:
+        return 32 + reg - 100, 0
+    return reg, 0
+
+
+def _s(k, reg):
+    if reg >= 200:
+        return k.breg(reg - 200)
+    if reg >= 100:
+        return k.acc(reg - 100)
+    return k.areg(reg)
+
+
+def _bank(reg):
+    if reg >= 200:
+        return 'B'
+    if reg >= 100:
+        return 'C'
+    return 'A'
+
+
+class E:
+    """ALU emitter with automatic bank-conflict staging.
+
+    The VC4 ALU can read at most one A-file and one B-file register per
+    instruction (qenc raises otherwise).  Constants live in B and temps in A,
+    so `B op B` and `A op A` words are common; the emitter stages the second
+    operand through acc2, which no body or core uses for data.
+    """
+
+    def __init__(self, k, b, ctx):
+        self.k, self.b, self.ctx = k, b, ctx
+
+    def _fit(self, a, bb):
+        if bb is None or a == bb:
+            return a, bb
+        ba, bbb = _bank(a), _bank(bb)
+        if ba == bbb and ba in ('A', 'B'):
+            self.mov(ACC2, bb)
+            return a, ACC2
+        return a, bb
+
+    def op(self, op, out, a, bb=None, sf=0):
+        a, bb = self._fit(a, bb)
+        o, ws = _d(out)
+        d = dict(add_op=op, add_out=o, ws=ws, add_a=_s(self.k, a), sf=sf)
+        if bb is not None:
+            d['add_b'] = _s(self.k, bb)
+        self.b.e(d)
+
+    def opi(self, op, out, a, imm):
+        if _bank(a) == 'B':
+            # a B register and a small immediate cannot share one word
+            self.mov(ACC2, a)
+            a = ACC2
+        o, ws = _d(out)
+        self.b.e(dict(add_op=op, add_out=o, ws=ws, add_a=_s(self.k, a),
+                      add_b=self.k.imm(imm)))
+
+    def mul(self, out, a, bb):
+        a, bb = self._fit(a, bb)
+        if 100 <= out < 200:
+            o = 32 + out - 100
+        else:
+            o = 32 + 3
+        self.b.e(dict(mul_op=self.k.MUL_FMUL, mul_out=o, ws=0,
+                      mul_a=_s(self.k, a), mul_b=_s(self.k, bb)))
+        self.b.e(self.k.nop(), self.k.nop())
+        if not (100 <= out < 200):
+            self.mov(out, ACC3)
+
+    def mul24(self, out, a, bb):
+        a, bb = self._fit(a, bb)
+        assert 100 <= out < 200, "MUL24 result must be an accumulator"
+        self.b.e(dict(mul_op=self.k.MUL_MUL24, mul_out=32 + out - 100, ws=0,
+                      mul_a=_s(self.k, a), mul_b=_s(self.k, bb)))
+
+    def mov(self, out, a):
+        o, ws = _d(out)
+        self.b.e(dict(add_op=self.k.ADD_OR, add_out=o, ws=ws,
+                      add_a=_s(self.k, a), add_b=_s(self.k, a)))
+
+
+class Ctx:
+    """Constant lookup + scratch registers for one vector body."""
+
+    def __init__(self, consts):
+        self.c = consts
+        # A_T0..3, then the prologue-only A registers (bus bases, qid, nqpu):
+        # all dead once the group loop starts.
+        self.a_free = [A_T0, A_T1, A_T2, A_T3, A_AB, A_OB, A_QID, A_NQ]
+        used = set(v[1] for v in consts.values() if v[0] == 'B')
+        self.b_free = [n for n in range(0, 16) if n not in used]
+        self.b_free += [n for n in range(25, 32) if n not in used]
+        self.a0 = list(self.a_free)
+        self.b0 = list(self.b_free)
+
+    def reset(self):
+        """Every vector body starts with the whole scratch pool again."""
+        self.a_free = list(self.a0)
+        self.b_free = list(self.b0)
+
+    def no_a(self):
+        self.a_free = []
+        self.a0 = []
+
+    def k(self, name):
+        bank, reg = self.c[name]
+        return 200 + reg if bank == 'B' else reg
+
+    def ta(self):
+        if self.a_free:
+            return self.a_free.pop(0)
+        return 200 + self.b_free.pop(0)
+
+    def tb(self):
+        if self.b_free:
+            return 200 + self.b_free.pop(0)
+        return self.a_free.pop(0)
+
+    def rel(self, *rs):
+        for r in rs:
+            if r >= 200:
+                self.b_free.insert(0, r - 200)
+            else:
+                self.a_free.insert(0, r)
+
+
+# ---------------------------------------------------------------- helpers
+def gt_mask(e, out, d):
+    k = e.k
+    e.opi(k.ADD_SUB, out, d, 1)
+    e.opi(k.ADD_ASR, out, out, 31)
+    e.op(k.ADD_NOT, out, out, out)
+
+
+def eq0_mask(e, out, d, t):
+    k = e.k
+    e.op(k.ADD_OR, t, d, d)
+    e.opi(k.ADD_SUB, t, t, 1)
+    e.opi(k.ADD_ASR, t, t, 31)
+    e.opi(k.ADD_ASR, out, d, 31)
+    e.op(k.ADD_NOT, out, out, out)
+    e.op(k.ADD_AND, out, out, t)
+
+
+def sel(e, out, mask, a_true, b_false, t):
+    k = e.k
+    e.op(k.ADD_AND, t, mask, a_true)
+    e.op(k.ADD_NOT, out, mask, mask)
+    e.op(k.ADD_AND, out, out, b_false)
+    e.op(k.ADD_OR, out, out, t)
+
+
+def core_exp2(e, t, out, z, sc):
+    """out = 2^t for t in [-126,128]; t,out,z,sc distinct accs."""
+    k = e.k
+    e.op(k.ADD_FMAX, t, t, e.ctx.k('EXP_LO'))
+    e.op(k.ADD_FMIN, t, t, e.ctx.k('EXP_HI'))
+    e.op(k.ADD_FADD, z, t, e.ctx.k('HALF'))
+    e.op(k.ADD_FADD, z, z, e.ctx.k('MAGIC'))
+    e.op(k.ADD_FTOI, sc, z, z)
+    e.opi(k.ADD_SHL, sc, sc, 8)
+    e.opi(k.ADD_SHL, sc, sc, 15)
+    e.op(k.ADD_ADD, sc, sc, e.ctx.k('ONE'))
+    e.op(k.ADD_FSUB, z, z, e.ctx.k('MAGIC'))
+    e.op(k.ADD_FSUB, t, t, z)
+    e.op(k.ADD_OR, out, e.ctx.k('E5'), e.ctx.k('E5'))
+    for c in ('E4', 'E3', 'E2', 'E1'):
+        e.mul(out, out, t)
+        e.op(k.ADD_FADD, out, out, e.ctx.k(c))
+    e.mul(out, out, t)
+    e.op(k.ADD_FADD, out, out, e.ctx.k('ONE'))
+    e.mul(out, out, sc)
+
+
+def core_rcp(e, d, out, q):
+    k = e.k
+    e.op(k.ADD_SUB, out, e.ctx.k('RCPM'), d)
+    for _ in range(4):
+        e.mul(q, out, d)
+        e.op(k.ADD_FSUB, q, e.ctx.k('TWO'), q)
+        e.mul(out, out, q)
+
+
+def core_rsqrt(e, a, out, q):
+    k = e.k
+    e.opi(k.ADD_SHR, out, a, 1)
+    e.op(k.ADD_SUB, out, e.ctx.k('RSQRTC'), out)
+    for _ in range(4):
+        e.mul(q, a, out)
+        e.mul(q, q, out)
+        e.mul(q, q, e.ctx.k('HALF'))
+        e.op(k.ADD_FSUB, q, e.ctx.k('THREEH'), q)
+        e.mul(out, out, q)
+
+
+def core_tanh(e, x, out, t1, t2, t3):
+    k = e.k
+    ax = e.ctx.ta()
+    e.op(k.ADD_AND, ax, x, e.ctx.k('ABSM'))
+    e.op(k.ADD_FMIN, ax, ax, e.ctx.k('T44'))
+    e.mul(t1, ax, e.ctx.k('NLOG2E2'))
+    core_exp2(e, t1, out, t2, t3)
+    e.op(k.ADD_FADD, t2, out, e.ctx.k('ONE'))
+    core_rcp(e, t2, t1, t3)
+    e.op(k.ADD_FSUB, t3, e.ctx.k('ONE'), out)
+    e.mul(t3, t3, t1)
+    e.op(k.ADD_AND, t1, x, e.ctx.k('SIGNB'))
+    e.op(k.ADD_OR, out, t3, t1)
+    e.ctx.rel(ax)
+
+
+def core_erf(e, x, out, t1, t2, t3):
+    k = e.k
+    a = e.ctx.ta()
+    e.op(k.ADD_AND, a, x, e.ctx.k('ABSM'))
+    e.op(k.ADD_FMIN, a, a, e.ctx.k('SIX'))
+    e.mul(t1, a, e.ctx.k('ERFC1'))
+    e.op(k.ADD_FADD, t1, t1, e.ctx.k('ONE'))
+    core_rcp(e, t1, t2, t3)
+    p = e.ctx.ta()
+    e.op(k.ADD_OR, p, e.ctx.k('ERF5'), e.ctx.k('ERF5'))
+    for c in ('ERF4', 'ERF3', 'ERF2', 'ERF1'):
+        e.mul(p, p, t2)
+        e.op(k.ADD_FADD, p, p, e.ctx.k(c))
+    e.mul(p, p, t2)
+    e.mul(t1, a, a)
+    e.mul(t1, t1, e.ctx.k('NLOG2E'))
+    core_exp2(e, t1, t1, t3, t2)
+    e.mul(p, p, t1)
+    e.op(k.ADD_FSUB, p, e.ctx.k('ONE'), p)
+    e.op(k.ADD_AND, t1, x, e.ctx.k('SIGNB'))
+    e.op(k.ADD_OR, out, p, t1)
+    e.ctx.rel(a, p)
+
+
+# ---------------------------------------------------------------- bodies
+def b_abs(e, IN, OUT):
+    e.op(e.k.ADD_AND, OUT, IN, e.ctx.k('ABSM'))
+
+
+def b_neg(e, IN, OUT):
+    e.op(e.k.ADD_XOR, OUT, IN, e.ctx.k('SIGNB'))
+
+
+def b_identity(e, IN, OUT):
+    e.mov(OUT, IN)
+
+
+def b_clip(e, IN, OUT):
+    k = e.k
+    e.op(k.ADD_FMAX, IN, IN, e.ctx.k('P_LO'))
+    e.op(k.ADD_FMIN, OUT, IN, e.ctx.k('P_HI'))
+
+
+def b_leakyrelu(e, IN, OUT):
+    k = e.k
+    t = e.ctx.tb()
+    e.op(k.ADD_FMAX, OUT, IN, e.ctx.k('ZERO'))
+    e.op(k.ADD_FMIN, t, IN, e.ctx.k('ZERO'))
+    e.mul(t, t, e.ctx.k('ALPHA'))
+    e.op(k.ADD_FADD, OUT, OUT, t)
+    e.ctx.rel(t)
+
+
+def _trunc(e, IN):
+    """n = ceil(|x|) as int, g = -1 iff |x| has a fraction, sg = sign mask."""
+    k = e.k
+    ax = e.ctx.tb()
+    n = e.ctx.tb()
+    fr = e.ctx.tb()
+    g = e.ctx.tb()
+    sg = e.ctx.tb()
+    e.op(k.ADD_AND, ax, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_FTOI, n, ax, ax)
+    e.op(k.ADD_ITOF, fr, n, n)
+    e.op(k.ADD_FSUB, fr, ax, fr)
+    gt_mask(e, g, fr)
+    e.op(k.ADD_SUB, n, n, g)
+    e.opi(k.ADD_ASR, sg, IN, 31)
+    e.ctx.rel(ax, fr)
+    return n, g, sg
+
+
+def b_floor(e, IN, OUT):
+    k = e.k
+    n, g, sg = _trunc(e, IN)
+    fl = e.ctx.tb()
+    e.op(k.ADD_ADD, fl, n, g)
+    t = e.ctx.tb()
+    e.op(k.ADD_SUB, n, k.imm(0), n)
+    sel(e, OUT, sg, n, fl, t)
+    e.op(k.ADD_ITOF, OUT, OUT, OUT)
+    e.ctx.rel(n, g, sg, fl, t)
+
+
+def b_ceil(e, IN, OUT):
+    k = e.k
+    n, g, sg = _trunc(e, IN)
+    fl = e.ctx.tb()
+    e.op(k.ADD_ADD, fl, n, g)
+    t = e.ctx.tb()
+    e.op(k.ADD_SUB, fl, k.imm(0), fl)
+    sel(e, OUT, sg, fl, n, t)
+    e.op(k.ADD_ITOF, OUT, OUT, OUT)
+    e.ctx.rel(n, g, sg, fl, t)
+
+
+def b_round(e, IN, OUT):
+    """ONNX Round: nearest, ties to even, all integer work."""
+    k = e.k
+    n = e.ctx.tb()
+    nf = e.ctx.tb()
+    fr = e.ctx.tb()
+    d = e.ctx.tb()
+    mk = e.ctx.tb()
+    lsb = e.ctx.tb()
+    e.op(k.ADD_FTOI, n, IN, IN)
+    e.op(k.ADD_ITOF, nf, n, n)
+    e.op(k.ADD_FSUB, fr, IN, nf)
+    e.op(k.ADD_AND, lsb, n, e.ctx.k('ONE_I'))
+    e.op(k.ADD_FSUB, d, fr, e.ctx.k('HALF'))
+    gt_mask(e, mk, d)
+    e.op(k.ADD_SUB, n, n, mk)
+    eq0_mask(e, mk, d, e.ctx.tb())
+    e.op(k.ADD_AND, mk, mk, lsb)
+    e.op(k.ADD_ADD, n, n, mk)
+    e.op(k.ADD_FADD, d, fr, e.ctx.k('HALF'))
+    e.opi(k.ADD_ASR, mk, d, 31)
+    e.op(k.ADD_ADD, n, n, mk)
+    eq0_mask(e, mk, d, e.ctx.tb())
+    e.op(k.ADD_AND, mk, mk, lsb)
+    e.op(k.ADD_SUB, n, n, mk)
+    e.op(k.ADD_ITOF, OUT, n, n)
+    e.ctx.rel(n, nf, fr, d, mk, lsb)
+
+
+def b_sign(e, IN, OUT):
+    k = e.k
+    m1 = e.ctx.tb()
+    m2 = e.ctx.tb()
+    t = e.ctx.tb()
+    gt_mask(e, m1, IN)
+    e.op(k.ADD_XOR, t, IN, e.ctx.k('SIGNB'))
+    gt_mask(e, m2, t)
+    e.op(k.ADD_AND, m1, m1, e.ctx.k('ONE'))
+    e.op(k.ADD_AND, m2, m2, e.ctx.k('NEGONE'))
+    e.op(k.ADD_OR, OUT, m1, m2)
+    e.ctx.rel(m1, m2, t)
+
+
+def b_exp(e, IN, OUT):
+    k = e.k
+    t = e.ctx.tb()
+    e.mul(t, IN, e.ctx.k('LOG2E'))
+    core_exp2(e, t, OUT, e.ctx.tb(), e.ctx.tb())
+    e.ctx.rel(t)
+
+
+def b_log(e, IN, OUT):
+    k = e.k
+    ee = e.ctx.tb()
+    m = e.ctx.tb()
+    d = e.ctx.tb()
+    mk = e.ctx.tb()
+    e.op(k.ADD_FMAX, IN, IN, e.ctx.k('TINY'))
+    e.opi(k.ADD_SHR, ee, IN, 23)
+    e.op(k.ADD_SUB, ee, ee, e.ctx.k('C127'))
+    e.op(k.ADD_AND, m, IN, e.ctx.k('MANT'))
+    e.op(k.ADD_OR, m, m, e.ctx.k('ONE'))
+    e.op(k.ADD_FSUB, d, m, e.ctx.k('SQRT2'))
+    gt_mask(e, mk, d)
+    e.mul(d, m, e.ctx.k('HALF'))
+    e.op(k.ADD_AND, d, mk, d)
+    e.op(k.ADD_NOT, m, mk, mk)
+    e.op(k.ADD_AND, m, m, m)
+    e.op(k.ADD_OR, m, m, d)
+    e.op(k.ADD_AND, mk, mk, e.ctx.k('ONE_I'))
+    e.op(k.ADD_ADD, ee, ee, mk)
+    e.ctx.rel(d, mk)
+    num = e.ctx.tb()
+    den = e.ctx.tb()
+    e.op(k.ADD_FSUB, num, m, e.ctx.k('ONE'))
+    e.op(k.ADD_FADD, den, m, e.ctx.k('ONE'))
+    core_rcp(e, den, OUT, e.ctx.tb())
+    e.mul(num, num, OUT)
+    e.ctx.rel(den)
+    u2 = e.ctx.tb()
+    p = e.ctx.tb()
+    e.mul(u2, num, num)
+    e.op(k.ADD_OR, p, e.ctx.k('L4'), e.ctx.k('L4'))
+    for c in ('L3', 'L2', 'L1', 'L0'):
+        e.mul(p, p, u2)
+        e.op(k.ADD_FADD, p, p, e.ctx.k(c))
+    e.mul(p, p, num)
+    e.op(k.ADD_FADD, p, p, p)
+    e.op(k.ADD_ITOF, ee, ee, ee)
+    e.mul(ee, ee, e.ctx.k('LN2'))
+    e.op(k.ADD_FADD, OUT, ee, p)
+    e.ctx.rel(num, u2, p, m, ee)
+
+
+def b_sqrt(e, IN, OUT):
+    k = e.k
+    a = e.ctx.tb()
+    y = e.ctx.tb()
+    e.op(k.ADD_FMAX, a, IN, e.ctx.k('TINY'))
+    core_rsqrt(e, a, y, e.ctx.tb())
+    e.mul(OUT, IN, y)
+    e.ctx.rel(a, y)
+
+
+def b_reciprocal(e, IN, OUT):
+    k = e.k
+    a = e.ctx.tb()
+    e.op(k.ADD_FMAX, a, IN, e.ctx.k('TINY'))
+    e.op(k.ADD_FMIN, a, a, e.ctx.k('BIG'))
+    core_rcp(e, a, OUT, e.ctx.tb())
+    e.ctx.rel(a)
+
+
+def b_tanh(e, IN, OUT):
+    core_tanh(e, IN, OUT, e.ctx.tb(), e.ctx.tb(), e.ctx.tb())
+
+
+def b_erf(e, IN, OUT):
+    core_erf(e, IN, OUT, e.ctx.tb(), e.ctx.tb(), e.ctx.tb())
+
+
+def b_elu(e, IN, OUT):
+    k = e.k
+    m = e.ctx.tb()
+    t = e.ctx.tb()
+    u = e.ctx.tb()
+    gt_mask(e, m, IN)
+    e.op(k.ADD_FMIN, t, IN, e.ctx.k('ZERO'))
+    e.mul(u, t, e.ctx.k('LOG2E'))
+    core_exp2(e, u, u, e.ctx.tb(), e.ctx.tb())
+    e.op(k.ADD_FSUB, u, u, e.ctx.k('ONE'))
+    e.mul(u, u, e.ctx.k('ALPHA'))
+    sel(e, OUT, m, IN, u, t)
+    e.ctx.rel(m, t, u)
+
+
+def b_selu(e, IN, OUT):
+    k = e.k
+    m = e.ctx.tb()
+    t = e.ctx.tb()
+    u = e.ctx.tb()
+    gt_mask(e, m, IN)
+    e.op(k.ADD_FMIN, t, IN, e.ctx.k('ZERO'))
+    e.mul(u, t, e.ctx.k('LOG2E'))
+    core_exp2(e, u, u, e.ctx.tb(), e.ctx.tb())
+    e.op(k.ADD_FSUB, u, u, e.ctx.k('ONE'))
+    e.mul(u, u, e.ctx.k('ALPHA'))
+    sel(e, OUT, m, IN, u, t)
+    e.mul(OUT, OUT, e.ctx.k('GAMMA'))
+    e.ctx.rel(m, t, u)
+
+
+def b_softplus(e, IN, OUT):
+    k = e.k
+    ax = e.ctx.tb()
+    a = e.ctx.tb()
+    e.op(k.ADD_AND, ax, IN, e.ctx.k('ABSM'))
+    e.mul(a, ax, e.ctx.k('NLOG2E'))
+    core_exp2(e, a, a, e.ctx.tb(), e.ctx.tb())
+    e.op(k.ADD_FADD, a, a, e.ctx.k('ONE'))
+    u = e.ctx.tb()
+    den = e.ctx.tb()
+    e.op(k.ADD_FSUB, u, a, e.ctx.k('ONE'))
+    e.op(k.ADD_FADD, den, a, e.ctx.k('ONE'))
+    core_rcp(e, den, den, e.ctx.tb())
+    e.mul(u, u, den)
+    u2 = e.ctx.tb()
+    p = e.ctx.tb()
+    e.mul(u2, u, u)
+    e.op(k.ADD_OR, p, e.ctx.k('L4'), e.ctx.k('L4'))
+    for c in ('L3', 'L2', 'L1', 'L0'):
+        e.mul(p, p, u2)
+        e.op(k.ADD_FADD, p, p, e.ctx.k(c))
+    e.mul(p, p, u)
+    e.op(k.ADD_FADD, p, p, p)
+    e.op(k.ADD_FMAX, ax, IN, e.ctx.k('ZERO'))
+    e.op(k.ADD_FADD, OUT, ax, p)
+    e.ctx.rel(ax, a, u, den, u2, p)
+
+
+def b_softsign(e, IN, OUT):
+    k = e.k
+    a = e.ctx.tb()
+    d = e.ctx.tb()
+    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_FADD, d, a, e.ctx.k('ONE'))
+    core_rcp(e, d, a, e.ctx.tb())
+    e.mul(OUT, IN, a)
+    e.ctx.rel(a, d)
+
+
+def b_gelu(e, IN, OUT):
+    k = e.k
+    x3 = e.ctx.tb()
+    u = e.ctx.tb()
+    e.mul(x3, IN, IN)
+    e.mul(x3, x3, IN)
+    e.mul(x3, x3, e.ctx.k('GELU_C'))
+    e.op(k.ADD_FADD, x3, x3, IN)
+    e.mul(u, x3, e.ctx.k('GELU_S'))
+    core_tanh(e, u, OUT, e.ctx.tb(), e.ctx.tb(), e.ctx.tb())
+    e.op(k.ADD_FADD, OUT, OUT, e.ctx.k('ONE'))
+    e.mul(OUT, OUT, IN)
+    e.mul(OUT, OUT, e.ctx.k('HALF'))
+    e.ctx.rel(x3, u)
+
+
+def b_gelu_erf(e, IN, OUT):
+    k = e.k
+    u = e.ctx.tb()
+    e.mul(u, IN, e.ctx.k('INV_SQRT2'))
+    core_erf(e, u, OUT, e.ctx.tb(), e.ctx.tb(), e.ctx.tb())
+    e.op(k.ADD_FADD, OUT, OUT, e.ctx.k('ONE'))
+    e.mul(OUT, OUT, IN)
+    e.mul(OUT, OUT, e.ctx.k('HALF'))
+    e.ctx.rel(u)
+
+
+def b_hardsigmoid(e, IN, OUT):
+    k = e.k
+    e.mul(OUT, IN, e.ctx.k('ALPHA'))
+    e.op(k.ADD_FADD, OUT, OUT, e.ctx.k('BETA'))
+    e.op(k.ADD_FMAX, OUT, OUT, e.ctx.k('ZERO'))
+    e.op(k.ADD_FMIN, OUT, OUT, e.ctx.k('ONE'))
+
+
+def b_hardswish(e, IN, OUT):
+    k = e.k
+    t = e.ctx.tb()
+    e.mul(t, IN, e.ctx.k('ALPHA'))
+    e.op(k.ADD_FADD, t, t, e.ctx.k('BETA'))
+    e.op(k.ADD_FMAX, t, t, e.ctx.k('ZERO'))
+    e.op(k.ADD_FMIN, t, t, e.ctx.k('ONE'))
+    e.mul(OUT, IN, t)
+    e.ctx.rel(t)
+
+
+def _sincos(e, IN):
+    """Range reduction and both polynomials: (sin r, cos r, q&1, q>>1)."""
+    k = e.k
+    t = e.ctx.tb()
+    q = e.ctx.tb()
+    r = e.ctx.tb()
+    e.mul(t, IN, e.ctx.k('TWO_OVER_PI'))
+    e.op(k.ADD_FADD, q, t, e.ctx.k('HALF'))
+    e.op(k.ADD_FADD, q, q, e.ctx.k('MAGIC'))
+    e.op(k.ADD_FSUB, t, q, e.ctx.k('MAGIC'))
+    e.op(k.ADD_FTOI, q, q, q)
+    q2 = e.ctx.tb()
+    e.op(k.ADD_AND, q2, q, e.ctx.k('THREE'))
+    e.mul(r, t, e.ctx.k('PIO2_HI'))
+    e.op(k.ADD_FSUB, r, IN, r)
+    h = e.ctx.tb()
+    e.mul(h, t, e.ctx.k('PIO2_LO'))
+    e.op(k.ADD_FSUB, r, r, h)
+    r2 = e.ctx.tb()
+    e.mul(r2, r, r)
+    sp = e.ctx.tb()
+    cp = e.ctx.tb()
+    e.op(k.ADD_OR, sp, e.ctx.k('S4'), e.ctx.k('S4'))
+    for c in ('S3', 'S2', 'S1'):
+        e.mul(sp, sp, r2)
+        e.op(k.ADD_FADD, sp, sp, e.ctx.k(c))
+    e.mul(sp, sp, r2)
+    e.op(k.ADD_FADD, sp, sp, e.ctx.k('ONE'))
+    e.mul(sp, sp, r)
+    e.op(k.ADD_OR, cp, e.ctx.k('C4P'), e.ctx.k('C4P'))
+    for c in ('C3P', 'C2P', 'C1P'):
+        e.mul(cp, cp, r2)
+        e.op(k.ADD_FADD, cp, cp, e.ctx.k(c))
+    e.mul(cp, cp, r2)
+    e.op(k.ADD_FADD, cp, cp, e.ctx.k('ONE'))
+    b0 = e.ctx.tb()
+    b1 = e.ctx.tb()
+    e.opi(k.ADD_AND, b0, q2, 1)
+    e.opi(k.ADD_SHR, b1, q2, 1)
+    e.ctx.rel(t, q, r, h, r2)
+    return sp, cp, b0, b1
+
+
+def b_sin(e, IN, OUT):
+    k = e.k
+    sp, cp, b0, b1 = _sincos(e, IN)
+    m = e.ctx.tb()
+    e.opi(k.ADD_SUB, m, b0, 1)
+    e.opi(k.ADD_ASR, m, m, 31)
+    e.op(k.ADD_NOT, m, m, m)
+    e.op(k.ADD_AND, sp, m, cp)
+    e.op(k.ADD_NOT, m, m, m)
+    e.op(k.ADD_AND, cp, m, cp)
+    e.op(k.ADD_OR, sp, sp, cp)
+    e.opi(k.ADD_SHL, b1, b1, 31)
+    e.op(k.ADD_XOR, OUT, sp, b1)
+    e.ctx.rel(sp, cp, b0, b1, m)
+
+
+def b_cos(e, IN, OUT):
+    k = e.k
+    sp, cp, b0, b1 = _sincos(e, IN)
+    m = e.ctx.tb()
+    e.opi(k.ADD_SUB, m, b0, 1)
+    e.opi(k.ADD_ASR, m, m, 31)          # -1 iff b0 == 0
+    e.op(k.ADD_NOT, m, m, m)            # select -sin when b0 == 0
+    e.op(k.ADD_XOR, sp, sp, e.ctx.k('SIGNB'))
+    e.op(k.ADD_AND, sp, m, sp)
+    e.op(k.ADD_NOT, m, m, m)
+    e.op(k.ADD_AND, cp, m, cp)
+    e.op(k.ADD_OR, sp, sp, cp)
+    e.opi(k.ADD_SHL, b1, b1, 31)
+    e.op(k.ADD_XOR, OUT, sp, b1)
+    e.ctx.rel(sp, cp, b0, b1, m)
+
+
+# ---------------------------------------------------------------- constants
+STD = {
+    'ABSM': (0x7FFFFFFF, 0), 'SIGNB': (0x80000000, 0),
+    'ONE': (0x3F800000, 0), 'TWO': (0x40000000, 0),
+    'HALF': (0x3F000000, 0), 'MAGIC': (0x4B400000, 0),
+    'RCPM': (0x7EF311C3, 0), 'ONE_I': (1, 1), 'NEG1': (M32, 0),
+    'TINY': (0x00800000, 0), 'C127': (127, 1), 'MANT': (0x007FFFFF, 0),
+    'ZERO': (0, 0), 'THREE': (3, 1),
+    'EXP_LO': (_fb(-126.0), 0), 'EXP_HI': (_fb(128.0), 0),
+    'E5': (0x3AAEC3FF, 0), 'E4': (0x3C1D955B, 0),
+    'E3': (0x3D635847, 0), 'E2': (0x3E75FDF0, 0), 'E1': (0x3F317218, 0),
+    'NEGONE': (0xBF800000, 0),
+    'LOG2E': (_fb(1.4426950408889634), 0),
+    'NLOG2E': (_fb(-1.4426950408889634), 0),
+    'NLOG2E2': (_fb(-2.8853900817779268), 0),
+    'T44': (_fb(44.0), 0), 'THREEH': (_fb(1.5), 0),
+    'RSQRTC': (0x5F3759DF, 0), 'BIG': (_fb(3.0e38), 0),
+    'SQRT2': (_fb(1.4142135623730951), 0),
+    'LN2': (_fb(0.6931471805599453), 0),
+    'L4': (_fb(1.0 / 9), 0), 'L3': (_fb(1.0 / 7), 0),
+    'L2': (_fb(1.0 / 5), 0), 'L1': (_fb(1.0 / 3), 0),
+    'L0': (_fb(1.0), 0),
+    'ERFC1': (_fb(0.3275911), 0), 'ERF1': (_fb(0.254829592), 0),
+    'ERF2': (_fb(-0.284496736), 0), 'ERF3': (_fb(1.421413741), 0),
+    'ERF4': (_fb(-1.453152027), 0), 'ERF5': (_fb(1.061405429), 0),
+    'SIX': (_fb(6.0), 0),
+    'TWO_OVER_PI': (_fb(0.6366197723675814), 0),
+    'PIO2_HI': (_fb(1.5707963705062866), 0),
+    'PIO2_LO': (_fb(-4.37113883e-8), 0),
+    'S1': (_fb(-1.0 / 6), 0), 'S2': (_fb(1.0 / 120), 0),
+    'S3': (_fb(-1.0 / 5040), 0), 'S4': (_fb(1.0 / 362880), 0),
+    'C1P': (_fb(-0.5), 0), 'C2P': (_fb(1.0 / 24), 0),
+    'C3P': (_fb(-1.0 / 720), 0), 'C4P': (_fb(1.0 / 40320), 0),
+    'GELU_C': (_fb(0.044715), 0), 'GELU_S': (_fb(0.7978845608028654), 0),
+    'INV_SQRT2': (_fb(0.7071067811865476), 0),
+    'NEGINF': (0xFF800000, 0), 'POSINF': (0x7F800000, 0),
+}
+
+E_CORE = ('LOG2E', 'E5', 'E4', 'E3', 'E2', 'E1', 'MAGIC', 'HALF', 'ONE',
+          'EXP_LO', 'EXP_HI', 'ONE_I')
+RCP_C = ('RCPM', 'TWO')
+LOG_C = ('SQRT2', 'MANT', 'C127', 'ONE', 'LN2', 'TINY')
+LOGP_C = ('L4', 'L3', 'L2', 'L1', 'L0')
+SIN_C = ('TWO_OVER_PI', 'MAGIC', 'HALF', 'PIO2_HI', 'PIO2_LO', 'THREE',
+         'S1', 'S2', 'S3', 'S4', 'C1P', 'C2P', 'C3P', 'C4P', 'ONE', 'SIGNB',
+         'ONE_I')
+ERF_C = ('ABSM', 'SIX', 'ERFC1', 'ERF1', 'ERF2', 'ERF3', 'ERF4', 'ERF5',
+         'NLOG2E', 'ONE', 'SIGNB') + E_CORE[1:] + RCP_C
+
+UOPS = {
+    'abs':        (('ABSM',), b_abs, ()),
+    'neg':        (('SIGNB',), b_neg, ()),
+    'identity':   ((), b_identity, ()),
+    'clip':       ((), b_clip, ('P_LO', 'P_HI')),
+    'leakyrelu':  (('ZERO',), b_leakyrelu, ('ALPHA',)),
+    'floor':      (('ABSM', 'SIGNB'), b_floor, ()),
+    'ceil':       (('ABSM', 'SIGNB'), b_ceil, ()),
+    'round':      (('ONE_I', 'HALF'), b_round, ()),
+    'sign':       (('ONE', 'NEGONE', 'SIGNB'), b_sign, ()),
+    'exp':        (E_CORE, b_exp, ()),
+    'log':        (LOG_C + LOGP_C + RCP_C + ('HALF', 'ONE_I'), b_log, ()),
+    'sqrt':       (('TINY', 'RSQRTC', 'HALF', 'THREEH'), b_sqrt, ()),
+    'reciprocal': (('TINY', 'BIG') + RCP_C, b_reciprocal, ()),
+    'tanh':       (('ABSM', 'T44', 'NLOG2E2', 'SIGNB', 'ONE') + E_CORE[1:]
+                   + RCP_C, b_tanh, ()),
+    'erf':        (ERF_C, b_erf, ()),
+    'elu':        (('ZERO', 'ONE') + E_CORE, b_elu, ('ALPHA',)),
+    'selu':       (('ZERO', 'ONE') + E_CORE, b_selu, ('ALPHA', 'GAMMA')),
+    'softplus':   (('ABSM', 'NLOG2E', 'ONE', 'ZERO') + LOGP_C + RCP_C
+                   + E_CORE[1:], b_softplus, ()),
+    'softsign':   (('ABSM', 'ONE') + RCP_C, b_softsign, ()),
+    'gelu':       (('GELU_C', 'GELU_S', 'ABSM', 'T44', 'NLOG2E2', 'SIGNB',
+                    'ONE', 'HALF') + E_CORE[1:] + RCP_C, b_gelu, ()),
+    'gelu_erf':   (('INV_SQRT2', 'HALF', 'ONE') + ERF_C, b_gelu_erf, ()),
+    'hardsigmoid': (('ZERO', 'ONE'), b_hardsigmoid, ('ALPHA', 'BETA')),
+    'hardswish':  (('ZERO', 'ONE'), b_hardswish, ('ALPHA', 'BETA')),
+    'sin':        (SIN_C, b_sin, ()),
+    'cos':        (SIN_C, b_cos, ()),
+}
+
+HEAVY = {'log', 'tanh', 'erf', 'elu', 'selu', 'softplus', 'softsign', 'gelu',
+         'gelu_erf', 'sin', 'cos', 'round', 'sqrt', 'reciprocal'}
+
+
+def _consts_for(k, names, extra=()):
+    names = list(dict.fromkeys(list(names) + list(extra)))
+    free = [n for n in range(0, 16)] + [n for n in range(25, 32)]
+    out = {}
+    for n in names:
+        if n not in STD:
+            raise KeyError("kops: no such constant %r" % (n,))
+        if n == 'ONE' and 'E1' in names and STD['E1'][0] == 0x3F800000:
+            continue
+        if not free:
+            raise RuntimeError("kops: %d constants do not fit the B file"
+                               % len(names))
+        out[n] = ('B', free.pop(0))
+    if 'ONE' in names and 'ONE' not in out and 'E1' in out:
+        out['ONE'] = out['E1']
+    return out
+
+
+# ---------------------------------------------------------------- prologue
+def _prologue(k, b, nvec, vpmq16, consts):
+    gb = nvec * 64
+    shift = {4: 2, 8: 3, 16: 4}[nvec] + 6
+    b.e(k.ldi(64, B_C64, ws=1))
+    b.e(k.ldi(gb, B_CSTEP, ws=1))
+    b.e(k.ldi(M32, B_NEG1, ws=1))
+    b.e(k.add_(k.ADD_SHL, B_STEP, k.areg(A_NQ), k.imm(shift), ws=1))
+    b.e(k.add_(k.ADD_ADD, A_T2, k.areg(A_NQ), k.breg(B_NEG1)))
+    b.e(k.add_(k.ADD_SHL, B_GAP, k.areg(A_T2), k.imm(shift), ws=1))
+    if vpmq16:
+        b.e(k.add_(k.ADD_SHL, A_VPMQ, k.areg(A_QID), k.imm(2)))
+        b.e(k.add_(k.ADD_SHL, B_VPMQ7, k.areg(A_VPMQ), k.imm(7), ws=1))
+    else:
+        b.e(k.add_(k.ADD_SHL, B_V4, k.areg(A_QID), k.imm(2), ws=1))
+        b.e(k.add_(k.ADD_SHL, B_V9, k.areg(A_QID), k.imm(9), ws=1))
+    b.e(k.add_(k.ADD_SHL, A_T1, k.areg(A_QID), k.imm(shift)))     # q*gb
+    b.e(k.add_(k.ADD_SHL, A_T0, k.areg(k.R_ELEM_NUM), k.imm(2)))  # lane*4
+    b.e(k.nop(), k.nop())
+
+
+def _stream_base(k, b, bus_reg, ptr_reg):
+    b.e(k.add_(k.ADD_OR, ACC3, k.areg(bus_reg), k.areg(bus_reg)))
+    b.e(k.nop(), k.nop())
+    b.e(k.add_(k.ADD_ADD, ACC3, k.acc(3), k.areg(A_T1)))
+    b.e(k.nop(), k.nop())
+    b.e(k.add_(k.ADD_ADD, ptr_reg, k.acc(3), k.areg(A_T0)))
+    b.e(k.nop(), k.nop())
+
+
+def _store(k, b, nvec, vpmq16):
+    p = b.p
+    b.check = False
+    if vpmq16:
+        k.emit_store16(p, 0)
+    else:
+        k._store4(b, B_V4, B_V9, A_CADR, 0)
+        if nvec == 8:
+            for i in range(4):
+                b.e(k.add_or(i, k.areg(4 + i), k.areg(4 + i)))
+            b.e(k.add_(k.ADD_ADD, A_CADR, k.areg(A_CADR), k.imm(0)))
+    b.check = True
+
+
+def _load(k, b, addr_reg, acc=0, tmu=0):
+    w = k.W_TMU0_S if tmu == 0 else k.W_TMU1_S
+    sig = k.SIG_LOAD_TMU0 if tmu == 0 else k.SIG_LOAD_TMU1
+    b.e(k.add_or(w, k.areg(addr_reg), k.areg(addr_reg), ws=1))
+    b.e(k.nop(), k.nop(), k.nop(), k.nop())
+    b.e(k.nop(), k.nop(), k.nop(), k.nop())
+    b.e(k.alu(sig=sig, cond_add=k.COND_NEVER, cond_mul=k.COND_NEVER))
+    b.e(k.add_or(32 + acc, k.acc(4), k.acc(4)))
+
+
+def _consts_load(k, b, consts):
+    for name, (bank, reg) in consts.items():
+        if bank != 'B':
+            continue
+        val = STD[name]
+        b.e(k.ldi(val[0] & M32, reg, ws=1), k.nop())
+
+
+def _head(k, nvec, vpmq16, consts):
+    b = k.Builder()
+    p = b.p
+    b.e(k.add_or(36, k.imm(1), k.imm(1)))
+    p._builder = b
+    return b, p
+
+
+def _tail(k, b, extra=0):
+    pass
+
+
+def _group_tail(k, b, nvec, gap_regs=()):
+    p = b.p
+    b.e(k.add_(k.ADD_ADD, A_OB2, k.areg(A_OB2), k.breg(B_STEP)))
+    b.e(k.add_(k.ADD_ADD, A_IB, k.areg(A_IB), k.breg(B_GAP)))
+    for r in gap_regs:
+        b.e(k.add_(k.ADD_ADD, r, k.areg(r), k.breg(B_GAP)))
+    b.e(k.add_(k.ADD_SUB, A_CNT, k.areg(A_CNT), k.imm(1), sf=1))
+    p.branch_to('grp', cond=k.BR_ALL_Z_CLEAR)
+    b.e(k.nop(), k.nop(), k.nop())
+    b.e(k.end_program())
+    b.e(k.nop(), k.nop(), k.nop())
+
+
+# ---------------------------------------------------------------- builders
+UOP_ORDER = ['abs', 'neg', 'identity', 'clip', 'leakyrelu', 'floor', 'ceil',
+             'round', 'sign', 'exp', 'log', 'sqrt', 'reciprocal', 'tanh',
+             'erf', 'elu', 'selu', 'softplus', 'softsign', 'gelu', 'gelu_erf',
+             'hardsigmoid', 'hardswish', 'sin', 'cos']
+
+# The unary ops ride on kgen.build_ew's *verified* harness (TMU priming, the
+# 16-vector group, the VPM->DMA store, the counter branch).  Only the body is
+# new, so a body bug can make a wrong number but cannot change control flow.
+# Register budget inside build_ew: B0..B20 and B26 are free for constants
+# (B21..B25, B27..B29 are harness state), A16..A18, A20, A24, A27, A30, A31 are
+# dead once the group loop starts.
+UOP_B = list(range(0, 21)) + [26]
+UOP_A = [16, 17, 18, 20, 24, 27, 30, 31]
+
+
+def _uop_info(code):
+    op = UOP_ORDER[code]
+    return UOPS[op]
+
+
+def ew_consts(k, b, code):
+    """Load this op's constants (called from build_ew's prologue)."""
+    names, body, params = _uop_info(code)
+    pool = list(UOP_B)
+    consts = {}
+    for n in names:
+        if n == 'ONE' and 'E1' in names and STD['E1'][0] == 0x3F800000:
+            continue
+        if n not in STD:
+            raise KeyError("kops: no such constant %r" % (n,))
+        if not pool:
+            raise RuntimeError("kops: too many constants for the ew harness")
+        consts[n] = ('B', pool.pop(0))
+    if 'ONE' in names and 'ONE' not in consts:
+        consts['ONE'] = consts['E1']
+    for i, name in enumerate(params):
+        if i < 2:
+            probe = (30 + i, 1)                     # B30 / B31
+            consts[name] = ('B', 30 + i)
+            b.read_uni(30 + i, ws=1)
+        else:
+            consts[name] = ('A', 24)
+            b.read_uni(24)
+    for n, (bank, reg) in consts.items():
+        if bank != 'B' or n in params:
+            continue
+        val = STD[n]
+        b.e(k.ldi(val[0] & M32, reg, ws=1), k.nop())
+    k._kops_consts[code] = consts
+
+
+def ew_body(k, b, code, j):
+    names, body, params = _uop_info(code)
+    consts = k._kops_consts[code]
+    used_b = set(v[1] for v in consts.values() if v[0] == 'B')
+    used_a = set(v[1] for v in consts.values() if v[0] == 'A')
+    ctx = Ctx(consts)
+    ctx.a_free = [r for r in UOP_A if r not in used_a]
+    ctx.b_free = [r for r in UOP_B if r not in used_b]
+    ctx.a0 = list(ctx.a_free)
+    ctx.b0 = list(ctx.b_free)
+    e = E(k, b, ctx)
+    body(e, 26, j)          # input A26 (E_AV), result into A j
+
+
+def build_uop(k, op, nvec=None):
+    if op not in UOP_ORDER:
+        raise ValueError("kops: unknown uop %r" % (op,))
+    if not hasattr(k, '_kops_consts'):
+        k._kops_consts = {}
+    nv = 4 if any(op in names for names in [HEAVY]) else 16
+    return k.build_ew(100 + UOP_ORDER.index(op), nvec=nv)
+
+
+def build_sel3(k, op):
+    if op not in ('where', 'clip3', 'prelu'):
+        raise ValueError("kops: unknown sel3 op %r" % (op,))
+    consts = _consts_for(k, ('ABSM',))
+    ctx = Ctx(consts)
+    nvec = 16
+    b, p = _head(k, nvec, True, consts)
+    b.read_uni(A_AB)          # a
+    b.read_uni(A_OB)          # out
+    b.read_uni(A_CNT)
+    b.read_uni(A_QID)
+    b.read_uni(A_NQ)
+    b.read_uni(A_P0)          # b
+    b.read_uni(A_P1)          # c
+    b.read_uni(A_P2)          # op (compile-time; kept for ABI stability)
+    _consts_load(k, b, consts)
+    _prologue(k, b, nvec, True, consts)
+    _stream_base(k, b, A_AB, A_IB)
+    _stream_base(k, b, A_OB, A_OB2)
+    A_BP, A_CP = A_P0, A_P1
+    for reg, bus in ((A_BP, A_BP), (A_CP, A_CP)):
+        b.e(k.add_(k.ADD_OR, ACC1, k.areg(bus), k.areg(bus)))
+        b.e(k.nop(), k.nop())
+        b.e(k.add_(k.ADD_ADD, ACC1, k.acc(1), k.areg(A_T1)))
+        b.e(k.nop(), k.nop())
+        b.e(k.add_(k.ADD_ADD, ACC1, k.acc(1), k.areg(A_T0)))
+        b.e(k.nop(), k.nop())
+        b.e(k.add_(k.ADD_OR, reg, k.acc(1), k.acc(1)))
+        b.e(k.nop(), k.nop())
+    p.label('grp')
+    b.e(k.add_or(A_CADR, k.areg(A_OB2), k.areg(A_OB2)))
+    for j in range(nvec):
+        _load(k, b, A_IB, 0)
+        _load(k, b, A_BP, 1, tmu=1)
+        _load(k, b, A_CP, 2, tmu=0)
+        ctx.reset()
+        e = E(k, b, ctx)
+        if op == 'where':
+            m = ctx.tb()
+            e.op(k.ADD_AND, m, ACC0, ctx.k('ABSM'))
+            gt_mask(e, m, m)
+            t = ctx.tb()
+            sel(e, ACC1, m, ACC1, ACC2, t)
+            ctx.rel(m, t)
+        elif op == 'clip3':
+            e.op(k.ADD_FMAX, ACC1, ACC1, ACC0)
+            e.op(k.ADD_FMIN, ACC1, ACC1, ACC2)
+        else:
+            m = ctx.tb()
+            t = ctx.tb()
+            u = ctx.tb()
+            gt_mask(e, m, ACC0)
+            e.mul(t, ACC0, ACC1)
+            sel(e, ACC1, m, ACC0, t, u)
+            ctx.rel(m, t, u)
+        b.e(k.add_or(j, k.acc(1), k.acc(1)))
+        b.e(k.add_(k.ADD_ADD, A_IB, k.areg(A_IB), k.breg(B_C64)))
+        b.e(k.add_(k.ADD_ADD, A_BP, k.areg(A_BP), k.breg(B_C64)))
+        b.e(k.add_(k.ADD_ADD, A_CP, k.areg(A_CP), k.breg(B_C64)))
+    _store(k, b, nvec, True)
+    _group_tail(k, b, nvec, gap_regs=(A_BP, A_CP))
+    return p
+
+
+def build_gather(k):
+    consts = _consts_for(k, ('ABSM',))
+    ctx = Ctx(consts)
+    nvec = 16
+    b, p = _head(k, nvec, True, consts)
+    b.read_uni(A_AB)          # table
+    b.read_uni(A_OB)
+    b.read_uni(A_CNT)
+    b.read_uni(A_QID)
+    b.read_uni(A_NQ)
+    b.read_uni(A_P0)          # arena bus base
+    b.read_uni(A_P1)          # fill
+    b.read_uni(A_P2)          # unused
+    _consts_load(k, b, consts)
+    _prologue(k, b, nvec, True, consts)
+    _stream_base(k, b, A_AB, A_IB)
+    _stream_base(k, b, A_OB, A_OB2)
+    p.label('grp')
+    b.e(k.add_or(A_CADR, k.areg(A_OB2), k.areg(A_OB2)))
+    for j in range(nvec):
+        _load(k, b, A_IB, 0)                    # acc0 = table vector
+        e = E(k, b, ctx)
+        m = ctx.ta()
+        tg = ctx.ta()
+        e.mov(tg, ACC0)
+        e.opi(k.ADD_ASR, m, tg, 31)             # -1 iff negative
+        e.op(k.ADD_NOT, ACC0, m, m)
+        e.op(k.ADD_AND, ACC0, tg, ACC0)         # 0 for negative entries
+        e.op(k.ADD_ADD, ACC0, ACC0, A_P0)       # absolute bus address
+        _load(k, b, ACC0, 0, tmu=1)             # per-lane gather
+        e.op(k.ADD_AND, m, m, A_P1)             # fill where negative
+        e.op(k.ADD_NOT, ACC1, m, m)
+        e.op(k.ADD_AND, ACC1, ACC1, ACC0)
+        e.op(k.ADD_OR, ACC1, ACC1, m)
+        ctx.rel(m, tg)
+        b.e(k.add_or(j, k.acc(1), k.acc(1)))
+        b.e(k.add_(k.ADD_ADD, A_IB, k.areg(A_IB), k.breg(B_C64)))
+    _store(k, b, nvec, True)
+    _group_tail(k, b, nvec)
+    return p
+
+
+RED_OPS = ('sum', 'mean', 'max', 'min', 'argmax', 'argmin')
+
+
+
+
+HARNESS_B = {17, 18, 19, 20, 21, 22, 23, 24}
+
+
+def _free_bs(consts, n):
+    used = set(v[1] for v in consts.values() if v[0] == 'B') | HARNESS_B
+    out = [r for r in list(range(0, 16)) + list(range(25, 32)) if r not in used]
+    if len(out) < n:
+        raise RuntimeError("kops: need %d more B registers" % n)
+    return out[:n]
+
+
+HARNESS_B = {17, 18, 19, 20, 21, 22, 23, 24}
+
+
+def _free_bs(consts, n):
+    used = set(v[1] for v in consts.values() if v[0] == 'B') | HARNESS_B
+    out = [r for r in list(range(0, 16)) + list(range(25, 32)) if r not in used]
+    if len(out) < n:
+        raise RuntimeError("kops: need %d more B registers" % n)
+    return out[:n]
+
+
+def build_reduce(k, op):
+    """out[o] = reduce_r a[o*red + r]; one vector = 16 consecutive o.
+
+    The host passes every byte stride (the q offset cannot be derived in the
+    kernel: q*256*red*4 would overflow 24-bit address arithmetic)."""
+    if op not in RED_OPS:
+        raise ValueError("kops: unknown reduce op %r" % (op,))
+    consts = _consts_for(k, ('NEGINF', 'POSINF', 'ZERO'))
+    b_red, b_inv, b_ogap, b_ostep, b_ls, b_ingap = _free_bs(consts, 6)
+    b_vstr = _free_bs(consts, 7)[6]
+    ctx = Ctx(consts)
+    ctx.no_a()
+    nvec = 16
+    b, p = _head(k, nvec, True, consts)
+    b.read_uni(A_AB)
+    b.read_uni(A_OB)
+    b.read_uni(A_CNT)
+    b.read_uni(A_QID)
+    b.read_uni(A_NQ)
+    b.read_uni(b_red, ws=1)
+    b.read_uni(b_inv, ws=1)
+    b.read_uni(b_vstr, ws=1)
+    b.read_uni(A_INBASE)
+    b.read_uni(A_OUTBASE)
+    b.read_uni(b_ingap, ws=1)
+    b.read_uni(b_ogap, ws=1)
+    b.read_uni(b_ostep, ws=1)
+    b.read_uni(b_ls, ws=1)
+    _consts_load(k, b, consts)
+    b.e(k.ldi(256, B_CSTEP, ws=1))
+    b.e(k.add_(k.ADD_SHL, A_VPMQ, k.areg(A_QID), k.imm(2)))
+    b.e(k.add_(k.ADD_SHL, B_VPMQ7, k.areg(A_QID), k.imm(7), ws=1))
+    # lane * lane_stride  and  lane * 4
+    b.e(k.add_(k.ADD_OR, ACC0, k.areg(k.R_ELEM_NUM), k.areg(k.R_ELEM_NUM)))
+    b.e(k.nop(), k.nop())
+    b.e(dict(mul_op=k.MUL_MUL24, mul_out=32 + 1, mul_a=k.acc(0),
+             mul_b=k.breg(b_ls), ws=0, sig=k.SIG_NONE))
+    b.e(k.nop(), k.nop())
+    b.e(k.add_(k.ADD_OR, ACC3, k.areg(A_AB), k.areg(A_AB)))
+    b.e(k.nop(), k.nop())
+    b.e(k.add_(k.ADD_ADD, ACC3, k.acc(3), k.areg(A_INBASE)))
+    b.e(k.nop(), k.nop())
+    b.e(k.add_(k.ADD_ADD, A_IB, k.acc(3), k.acc(1)))
+    b.e(k.nop(), k.nop())
+    b.e(k.add_(k.ADD_SHL, ACC2, k.acc(0), k.imm(2)))
+    b.e(k.nop(), k.nop())
+    b.e(k.add_(k.ADD_OR, ACC3, k.areg(A_OB), k.areg(A_OB)))
+    b.e(k.nop(), k.nop())
+    b.e(k.add_(k.ADD_ADD, ACC3, k.acc(3), k.areg(A_OUTBASE)))
+    b.e(k.nop(), k.nop())
+    b.e(k.add_(k.ADD_ADD, A_OB2, k.acc(3), k.acc(2)))
+    b.e(k.nop(), k.nop())
+    p.label('grp')
+    b.e(k.add_or(A_CADR, k.areg(A_OB2), k.areg(A_OB2)))
+    for j in range(nvec):
+        b.e(k.add_(k.ADD_OR, A_RA, k.areg(A_IB), k.areg(A_IB)))
+        b.e(k.add_(k.ADD_OR, A_NR, k.breg(b_red), k.breg(b_red)))
+        b.e(k.ldi(0, A_RIDX, ws=0))
+        b.e(k.ldi(0, A_BESTI, ws=0))
+        if op in ('sum', 'mean'):
+            b.e(k.add_or(ACC0, k.breg(consts['ZERO'][1]), k.breg(consts['ZERO'][1])))
+        elif op == 'min':
+            b.e(k.add_or(ACC0, k.breg(consts['POSINF'][1]), k.breg(consts['POSINF'][1])))
+        else:
+            b.e(k.add_or(ACC0, k.breg(consts['NEGINF'][1]), k.breg(consts['NEGINF'][1])))
+        b.e(k.nop(), k.nop())
+        p.label('r%d' % j)
+        _load(k, b, A_RA, 1)
+        ctx.reset()
+        e = E(k, b, ctx)
+        if op in ('sum', 'mean'):
+            e.op(k.ADD_FADD, ACC0, ACC0, ACC1)
+        elif op == 'max':
+            e.op(k.ADD_FMAX, ACC0, ACC0, ACC1)
+        elif op == 'min':
+            e.op(k.ADD_FMIN, ACC0, ACC0, ACC1)
+        else:
+            t = ctx.tb()
+            u = ctx.tb()
+            if op == 'argmax':
+                e.op(k.ADD_FSUB, t, ACC1, ACC0)
+            else:
+                e.op(k.ADD_FSUB, t, ACC0, ACC1)
+            gt_mask(e, t, t)
+            sel(e, ACC0, t, ACC1, ACC0, u)
+            sel(e, A_BESTI, t, A_RIDX, A_BESTI, u)
+            ctx.rel(t, u)
+        b.e(k.add_(k.ADD_ADD, A_RA, k.areg(A_RA), k.imm(4)))
+        b.e(k.add_(k.ADD_ADD, A_RIDX, k.areg(A_RIDX), k.imm(1)))
+        b.e(k.add_(k.ADD_SUB, A_NR, k.areg(A_NR), k.imm(1), sf=1))
+        p.branch_to('r%d' % j, cond=k.BR_ALL_Z_CLEAR)
+        b.e(k.nop(), k.nop(), k.nop())
+        if op == 'mean':
+            e.mul(ACC0, ACC0, 200 + b_inv)
+        if op in ('argmax', 'argmin'):
+            b.e(k.add_or(j, k.areg(A_BESTI), k.areg(A_BESTI)))
+        else:
+            b.e(k.add_or(j, k.acc(0), k.acc(0)))
+        b.e(k.add_(k.ADD_ADD, A_IB, k.areg(A_IB), k.breg(b_vstr)))
+    _store(k, b, nvec, True)
+    b.e(k.add_(k.ADD_ADD, A_OB2, k.areg(A_OB2), k.breg(b_ostep)))
+    b.e(k.add_(k.ADD_ADD, A_IB, k.areg(A_IB), k.breg(b_ingap)))
+    b.e(k.add_(k.ADD_SUB, A_CNT, k.areg(A_CNT), k.imm(1), sf=1))
+    p.branch_to('grp', cond=k.BR_ALL_Z_CLEAR)
+    b.e(k.nop(), k.nop(), k.nop())
+    b.e(k.end_program())
+    b.e(k.nop(), k.nop(), k.nop())
+    return p
+
+
+def build_cumsum(k):
+    """Inclusive prefix sum over the last axis.  `cols` must be a multiple of
+    256 (the C layer zero-pads and slices); rows are independent."""
+    consts = _consts_for(k, ('ONE_I', 'ZERO'))
+    b_m1, b_m2, b_m4, b_m8, b_t, b_carry = _free_bs(consts, 6)
+    ctx = Ctx(consts)
+    nvec = 16
+    b, p = _head(k, nvec, True, consts)
+    b.read_uni(A_AB)
+    b.read_uni(A_OB)
+    b.read_uni(A_CNT)
+    b.read_uni(A_QID)
+    b.read_uni(A_NQ)
+    b.read_uni(A_P0)
+    b.read_uni(A_P1)
+    b.read_uni(A_P2)
+    _consts_load(k, b, consts)
+    _prologue(k, b, nvec, True, consts)
+    _stream_base(k, b, A_AB, A_IB)
+    _stream_base(k, b, A_OB, A_OB2)
+    # mask_s = all ones iff lane >= s
+    for s, reg in ((1, b_m1), (2, b_m2), (4, b_m4), (8, b_m8)):
+        b.e(k.add_(k.ADD_SUB, ACC0, k.areg(k.R_ELEM_NUM), k.imm(s)))
+        b.e(k.nop(), k.nop())
+        b.e(k.add_(k.ADD_ASR, ACC0, k.acc(0), k.imm(31)))
+        b.e(k.nop(), k.nop())
+        b.e(k.add_(k.ADD_NOT, 200 + reg, k.acc(0), k.acc(0), ws=1))
+        b.e(k.nop(), k.nop())
+    p.label('grp')
+    b.e(k.add_or(A_CADR, k.areg(A_OB2), k.areg(A_OB2)))
+    b.e(k.add_(k.ADD_OR, 200 + b_carry, k.breg(consts['ZERO'][1]),
+               k.breg(consts['ZERO'][1]), ws=1))
+    b.e(k.nop(), k.nop())
+    for j in range(nvec):
+        _load(k, b, A_IB, 0)
+        b.e(k.add_(k.ADD_OR, ACC1, k.acc(0), k.acc(0)))
+        b.e(k.nop(), k.nop())
+        for s, reg in ((1, b_m1), (2, b_m2), (4, b_m4), (8, b_m8)):
+            b.e(k.mul_rot(2, 1, s))
+            b.e(k.nop(), k.nop())
+            b.e(k.add_(k.ADD_AND, 200 + b_t, k.acc(2), k.breg(reg), ws=1))
+            b.e(k.nop(), k.nop())
+            b.e(k.add_(k.ADD_ADD, ACC1, k.acc(1), k.breg(b_t)))
+            b.e(k.nop(), k.nop())
+        b.e(k.add_(k.ADD_FADD, ACC1, k.acc(1), k.breg(b_carry)))
+        b.e(k.nop(), k.nop())
+        b.e(k.mul_rot(2, 1, 1))                 # lane0 <- lane15
+        b.e(k.nop(), k.nop())
+        b.e(k.add_or(37, k.acc(2), k.acc(2)))   # replicate lane 0
+        b.e(k.add_(k.ADD_OR, 200 + b_carry, k.acc(5), k.acc(5), ws=1))
+        b.e(k.nop(), k.nop())
+        b.e(k.add_or(j, k.acc(1), k.acc(1)))
+        b.e(k.add_(k.ADD_ADD, A_IB, k.areg(A_IB), k.breg(B_C64)))
+    _store(k, b, nvec, True)
+    _group_tail(k, b, nvec)
+    return p
+
+
+def build(k, kind, opts):
+    if kind == 'uop':
+        nv = opts.get('nvec')
+        return build_uop(k, opts.get('op'), int(nv) if nv else None)
+    if kind == 'sel3':
+        return build_sel3(k, opts.get('op'))
+    if kind == 'gather':
+        return build_gather(k)
+    if kind == 'reduce':
+        return build_reduce(k, opts.get('op'))
+    if kind == 'cumsum':
+        return build_cumsum(k)
+    if kind == 'blit':
+        return build_copy(k)
+    raise ValueError("kops: unknown kind %r" % (kind,))
+
+
+def build_copy(k):  # kind "blit"
+    """Contiguous QPU copy: 64 B per group (one 16-float vector).
+
+    The 4-row store writes the same 64 B four times (stride 0), which is
+    idempotent, so a single vector per group is enough.  The C layer requires
+    a length that is a multiple of 64 B and uses the gather table for
+    everything else (strided rows, permutations, broadcasts)."""
+    nvec = 4
+    consts = _consts_for(k, ())
+    b, p = _head(k, nvec, False, consts)
+    b.read_uni(A_AB)
+    b.read_uni(A_OB)
+    b.read_uni(A_CNT)
+    b.read_uni(A_QID)
+    b.read_uni(A_NQ)
+    b.read_uni(A_P0)
+    b.read_uni(A_P1)
+    b.read_uni(A_P2)
+    # A_BSTEP: group stride in bytes (64 unless the caller wants another unit)
+    b.e(k.ldi(64, B_C64, ws=1))
+    b.e(k.ldi(64, B_CSTEP, ws=1))
+    b.e(k.ldi(M32, B_NEG1, ws=1))
+    b.e(k.add_(k.ADD_SHL, B_V4, k.areg(A_QID), k.imm(2), ws=1))
+    b.e(k.add_(k.ADD_SHL, B_V9, k.areg(A_QID), k.imm(9), ws=1))
+    b.e(k.add_(k.ADD_SHL, A_T1, k.areg(A_QID), k.imm(8)))
+    b.e(k.add_(k.ADD_SHL, A_T0, k.areg(k.R_ELEM_NUM), k.imm(2)))
+    b.e(k.add_(k.ADD_SHL, B_STEP, k.areg(A_NQ), k.imm(8), ws=1))
+    b.e(k.add_(k.ADD_ADD, A_T2, k.areg(A_NQ), k.breg(B_NEG1)))
+    b.e(k.add_(k.ADD_SHL, B_GAP, k.areg(A_T2), k.imm(8), ws=1))
+    _stream_base(k, b, A_AB, A_IB)
+    _stream_base(k, b, A_OB, A_OB2)
+    p.label('grp')
+    b.e(k.add_or(A_CADR, k.areg(A_OB2), k.areg(A_OB2)))
+    for j in range(4):
+        _load(k, b, A_IB, 0)
+        b.e(k.add_or(j, k.acc(0), k.acc(0)))
+        b.e(k.add_(k.ADD_ADD, A_IB, k.areg(A_IB), k.breg(B_C64)))
+    _store(k, b, 4, False)
+    _group_tail(k, b, nvec)
+    return p

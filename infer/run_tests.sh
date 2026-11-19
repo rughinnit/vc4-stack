@@ -1,4 +1,6 @@
 #!/bin/sh
+# The wheel ships a copy of the kernel generator; they must stay identical.
+python3 "$(dirname "$0")/../tools/check_kgen_sync.py" || exit 1
 # run_tests.sh - the whole verification suite, serialised and health-checked.
 #
 # Every test takes /tmp/vc4-gpu.lock itself (flock) and every GPU run is

@@ -25,6 +25,10 @@ install -d "$out"
 rm -f "$out"/vc4infer-*-py3-none-any.whl
 
 cd "$root"
+python3 tools/check_kgen_sync.py || {
+	echo "refusing to build: generator copies have drifted" >&2
+	exit 1
+}
 python3 -m pip wheel --no-build-isolation --no-deps --wheel-dir "$out" .
 
 whl=$(ls "$out"/vc4infer-*-py3-none-any.whl)

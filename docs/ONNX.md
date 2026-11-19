@@ -789,9 +789,26 @@ time, so the wall time improves by 108 ms (-17%) and FPS by 20%.
 
 Output against `ref_onnx` (`|got-ref| <= 5e-4 + 5e-4*max(|ref|,1)`):
 **0/44100**, max abs 0.0204, in **20/20 fresh processes and 20/20 repeats in
-one process** (`/tmp/vc4t/det20.py`).  Before the coherency fix the same model
-reported 12-80 elements over tolerance on a first run and ~22,700 on repeats,
-varying per process.
+one process**.  Before the coherency fix the same model reported 12-80
+elements over tolerance on a first run and ~22,700 on repeats, varying per
+process.
+
+320x320, same board and clocks, daemon at `--arena-mb 150` with
+`VC4INFER_ARENA_MB=145 VC4_POOL_RESERVE_MB=32` (as §7.5 describes):
+
+| metric | value |
+|---|---:|
+| `bytes_copied_by_host` | **0** |
+| `arithmetic_on_vc4` | **100.0%** (1,092,998,400 MACs) |
+| wall / FPS | 1323.1 ms / 0.76 |
+| `qpu_duty` | **71.9%** (950.8 / 1323.1 ms) |
+| launches | 1936 (11.0 per dispatched node) |
+| launch path | 372.3 ms (28.1%) |
+| output vs `ref_onnx` | 1/176,400 over 5e-4 (`(0,2,2060)`: 86.8006 vs 86.7566, 1.003x the tolerance), identical in 3 runs |
+
+The larger map is where the device copies pay off most: the same 11 points of
+duty became 72%, because at 320x320 the ARM-side copies were four times
+bigger.
 
 #### 10.4.4 What the device paths refuse (named, never a host fallback)
 

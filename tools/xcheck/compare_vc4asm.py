@@ -28,14 +28,8 @@ def main():
     from qenc import (ACC0, ADD_ADD, ADD_NOP, ADD_OR, ADD_SHL, BR_ALL_C_SET,
                       COND_ALWAYS, COND_NEVER, NOP_ADDR, REGB, SIG_ALU_IMMEDIATE,
                       SIG_LOAD_TMU1, W_NOP, acc, alu, areg, branch, breg,
-                      end_program, fmul_fadd, imm, ldi, nop)
+                      end_program, fmul_fadd, imm, ldi, nop, rot_inst)
     from qenc import _ops
-
-    def rot(n):
-        return alu(add_op=ADD_NOP, mul_op=4, add_out=W_NOP, mul_out=33, ws=0,
-                   cond_add=COND_NEVER, cond_mul=COND_ALWAYS,
-                   sig=SIG_ALU_IMMEDIATE, mul_a=ACC0, mul_b=REGB,
-                   raddr_a=NOP_ADDR, raddr_b=48 + n)
 
     cases = [
         ("or ra1, unif, unif",
@@ -82,11 +76,22 @@ def main():
         ("mov t0s, r3",
          _ops(add_op=ADD_OR, add_out=56, add_a=acc(3), add_b=acc(3)),
          "\tmov t0s, r3", 1),
-        ("v8min r1, r0, rot15", rot(15), "\tmov r1, r0>>15", 1),
-        ("v8min r1, r0, rot1", rot(1), "\tmov r1, r0>>1", 1),
         ("branch +2 words",
          branch(16, cond=BR_ALL_C_SET),
          "\tbrr.allc -, r:tgt\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\ntgt:\tnop", 7),
+    ]
+    # every rotate form gemm6 emits: 0 is the plain move, 1..15 are the
+    # rotator small immediates 49..63 (48 = rotate by r5 is not used).
+    # The rotate shares its word with the r5rep broadcast (that is how the
+    # kernel uses it), so compare the real two-slot word, not a standalone
+    # rotate whose add-slot condition would be synthetic.
+    rep = dict(add_op=ADD_OR, add_out=37, ws=1, add_a=acc(1), add_b=acc(1))
+    cases += [
+        ("r5rep + rot%d" % k,
+         _ops(**{**rot_inst(k, src=0, out=1), **rep}),
+         ("\tmov r5rep, r1; v8min r1, r0, r0" if k == 0
+          else "\tmov r5rep, r1; mov r1, r0>>%d" % k), 1)
+        for k in range(16)
     ]
 
     d = os.path.dirname(os.path.abspath(__file__))

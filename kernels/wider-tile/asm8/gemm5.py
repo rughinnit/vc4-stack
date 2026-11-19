@@ -60,8 +60,8 @@ Invariants kept from asm3/asm4/asm7 (all empirically required on this Si):
   * A-file and B-file RAW gaps >= 2 words (accumulator gaps are 1);
   * ws bit: add writes A file (ws=0) / B file (ws=1) and the mul ALU writes
     the opposite file, so a word's fadd file and its mul copy must agree;
-  * ws=1 rep, v8min small immediate 49..63 only (48 is 1.0f, so "rotate by
-    0" is an exact self-copy);
+  * ws=1 rep, v8min small immediates 49..63 = rotate 1..15 and 48 =
+    rotate-by-r5, so "rotate by 0" is the plain accumulator move;
   * B column block 64*K, VPM DMA store DEPTH=16 words, UNITS=4 rows, stride
     (N-16)*4, VPM row base 4*qpu (12 QPUs x 4 rows), 16 encoded as 0.
 
@@ -130,9 +130,9 @@ def fmul_j(j, h, t):
 
 def rot_inst(n):
     if n == 0:
-        # v8min's small immediate 48 is the float 1.0, not "rotate by 0"
-        # (only 49..63 are the rotate amounts 1..15), so row 0 ("no
-        # rotation") needs an exact copy of the A vector instead.
+        # small immediate 48 is rotate-by-r5, not "rotate by 0"; 49..63 are
+        # rotate 1..15 and 1.0f is code 32.  There is no rotate-by-0 code, so
+        # row 0 ("no rotation") needs an exact copy of the A vector instead.
         return dict(mul_op=MUL_V8MIN, mul_out=32 + ACC_ROT,
                     mul_a=acc(ACC_AVEC), mul_b=acc(ACC_AVEC))
     return dict(mul_op=MUL_V8MIN, mul_out=32 + ACC_ROT, mul_a=acc(ACC_AVEC),

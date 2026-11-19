@@ -8,6 +8,8 @@ LOG=/tmp/accept10.log
 say() { echo "$@" | tee -a $LOG; }
 export PACK_QPUS=4 QRUN_PACK_STRIDE=1
 say "== asm10 acceptance $(date -Is) =="
+say "-- encoder field unit test"
+python3 test_qenc_fields.py 2>&1 | tee -a $LOG
 say "-- clocks:"; sudo -n vcgencmd measure_clock v3d 2>/dev/null | tee -a $LOG
 sudo -n vcgencmd get_throttled 2>/dev/null | tee -a $LOG
 say "-- 1 QPU control, N=128"

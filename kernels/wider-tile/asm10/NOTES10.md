@@ -135,3 +135,29 @@ Consequence: the prime was left **unchanged** (all changes to it are worth
 | `packtest.py`, `packscreen*.sh`, `screen*.sh` | pack-only timing + `check_panel8` driver, and the probe batches |
 | `gemm6.py`, `gemm6_*.bin` | unchanged from asm9 (byte-identical) |
 | `gemm6_*_skip{prime,loop}.bin` | diagnostic builds used for §4 |
+
+## 6. Encoder follow-up (XCHECK corrections, same day)
+
+The cross-check in `/home/raspi/work/vc4-stack/docs/XCHECK.md` found two
+latent encoder defects. Both are fixed in `qenc.py`; the GEMM is element-exact
+before and after and the k loop is the same length (303 words, 653/754 words
+in the blob):
+
+* the rotate word now uses the canonical vc4asm/qpuasm MUX (`mul_b=acc(src)`,
+  ACC0). That changes exactly 3 bits in each of the 60 rotate words of
+  `gemm6_128.bin` (75 in the N=64/256 builds) and nothing else; flipping only
+  those bits back reproduces the previous binaries byte-for-byte (sha256
+  `5cec565d…` / `9ca67b05…` / `2dddbb26…`). Hardware A/B: both forms
+  `Cmm=0 Pmm=0`, 398.5 cyc/k, 2.451 ms - the 3 bits are don't-care on this
+  silicon (XCHECK §3.4).
+* `pack` / `PM` / `unpack` now use the header widths (4 bits at 52, 1 bit at
+  56, 3 bits at 57) instead of the overlapping 5- and 4-bit fields. No blob
+  changes, because every kernel uses pack=unpack=0; `accept10.sh` now runs
+  `test_qenc_fields.py` on every acceptance.
+* the "48 is 1.0f" comment was wrong. 48 = rotate by r5 (dynamic), 49..63 =
+  rotate 1..15, rotate 0 = the plain move, 1.0f = 32, and 48..63 also alias
+  the constants -16..-1.
+
+`rot_inst` now lives in `qenc.py` and is shared by `gemm6.py` and
+`engine/tools/kgen.py`, so the two kernel trees cannot drift. The canonical
+blobs were re-run on hardware (RESULTS10, "Encoder correction").

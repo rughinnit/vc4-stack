@@ -50,6 +50,7 @@ import sys
 ASM3 = os.environ.get("ASM3_DIR", "/home/raspi/work/asm3")
 sys.path.insert(0, ASM3)
 
+import qenc
 from qenc import *                                   # noqa: F401,F403
 from qenc import _ops, imm as _imm, W_VPM, W_VPW_SETUP, W_VPW_ADDR
 from gen import Prog
@@ -71,7 +72,10 @@ Prog.emit = _emit
 
 def imm(v):
     """qenc small immediate.  Values 48..63 are the mul-ALU vector-rotate
-    encodings and are legal here, so the range is not asserted."""
+    encodings and are legal here, so the range is not asserted.
+    48 = rotate by r5 (dynamic), 49..63 = rotate 1..15; rotate 0 has no code
+    (use the plain move) and 1.0f is code 32, not 48.  As constants the same
+    codes alias -16..-1."""
     return _imm(v)
 
 
@@ -94,8 +98,8 @@ def mul_fmul(out_acc, a, b):
 
 
 def mul_rot(out_acc, src_acc, n):
-    return dict(mul_op=MUL_V8MIN, mul_out=32 + out_acc, ws=0,
-                mul_a=acc(src_acc), mul_b=imm(48 + n))
+    """Canonical v8min 16-lane rotate (see qenc.rot_inst)."""
+    return qenc.rot_inst(n, src=src_acc, out=out_acc)
 
 
 def rep_all(src_acc):
@@ -885,13 +889,8 @@ def g10_fmul(j, vec, t):
 
 
 def g10_rot(n):
-    if n == 0:
-        # small immediate 48 is 1.0f, not "rotate by 0" (only 49..63 are the
-        # rotate amounts), so row 0 of the k-even half needs an exact copy.
-        return dict(mul_op=MUL_V8MIN, mul_out=32 + G10_ACC_ROT,
-                    mul_a=acc(G10_ACC_AVEC), mul_b=acc(G10_ACC_AVEC))
-    return dict(mul_op=MUL_V8MIN, mul_out=32 + G10_ACC_ROT,
-                mul_a=acc(G10_ACC_AVEC), mul_b=imm(48 + n))
+    """Canonical v8min rotate of the A vector (see qenc.rot_inst)."""
+    return qenc.rot_inst(n, src=G10_ACC_AVEC, out=G10_ACC_ROT)
 
 
 def g10_fadd(r, j, t):

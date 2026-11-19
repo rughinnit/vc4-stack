@@ -87,10 +87,11 @@ def fmul_j(j, h):
 
 def rot_inst(n):
     if n == 0:
-        # v8min's small immediate 48 is the float 1.0, not "rotate by 0"
-        # (only 49..63 are the rotate amounts 1..15 that asm3 uses), so row 0
-        # ("no rotation") needs an exact copy of the A vector instead.  This is
-        # the same v8min self-copy idiom the B-file copies use.
+        # small immediate 48 is rotate-by-r5, not "rotate by 0"; 49..63 are
+        # the rotate amounts 1..15 that asm3 uses (1.0f is code 32).  There is
+        # no rotate-by-0 code, so row 0 ("no rotation") needs an exact copy of
+        # the A vector instead.  This is the same v8min self-copy idiom the
+        # B-file copies use.
         return dict(mul_op=MUL_V8MIN, mul_out=32 + ACC_ROT,
                     mul_a=acc(ACC_AVEC), mul_b=acc(ACC_AVEC))
     return dict(mul_op=MUL_V8MIN, mul_out=32 + ACC_ROT, mul_a=acc(ACC_AVEC),

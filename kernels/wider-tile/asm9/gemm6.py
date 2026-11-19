@@ -87,8 +87,9 @@ Invariants kept from asm3/4/7/8 (all empirically required on this Si):
   * TMU issue -> pop >= 8 words, pops in issue (FIFO) order per TMU;
   * A-file and B-file RAW gaps >= 2 words; accumulator gaps >= 2 for the
     A vector (copy -> rot);
-  * ws=1 rep; v8min small immediate 49..63 only (48 is 1.0f, so "rotate by 0"
-    is an exact self-copy); rot -> rep >= 2;
+  * ws=1 rep; v8min small immediates 49..63 are rotate 1..15 and 48 is
+    rotate-by-r5 (dynamic), so "rotate by 0" is the plain accumulator move;
+    rot -> rep >= 2;
   * B column block 64*K bytes, VPM DMA store DEPTH=16, UNITS=4 rows, stride
     (N-16)*4, VPM row base 4*qpu, 16 encoded as 0.
 
@@ -155,8 +156,9 @@ def fmul_j(j, vec, t):
 
 def rot_inst(n):
     if n == 0:
-        # small immediate 48 is 1.0f, not "rotate by 0" (only 49..63 are the
-        # rotate amounts), so row 0 of the k-even half needs an exact copy.
+        # small immediate 48 is rotate-by-r5, not "rotate by 0"; 49..63 are
+        # rotate 1..15 and 1.0f is code 32.  There is no rotate-by-0 code, so
+        # row 0 of the k-even half needs an exact copy.
         return dict(mul_op=MUL_V8MIN, mul_out=32 + ACC_ROT,
                     mul_a=acc(ACC_AVEC), mul_b=acc(ACC_AVEC))
     return dict(mul_op=MUL_V8MIN, mul_out=32 + ACC_ROT, mul_a=acc(ACC_AVEC),

@@ -94,3 +94,20 @@ QPUs) and therefore a new, unverified VDW-stride write mode.
 * **Not adopted** (harness-level, and it would move the pack's writeback into
   the GEMM's window): dropping the L2 flush between the pack and the GEMM,
   which is what makes the N=64 loop start on cold DRAM.
+
+## Encoder correction re-verification (2026-11-19)
+
+`qenc.py` was corrected after the XCHECK cross-validation (NOTES10 §6): the
+rotate words now use the vc4asm-canonical B mux, and pack/PM/unpack follow the
+header widths. Behaviour and speed are unchanged. Three fresh launches after a
+reboot, N=256, 12 QPUs, stock clocks, `get_throttled=0x0`, one `flock`:
+
+| run | pack ms | gemm ms | total ms | GFLOP/s total | cyc/k | Cmm | Pmm |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.3857 | 2.4438 | 2.8294 | 11.859 | 398.5 | 0 | 0 |
+| 2 | 0.3861 | 2.4503 | 2.8364 | 11.830 | 398.5 | 0 | 0 |
+| 3 | 0.3855 | 2.4510 | 2.8365 | 11.829 | 398.5 | 0 | 0 |
+
+`SRQCS=0x000c0c00`, `STATE: LIVE`, `maxabs=1.557e-4` on every run - identical
+to the pre-change numbers above. `qpu_disasm.py`: 754 words, 75 rotates,
+0 unknown/illegal.

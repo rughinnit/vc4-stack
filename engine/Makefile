@@ -27,7 +27,7 @@ $(LIB): $(OBJ) $(VC4D_DIR)/build/libvc4client.a
 	$(AR) rcs $@ $^
 
 $(BUILD)/libvc4infer.so: $(OBJ) $(VC4D_DIR)/build/libvc4client.a
-	$(CC) -shared -o $@ $^
+	$(CC) -shared -Wl,-soname,libvc4infer.so.1 -o $@ $^
 
 $(VC4D_DIR)/build/libvc4client.a:
 	$(MAKE) -C $(VC4D_DIR) build/libvc4client.a

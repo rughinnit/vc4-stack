@@ -47,7 +47,12 @@ import os
 import struct
 import sys
 
-ASM3 = os.environ.get("ASM3_DIR", "/home/raspi/work/asm3")
+# Self-contained: the encoder modules (qenc.py, gen.py, vpmwords.py) sit next
+# to this file in an installed tree (/usr/lib/vc4infer/kgen) and in the asm3
+# working tree in the original development checkout.  ASM3_DIR still wins when
+# set, for a developer comparing encoders.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+ASM3 = os.path.join(os.environ.get("ASM3_DIR") or _HERE)
 sys.path.insert(0, ASM3)
 
 import qenc

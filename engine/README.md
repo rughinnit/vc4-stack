@@ -22,7 +22,7 @@ src/vc4_train.c         transpose, C=A*B^T, fused softmax+CE backward
 src/vc4_api.c           the op registry (strict dispatch) + coverage table
 tools/kgen.py           QPU kernel generator (reuses the asm3 encoder)
 tests/                  CPU-oracle verification, no fallback paths
-python/vc4infer.py      ctypes binding with the same API
+vc4infer/_binding.py    ctypes binding with the same API (Python package)
 run_tests.sh            serialised, health-checked test runner
 ```
 

@@ -18,6 +18,13 @@ plane only (framework, allocation, I/O); there is no CPU compute fallback.
               the YOLOv8n coverage gap in `docs/ONNX.md`
 - `training/` forward+backward kernels and a toy trainer (MLP/conv) demonstrating
               gradient computation on the VC4 data plane
+- `vc4infer/` the installable product: Python engine API (`Engine`, `Device`),
+              `postprocess`, the YOLO adapter, the CLI and the optional
+              Ultralytics backend; docs in `docs/VC4INFER.md` and
+              `docs/PYTHON-API.md`
+- `cli/vc4infer` the `/usr/bin/vc4infer` entry point (thin over the package)
+- `examples/` Engine, Detector, bench and Ultralytics examples
+- `packaging/` the `.deb` and wheel builders plus the signed apt/pub publisher
 - `docs/`     measurements, ceilings, coverage tables, per-track results
 - `vc4d/`     privileged helper daemon (protocol v2): /dev/mem and V3D
               dispatch in one small root process that drops capabilities, so

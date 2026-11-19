@@ -51,6 +51,7 @@ OPS = {
     "HardSigmoid": "QPU unary (UOP_HARDSIGMOID, alpha/beta)",
     "HardSwish": "QPU unary (UOP_HARDSWISH)",
     "Sigmoid": "QPU elementwise",
+    "Tanh": "QPU sigmoid composition: 2*sigmoid(2x)-1",
     "Silu": "QPU elementwise (fused)",
     "Add": "QPU elementwise",
     "Mul": "QPU elementwise",

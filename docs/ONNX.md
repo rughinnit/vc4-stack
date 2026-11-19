@@ -941,3 +941,49 @@ Only the seven ops of section 10.2 plus the ONNX wiring of section 10 (now in
 none).  `Exp`/`Log`/`Sqrt`/`Tanh`/`Erf`/`Sin`/`Cos`/`Softplus`/`Gelu`/... keep
 their kernels in `kops.py` but remain **unregistered**: a graph node using them
 raises `UnsupportedNode`, never a wrong number and never a CPU path.
+
+### 11.6 The `nvec` hypothesis, tested and ruled out
+
+The leading hypothesis for the section-11.3 numbers was the 4-vector group path
+(`_store4` + `_gshift` 8 + the VPMQ7/CSTEP staging) rather than the math: every
+failing op was in `kops.HEAVY` (nvec=4) and every working op was at nvec=16.
+Two experiments settle it:
+
+| experiment | body | nvec | result |
+|---|---|---:|---|
+| `Abs` forced into `HEAVY` | 1 ALU word, no arithmetic | 4 | **exact** (2.7, -2.7, 0.5, -0.9 all bit-exact) |
+| `Softsign` removed from `HEAVY` | `x * rcp(1+\|x\|)` | 16 | **0 for every lane**, same as at nvec=4 |
+
+So the 4-vector store/step path is sound (`Abs` runs through it exactly) and a
+failing body fails at both group sizes (`Softsign`).  The `nvec` hypothesis is
+ruled out, and the section-11.3 observation that the old and new bodies agree
+"to the last digit" says nothing about the store: both were measured at nvec=4.
+
+What the failing bodies share, and the working ones do not: every working body
+(`Abs`, `Neg`, `Sign`, `Clip`, `LeakyRelu`, `HardSigmoid`, `HardSwish`,
+`Identity`, and the verified `Sigmoid`/`Silu`) feeds the arithmetic ALU only
+from **`ldi` constants, uniforms and add-ALU results**.  Every failing body
+(`Softsign`, `Exp`, `Log`, `Sqrt`, `Tanh`, `Reciprocal`, `Round`) feeds a
+**MUL-ALU result back into a later MUL**, through either an accumulator
+(`e.mul(ACC1, ACC1, ACC0)`) or a B register written by the mul's `mov`
+(`core_rcp`'s Newton chain).  That is the next thing to probe: a two-op
+sequence `t = fmul(x, 2); y = fmul(t, 3)` at nvec=16, compared bit-for-bit.
+If it fails, chained products are the defect and every core must keep a chain
+in one accumulator, or route it through the packed `fmul`+`fadd` word the
+verified GEMM uses.
+
+### 11.7 `Tanh` shipped by composition (no new kernel)
+
+`tanh(x) = 2*sigmoid(2x) - 1`, where `sigmoid` is the **verified** element-wise
+kernel (7.15e-07) and the scalings are the engine's correctly-rounded `MUL`
+and a broadcast `ADD`.  Four GPU launches, no host arithmetic, no new kernel:
+
+| graph | shape | max abs | max rel | mismatches |
+|---|---|---:|---:|---:|
+| `Tanh` | 1x3x8x8 | 6.41e-07 | 6.41e-07 | 0 / 192 |
+| `Tanh` | 2x5x7x3 | 1.55e-06 | 1.55e-06 | 0 / 210 |
+| `Tanh` | 1x16x4x4 (edge vector incl. 0, +-1e30, +-1e-30) | 0 | 0 | 0 / 256 |
+
+Against `onnx.reference.ReferenceEvaluator`, tolerance `1e-4 + 1e-4*max(|ref|,1)`.
+`genops_onnx.py` now covers 8 ops / 28 graphs / 4670 elements, 0 mismatches.
+`vc4infer nodes` reports `Tanh` as a vc4 node.

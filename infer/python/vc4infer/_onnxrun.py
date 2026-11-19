@@ -1110,6 +1110,27 @@ class Runner:
             raise UnsupportedNode(node.name, "Clip", "min %g > max %g" % (lo, hi))
         return self._unary_uop(node, vc4infer.UOP_CLIP, lo, hi)
 
+    def _tanh(self, node):
+        """tanh(x) = 2*sigmoid(2x) - 1, composed from verified QPU kernels.
+
+        VC4_OP_SIGMOID is the fused element-wise kernel (degree-5 2^f
+        polynomial + 3x Newton reciprocal, measured 7.15e-07) and the two
+        scalings are the engine's correctly-rounded MUL plus a broadcast ADD,
+        so the whole node is four GPU launches with no new kernel and no host
+        arithmetic.  The direct tanh body in kops.py is not element-verified
+        yet (docs/ONNX.md sec. 11), so this composition is the shipped path.
+        """
+        x = self._float(node.input[0])
+        t = self._scaled(x, 2.0)
+        self._tmp(t)
+        y = self.pool.alloc(t.size * 4 + 64)
+        self.eng.elementwise(vc4infer.OP_SIGMOID, t.buf, y, t.size)
+        t2 = Tensor(y, t.shape, t.layout, t.pitch)
+        self._tmp(t2)
+        u = self._scaled(t2, 2.0)
+        self._tmp(u)
+        return self._addconst(u, -1.0)
+
     def _maxpool(self, node):
         x = self._float(node.input[0])
         if len(x.shape) != 4:
@@ -1682,6 +1703,7 @@ class Runner:
             "HardSigmoid": self._hardsigmoid,
             "HardSwish": self._hardswish,
             "Sigmoid": self._sigmoid,
+            "Tanh": self._tanh,
             "Silu": lambda node: self._silu(self._float(node.input[0])),
             "Add": self._add,
             "Mul": self._mul,

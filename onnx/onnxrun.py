@@ -39,7 +39,7 @@ Supported nodes
     Div, Sub      lowered to GPU Mul / Mul+Add (constant operand for Div)
     Softmax       any axis (host permute to the last, <= 16 classes, rows%8)
     Transpose     host permute
-    Resize        nearest, asymmetric or half_pixel (bilinear raises)
+    Resize        nearest or linear (linear: GPU Mul/Add), asymmetric/half_pixel
     MatMul, Gemm  2-D
     Flatten, Reshape, Squeeze, Unsqueeze, Cast, Identity, Constant
     Shape, Gather int64 host tensors (static shapes)
@@ -915,7 +915,7 @@ class Runner:
         x = self._float(node.input[0])
         mode = _attr(node, "mode", "nearest")
         coord = _attr(node, "coordinate_transformation_mode", "half_pixel")
-        if mode != "nearest":
+        if mode not in ("nearest", "linear"):
             raise UnsupportedNode("Resize %s: mode=%s" % (node.name, mode))
         if coord not in ("asymmetric", "half_pixel"):
             raise UnsupportedNode("Resize %s: coord=%s" % (node.name, coord))
@@ -937,21 +937,88 @@ class Runner:
             Wo = int(round(w * float(scales[3])))
         else:
             raise UnsupportedNode("Resize %s: no scales/sizes" % node.name)
-        sy = np.arange(Ho, dtype=np.float64)
-        sx = np.arange(Wo, dtype=np.float64)
-        if coord == "asymmetric":
-            iy = np.floor(sy * (h / Ho)).astype(np.int64)
-            ix = np.floor(sx * (w / Wo)).astype(np.int64)
-        else:
-            iy = np.floor((sy + 0.5) * (h / Ho) - 0.5).astype(np.int64)
-            ix = np.floor((sx + 0.5) * (w / Wo) - 0.5).astype(np.int64)
-        iy = np.clip(iy, 0, h - 1)
-        ix = np.clip(ix, 0, w - 1)
+
+        def axis(n_in, n_out):
+            s = np.arange(n_out, dtype=np.float64)
+            if coord == "asymmetric":
+                src = s * (n_in / n_out)
+            else:
+                src = (s + 0.5) * (n_in / n_out) - 0.5
+            i0u = np.floor(src).astype(np.int64)
+            if mode == "nearest":
+                if coord == "asymmetric":
+                    idx = np.floor(s * (n_in / n_out)).astype(np.int64)
+                else:
+                    idx = np.floor((s + 0.5) * (n_in / n_out) - 0.5).astype(np.int64)
+                return np.clip(idx, 0, n_in - 1), None, None
+            return (np.clip(i0u, 0, n_in - 1), np.clip(i0u + 1, 0, n_in - 1),
+                    src - i0u)
+
+        iy0, iy1, wy = axis(h, Ho)
+        ix0, ix1, wx = axis(w, Wo)
+        if mode == "nearest":
+            if nhwc:
+                y = np.ascontiguousarray(a[:, iy0][:, :, ix0])
+                return self.upload_nhwc(y, (a.shape[0], x.shape[1], Ho, Wo))
+            y = np.ascontiguousarray(a[:, :, iy0][:, :, :, ix0])
+            return self.upload(y)
+
+        # Bilinear.  The ARM only gathers the four neighbours and builds the
+        # coordinate weights; the four multiplies and three adds that touch
+        # the activations run on the QPUs (vc4_elementwise MUL/ADD).
         if nhwc:
-            y = np.ascontiguousarray(a[:, iy][:, :, ix])
-            return self.upload_nhwc(y, (a.shape[0], x.shape[1], Ho, Wo))
-        y = np.ascontiguousarray(a[:, :, iy][:, :, :, ix])
-        return self.upload(y)
+            taps = [a[:, iy0][:, :, ix0], a[:, iy0][:, :, ix1],
+                    a[:, iy1][:, :, ix0], a[:, iy1][:, :, ix1]]
+            wy0, wy1 = 1.0 - wy, wy
+            wx0, wx1 = 1.0 - wx, wx
+            wts = [wy0[:, None] * wx0[None, :], wy0[:, None] * wx1[None, :],
+                   wy1[:, None] * wx0[None, :], wy1[:, None] * wx1[None, :]]
+            shp = (a.shape[0], x.shape[1], Ho, Wo)
+            ashp = (a.shape[0], Ho, Wo, x.shape[1])
+            wts = [np.broadcast_to(z[None, :, :, None], ashp) for z in wts]
+        else:
+            taps = [a[:, :, iy0][:, :, :, ix0], a[:, :, iy0][:, :, :, ix1],
+                    a[:, :, iy1][:, :, :, ix0], a[:, :, iy1][:, :, :, ix1]]
+            wy0, wy1 = 1.0 - wy, wy
+            wx0, wx1 = 1.0 - wx, wx
+            wts = [wy0[None, None, :, None] * wx0[None, None, None, :],
+                   wy0[None, None, :, None] * wx1[None, None, None, :],
+                   wy1[None, None, :, None] * wx0[None, None, None, :],
+                   wy1[None, None, :, None] * wx1[None, None, None, :]]
+            shp = (a.shape[0], x.shape[1], Ho, Wo)
+            wts = [np.broadcast_to(z, shp) for z in wts]
+        return self._lerp4(taps, wts, shp, nhwc)
+
+    def _lerp4(self, taps, weights, shape, nhwc):
+        """sum taps[i]*weights[i] with GPU MUL/ADD (no new QPU kernel)."""
+        def up(arr):
+            arr = np.ascontiguousarray(arr, np.float32)
+            if nhwc:
+                return self.upload_nhwc(arr, shape)
+            return self.upload(arr)
+
+        def ew(op, a, b):
+            out = self.pool.alloc(a.size * 4 + 64)
+            self.eng.elementwise(op, a.buf, out, a.size, b=b.buf)
+            return Tensor(out, a.shape, a.layout, a.pitch)
+
+        t = [up(z) for z in taps]
+        w = [up(z) for z in weights]
+        p0 = ew(vc4infer.OP_MUL, t[0], w[0])
+        self._free(t[0].buf), self._free(w[0].buf)
+        p1 = ew(vc4infer.OP_MUL, t[1], w[1])
+        self._free(t[1].buf), self._free(w[1].buf)
+        s0 = ew(vc4infer.OP_ADD, p0, p1)
+        self._free(p0.buf), self._free(p1.buf)
+        p2 = ew(vc4infer.OP_MUL, t[2], w[2])
+        self._free(t[2].buf), self._free(w[2].buf)
+        p3 = ew(vc4infer.OP_MUL, t[3], w[3])
+        self._free(t[3].buf), self._free(w[3].buf)
+        s1 = ew(vc4infer.OP_ADD, p2, p3)
+        self._free(p2.buf), self._free(p3.buf)
+        out = ew(vc4infer.OP_ADD, s0, s1)
+        self._free(s0.buf), self._free(s1.buf)
+        return out
 
     def _slice(self, node):
         x = self._float(node.input[0])

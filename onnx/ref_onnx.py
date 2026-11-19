@@ -143,16 +143,36 @@ def eval_node(node, ins, vals=None):
             Ho = int(round(x0.shape[2] * float(scales[2])))
             Wo = int(round(x0.shape[3] * float(scales[3])))
         coord = a(node, "coordinate_transformation_mode", "half_pixel")
+        mode = a(node, "mode", "nearest")
         h, w = x0.shape[2], x0.shape[3]
-        sy = np.arange(Ho, dtype=np.float64)
-        sx = np.arange(Wo, dtype=np.float64)
-        if coord == "asymmetric":
-            iy = np.floor(sy * (h / Ho)).astype(np.int64)
-            ix = np.floor(sx * (w / Wo)).astype(np.int64)
+
+        def ax(n_in, n_out):
+            s = np.arange(n_out, dtype=np.float64)
+            src = (s * (n_in / n_out) if coord == "asymmetric"
+                   else (s + 0.5) * (n_in / n_out) - 0.5)
+            i0u = np.floor(src).astype(np.int64)
+            if mode == "nearest":
+                idx = (np.floor(s * (n_in / n_out)).astype(np.int64)
+                       if coord == "asymmetric"
+                       else np.floor((s + 0.5) * (n_in / n_out) - 0.5)
+                       .astype(np.int64))
+                return np.clip(idx, 0, n_in - 1), None, None
+            return (np.clip(i0u, 0, n_in - 1), np.clip(i0u + 1, 0, n_in - 1),
+                    src - i0u)
+
+        iy0, iy1, wy = ax(h, Ho)
+        ix0, ix1, wx = ax(w, Wo)
+        if mode == "nearest":
+            out = x0[:, :, iy0][:, :, :, ix0]
         else:
-            iy = np.floor((sy + 0.5) * (h / Ho) - 0.5).astype(np.int64)
-            ix = np.floor((sx + 0.5) * (w / Wo) - 0.5).astype(np.int64)
-        out = x0[:, :, np.clip(iy, 0, h - 1)][:, :, :, np.clip(ix, 0, w - 1)]
+            a00 = x0[:, :, iy0][:, :, :, ix0]
+            a01 = x0[:, :, iy0][:, :, :, ix1]
+            a10 = x0[:, :, iy1][:, :, :, ix0]
+            a11 = x0[:, :, iy1][:, :, :, ix1]
+            wy0, wy1 = (1.0 - wy)[:, None], wy[:, None]
+            wx0, wx1 = (1.0 - wx)[None, :], wx[None, :]
+            out = (wy0 * wx0 * a00 + wy0 * wx1 * a01 +
+                   wy1 * wx0 * a10 + wy1 * wx1 * a11)
     elif op in ("Identity",):
         out = ins[0]
     elif op == "Cast":
@@ -244,16 +264,36 @@ def run_model(path, feeds, want=None):
                 Ho = int(round(x0.shape[2] * float(scales[2])))
                 Wo = int(round(x0.shape[3] * float(scales[3])))
             coord = a(node, "coordinate_transformation_mode", "half_pixel")
+            mode = a(node, "mode", "nearest")
             h, w = x0.shape[2], x0.shape[3]
-            sy = np.arange(Ho, dtype=np.float64)
-            sx = np.arange(Wo, dtype=np.float64)
-            if coord == "asymmetric":
-                iy = np.floor(sy * (h / Ho)).astype(np.int64)
-                ix = np.floor(sx * (w / Wo)).astype(np.int64)
+
+            def ax(n_in, n_out):
+                s = np.arange(n_out, dtype=np.float64)
+                src = (s * (n_in / n_out) if coord == "asymmetric"
+                       else (s + 0.5) * (n_in / n_out) - 0.5)
+                i0u = np.floor(src).astype(np.int64)
+                if mode == "nearest":
+                    idx = (np.floor(s * (n_in / n_out)).astype(np.int64)
+                           if coord == "asymmetric"
+                           else np.floor((s + 0.5) * (n_in / n_out) - 0.5)
+                           .astype(np.int64))
+                    return np.clip(idx, 0, n_in - 1), None, None
+                return (np.clip(i0u, 0, n_in - 1),
+                        np.clip(i0u + 1, 0, n_in - 1), src - i0u)
+
+            iy0, iy1, wy = ax(h, Ho)
+            ix0, ix1, wx = ax(w, Wo)
+            if mode == "nearest":
+                out = x0[:, :, iy0][:, :, :, ix0]
             else:
-                iy = np.floor((sy + 0.5) * (h / Ho) - 0.5).astype(np.int64)
-                ix = np.floor((sx + 0.5) * (w / Wo) - 0.5).astype(np.int64)
-            out = x0[:, :, np.clip(iy, 0, h - 1)][:, :, :, np.clip(ix, 0, w - 1)]
+                a00 = x0[:, :, iy0][:, :, :, ix0]
+                a01 = x0[:, :, iy0][:, :, :, ix1]
+                a10 = x0[:, :, iy1][:, :, :, ix0]
+                a11 = x0[:, :, iy1][:, :, :, ix1]
+                wy0, wy1 = (1.0 - wy)[:, None], wy[:, None]
+                wx0, wx1 = (1.0 - wx)[None, :], wx[None, :]
+                out = (wy0 * wx0 * a00 + wy0 * wx1 * a01 +
+                       wy1 * wx0 * a10 + wy1 * wx1 * a11)
         elif op in ("Identity",):
             out = ins[0]
         elif op == "Cast":

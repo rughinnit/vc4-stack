@@ -60,6 +60,39 @@ def build(name, shape, convs):
     print("%-14s %s -> x %s" % (name, path, shape))
 
 
+def build_bilinear():
+    rng = np.random.default_rng(4242)
+    w = (rng.standard_normal((16, 8, 3, 3)) * 0.15).astype(np.float32)
+    b = (rng.standard_normal(16) * 0.1).astype(np.float32)
+    roi = np.zeros((0,), np.float32)
+    scales = np.array([1, 1, 2, 2], np.float32)
+    inits = [numpy_helper.from_array(w, "w0"),
+             numpy_helper.from_array(b, "b0"),
+             numpy_helper.from_array(roi, "roi"),
+             numpy_helper.from_array(scales, "scales")]
+    nodes = [
+        helper.make_node("Conv", ["x", "w0", "b0"], ["c"], name="c",
+                         kernel_shape=[3, 3], strides=[1, 1],
+                         pads=[1, 1, 1, 1]),
+        helper.make_node("Resize", ["c", "roi", "scales"], ["y"], name="r",
+                         mode="linear",
+                         coordinate_transformation_mode="half_pixel"),
+    ]
+    graph = helper.make_graph(
+        nodes, "bilinear",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT,
+                                       [1, 8, 12, 12])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)], inits)
+    m = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    m.ir_version = 8
+    m = onnx.shape_inference.infer_shapes(m)
+    onnx.save(m, os.path.join(OUT, "bilinear.onnx"))
+    x = rng.standard_normal((1, 8, 12, 12)).astype(np.float32)
+    np.save(os.path.join(OUT, "bilinear.in.npy"), x)
+    print("bilinear       %s -> x %s" % (os.path.join(OUT, "bilinear.onnx"),
+                                         x.shape))
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     build("batched", [2, 16, 20, 20],
@@ -68,6 +101,7 @@ def main():
     build("dilated", [1, 16, 24, 24], [(16, 16, 3, 1, 2, 2, 1, False)])
     build("depthwise", [1, 32, 16, 16], [(32, 32, 3, 1, 1, 1, 32, False)])
     build("stride2", [1, 32, 32, 32], [(32, 32, 3, 2, 1, 1, 1, False)])
+    build_bilinear()
     return 0
 
 

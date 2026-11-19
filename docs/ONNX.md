@@ -34,6 +34,7 @@ onnx/yolo_bench.py      end-to-end benchmark + tolerance check + JSON report
 onnx/make_extra_models.py  build the dilated/grouped/batch/depthwise/stride-2
                         graphs used by the §8 verification
 onnx/verify_extra.py    5 runs per graph vs ref_onnx, per-node time + MACs
+                        (includes the bilinear Resize graph)
 ```
 
 Generated artifacts live in `onnx/models/` (not committed; regenerate with
@@ -93,6 +94,7 @@ the single 64 MiB arena.
 | `MaxPool` NxN, any stride/pad | `vc4_maxpooln` (new QPU kernel) | border filled with `-inf` on host (bytes); output compacted |
 | `Concat` | host byte concat | channel axis of NCHW only |
 | `Resize` nearest | host byte gather | `mode=nearest`, `asymmetric` or `half_pixel`, integer or float scale |
+| `Resize` linear | 4 host gathers + GPU `Mul`/`Add` | `mode=linear`, `asymmetric` or `half_pixel`; the ARM gathers the four neighbours and builds the coordinate weights, the activation multiplies/adds run on the QPUs |
 | `MatMul` | `vc4_matmul` | 2-D only |
 | `Gemm` | `vc4_matmul` + GPU `Add` for bias | `transA=0`, `alpha=1`, `beta∈{0,1}`; C of `[N]`, `[1,N]` or `[M,N]` |
 | `Softmax` | `vc4_softmax_fwd` (new) | last axis, ≤16 classes, rows padded to 8 |
@@ -106,7 +108,8 @@ onnxrun.UnsupportedNode: node '/model.9/Split' (Split): unsupported op Split
 ```
 
 Inputs/outputs must be fp32.  `Expand`, `BatchNormalization`, `Pow`, `LRN`,
-bilinear `Resize` and arbitrary `ConvTranspose` are not implemented;
+arbitrary `ConvTranspose` is not implemented; bilinear `Resize` is a
+GPU-MUL/ADD composition (§8.6);
 `Div`/`Sub` only in the lowered forms of section 7.  A shape or attribute
 combination outside the table above still raises `UnsupportedNode`.
 
@@ -400,6 +403,7 @@ with the node name, and every activation MAC runs on a QPU.
 | dilation | `vc4_conv_nhwc_dil` | `im2col_nhwc --dil d`: taps of one kernel row are `d` pixels apart and kernel rows `d` input rows apart.  Output `ho = (H+2p-d*(K-1)-1)/stride+1`. |
 | grouped | `vc4_conv_nhwc_group` | one padded input, one activation panel reused by every group; each group runs im2col+GEMM and the GEMM writes **straight into its channel range** of the single `[M][Cout]` output.  The GEMM gained a C row stride (`vc4__gemm3_run_c`, kgen `gemm3 --cstride`).  Real grouped MACs. |
 | batch N | all NHWC ops | `nimg` already existed in the kernels; the runner now allocates `N*M*Cout` and passes it.  Conv, pool, upsample, concat, elementwise and softmax share one launch across images. |
+| bilinear `Resize` | runner (`_resize` + `_lerp4`) | four taps are host byte gathers, the four weights are host coordinate math, and `vc4_elementwise` MUL/ADD does every activation multiply/add on the QPUs (7 full-tensor passes). |
 | 320x320 | runner + daemon | client region via `VC4INFER_ARENA_MB`, pool reserve via `VC4_POOL_RESERVE_MB`; the conv scratch (padded image + im2col panel) is 23 MiB at 320. |
 
 Normative kernel constraints (all checked before a launch):
@@ -437,6 +441,7 @@ checked.
 | dilated | Conv 16→16 3x3 d=2 p=2 | 1x16x24x24 | 0/9216 | 3.7 | 1.0 | 2 | 1.33 M | 5.31 M (dense d=1) | 4x |
 | depthwise | Conv 32→32 g=32 3x3 | 1x32x16x16 | 0/8192 | 3.9 | 1.1 | 2 | 2.36 M | 2.36 M | 1x (dense kept) |
 | stride-2 | Conv 32→32 3x3 s=2 p=1 | 1x32x16x16 | 0/8192 | 6.2 | 1.1 | 2 | 2.36 M | 9.44 M (4 phases) | 4x |
+| bilinear | Conv 8→16 3x3 + Resize 2x linear | 1x16x24x24 | 0/9216 | 16.2 | 1.9 | 23 | 230 K (conv) + 64.5 K (lerp) | 0 (raised) | n/a |
 
 The raw kernels have their own float64 CPU oracle in `engine/tests/test_nhwc.c`
 (stride 1/2, batch 2, dilated 3x3 d2/d3, 5x5, grouped g2/g3/g4, depthwise):
@@ -512,12 +517,6 @@ only reached for non-square kernels/strides, and says so when batch > 1.
   an A-file pop into A27 followed by the next load wedged the TMU after the
   third load.  The verified dense block-diagonal expansion (Cin x the MACs)
   remains the dispatch.
-* **Bilinear `Resize`.**  Still only nearest.  The invariant that blocks it
-  is the strictness rule itself: the engine has no bilinear op, and the host
-  may only move bytes and build coordinate/weight tables - it may not perform
-  the lerp.  A QPU kernel for it was not landed in this milestone, so the op
-  raises rather than falling back to the ARM.  Nearest is what the YOLO
-  models here use.
 * **On-device NMS.**  Greedy NMS is sequential in a data-dependent kept set
   (each kept box changes which later boxes survive), which the engine's
   static task grid and one-launch-per-program model cannot express without
@@ -526,6 +525,27 @@ only reached for non-square kernels/strides, and says so when batch > 1.
   node raises rather than computing on the ARM.  A host implementation is
   therefore not benchmarked against a shipped GPU one; claiming a speedup
   would be dishonest.
+
+### 8.6 Bilinear resize (composition, no new kernel)
+
+`mode=linear` (asymmetric or half_pixel) is implemented without a new QPU
+kernel:
+
+1. the host gathers the four neighbours (`X[y0,x0]`, `X[y0,x1]`, `X[y1,x0]`,
+   `X[y1,x1]`) - byte movement only;
+2. the host builds the four per-tap weight tensors
+   `(1-wy)(1-wx), (1-wy)wx, wy(1-wx), wy*wx` from the static scale - this is
+   coordinate math, never activation data;
+3. seven `vc4_elementwise` passes (4 MUL + 3 ADD) do every activation
+   multiply/add on the QPUs, with the intermediates recycled by the pool.
+
+Measured on the `bilinear` graph (Conv 8->16 3x3 then a 2x linear resize of a
+12x12 map): **5 runs, 0/9216 mismatches, max abs 5.25e-6**, 16.2 ms mean
+wall, 1.9 ms GPU, 23 launches.  The working set is about 6x the output (four
+taps + four weights + temporaries), so a large resize can exhaust the graph
+pool; `Pool.alloc` raises `graph pool exhausted` with the exact byte count.
+A dedicated bilinear kernel would cut both the launches and the memory; it is
+the obvious next step.
 
 ## 9. Limitations that matter for real models
 
@@ -539,8 +559,9 @@ only reached for non-square kernels/strides, and says so when batch > 1.
   batch 1 and say so.
 * **Softmax** is limited to 16 classes by the fused kernel's 16-lane rows.
 * **Concat/Resize** are host byte copies, so they cost a round trip but no
-  arithmetic.  `Resize` is nearest only; bilinear and NMS are not shipped
-  (§8.5).  A real runner would do them in the arena (a memcpy kernel).
+  arithmetic.  `Resize` is nearest or a Mul/Add composition for bilinear
+  (§8.6); NMS is not shipped (§8.5).  A real runner would do nearest in the
+  arena (a memcpy kernel).
 * **Launch overhead.**  Small layers are launch-bound: the elementwise path
   issues one launch per 12 groups of 256 floats, so a 32x32x32 ReLU is 11
   launches (~0.8 ms GPU, ~2 ms wall).  Fusing or batching more groups per

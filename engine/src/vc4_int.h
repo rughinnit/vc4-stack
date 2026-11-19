@@ -5,7 +5,7 @@
 #include "vc4infer.h"
 #include <sys/types.h>
 
-#define VC4_MAX_KERNELS   32
+#define VC4_MAX_KERNELS   128
 #define VC4_MAX_QPU       12
 
 /* arena layout (one dma-buf):
@@ -16,9 +16,9 @@
  */
 #define VC4_CODE_BASE     0x001000u
 #define VC4_CODE_SLOT     0x4000u
-#define VC4_UNI_BASE      0x090000u
+#define VC4_UNI_BASE      0x210000u
 #define VC4_UNI_SLOT      0x1000u
-#define VC4_DATA_BASE     0x100000u
+#define VC4_DATA_BASE     0x300000u
 
 #define VC4_UNI_WORDS     16
 

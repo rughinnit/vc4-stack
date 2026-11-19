@@ -2129,6 +2129,561 @@ B_K = dict(C1=9, C2=10, C3=11, C4=12, C5=13, NLOG2E=14, MAGIC=15,
            QOFF=27, LOFF=28, GAP=29, HALF=27)
 
 
+def _tmu_load_a(b, tmu, addr_reg, dst):
+    """Serialised TMU load, popping into A-file register `dst` (0..31)."""
+    sig = SIG_LOAD_TMU0 if tmu == 0 else SIG_LOAD_TMU1
+    b.e(add_or(W_TMU0_S if tmu == 0 else W_TMU1_S,
+               areg(addr_reg), areg(addr_reg), ws=1))
+    b.e(nop(), nop(), nop(), nop(), nop(), nop(), nop(), nop())
+    b.e(alu(sig=sig, cond_add=COND_NEVER, cond_mul=COND_NEVER))
+    b.e(add_or(dst, acc(4), acc(4)))
+
+
+def _tmu_load_b(b, tmu, addr_reg, dst):
+    """Serialised TMU load, popping into B-file register `dst` (16..31)."""
+    sig = SIG_LOAD_TMU0 if tmu == 0 else SIG_LOAD_TMU1
+    b.e(add_or(W_TMU0_S if tmu == 0 else W_TMU1_S,
+               areg(addr_reg), areg(addr_reg), ws=1))
+    b.e(nop(), nop(), nop(), nop(), nop(), nop(), nop(), nop())
+    b.e(alu(sig=sig, cond_add=COND_NEVER, cond_mul=COND_NEVER))
+    b.e(add_or(dst, acc(4), acc(4), ws=1))
+
+
+def build_im2col_nhwc(Cin, KH, KW, stride=1, vpitch=1):
+    """K-major GEMM panel straight from a zero-padded NHWC image.
+
+    One row block = 16 consecutive OUTPUT pixels of one output row, so the
+    source pixels of one tap are 16 words at a constant step of
+    stride*Cin*4 bytes - the VDR pitch.  The VDR loads [pixel][channel] into
+    the VPM and the vertical VDW stores it transposed, giving the panel block
+    PANEL[(rb*K + tap*Cin + ci)*16 + p] directly.
+
+    Per row block the kernel unrolls the KH*KW taps at generation time and
+    loops over the Cin/16 channel blocks; nx (16-pixel blocks per row) and the
+    rows per QPU are uniforms, so one blob serves every spatial size.
+
+    KERNEL ABI (u0..u10)
+      u0 src base bus                       u1 panel base bus
+      u2 src 16-pixel block step (16*stride*Cin*4)
+      u3 dst panel block step (64*nk)
+      u4 output rows for this QPU
+      u5 source offset of the first row  (y0*stride*row_pitch)
+      u6 panel offset of the first block (y0*nx*64*nk)
+      u7 VDR pitch (stride*Cin*4)           u8 QPU index
+      u9 padded-image row stride            u10 nx (blocks per row)
+      u11 source advance per output row (stride*row stride)
+    """
+    assert Cin % 16 == 0
+    nseg = KH * KW
+    A = dict(SRCB=16, PB=17, SRC=18, SEG0=19, DSTX=20, DSTB=21,
+             CNT=22, TMP=23, VDRW=24, VDWW=25, VDRS=26, VDWS=27,
+             Q=28, KB=29, XCNT=30, SEGSRC=31)
+    B = dict(C4=16, BLK=17, DBLK=18, PIT=19, PLANE=20, C64=21, D1K=22,
+             SOFF=23, DOFF=24, NX=25, T=26, RADV=27)
+
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))                     # tmu_noswap
+    b.read_uni(A['SRCB'])                               # u0
+    b.read_uni(A['PB'])                                 # u1
+    b.read_uni(B['BLK'], ws=1)                          # u2
+    b.read_uni(B['DBLK'], ws=1)                         # u3
+    b.read_uni(A['CNT'])                                # u4
+    b.read_uni(B['SOFF'], ws=1)                         # u5
+    b.read_uni(B['DOFF'], ws=1)                         # u6
+    b.read_uni(B['PIT'], ws=1)                          # u7
+    b.read_uni(A['Q'])                                  # u8
+    b.read_uni(B['PLANE'], ws=1)                        # u9
+    b.read_uni(B['NX'], ws=1)                           # u10
+    b.read_uni(B['RADV'], ws=1)                         # u11 stride*row_pitch
+
+    b.e(ldi(V.vdr_basic(0, vpitch), A['VDRW']), nop())
+    b.e(ldi(V.vdw_basic(0, 16, 16, horizontal=0), A['VDWW']), nop())
+    b.e(add_(ADD_SHL, B['T'], ws=1, a=areg(A['Q']), b=imm(8)))
+    b.e(add_(ADD_ADD, A['VDRW'], areg(A['VDRW']), breg(B['T'])), nop())
+    b.e(add_(ADD_SHL, B['T'], ws=1, a=areg(A['Q']), b=imm(11)))
+    b.e(add_(ADD_ADD, A['VDWW'], areg(A['VDWW']), breg(B['T'])), nop())
+    b.e(ldi(V.vdr_stride(0) & ~0xFFF, A['TMP']), nop())
+    b.e(add_(ADD_ADD, A['VDRS'], areg(A['TMP']), breg(B['PIT'])), nop())
+    b.e(ldi(V.vdw_stride(0), A['VDWS']), nop())
+    b.e(ldi(64, B['C64'], ws=1), nop())
+    b.e(ldi(1024, B['D1K'], ws=1), nop())
+    b.e(ldi(Cin * 4, B['C4'], ws=1), nop())     # per-kx tap step (compile-time)
+    b.e(add_(ADD_ADD, A['SRC'], areg(A['SRCB']), breg(B['SOFF'])), nop())
+    b.e(add_(ADD_ADD, A['DSTX'], areg(A['PB']), breg(B['DOFF'])), nop(), nop())
+
+    p.label('row')
+    b.e(add_or(A['SEG0'], areg(A['SRC']), areg(A['SRC'])), nop())
+    b.e(add_or(A['XCNT'], breg(B['NX']), breg(B['NX'])), nop(), nop())
+    p.label('xb')
+    b.e(add_or(A['DSTB'], areg(A['DSTX']), areg(A['DSTX'])), nop(), nop())
+    for s in range(nseg):
+        ky, kx = divmod(s, KW)
+        b.e(add_or(A['SEGSRC'], areg(A['SEG0']), areg(A['SEG0'])), nop())
+        for _ in range(ky):
+            b.e(add_(ADD_ADD, A['SEGSRC'], areg(A['SEGSRC']), breg(B['PLANE'])))
+        for _ in range(kx):
+            b.e(add_(ADD_ADD, A['SEGSRC'], areg(A['SEGSRC']), breg(B['C4'])))
+        b.e(add_or(A['TMP'], areg(A['SEGSRC']), areg(A['SEGSRC'])), nop(), nop())
+        p.emit(ldi(Cin // 16, A['KB']))
+        b.e(nop(), nop())
+        p.label('cib%d' % s)
+        b.e(add_or(W_VPR_SETUP, areg(A['VDRW']), areg(A['VDRW'])))
+        b.e(add_or(W_VPR_SETUP, areg(A['VDRS']), areg(A['VDRS'])))
+        b.e(add_or(W_VPR_ADDR, areg(A['TMP']), areg(A['TMP'])))
+        b.e(add_or(W_NOP, areg(50), areg(50)))              # vpr_wait
+        b.e(add_or(W_VPW_SETUP, areg(A['VDWW']), areg(A['VDWW']), ws=1))
+        b.e(add_or(W_VPW_SETUP, areg(A['VDWS']), areg(A['VDWS']), ws=1))
+        b.e(add_or(W_VPW_ADDR, areg(A['DSTB']), areg(A['DSTB']), ws=1))
+        b.e(add_or(W_NOP, breg(R_VPW_WAIT), breg(R_VPW_WAIT)))  # vpw_wait
+        b.e(add_(ADD_ADD, A['TMP'], areg(A['TMP']), breg(B['C64'])))
+        b.e(add_(ADD_ADD, A['DSTB'], areg(A['DSTB']), breg(B['D1K'])))
+        b.e(add_(ADD_SUB, A['KB'], areg(A['KB']), imm(1), sf=1))
+        p.branch_to('cib%d' % s, cond=BR_ALL_Z_CLEAR)
+        b.e(nop(), nop(), nop())
+    b.e(add_(ADD_ADD, A['SEG0'], areg(A['SEG0']), breg(B['BLK'])))
+    b.e(add_(ADD_ADD, A['DSTX'], areg(A['DSTX']), breg(B['DBLK'])))
+    b.e(add_(ADD_SUB, A['XCNT'], areg(A['XCNT']), imm(1), sf=1))
+    p.branch_to('xb', cond=BR_ALL_Z_CLEAR)
+    b.e(nop(), nop(), nop())
+    b.e(add_(ADD_ADD, A['SRC'], areg(A['SRC']), breg(B['RADV'])))
+    b.e(add_(ADD_SUB, A['CNT'], areg(A['CNT']), imm(1), sf=1))
+    p.branch_to('row', cond=BR_ALL_Z_CLEAR)
+    b.e(nop(), nop(), nop())
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
+def build_probe_lane():
+    """Diagnostic: one TMU gather of 16 4-byte words at src + lane*4.
+
+    The result is replicated into the four store rows so the destination shows
+    the per-lane mapping of one gather (4 x 64 B at stride 0).
+    """
+    A = dict(SRC=16, DST=17, Q=18, KADDR=19)
+    B = dict(V4=20, V9=21, L4=22)
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))
+    b.read_uni(A['SRC'])            # u0
+    b.read_uni(A['DST'])            # u1
+    b.read_uni(A['Q'])              # u2
+    b.e(add_(ADD_SHL, B['L4'], ws=1, a=areg(R_ELEM_NUM), b=imm(2)))
+    b.e(add_(ADD_ADD, A['KADDR'], areg(A['SRC']), breg(B['L4'])), nop())
+    _tmu_load_a(b, 0, A['KADDR'], 0)
+    b.e(add_or(1, areg(0), areg(0)))
+    b.e(add_or(2, areg(0), areg(0)))
+    b.e(add_or(3, areg(0), areg(0)), nop(), nop())
+    b.e(add_(ADD_SHL, B['V4'], ws=1, a=areg(A['Q']), b=imm(2)))
+    b.e(add_(ADD_SHL, B['V9'], ws=1, a=areg(A['Q']), b=imm(9)))
+    _store4(b, B['V4'], B['V9'], A['DST'], 0)
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
+def build_probe_lane_b():
+    """Diagnostic: same gather, but popped into a B register (fmax path)."""
+    A = dict(SRC=16, DST=17, Q=18, KADDR=19, VAL=20)
+    B = dict(V4=21, V9=22, L4=23, BV=24)
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))
+    b.read_uni(A['SRC'])
+    b.read_uni(A['DST'])
+    b.read_uni(A['Q'])
+    b.e(add_(ADD_SHL, B['L4'], ws=1, a=areg(R_ELEM_NUM), b=imm(2)))
+    b.e(add_(ADD_ADD, A['KADDR'], areg(A['SRC']), breg(B['L4'])), nop())
+    _tmu_load_b(b, 0, A['KADDR'], B['BV'])
+    b.e(add_or(A['VAL'], breg(B['BV']), breg(B['BV'])))
+    b.e(add_or(0, areg(A['VAL']), areg(A['VAL'])))
+    b.e(add_or(1, areg(A['VAL']), areg(A['VAL'])))
+    b.e(add_or(2, areg(A['VAL']), areg(A['VAL'])))
+    b.e(add_or(3, areg(A['VAL']), areg(A['VAL'])), nop(), nop())
+    b.e(add_(ADD_SHL, B['V4'], ws=1, a=areg(A['Q']), b=imm(2)))
+    b.e(add_(ADD_SHL, B['V9'], ws=1, a=areg(A['Q']), b=imm(9)))
+    _store4(b, B['V4'], B['V9'], A['DST'], 0)
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
+def build_probe_pool(C):
+    """Diagnostic: 8 column gathers + fmax + store (pool inner loop shape)."""
+    A = dict(SRC=16, DST=17, Q=18, KADDR=19)
+    B = dict(V4=24, V9=25, L4=26, C4=27)
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))
+    b.read_uni(A['SRC'])
+    b.read_uni(A['DST'])
+    b.read_uni(A['Q'])
+    b.e(add_(ADD_SHL, B['L4'], ws=1, a=areg(R_ELEM_NUM), b=imm(2)))
+    b.e(ldi(C * 4, B['C4'], ws=1))
+    b.e(add_(ADD_ADD, A['KADDR'], areg(A['SRC']), breg(B['L4'])), nop())
+    for k in range(8):
+        if k:
+            b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['C4'])))
+        _tmu_load_b(b, 0, A['KADDR'], 16 + k)
+    for j in range(4):
+        b.e(add_(ADD_OR, 32 + j, breg(16 + j), breg(16 + j)))
+        for k in range(1, 5):
+            b.e(add_(ADD_FMAX, 32 + j, acc(j), breg(16 + j + k)))
+    for j in range(4):
+        b.e(add_or(j, acc(j), acc(j)))
+    b.e(add_(ADD_SHL, B['V4'], ws=1, a=areg(A['Q']), b=imm(2)))
+    b.e(add_(ADD_SHL, B['V9'], ws=1, a=areg(A['Q']), b=imm(9)))
+    _store4(b, B['V4'], B['V9'], A['DST'], 0)
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
+def build_depthwise_nhwc(C):
+    """3x3 depthwise conv, NHWC, stride 1, from a zero-padded NHWC image.
+
+    Lanes are the 16 channels of one channel block, so a tap is one coalesced
+    64 B gather.  A group of four output pixels shares the six input columns
+    of a row, so a group needs 18 loads (not 36) for 108 MACs; the four
+    results leave through the verified 4-row VPM->DMA store.
+
+    Weights are pre-permuted on the host to WP[tap][C] (tap = ky*3+kx), so the
+    nine per-lane weight vectors are nine contiguous 64 B lines and are loaded
+    once per task into A16..A24.
+
+    KERNEL ABI (u0..u12)
+      u0 src base bus (padded image)      u1 dst base bus
+      u2 output rows for this QPU         u3 src first-row offset
+      u4 dst first-row offset             u5 QPU index
+      u6 pixel stride (C*4)               u7 src row stride
+      u8 dst row stride                   u9 groups of 4 pixels per row
+      u10 channel-block byte offset       u11 weight bus (this block)
+      u12 weight tap stride (C*4)
+    """
+    assert C % 16 == 0
+    A = dict(SRC=25, DST=26, SEG=27, DSTG=28, KADDR=29, CNT=30, XCNT=31)
+    B = dict(C4=22, ROWSTR=23, DROWSTR=24, WSTR=25, V4=31, V9=27,
+             G4=28, NX4=29, CBO=30, T=26)
+    # A0..A3 store rows, A16..A24 weights, B16..B21 six input vectors
+
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))
+    b.read_uni(B['T'], ws=1)            # u0 src bus
+    b.read_uni(B['WSTR'], ws=1)         # u1 dst bus (parked, overwritten)
+    b.read_uni(A['CNT'])                # u2 rows
+    b.read_uni(A['XCNT'])               # u3 src row offset
+    b.read_uni(A['DSTG'])               # u4 dst row offset
+    b.read_uni(A['SEG'])                # u5 q
+    b.e(add_(ADD_ADD, A['SRC'], breg(B['T']), areg(A['XCNT'])), nop())
+    b.e(add_(ADD_ADD, A['DST'], breg(B['WSTR']), areg(A['DSTG'])), nop())
+    b.e(add_(ADD_SHL, B['V4'], ws=1, a=areg(A['SEG']), b=imm(2)))
+    b.e(add_(ADD_SHL, B['V9'], ws=1, a=areg(A['SEG']), b=imm(9)))
+    b.read_uni(A['SEG'])                # u6 pixel stride (A temp)
+    b.e(add_(ADD_OR, B['C4'], areg(A['SEG']), areg(A['SEG']), ws=1), nop())
+    b.e(add_(ADD_SHL, B['G4'], ws=1, a=areg(A['SEG']), b=imm(2)), nop())
+    b.read_uni(B['ROWSTR'], ws=1)       # u7
+    b.read_uni(B['DROWSTR'], ws=1)      # u8
+    b.read_uni(B['NX4'], ws=1)          # u9
+    b.read_uni(B['CBO'], ws=1)          # u10
+    b.read_uni(A['KADDR'])              # u11 weight bus
+    b.read_uni(B['WSTR'], ws=1)         # u12
+
+    # per-lane TMU offset: lane L reads channel (cb*16 + L), i.e. base + L*4
+    b.e(add_(ADD_SHL, B['T'], ws=1, a=areg(R_ELEM_NUM), b=imm(2)), nop())
+    if os.environ.get('KGEN_L4_CONST'):
+        b.e(ldi(int(os.environ['KGEN_L4_CONST']), B['T'], ws=1), nop())
+    b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['T'])), nop())
+    for t in range(9):
+        _tmu_load_a(b, 0, A['KADDR'], A['SEG'])
+        b.e(add_or(16 + t, areg(A['SEG']), areg(A['SEG'])))
+        if t != 8:
+            b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['WSTR'])))
+
+    p.label('row')
+    b.e(add_(ADD_ADD, A['SEG'], areg(A['SRC']), breg(B['T'])), nop())
+    b.e(add_(ADD_ADD, A['DSTG'], areg(A['DST']), breg(B['CBO'])), nop())
+    b.e(add_or(A['XCNT'], breg(B['NX4']), breg(B['NX4'])), nop(), nop())
+    p.label('grp')
+    for ky in range(3):
+        b.e(add_or(A['KADDR'], areg(A['SEG']), areg(A['SEG'])), nop())
+        for _ in range(ky):
+            b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['ROWSTR'])))
+        for k in range(6):
+            if k:
+                b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['C4'])))
+            _tmu_load_b(b, 0, A['KADDR'], 16 + k)
+        for j in range(4):
+            for kx in range(3):
+                s = 16 + j + kx
+                w = 16 + ky * 3 + kx
+                if ky == 0 and kx == 0:
+                    b.e(mul_fmul(j, areg(w), breg(s)))
+                else:
+                    # r4 is the TMU result register AND the TMU config latch:
+                    # writing it (any mul into r4) changes the lane addressing
+                    # of the following gathers, so the product goes to r5.
+                    b.e(mul_fmul(5, areg(w), breg(s)))
+                    b.e(nop())
+                    b.e(add_(ADD_FADD, 32 + j, acc(j), acc(5)))
+    for j in range(4):
+        b.e(add_or(j, acc(j), acc(j)))
+    _store4(b, B['V4'], B['V9'], A['DSTG'], C * 4 - 64)
+    b.e(add_(ADD_ADD, A['SEG'], areg(A['SEG']), breg(B['G4'])))
+    b.e(add_(ADD_ADD, A['DSTG'], areg(A['DSTG']), breg(B['G4'])))
+    b.e(add_(ADD_SUB, A['XCNT'], areg(A['XCNT']), imm(1), sf=1))
+    p.branch_to('grp', cond=BR_ALL_Z_CLEAR)
+    b.e(nop(), nop(), nop())
+    b.e(add_(ADD_ADD, A['SRC'], areg(A['SRC']), breg(B['ROWSTR'])))
+    b.e(add_(ADD_ADD, A['DST'], areg(A['DST']), breg(B['DROWSTR'])))
+    b.e(add_(ADD_SUB, A['CNT'], areg(A['CNT']), imm(1), sf=1))
+    p.branch_to('row', cond=BR_ALL_Z_CLEAR)
+    b.e(nop(), nop(), nop())
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
+def build_pool_nhwc(C, K):
+    """KxK stride-1 max pool, NHWC, from a zero-padded NHWC image.
+
+    SPPF-style (K=5, pad 2) as well as 3x3.  Lanes are 16 channels.  A group
+    of four output pixels needs 4+K-1 input columns per row, so K=5 costs 40
+    coalesced gathers for 100 fmax and one 4-row store.
+
+    KERNEL ABI (u0..u10)
+      u0 src base bus (padded image)  u1 dst base bus
+      u2 output rows for this QPU     u3 src first-row offset
+      u4 dst first-row offset         u5 QPU index
+      u6 pixel stride (C*4)           u7 src row stride
+      u8 dst row stride               u9 groups of 4 pixels per row
+      u10 channel-block byte offset
+    """
+    A = dict(SRC=16, DST=17, SEG=18, DSTG=19, KADDR=20, CNT=21, XCNT=22,
+             NX4=23)
+    B = dict(C4=24, ROWSTR=25, DROWSTR=26, G4=27, L4=28, CBO=29,
+             V4=30, V9=31)
+    # A0..A3 store rows, B16..B23 the 4+K-1 input vectors
+    ncol = 4 + K - 1
+
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))
+    b.read_uni(B['V4'], ws=1)       # u0 src bus (parked in B30, overwritten)
+    b.read_uni(B['V9'], ws=1)       # u1 dst bus (parked in B31, overwritten)
+    b.read_uni(A['CNT'])            # u2 rows
+    b.read_uni(A['XCNT'])           # u3 src row offset
+    b.read_uni(A['DSTG'])           # u4 dst row offset
+    b.read_uni(A['SEG'])            # u5 q
+    b.e(add_(ADD_ADD, A['SRC'], breg(B['V4']), areg(A['XCNT'])), nop())
+    b.e(add_(ADD_ADD, A['DST'], breg(B['V9']), areg(A['DSTG'])), nop())
+    b.e(add_(ADD_SHL, B['V4'], ws=1, a=areg(A['SEG']), b=imm(2)))
+    b.e(add_(ADD_SHL, B['V9'], ws=1, a=areg(A['SEG']), b=imm(9)))
+    b.read_uni(A['KADDR'])          # u6 pixel stride (A temp; == last tap addr)
+    b.e(add_(ADD_OR, B['C4'], areg(A['KADDR']), areg(A['KADDR']), ws=1), nop())
+    b.e(add_(ADD_SHL, B['G4'], ws=1, a=areg(A['KADDR']), b=imm(2)), nop())
+    b.read_uni(B['ROWSTR'], ws=1)   # u7
+    b.read_uni(B['DROWSTR'], ws=1)  # u8
+    b.read_uni(A['NX4'])            # u9 groups per row
+    b.read_uni(B['CBO'], ws=1)      # u10 channel-block offset
+
+    p.label('row')
+    b.e(add_(ADD_SHL, B['L4'], ws=1, a=areg(R_ELEM_NUM), b=imm(2)))
+    b.e(add_(ADD_ADD, A['SEG'], areg(A['SRC']), breg(B['L4'])), nop())
+    b.e(add_(ADD_ADD, A['DSTG'], areg(A['DST']), breg(B['CBO'])), nop())
+    b.e(add_or(A['XCNT'], areg(A['NX4']), areg(A['NX4'])), nop(), nop())
+    p.label('grp')
+    for ky in range(K):
+        b.e(add_or(A['KADDR'], areg(A['SEG']), areg(A['SEG'])), nop())
+        for _ in range(ky):
+            b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['ROWSTR'])))
+        for k in range(ncol):
+            if k:
+                b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['C4'])))
+            _tmu_load_b(b, 0, A['KADDR'], 16 + k)
+        for j in range(4):
+            if ky == 0:
+                b.e(add_(ADD_OR, 32 + j, breg(16 + j), breg(16 + j)))
+                for k in range(1, K):
+                    b.e(add_(ADD_FMAX, 32 + j, acc(j), breg(16 + j + k)))
+            else:
+                for k in range(K):
+                    b.e(add_(ADD_FMAX, 32 + j, acc(j), breg(16 + j + k)))
+    for j in range(4):
+        b.e(add_or(j, acc(j), acc(j)))
+    _store4(b, B['V4'], B['V9'], A['DSTG'], C * 4 - 64)
+    b.e(add_(ADD_ADD, A['SEG'], areg(A['SEG']), breg(B['G4'])))
+    b.e(add_(ADD_ADD, A['DSTG'], areg(A['DSTG']), breg(B['G4'])))
+    b.e(add_(ADD_SUB, A['XCNT'], areg(A['XCNT']), imm(1), sf=1))
+    p.branch_to('grp', cond=BR_ALL_Z_CLEAR)
+    b.e(nop(), nop(), nop())
+    b.e(add_(ADD_ADD, A['SRC'], areg(A['SRC']), breg(B['ROWSTR'])))
+    b.e(add_(ADD_ADD, A['DST'], areg(A['DST']), breg(B['DROWSTR'])))
+    b.e(add_(ADD_SUB, A['CNT'], areg(A['CNT']), imm(1), sf=1))
+    p.branch_to('row', cond=BR_ALL_Z_CLEAR)
+    b.e(nop(), nop(), nop())
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
+def build_up2_nhwc(C):
+    """Nearest-neighbour 2x upsample of a contiguous NHWC tensor.
+
+    One task = a row-pair range.  Destination (y,x) <- source (y/2, x/2), so a
+    group of four destination pixels is two source pixels stored twice; both
+    destination rows of the pair are written from the same two gathers.
+
+    KERNEL ABI (u0..u9)
+      u0 src base bus                 u1 dst base bus
+      u2 destination row pairs for this QPU
+      u3 src first-row offset (y0/2 * src row stride)
+      u4 dst first-row offset (y0 * dst row stride)
+      u5 QPU index                    u6 pixel stride (C*4)
+      u7 src row stride               u8 dst row stride
+      u9 groups of 4 dst pixels per row
+    """
+    assert C % 16 == 0
+    A = dict(SRC=16, DST=17, SGP=18, DGP=19, CNT=20, XCNT=21, KADDR=22,
+             TMP=23)
+    B = dict(C4=16, SROWSTR=17, DROWSTR=18, G4=19, NX4=20, SG2=21,
+             V4=22, V9=23, T=24, T2=25, CBT=26, L4=27)
+
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))
+    b.read_uni(B['T'], ws=1)        # u0 src bus
+    b.read_uni(B['T2'], ws=1)       # u1 dst bus
+    b.read_uni(A['CNT'])            # u2 pairs
+    b.read_uni(A['KADDR'])          # u3 src row offset
+    b.read_uni(A['XCNT'])           # u4 dst row offset
+    b.read_uni(A['DGP'])            # u5 q
+    b.e(add_(ADD_ADD, A['SRC'], breg(B['T']), areg(A['KADDR'])), nop())
+    b.e(add_(ADD_ADD, A['DST'], breg(B['T2']), areg(A['XCNT'])), nop())
+    b.e(add_(ADD_SHL, B['V4'], ws=1, a=areg(A['DGP']), b=imm(2)))
+    b.e(add_(ADD_SHL, B['V9'], ws=1, a=areg(A['DGP']), b=imm(9)))
+    b.read_uni(A['TMP'])            # u6 pixel stride (A temp)
+    b.e(add_(ADD_OR, B['C4'], areg(A['TMP']), areg(A['TMP']), ws=1), nop())
+    b.e(add_(ADD_SHL, B['G4'], ws=1, a=areg(A['TMP']), b=imm(2)))
+    b.e(add_(ADD_SHL, B['SG2'], ws=1, a=areg(A['TMP']), b=imm(1)), nop())
+    b.read_uni(B['SROWSTR'], ws=1)  # u7
+    b.read_uni(B['DROWSTR'], ws=1)  # u8
+    b.read_uni(B['NX4'], ws=1)      # u9
+    b.e(add_(ADD_SHL, B['L4'], ws=1, a=areg(R_ELEM_NUM), b=imm(2)), nop())
+
+    p.label('pair')
+    for cb in range(C // 16):
+        b.e(ldi(cb * 64, B['CBT'], ws=1))
+        if cb:
+            b.e(add_(ADD_ADD, A['SGP'], areg(A['SRC']), breg(B['CBT'])))
+            b.e(add_(ADD_ADD, A['DGP'], areg(A['DST']), breg(B['CBT'])))
+        else:
+            b.e(add_or(A['SGP'], areg(A['SRC']), areg(A['SRC'])))
+            b.e(add_or(A['DGP'], areg(A['DST']), areg(A['DST'])))
+        b.e(add_(ADD_ADD, A['SGP'], areg(A['SGP']), breg(B['L4'])), nop())
+        b.e(add_or(A['XCNT'], breg(B['NX4']), breg(B['NX4'])), nop(), nop())
+        p.label('g%d' % cb)
+        b.e(add_or(A['KADDR'], areg(A['SGP']), areg(A['SGP'])), nop())
+        _tmu_load_a(b, 0, A['KADDR'], 0)
+        b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['C4'])))
+        _tmu_load_a(b, 0, A['KADDR'], 2)
+        b.e(add_or(1, areg(0), areg(0)))
+        b.e(add_or(3, areg(2), areg(2)), nop(), nop())
+        _store4(b, B['V4'], B['V9'], A['DGP'], C * 4 - 64)
+        b.e(add_(ADD_ADD, A['KADDR'], areg(A['DGP']), breg(B['DROWSTR'])))
+        _store4(b, B['V4'], B['V9'], A['KADDR'], C * 4 - 64)
+        b.e(add_(ADD_ADD, A['SGP'], areg(A['SGP']), breg(B['SG2'])))
+        b.e(add_(ADD_ADD, A['DGP'], areg(A['DGP']), breg(B['G4'])))
+        b.e(add_(ADD_SUB, A['XCNT'], areg(A['XCNT']), imm(1), sf=1))
+        p.branch_to('g%d' % cb, cond=BR_ALL_Z_CLEAR)
+        b.e(nop(), nop(), nop())
+    b.e(add_(ADD_ADD, A['SRC'], areg(A['SRC']), breg(B['SROWSTR'])))
+    b.e(add_(ADD_ADD, A['DST'], areg(A['DST']), breg(B['DROWSTR'])))
+    b.e(add_(ADD_ADD, A['DST'], areg(A['DST']), breg(B['DROWSTR'])))
+    b.e(add_(ADD_SUB, A['CNT'], areg(A['CNT']), imm(1), sf=1))
+    p.branch_to('pair', cond=BR_ALL_Z_CLEAR)
+    b.e(nop(), nop(), nop())
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
+def build_copy_nhwc(Csrc, Cdst):
+    """Copy Csrc channels (Csrc/16 blocks) into a Cdst-channel NHWC tensor.
+
+    Used for channel concat: one launch per source tensor, each task copies a
+    range of 4-pixel groups.  A group is four coalesced 64 B gathers per
+    channel block and one verified 4-row store.
+
+    KERNEL ABI (u0..u7)
+      u0 src base bus (+ pixel offset)  u1 dst base bus (+ pixel offset)
+      u2 src pixel stride               u3 dst pixel stride
+      u4 groups of 4 pixels for this QPU  u5 QPU index
+      u6 src channel byte offset        u7 dst channel byte offset
+    """
+    assert Csrc % 16 == 0 and Cdst % 16 == 0
+    nblk = Csrc // 16
+    A = dict(SRC=16, DST=17, CNT=18, KADDR=19, DTMP=20, T=21, T2=22,
+             T3=23, T4=24)
+    B = dict(SRCPIX=16, DSTPIX=17, G4S=18, G4D=19, V4=20, V9=21, CBT=22,
+             SCB=23, DCB=24, L4=25)
+
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))
+    b.read_uni(A['T'])              # u0 src bus
+    b.read_uni(A['T2'])             # u1 dst bus
+    b.read_uni(A['T3'])             # u2 src pixel stride
+    b.read_uni(A['T4'])             # u3 dst pixel stride
+    b.read_uni(A['CNT'])            # u4 groups
+    b.read_uni(A['KADDR'])          # u5 q
+    b.read_uni(B['SCB'], ws=1)      # u6
+    b.read_uni(B['DCB'], ws=1)      # u7
+    b.e(add_(ADD_SHL, B['L4'], ws=1, a=areg(R_ELEM_NUM), b=imm(2)))
+    b.e(add_(ADD_ADD, A['SRC'], areg(A['T']), breg(B['L4'])), nop())
+    b.e(add_or(A['DST'], areg(A['T2']), areg(A['T2'])), nop())
+    b.e(add_(ADD_SHL, B['V4'], ws=1, a=areg(A['KADDR']), b=imm(2)))
+    b.e(add_(ADD_SHL, B['V9'], ws=1, a=areg(A['KADDR']), b=imm(9)))
+    b.e(add_(ADD_OR, B['SRCPIX'], areg(A['T3']), areg(A['T3']), ws=1))
+    b.e(add_(ADD_OR, B['DSTPIX'], areg(A['T4']), areg(A['T4']), ws=1))
+    b.e(add_(ADD_SHL, B['G4S'], ws=1, a=areg(A['T3']), b=imm(2)))
+    b.e(add_(ADD_SHL, B['G4D'], ws=1, a=areg(A['T4']), b=imm(2)), nop())
+
+    p.label('grp')
+    for cb in range(nblk):
+        b.e(ldi(cb * 64, B['CBT'], ws=1))
+        b.e(add_(ADD_ADD, A['KADDR'], areg(A['SRC']), breg(B['SCB'])))
+        if cb:
+            b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['CBT'])))
+        for px in range(4):
+            if px:
+                b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['SRCPIX'])))
+            _tmu_load_a(b, 0, A['KADDR'], px)
+        b.e(add_(ADD_ADD, A['DTMP'], areg(A['DST']), breg(B['DCB'])))
+        if cb:
+            b.e(add_(ADD_ADD, A['DTMP'], areg(A['DTMP']), breg(B['CBT'])))
+        _store4(b, B['V4'], B['V9'], A['DTMP'], Cdst * 4 - 64)
+    b.e(add_(ADD_ADD, A['SRC'], areg(A['SRC']), breg(B['G4S'])))
+    b.e(add_(ADD_ADD, A['DST'], areg(A['DST']), breg(B['G4D'])))
+    b.e(add_(ADD_SUB, A['CNT'], areg(A['CNT']), imm(1), sf=1))
+    p.branch_to('grp', cond=BR_ALL_Z_CLEAR)
+    b.e(nop(), nop(), nop())
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
+# =============================================================== elementwise
+OP_ADD, OP_MUL, OP_RELU, OP_SIGMOID, OP_SILU, OP_RELU_BWD, OP_RSQRT = 0, 1, 2, 3, 4, 5, 6
+
+E_AB, E_BB, E_OB = 16, 17, 18
+E_CNT, E_LANE = 19, 20
+E_AA, E_AB2, E_AO = 21, 22, 23
+E_TMP, E_VPMQ, E_AV, E_T8 = 24, 25, 26, 27
+E_CADR = 28
+E_T9, E_T10, E_T11 = 29, 30, 31
+
 def build_ew(op, depth=2):
     """out[i] = f(a[i], b[i]); one group = 16 vectors = 256 floats per QPU
     iteration, stored with the verified 4-chunk VPM->DMA sequence (stride 0,
@@ -2760,6 +3315,22 @@ def main(argv):
         p = build_pool(g('h'), g('w'), g('op'), opts.get('mode', 'fwd'))
     elif kind == 'pooln':
         p = build_pooln(g('n'), g('s'), g('wp'), g('op'))
+    elif kind == 'im2col_nhwc':
+        p = build_im2col_nhwc(g('cin'), g('kh'), g('kw'), g('stride', 1))
+    elif kind == 'probe_lane':
+        p = build_probe_lane()
+    elif kind == 'probe_lane_b':
+        p = build_probe_lane_b()
+    elif kind == 'probe_pool':
+        p = build_probe_pool(g('cin'))
+    elif kind == 'depthwise':
+        p = build_depthwise_nhwc(g('cin'))
+    elif kind == 'pool_nhwc':
+        p = build_pool_nhwc(g('cin'), g('k'))
+    elif kind == 'up2':
+        p = build_up2_nhwc(g('cin'))
+    elif kind == 'copy':
+        p = build_copy_nhwc(g('cin'), g('cout'))
     elif kind == 'ew':
         p = build_ew(g('op'))
     elif kind == 'softmax':

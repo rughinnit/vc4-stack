@@ -49,12 +49,23 @@ static const vc4_op_info OPS[] = {
       "dy routed to the group maximum; ties share the gradient" },
     { "maxpool/NxNsS", "qpu max + 4-row store", 1,
       "any N>=1, stride>=1, pad>=0; host pads the border with -inf (bytes only)" },
+    /* the NHWC channel-tiled plane (src/vc4_nhwc.c): the im2col VDR pitch is
+       stride*Cin*4, so the map size is no longer limited by the 8191 B field */
+    { "conv2d/nhwc", "qpu im2col_nhwc + qpu gemm3", 1,
+      "f32 NHWC; stride 1/2; KH=KW in {1,3}; Cin,Cout%16==0; stride*Cin*4<=8191" },
+    { "conv2d/stride2", "qpu im2col_nhwc (pitch = 2*Cin*4)", 1,
+      "NHWC path only (vc4_conv_nhwc); NCHW stride 2 stays unsupported" },
+    { "conv2d/depthwise", "qpu im2col_nhwc + gemm3 (block-diagonal B)", 1,
+      "3x3 pad 1 stride 1, C%16==0; costs C/16x a true depthwise" },
+    { "maxpool/3x3", "qpu max + 4-row store (NHWC)", 1,
+      "kxk stride 1, pad=(k-1)/2, k in {3,5}; the -inf border is a host fill" },
+    { "maxpool/5x5s1", "qpu max + 4-row store (NHWC)", 1,
+      "5x5 stride 1, pad 2 (SPPF); 3x3 also generated" },
+    { "concat/channel", "-", 0, "host byte concat (NCHW or NHWC), no GPU kernel" },
+    { "upsample/nearest2x", "-", 0, "host byte gather" },
     { "avgpool", "-", 0, "not written" },
     /* not implemented -- listed so the table is an honest coverage statement */
     { "conv2d/5x5", "-", 0, "no kernel; would need another im2col tap schedule" },
-    { "conv2d/stride2", "-", 0,
-      "the VDR loads 16 consecutive pixels; stride 2 needs a decimation pass" },
-    { "conv2d/depthwise", "-", 0, "needs a per-channel schedule, not a GEMM" },
     { "conv2d/grouped", "-", 0, "needs one GEMM per group (trivial extension)" },
     { "matmul/f16", "-", 0, "kernels are fp32 only" },
     { "matmul/f32x4-tile", "-", 0, "4-column register tile: the documented next speed step" },
@@ -62,10 +73,9 @@ static const vc4_op_info OPS[] = {
     { "softmax", "qpu fused row kernel ('p' probe)", 1,
       "forward probabilities; cols<=16, rows%8==0; CPU pads/compacts bytes only" },
     { "layernorm", "-", 0, "needs reduction + rsqrt kernel" },
-    { "concat/slice", "-", 0, "pure data movement; no GPU kernel yet" },
+    { "slice/split", "-", 0, "pure data movement (host), no GPU kernel" },
     { "transpose/permute", "qpu pack (VDW strided)", 1,
       "2-D dense transpose only; no arbitrary permutation" },
-    { "upsample", "-", 0, "not written" },
     { "quantize/dequantize", "-", 0, "not written" },
 };
 

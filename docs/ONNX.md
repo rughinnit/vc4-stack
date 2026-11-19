@@ -2,7 +2,7 @@
 
 `libvc4infer` is an **operator library**, not a graph runtime.  This document
 describes the graph path added on top of it: a small ONNX exporter/runner in
-`onnx/`, the two engine ops it needed (`vc4_maxpooln`, `vc4_softmax_fwd`), the
+`infer/tools/onnx/`, the two engine ops it needed (`vc4_maxpooln`, `vc4_softmax_fwd`), the
 measured end-to-end numbers, and the honest coverage gap for YOLOv8n.
 
 Everything that *computes* runs on the QPU.  The host only moves bytes
@@ -15,38 +15,38 @@ Hardware: Raspberry Pi 3B, BCM2837, VideoCore IV @ **stock** clocks
 (core 400 MHz / V3D 300 MHz), kernel 6.18, engine through **vc4d**
 (`VC4INFER_DAEMON=1`, unprivileged, one GPU user at a time).
 
-Test date: 2026-11-19.  Engine tree: `engine/` at this commit.
+Test date: 2026-11-19.  Engine tree: `infer/` at this commit.
 
 ## 1. Files
 
 ```
-onnx/export_models.py   define + torch.onnx.export the fixed-shape models,
-                        save models/<name>.onnx, .in.npy and the torch CPU
-                        reference .out.npy
-onnx/onnxrun.py         the ONNX executor (onnx package + ctypes binding)
-onnx/verify.py          3 runs per model, compares with the torch reference,
-                        prints per-node wall/GPU time and launch counts
-onnx/export_yolo.py     real pretrained YOLOv8n -> ONNX (ultralytics)
-onnx/yolo_report.py     static op/attribute/shape coverage + a dynamic run
-onnx/tvshim/            name-only torchvision stand-in for the YOLO export
-onnx/ref_onnx.py        independent numpy ONNX evaluator (the CPU reference)
-onnx/yolo_bench.py      end-to-end benchmark + tolerance check + JSON report
-onnx/make_extra_models.py  build the dilated/grouped/batch/depthwise/stride-2
+infer/tools/onnx/export_models.py      define + torch.onnx.export the fixed-shape
+                        models, save models/<name>.onnx, .in.npy and the torch
+                        CPU reference .out.npy
+infer/tools/onnx/onnxrun.py            the ONNX executor (onnx + ctypes binding)
+infer/tools/onnx/verify.py             3 runs per model, compares with the torch
+                        reference, prints per-node wall/GPU time and launches
+infer/tools/onnx/export_yolo.py        real pretrained YOLOv8n -> ONNX (ultralytics)
+infer/tools/onnx/yolo_report.py        static op/attribute/shape coverage + a run
+infer/tools/onnx/tvshim/               name-only torchvision stand-in (YOLO export)
+infer/tools/onnx/ref_onnx.py           independent numpy ONNX evaluator (CPU reference)
+infer/tools/onnx/yolo_bench.py         end-to-end benchmark + tolerance + JSON report
+infer/tools/onnx/make_extra_models.py  dilated/grouped/batch/depthwise/stride-2
                         graphs used by the §8 verification
-onnx/verify_extra.py    5 runs per graph vs ref_onnx, per-node time + MACs
+infer/tools/onnx/verify_extra.py       5 runs per graph vs ref_onnx, per-node time + MACs
                         (includes the bilinear Resize graph)
 ```
 
-Generated artifacts live in `onnx/models/` (not committed; regenerate with
+Generated artifacts live in `infer/tools/onnx/models/` (not committed; regenerate with
 `export_models.py`).  The engine additions are:
 
 ```
-src/vc4_nhwc.c      vc4_conv_nhwc/pack_w  NHWC channel-tiled conv (+ pool/up2/copy)
-src/vc4_convbwd.c   vc4_maxpooln          generic NxN / stride-S max pool
-src/vc4_train.c     vc4_softmax_fwd       forward softmax (fused kernel 'p' probe)
-tools/kgen.py       build_pooln           the generic pool kernel
-tests/test_onnxops.c CPU-oracle check of both
-vc4infer/_binding.py ctypes binding for both ops, vc4_get_stats, and a conv2d argtypes fix
+infer/src/vc4_nhwc.c           vc4_conv_nhwc/pack_w  NHWC channel-tiled conv (+ pool/up2/copy)
+training/src/vc4_convbwd.c     vc4_maxpooln          generic NxN / stride-S max pool
+training/src/vc4_train.c       vc4_softmax_fwd       forward softmax (fused 'p' probe)
+infer/tools/kgen.py            build_pooln           the generic pool kernel
+infer/tests/test_onnxops.c     CPU-oracle check of both
+infer/python/vc4infer/_binding.py ctypes binding for both ops, vc4_get_stats, and a conv2d argtypes fix
 ```
 
 ## 2. Running a model
@@ -54,20 +54,26 @@ vc4infer/_binding.py ctypes binding for both ops, vc4_get_stats, and a conv2d ar
 ```sh
 cd vc4-stack
 source /home/raspi/work/torch-vc4/.venv/bin/activate   # torch CPU + numpy + onnx
+export VC4INFER_CACHE=$HOME/.cache/vc4infer/kcache      # writable JIT cache
 
-python onnx/export_models.py
-VC4INFER_DAEMON=1 python onnx/verify.py                # all three models
-VC4INFER_DAEMON=1 python onnx/onnxrun.py onnx/models/modelB.onnx \
-        --input onnx/models/modelB.in.npy --profile --repeat 3
+python infer/tools/onnx/export_models.py
+VC4INFER_DAEMON=1 python infer/tools/onnx/verify.py                # all three models
+VC4INFER_DAEMON=1 python infer/tools/onnx/onnxrun.py infer/tools/onnx/models/modelB.onnx \
+        --input infer/tools/onnx/models/modelB.in.npy --profile --repeat 3
 
 # optional real YOLOv8n export + coverage report (downloads ~6 MB of weights)
-python onnx/export_yolo.py                             # YOLO_IMGSZ=32 for 32x32
-VC4INFER_DAEMON=1 python onnx/yolo_report.py onnx/models/yolov8n_640.onnx
+python infer/tools/onnx/export_yolo.py                             # YOLO_IMGSZ=32 for 32x32
+VC4INFER_DAEMON=1 python infer/tools/onnx/yolo_report.py infer/tools/onnx/models/yolov8n_640.onnx
 ```
 
 The runner takes the GPU lock through vc4d; do **not** hold
 `/tmp/vc4-gpu.lock` in the calling shell in daemon mode (vc4d takes it per
 launch, and a second holder makes every launch time out).
+
+`VC4INFER_CACHE` matters: the C library's built-in cache path is the installed
+`/usr/lib/vc4infer/kcache`, which is root-owned once the `.deb` is installed, so
+the kernel JIT cannot write there as an ordinary user.  The blocks below set a
+per-user cache directory for that reason.
 
 `onnxrun.py` accepts fixed-shape fp32 models with batch 1 and one float input.
 It evaluates the graph in ONNX topological order and keeps every activation in
@@ -177,7 +183,7 @@ dominated by the 64-column pad of a 10-wide output.
   Uses the fused training kernel's `p` probe (same degree-5 `2^f` polynomial
   and 3x Newton reciprocal); the host pads to 16 classes with `-1e30` and
   compacts the result.  Measured error ≤ 3.4e-07.
-* The Python binding (`vc4infer/_binding.py`, formerly `python/vc4infer.py`)
+* The Python binding (`infer/python/vc4infer/_binding.py`, formerly `python/vc4infer.py`)
   gained `maxpooln`, `softmax_fwd`, `stats`, and a corrected `vc4_conv2d`
   ctypes signature (the old one had the wrong number
   and order of argument types, so `conv2d` could not be called from Python).
@@ -211,12 +217,13 @@ used anywhere.
 ## 7. YOLOv8n end to end at 160x160
 
 The real Ultralytics YOLOv8n COCO checkpoint (3,151,904 parameters) exported
-with `onnx/export_yolo.py` at **1x3x160x160** (opset 13, 12.4 MiB, 263 nodes)
+with `infer/tools/onnx/export_yolo.py` at **1x3x160x160** (opset 13, 12.4 MiB, 263 nodes)
 now runs to completion on the QPUs and matches a CPU reference.
 
 ```
 source /home/raspi/work/torch-vc4/.venv/bin/activate
-cd vc4-stack/onnx
+cd vc4-stack/infer/tools/onnx
+export VC4INFER_CACHE=$HOME/.cache/vc4infer/kcache
 VC4INFER_DAEMON=1 python3 yolo_bench.py \
     /home/raspi/work/onnx/models/yolov8n_160.onnx \
     --input yolo160_in.npy --ref yolo160_ref.npy --repeat 3
@@ -278,7 +285,7 @@ of a 40 MiB pool (12.3 MiB of that is the weights) instead of growing past the
   their bias, data-dependently.  This was the last correctness bug.
 * Kernel/program tables: a 263-node model needs ~100 distinct QPU blobs (one
   GEMM per conv shape), but the client table held 32 and vc4d held 64
-  programs.  Both are 128 now (`engine/src/vc4_int.h`, `vc4d/src/vc4d.[ch]`,
+  programs.  Both are 128 now (`infer/src/vc4_int.h`, `vc4d/src/vc4d.[ch]`,
   code slot 16 KiB, client data base 3 MiB).
 * SPPF `MaxPool` pads with **-inf** in ONNX; the NHWC pool kernel pads with
   zero, which biases every border window that is entirely negative (SiLU
@@ -302,7 +309,7 @@ Input **1x3x160x160**, output **1x84x525** (P3 400 + P4 100 + P5 25 anchors),
 | node wall sum | 682.2 ms |
 | arena / graph pool / peak | 64.0 / 40.0 / 26.6 MiB |
 
-(JSON: `onnx/yolo160_bench.json`.  The per-op table below is from an earlier
+(JSON: `infer/tools/onnx/yolo160_bench.json`.  The per-op table below is from an earlier
 equivalent run, 663.2 ms node wall sum at 277.3 ms GPU.)
 
 Per op type (wall ms, GPU ms, launches):
@@ -334,7 +341,7 @@ Sigmoid+Mul into the engine's existing `OP_SILU`) is the cheapest win.
 
 ### 7.4 Verification
 
-Reference: the **same ONNX graph** evaluated on the Pi by `onnx/ref_onnx.py`,
+Reference: the **same ONNX graph** evaluated on the Pi by `infer/tools/onnx/ref_onnx.py`,
 an independent numpy float32 evaluator (float64 accumulation), cross-checked
 against the torch CPU export-mode forward of the same `yolov8n.pt` (they agree
 to 4.3e-4 absolute on this input).
@@ -353,7 +360,7 @@ accumulation through 64 conv layers plus the 16-bin DFL softmax weighted sum,
 not a structural error.  The per-node check (each node evaluated from the
 VC4's *own* inputs) is clean to <= 1e-4 relative everywhere.
 
-`onnx/yolo_bench.py` reproduces all of this and writes the JSON report.
+`infer/tools/onnx/yolo_bench.py` reproduces all of this and writes the JSON report.
 
 ### 7.5 320x320: the memory wall this milestone removed
 
@@ -429,8 +436,8 @@ Normative kernel constraints (all checked before a launch):
 
 ### 8.2 Measured (5 runs, numpy ONNX oracle)
 
-`onnx/verify_extra.py` builds five fixed graphs with
-`onnx/make_extra_models.py`, evaluates each with the independent numpy
+`infer/tools/onnx/verify_extra.py` builds five fixed graphs with
+`infer/tools/onnx/make_extra_models.py`, evaluates each with the independent numpy
 evaluator (`ref_onnx.py`), then runs the ONNX graph on the QPUs five times.
 Tolerance `|got-ref| <= 1e-4 + 1e-4*max(|ref|,1)`; **every** element is
 checked.
@@ -444,7 +451,7 @@ checked.
 | stride-2 | Conv 32→32 3x3 s=2 p=1 | 1x32x16x16 | 0/8192 | 6.2 | 1.1 | 2 | 2.36 M | 9.44 M (4 phases) | 4x |
 | bilinear | Conv 8→16 3x3 + Resize 2x linear | 1x16x24x24 | 0/9216 | 16.2 | 1.9 | 23 | 230 K (conv) + 64.5 K (lerp) | 0 (raised) | n/a |
 
-The raw kernels have their own float64 CPU oracle in `engine/tests/test_nhwc.c`
+The raw kernels have their own float64 CPU oracle in `infer/tests/test_nhwc.c`
 (stride 1/2, batch 2, dilated 3x3 d2/d3, 5x5, grouped g2/g3/g4, depthwise):
 `test_nhwc 5` reports **5/5 clean** for every case.  Kernel-level GPU times are
 in §8.3.
@@ -460,7 +467,8 @@ daemon serves; the runner's reserve is configurable:
 sudo systemctl stop vc4d
 sudo /usr/local/sbin/vc4d --socket /run/vc4d.sock --arena-mb 150 \
      --group vc4 --drop-user nobody --max-timeout-ms 10000
-cd vc4-stack/onnx
+cd vc4-stack/infer/tools/onnx
+export VC4INFER_CACHE=$HOME/.cache/vc4infer/kcache
 VC4INFER_ARENA_MB=145 VC4_POOL_RESERVE_MB=32 VC4INFER_DAEMON=1 \
   python3 yolo_bench.py yolov8n_320.onnx --input ... --ref ...
 ```

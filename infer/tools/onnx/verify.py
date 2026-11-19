@@ -48,7 +48,7 @@ def run_model(name):
     x = np.load(os.path.join(HERE, "models", name + ".in.npy")).astype(np.float32)
     ref = np.load(os.path.join(HERE, "models", name + ".out.npy")).astype(np.float32)
 
-    eng = vc4infer.Engine(cache_dir=os.environ.get(
+    eng = vc4infer._binding.Engine(cache_dir=os.environ.get(
         "VC4INFER_CACHE", os.path.join(ENGINE, "kcache")))
     try:
         r = Runner(onnx_path, eng)

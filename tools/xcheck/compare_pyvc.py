@@ -571,8 +571,8 @@ def main():
             'kernels/wider-tile/asm10/gemm6_128.bin',
             'kernels/wider-tile/asm10/gemm6_256.bin',
             'kernels/wider-tile/asm10/pack10_*_us.bin',
-            'engine/kcache/col2im_*.bin', 'engine/kcache/pool_*.bin',
-            'engine/kcache/ew_*.bin',
+            'infer/kcache/col2im_*.bin', 'infer/kcache/pool_*.bin',
+            'infer/kcache/ew_*.bin',
         ]
         paths = []
         for p in pats:

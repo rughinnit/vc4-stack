@@ -12,11 +12,11 @@ shared with concurrent jobs; every GPU run was serialised by
 
 ## What changed
 
-- `engine/src/vc4_dev_remote.c` (~480 lines): connect to `/run/vc4d.sock`,
+- `infer/src/vc4_dev_remote.c` (~480 lines): connect to `/run/vc4d.sock`,
   `ALLOC` one 64 MiB region and `mmap` the dma-buf fd, upload each kernel blob
   on first use, launch with `UNI_IN_ARENA | WAIT` in one round trip, and do
   the client-side cache maintenance.
-- `engine/src/vc4_dev.c`: dispatch at `vc4_init`, `vc4__launch`,
+- `infer/src/vc4_dev.c`: dispatch at `vc4_init`, `vc4__launch`,
   `vc4_upload`, `vc4_download`, `vc4__l2_flush`, `vc4__write`,
   `vc4__kernel_load_file`, `vc4__wait_idle`, `vc4__health`, `vc4_shutdown`.
 - `vc4d` protocol version 2: `ALLOC` replies with the region's GPU bus

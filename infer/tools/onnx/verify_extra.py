@@ -47,7 +47,7 @@ def main(argv):
     ap.add_argument("--rtol", type=float, default=1e-4)
     args = ap.parse_args(argv)
 
-    eng = vc4infer.Engine(cache_dir=os.path.join(ENGINE, "kcache"))
+    eng = vc4infer._binding.Engine(cache_dir=os.path.join(ENGINE, "kcache"))
     rows = []
     try:
         for name, (desc, prev, mnow, mbefore) in INFO.items():

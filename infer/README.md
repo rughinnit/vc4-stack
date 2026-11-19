@@ -18,11 +18,12 @@ src/vc4_kern.c          kernel blob cache + JIT, the asm3 two-launch rule
 src/vc4_gemm.c          vc4_matmul: QPU pack -> verified QPU GEMM
 src/vc4_conv.c          vc4_conv2d: QPU im2col -> GEMM (bias folded as a k term)
 src/vc4_ew.c            add/mul/relu/sigmoid/silu/relu_bwd/rsqrt kernels
-src/vc4_train.c         transpose, C=A*B^T, fused softmax+CE backward
 src/vc4_api.c           the op registry (strict dispatch) + coverage table
+../training/src/vc4_train.c    transpose, C=A*B^T, fused softmax+CE backward
+../training/src/vc4_convbwd.c  im2col/col2im, conv dX/dW, maxpool fwd/bwd
 tools/kgen.py           QPU kernel generator (reuses the asm3 encoder)
 tests/                  CPU-oracle verification, no fallback paths
-vc4infer/_binding.py    ctypes binding with the same API (Python package)
+python/vc4infer/        the Python package (ctypes binding, executor, CLI)
 run_tests.sh            serialised, health-checked test runner
 ```
 
@@ -184,7 +185,7 @@ forwarding), except inside the verified k loop and store, which keep asm3's
 proven schedule verbatim.  Kernel loop bounds are compile-time constants, not
 uniforms, wherever they drive DMA.  Both rules exist because a wrong counter
 in a panel builder turns a 64-tile transpose into an unbounded VPM DMA march
-over physical memory — see `RESULTS.md`.
+over physical memory — see `../docs/results/engine.md`.
 
 ## conv2d backward, col2im and pooling
 
@@ -200,7 +201,7 @@ The training path now covers a small convolutional net:
   VPM->DMA store.  There is no read-modify-write and no cross-QPU
   accumulation, so the result does not depend on QPU scheduling.  The
   overlapping-patch sum is fp32 with the QPU's truncating `fadd`; it is
-  deterministic but not IEEE (see NUMERICS.md).  Guard row blocks of zeros
+  deterministic but not IEEE (see ../docs/NUMERICS.md).  Guard row blocks of zeros
   around the packed panel make the source gather legal at the image border.
 * `vc4_conv2d_backward` = row-major im2col (dW path) + `gemm3` for
   `dA = dY*W^T` and `dW = dY^T*A` + `transpose` + `col2im` for `dX`.
@@ -221,7 +222,7 @@ and killed the queue.  The kernels are also exercised offline against
 
 ## Results
 
-`RESULTS-conv.md` has the measured conv-backward gradient checks and the toy
+`../docs/CONV-RESULTS.md` has the measured conv-backward gradient checks and the toy
 conv-net training curve / throughput (SGD and Adam, bit-identical across two
 runs).
 
@@ -239,7 +240,7 @@ coverage statement): `conv2d/5x5`, `conv2d/stride2`, `conv2d/depthwise`,
 `conv2d/grouped`, `matmul/f16`, `batched-matmul`, `avgpool`, `layernorm`,
 `concat/slice`, arbitrary `permute`, `upsample`, `quantize/dequantize`.
 
-The ONNX graph path (`../onnx/`, documented in `../docs/ONNX.md`) composes
+The ONNX graph path (`tools/onnx/`, documented in `../docs/ONNX.md`) composes
 the supported ops into stride-2 and depthwise convolutions and uses host byte
 copies for concat/nearest-resize.  It is a graph-level layer; the engine
 dispatch above remains strict.
@@ -259,7 +260,7 @@ GPU GEMM.
 `tests/test_train.c` is a full-batch 64-32-10 MLP trainer (SGD or Adam) on a
 deterministic synthetic 10-class dataset.  `tests/test_grad.c` checks the
 matmul dA/dB, relu and softmax gradients against central finite differences
-(h = 0.1 / 0.02) with a CPU checker.  `RESULTS-train.md` has the measured
+(h = 0.1 / 0.02) with a CPU checker.  `../docs/results/training.md` has the measured
 numbers and the honest limits.
 
 ## conv2d

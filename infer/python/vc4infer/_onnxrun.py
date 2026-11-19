@@ -1944,7 +1944,7 @@ class Runner:
         x = self._float(node.input[0])
         v = self.host.get(node.input[1], self.values.get(node.input[1]))
         axes = sorted(int(a) for a in np.asarray(v).ravel())
-        a = self.nchw(x) if x.layout == "nhwc" else None
+        nb = self._to_nchw_buf(x) if x.layout == "nhwc" else None
         shape = list(x.shape)
         for ax in axes:
             shape.insert(ax, 1)

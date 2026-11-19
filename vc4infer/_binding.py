@@ -26,11 +26,55 @@ except ImportError:        # pragma: no cover
     np = None
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_LIB = os.environ.get("VC4INFER_LIB",
-                      os.path.join(_HERE, "..", "build", "libvc4infer.so"))
+
+
+def _find_lib():
+    """Locate libvc4infer: $VC4INFER_LIB, the in-tree build, then the system.
+
+    The package installs the library as /usr/lib/<triplet>/libvc4infer.so.1;
+    an in-tree checkout keeps it in engine/build.  The first existing candidate
+    wins, so a developer build is never shadowed by an installed one.
+    """
+    env = os.environ.get("VC4INFER_LIB")
+    if env:
+        return env
+    cands = [os.path.join(_HERE, "libvc4infer.so"),
+             os.path.join(_HERE, "..", "engine", "build", "libvc4infer.so"),
+             os.path.join(_HERE, "..", "build", "libvc4infer.so"),
+             "/usr/lib/aarch64-linux-gnu/libvc4infer.so.1",
+             "/usr/lib/libvc4infer.so.1",
+             "/usr/local/lib/libvc4infer.so"]
+    for c in cands:
+        if os.path.isfile(c):
+            return os.path.realpath(c)
+    try:
+        import ctypes.util
+        found = ctypes.util.find_library("vc4infer")
+        if found:
+            return found
+    except Exception:
+        pass
+    raise ImportError("libvc4infer.so not found (tried %s); set VC4INFER_LIB"
+                      % ", ".join(cands))
+
+
+_LIB = _find_lib()
 
 VC4_OK = 0
+ERR_INVAL, ERR_NOMEM, ERR_IO, ERR_TIMEOUT = -1, -2, -3, -4
 ERR_UNSUPPORTED = -5
+ERR_GPU, ERR_KERNEL = -6, -7
+
+_STATUS = {
+    ERR_INVAL: "invalid argument",
+    ERR_NOMEM: "out of memory: no arena (another process holds it, or CMA "
+               "is exhausted)",
+    ERR_IO: "I/O error: vc4d socket or /dev/mem",
+    ERR_TIMEOUT: "QPU timeout; the context is dead",
+    ERR_UNSUPPORTED: "unsupported operation",
+    ERR_GPU: "V3D/queue error after a launch",
+    ERR_KERNEL: "QPU kernel blob missing and generation failed",
+}
 
 OP_MATMUL, OP_CONV2D, OP_ADD, OP_MUL, OP_RELU, OP_SIGMOID, OP_SILU = range(7)
 LAYOUT_ROW_MAJOR = 0
@@ -52,7 +96,11 @@ class Stats(ctypes.Structure):
 
 
 class Error(RuntimeError):
-    pass
+    """An engine call failed; ``code`` is the vc4_status value when known."""
+
+    def __init__(self, msg, code=None):
+        self.code = code
+        super().__init__(msg)
 
 
 class Unsupported(Error):
@@ -160,10 +208,18 @@ class Engine:
             mb = int(os.environ.get("VC4INFER_ARENA_MB", "0"))
             if mb > 0:
                 arena_bytes = mb << 20
+        if cache_dir:
+            # kgen.py writes the blob into the cache directory; it does not
+            # create it, so the caller's cache path must exist.
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+            except OSError:
+                pass
         st = L.vc4_init(ctypes.byref(self.ctx),
                         cache_dir.encode() if cache_dir else None, arena_bytes)
         if st != VC4_OK:
-            raise Error("vc4_init failed: %d" % st)
+            raise Error("vc4_init failed: %s (%d)"
+                        % (_STATUS.get(st, "unknown error"), st), st)
 
     # ---- lifecycle
     def close(self):
@@ -184,7 +240,8 @@ class Engine:
         msg = self.lib.vc4_last_error(self.ctx).decode()
         if st == ERR_UNSUPPORTED:
             raise Unsupported("%s: %s" % (what, msg))
-        raise Error("%s: %s (%s)" % (what, self.lib.vc4_strerror(st).decode(), msg))
+        raise Error("%s: %s (%s)"
+                    % (what, self.lib.vc4_strerror(st).decode(), msg), st)
 
     @property
     def arena_bytes(self):

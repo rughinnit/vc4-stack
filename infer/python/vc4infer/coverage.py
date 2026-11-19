@@ -1,4 +1,4 @@
-"""Static node coverage for the vc4infer executor.
+"""Static node coverage and host-tier classification for the vc4infer executor.
 
 This mirrors the dispatch table and the constraint checks in ``onnxrun.py``.
 It is a *static* report: it reads the graph, the initialiser shapes and the
@@ -15,9 +15,29 @@ Status values:
                  why
     unknown      the op is implemented but a constraint depends on a shape that
                  static inference could not produce (a data-dependent shape)
+
+Every node is also classified into exactly one execution tier:
+
+    vc4                 the VC4 executor runs it (its kernels may do byte
+                        movement on the ARM, as the engine always has)
+    host-meta           metadata / shape arithmetic only (Shape, Size,
+                        Constant, ConstantOfShape, and integer or boolean
+                        tensor plumbing): no activation arithmetic
+    host-control        If / Loop / Scan: the executor is host-scheduled, so the
+                        node runs in the reference evaluator
+    host-unwritten      a numeric operator with no VC4 kernel yet.  This is
+                        *debt*: structural hybrid refuses it, ``host_policy=
+                        "any"`` is the explicit escape hatch
+    unsupported-graph   invalid or unsupported types/domains that cannot be run
+                        at all, on either backend
+
+``backend_plan`` turns the tiers into the per-node ``vc4 | host-meta |
+host-control | host-unwritten | unsupported-graph`` report used by
+``Engine.node_backends`` and ``vc4infer nodes``.
 """
 import onnx
-from onnx import numpy_helper
+import numpy as np
+from onnx import TensorProto, numpy_helper
 
 # op -> short implementation note (mirrors onnxrun.Runner._dispatch)
 OPS = {
@@ -50,6 +70,24 @@ OPS = {
     "Gather": "host int64",
 }
 
+# tiers ---------------------------------------------------------------------
+META_OPS = frozenset(("Shape", "Size", "Constant", "ConstantOfShape"))
+CONTROL_OPS = frozenset(("If", "Loop", "Scan"))
+
+_FLOAT_TYPES = frozenset(
+    t for t in (TensorProto.FLOAT, TensorProto.DOUBLE, TensorProto.FLOAT16,
+                getattr(TensorProto, "BFLOAT16", -1),
+                getattr(TensorProto, "FLOAT8E4M3FN", -2),
+                getattr(TensorProto, "FLOAT8E5M2", -3))
+    if t >= 0)
+_UNSUPPORTED_TYPES = frozenset(
+    t for t in (TensorProto.STRING, TensorProto.FLOAT16,
+                getattr(TensorProto, "BFLOAT16", -1),
+                getattr(TensorProto, "FLOAT8E4M3FN", -2),
+                getattr(TensorProto, "FLOAT8E5M2", -3),
+                TensorProto.COMPLEX64, TensorProto.COMPLEX128)
+    if t >= 0)
+
 _INT_ATTR = ("group", "axis", "ceil_mode", "transA", "transB")
 
 
@@ -65,55 +103,71 @@ def _attr(node, name, default=None):
             return float(a.f)
         if a.type == onnx.AttributeProto.STRING:
             return a.s.decode()
+        if a.type == onnx.AttributeProto.TENSOR:
+            return numpy_helper.to_array(a.t)
+        if a.type == onnx.AttributeProto.FLOATS:
+            return list(a.floats)
         return default
     return default
 
 
 def _shape_map(model):
-    """name -> list of dims (0/negative = unknown) from shape inference."""
+    """(name -> list of dims, name -> TensorProto elem_type) via inference."""
     try:
         m = onnx.shape_inference.infer_shapes(model, strict_mode=False,
                                               data_prop=False)
     except Exception:
         m = model
     out = {}
+    types = {}
     vals = list(m.graph.input) + list(m.graph.value_info) + \
         list(m.graph.output)
     for vi in vals:
         tt = vi.type.tensor_type
+        if tt.elem_type:
+            types[vi.name] = int(tt.elem_type)
         if not tt.HasField("shape"):
             continue
         dims = []
         for d in tt.shape.dim:
             dims.append(int(d.dim_value) if d.HasField("dim_value") else -1)
         out[vi.name] = dims
-        out.setdefault(vi.name + "#dtype", tt.elem_type)
-    return out
+        if tt.elem_type:
+            types.setdefault(vi.name, int(tt.elem_type))
+    return out, types
 
 
 def _init_shapes(model):
+    """(name -> shape, name -> elem type) for initialisers and Constant."""
     shapes = {}
+    types = {}
     for init in model.graph.initializer:
         try:
             shapes[init.name] = list(numpy_helper.to_array(init).shape)
         except Exception:
             pass
+        types[init.name] = int(init.data_type)
     for n in model.graph.node:                 # Constant nodes
         if n.op_type != "Constant" or not n.output:
             continue
         for a in n.attribute:
             if a.name == "value" and a.t is not None:
                 try:
-                    shapes[n.output[0]] = list(
-                        numpy_helper.to_array(a.t).shape)
+                    arr = numpy_helper.to_array(a.t)
+                    shapes[n.output[0]] = list(arr.shape)
+                    types[n.output[0]] = int(a.t.data_type)
                 except Exception:
                     pass
-    return shapes
+    return shapes, types
 
 
 def _rank(shapes, name):
     s = shapes.get(name)
     return len(s) if s else None
+
+
+def _is_float(elem):
+    return elem in _FLOAT_TYPES
 
 
 def _check_conv(node, shapes, inits):
@@ -281,12 +335,122 @@ _CHECKS = {
 }
 
 
-def analyse(path):
-    """Read a model and return the coverage report as a dict."""
-    model = onnx.load(path)
+def _macs(node, shapes, inits):
+    """Static multiply-accumulate count for the arithmetic ops.
+
+    Only true MACs are counted (Conv, MatMul, Gemm, GlobalAveragePool); data
+    movement and elementwise ops are 0.  This is the denominator for
+    ``arithmetic_on_vc4``.
+    """
+    op = node.op_type
+    try:
+        if op == "Conv":
+            w = inits.get(node.input[1]) if len(node.input) > 1 else None
+            if w is None:
+                return 0
+            kh, kw = int(w[2]), int(w[3])
+            cout, cin = int(w[0]), int(w[1]) * int(_attr(node, "group", 1)
+                                                   or 1)
+            xs = shapes.get(node.input[0])
+            if xs and len(xs) == 4 and all(d > 0 for d in xs):
+                N, _, H, W = (int(d) for d in xs)
+                sh = int((_attr(node, "strides", [1, 1]) or [1, 1])[0])
+                pads = _attr(node, "pads", [0, 0, 0, 0])
+                dil = int((_attr(node, "dilations", [1, 1]) or [1, 1])[0])
+                ho = (H + int(pads[0]) + int(pads[2]) - dil * (kh - 1) - 1) \
+                    // sh + 1
+                wo = (W + int(pads[1]) + int(pads[3]) - dil * (kw - 1) - 1) \
+                    // sh + 1
+                return max(0, N * cout * ho * wo * cin * kh * kw)
+            return 0
+        if op in ("MatMul", "Gemm"):
+            a = shapes.get(node.input[0])
+            b = shapes.get(node.input[1])
+            if a and b and len(a) == 2 and len(b) == 2:
+                return max(0, int(a[0]) * int(b[1]) * int(a[1]))
+            return 0
+        if op == "GlobalAveragePool":
+            xs = shapes.get(node.input[0])
+            if xs and all(d > 0 for d in xs):
+                n = 1
+                for d in xs:
+                    n *= int(d)
+                return n
+            return 0
+    except Exception:
+        return 0
+    return 0
+
+
+def _defined(model, node):
+    try:
+        return bool(onnx.defs.has(node.op_type, node.domain or ""))
+    except Exception:
+        return False
+
+
+def _tier(node, status, reason, dtypes, model):
+    """Classify one node into exactly one execution tier."""
+    op = node.op_type
+    data_in = [i for i in node.input if i]
+    outs = [o for o in node.output if o]
+    elems = [dtypes.get(n) for n in data_in + outs]
+    known = [e for e in elems if e is not None]
+
+    if op in META_OPS:
+        return "host-meta", "metadata: %s (no activation arithmetic)" % op
+    if op in CONTROL_OPS:
+        return ("host-control",
+                "control flow %s: subgraphs are host-scheduled (a persistent "
+                "kernel + device-side dispatch would be needed on VC4)" % op)
+
+    if any(e in _UNSUPPORTED_TYPES for e in known):
+        return ("unsupported-graph",
+                "tensor type %s cannot cross the fp32 engine boundary"
+                % "/".join(sorted(set(TensorProto.DataType.Name(e)
+                                      for e in known
+                                      if e in _UNSUPPORTED_TYPES))))
+
+    # Shape / index plumbing on integer or boolean tensors is metadata, even
+    # when the op (Concat, Mul, Slice, ...) would otherwise be a VC4 kernel.
+    if data_in and all(e is not None and not _is_float(e) for e in
+                       [dtypes.get(n) for n in data_in]):
+        return ("host-meta",
+                "metadata/shape arithmetic on non-float tensors (%s)"
+                % op)
+
+    if op == "Cast":
+        to = int(_attr(node, "to", TensorProto.FLOAT))
+        return ("host-meta",
+                "metadata/control type conversion (Cast to %s)"
+                % TensorProto.DataType.Name(to))
+
+    if op not in OPS and not _defined(model, node):
+        return ("unsupported-graph",
+                "no ONNX definition for op %r in domain %r"
+                % (op, node.domain or "ai.onnx"))
+
+    if op == "Gather":
+        src = dtypes.get(node.input[0]) if node.input else None
+        if src is not None and _is_float(src):
+            return ("host-unwritten",
+                    "Gather on activation data (only int64 shape tensors are "
+                    "implemented)")
+
+    if status == "supported":
+        return "vc4", reason
+    if status == "unknown":
+        return "vc4", "unverified: %s (runtime decides)" % reason
+    return ("host-unwritten",
+            "numeric op with no VC4 kernel: %s" % reason)
+
+
+def analyse_model(model):
+    """Analyse an in-memory ModelProto and return the coverage report."""
     g = model.graph
-    shapes = _shape_map(model)
-    inits = _init_shapes(model)
+    shapes, dtypes = _shape_map(model)
+    inits, init_types = _init_shapes(model)
+    dtypes.update(init_types)
 
     # producer/consumer map for the SiLU rewrite (Mul(x, Sigmoid(x)))
     producer = {}
@@ -294,6 +458,11 @@ def analyse(path):
         for o in n.output:
             if o:
                 producer[o] = n
+    producer_idx = {}
+    for idx, n in enumerate(g.node):
+        for o in n.output:
+            if o:
+                producer_idx[o] = idx
     consumers = {}
     for n in g.node:
         for i in n.input:
@@ -301,7 +470,9 @@ def analyse(path):
                 consumers.setdefault(i, []).append(n)
     gouts = set(o.name for o in g.output)
     silu_pairs = 0
-    for n in g.node:
+    silu_skip = []                 # Sigmoid node indices folded into a Mul
+    silu_src = {}                  # Mul index -> x tensor name
+    for idx, n in enumerate(g.node):
         if n.op_type != "Mul" or len(n.input) != 2:
             continue
         for sig, x in ((n.input[0], n.input[1]), (n.input[1], n.input[0])):
@@ -310,6 +481,10 @@ def analyse(path):
                 continue
             if len(consumers.get(sig, [])) == 1 and sig not in gouts:
                 silu_pairs += 1
+                sig_idx = producer_idx.get(sig)
+                if sig_idx is not None:
+                    silu_skip.append(sig_idx)
+                silu_src[idx] = x
                 break
 
     nodes = []
@@ -321,8 +496,11 @@ def analyse(path):
             fn = _CHECKS.get(n.op_type)
             status, reason = (fn(n, shapes, inits) if fn else
                               ("supported", OPS[n.op_type]))
+        tier, tier_reason = _tier(n, status, reason, dtypes, model)
         nodes.append({"index": idx, "name": name, "op": n.op_type,
                       "status": status, "reason": reason,
+                      "tier": tier, "tier_reason": tier_reason,
+                      "macs": _macs(n, shapes, inits),
                       "outputs": [o for o in n.output if o]})
 
     counts = {}
@@ -360,9 +538,10 @@ def analyse(path):
         if o.domain in ("", "ai.onnx"):
             opset = o.version
     return {
-        "path": path,
-        "bytes": os.path.getsize(path),
-        "producer": (model.producer_name + " " + model.producer_version).strip(),
+        "path": None,
+        "bytes": None,
+        "producer": (model.producer_name + " " +
+                     model.producer_version).strip(),
         "opset": opset,
         "inputs": inputs,
         "outputs": outputs,
@@ -373,5 +552,138 @@ def analyse(path):
         "unsupported": sum(1 for e in nodes if e["status"] == "unsupported"),
         "unknown": sum(1 for e in nodes if e["status"] == "unknown"),
         "silu_pairs": silu_pairs,
+        "silu_skip": silu_skip,
+        "silu_src": silu_src,
         "dispatches": len(nodes) - silu_pairs,
+        "shapes": shapes,
+        "macs_total": sum(int(n.get("macs") or 0) for n in nodes),
+        "tiers": {t: sum(1 for e in nodes if e["tier"] == t)
+                  for t in ("vc4", "host-meta", "host-control",
+                            "host-unwritten", "unsupported-graph")},
     }
+
+
+def analyse(path):
+    """Read a model and return the coverage report as a dict."""
+    import os
+    model = onnx.load(path)
+    rep = analyse_model(model)
+    rep["path"] = path
+    try:
+        rep["bytes"] = os.path.getsize(path)
+    except OSError:
+        rep["bytes"] = None
+    return rep
+
+
+def backend_plan(rep, mode="hybrid", host_policy="device",
+                 silu_skip=None, silu_src=None, folded=None):
+    """Per-node backend report: ``vc4`` / ``folded`` / ``host-meta`` /
+    ``host-control`` / ``host-unwritten`` / ``unsupported-graph``.
+
+    ``folded`` is the set of node indices resolved at plan time under the
+    ``device`` policy (constant/shape folding).  Folded nodes cost zero runtime
+    work and are not executed nodes.  Skipped ``Sigmoid`` nodes are part of the
+    fused VC4 SiLU, not host nodes.
+    """
+    skip = set(silu_skip if silu_skip is not None else rep.get("silu_skip", ()))
+    src = silu_src if silu_src is not None else rep.get("silu_src", {})
+    folded = set(folded or ())
+    out = []
+    for n in rep["nodes"]:
+        tier = n.get("tier") or "host-unwritten"
+        reason = n.get("tier_reason") or n["reason"]
+        if n["index"] in skip:
+            tier = "vc4"
+            reason = "fused into the consumer Mul as one SiLU launch"
+        elif n["index"] in folded:
+            tier = "folded"
+            reason = ("plan-time constant/shape resolution (device policy): "
+                      "no runtime work")
+        elif n["index"] in src:
+            reason += " (fused SiLU)"
+        out.append({"index": n["index"], "name": n["name"], "op": n["op"],
+                    "backend": tier, "reason": reason,
+                    "status": n["status"], "macs": int(n.get("macs") or 0),
+                    "mode": mode, "host_policy": host_policy})
+    return out
+
+
+def host_debt(rep):
+    """Only the host-unwritten nodes (numeric ops with no VC4 kernel)."""
+    return [n for n in rep["nodes"] if n.get("tier") == "host-unwritten"]
+
+
+def fold_metadata(model, rep):
+    """Plan-time constant/shape resolution for the device policy.
+
+    Returns ``(folded_indices, values)``.  ``values`` maps tensor name to the
+    numpy array resolved at plan time.  Only ``host-meta`` nodes are folded;
+    they cost zero runtime work and never appear as executed nodes.
+    """
+    from ._hybrid import HostEvaluator
+    shapes = rep.get("shapes", {})
+    known = {}
+    for init in model.graph.initializer:
+        try:
+            known[init.name] = numpy_helper.to_array(init)
+        except Exception:
+            pass
+    ev = HostEvaluator(model)
+    folded = set()
+    for idx, node in enumerate(model.graph.node):
+        if rep["nodes"][idx]["tier"] != "host-meta":
+            continue
+        op = node.op_type
+        outs = [o for o in node.output if o]
+        if any(a.type in (onnx.AttributeProto.GRAPH,
+                          onnx.AttributeProto.GRAPHS)
+               for a in node.attribute):
+            continue
+        if op == "Constant":
+            v = _attr(node, "value")
+            if v is None or not outs:
+                continue
+            known[outs[0]] = np.asarray(v)
+            folded.add(idx)
+            continue
+        if op == "Shape":
+            src = shapes.get(node.input[0])
+            if not src or any(int(d) < 0 for d in src) or not outs:
+                continue
+            known[outs[0]] = np.asarray(src, dtype=np.int64)
+            folded.add(idx)
+            continue
+        if op == "Size":
+            src = shapes.get(node.input[0])
+            if not src or any(int(d) < 0 for d in src) or not outs:
+                continue
+            n = 1
+            for d in src:
+                n *= int(d)
+            known[outs[0]] = np.asarray(n, dtype=np.int64)
+            folded.add(idx)
+            continue
+        feeds = {}
+        ok = True
+        for name in node.input:
+            if not name:
+                continue
+            if name in known:
+                feeds[name] = np.asarray(known[name])
+            else:
+                ok = False
+                break
+        if not ok:
+            continue
+        try:
+            vals = ev.run(node, feeds, idx)
+        except Exception:                            # noqa: BLE001
+            continue
+        if len(vals) != len(outs):
+            continue
+        for name, arr in zip(outs, vals):
+            known[name] = np.asarray(arr)
+        folded.add(idx)
+    return folded, known
+

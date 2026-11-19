@@ -5,11 +5,13 @@ describes the graph path added on top of it: a small ONNX exporter/runner in
 `infer/tools/onnx/`, the two engine ops it needed (`vc4_maxpooln`, `vc4_softmax_fwd`), the
 measured end-to-end numbers, and the honest coverage gap for YOLOv8n.
 
-Everything that *computes* runs on the QPU.  The host only moves bytes
-(padding, channel gathers, concat, nearest resize, boundary compaction) — the
-same class of work the engine already does for its im2col layout.  An op or
-attribute the engine cannot dispatch raises an error naming the node and its
-ONNX op type; there is no CPU math fallback.
+In **strict mode** (the default) everything that *computes* runs on the QPU.
+The host only moves bytes (padding, channel gathers, concat, nearest resize,
+boundary compaction) — the same class of work the engine already does for its
+im2col layout.  An op or attribute the engine cannot dispatch raises an error
+naming the node and its ONNX op type; there is no CPU math fallback.  The
+opt-in `mode="hybrid"` adds explicit host tiers; section 10 describes the
+trade-off, and strict remains the default.
 
 Hardware: Raspberry Pi 3B, BCM2837, VideoCore IV @ **stock** clocks
 (core 400 MHz / V3D 300 MHz), kernel 6.18, engine through **vc4d**
@@ -107,7 +109,7 @@ the single 64 MiB arena.
 | `Flatten`, `Reshape`, `Identity` | view (no copy) | element count must match |
 | `GlobalAveragePool` | `vc4_matmul` with a `1/HW` column | NCHW, batch 1 |
 
-Everything else fails loudly, e.g.:
+Everything else fails loudly in strict mode, e.g.:
 
 ```
 onnxrun.UnsupportedNode: node '/model.9/Split' (Split): unsupported op Split
@@ -580,3 +582,148 @@ the obvious next step.
   launch is the fix.
 * The runner re-executes the graph from scratch each call; weights are
   uploaded once per process but there is no graph-level memory planner.
+
+## 10. Host policy: the device invariant (default), `structural`, `any`
+
+Strict mode is unchanged and remains the default (`Engine(path)`).  Hybrid mode
+is opt-in (`mode="hybrid"`) and now defaults to `host_policy="device"`.
+
+### 10.1 The invariant
+
+Under `host_policy="device"` the host may do **only**:
+
+* plan-time constant folding / shape resolution (`Shape`, `Size`, `Constant`,
+  `ConstantOfShape`, `Gather` over shape tensors, and the integer shape
+  arithmetic feeding them) - resolved when the plan is built, so they cost
+  zero runtime work and never appear as executed nodes;
+* orchestration: launch issuing, DMA/copy setup, daemon validation and memory
+  allocation.
+
+Every other node must execute on VC4.  There is no host escape:
+
+* a numeric node with no kernel raises `HostNotAllowed(node, op)`;
+* `If`/`Loop`/`Scan` raise `NeedsDeviceDispatch(node, op)` naming the missing
+  device-side dispatch feature;
+* `Engine.host_compute_nodes()` is the list of nodes that performed *runtime*
+  CPU compute.  It is `[]` for a device-policy run and `plan()` asserts it.
+* `Engine.profile()` reports `host_compute_nodes=0` explicitly.
+
+"Slow on VC4" is not a reason to use the host.  Emulation on the QPU is
+allowed; delegation is not.
+
+### 10.2 Tiers
+
+Every node is classified into exactly one tier, printed per node by
+`vc4infer nodes -v` and returned by `Engine.node_backends()`:
+
+| tier | members | device | structural | why |
+|---|---|---|---|---|
+| `vc4` | Conv, Relu, ... | runs | runs | the QPU path |
+| `folded` | Shape/Size/Constant/ConstantOfShape and integer shape arithmetic | plan-time only | metadata (runtime) | resolved during planning; zero runtime cost |
+| `host-meta` | metadata that could not be folded | **refused** (`HostNotAllowed`) | runs | runtime host metadata is still host compute |
+| `host-control` | `If`, `Loop`, `Scan` | **refused** (`NeedsDeviceDispatch`) | runs | the executor is host-scheduled; the QPU has no device-side work queue |
+| `host-unwritten` | `Erf`, `TopK`, `NonZero`, `Einsum`, `LSTM`, ... | **refused** (`HostNotAllowed`) | refused | a numeric operator with no VC4 kernel: DEBT |
+| `unsupported-graph` | invalid domains/types, fp16/string tensors | refused | refused | cannot run on either backend |
+
+`host-control` is architectural, not "slow": every branch/iteration decision
+would be made by the ARM, and body tensors live in the caller's pool.  Making
+it device-executable needs a persistent QPU kernel pulling work items
+(including nested bodies) from a device-side queue so the QPU makes the branch
+decision and the host is not in the loop per iteration.  That is a different
+runtime, not another kernel.
+
+`host_policy="structural"` is the previous behaviour: metadata and control flow
+may run on the host.  `host_policy="any"` additionally runs `host-unwritten`
+nodes in the numpy reference evaluator, for compatibility only.  Neither is a
+performance mode, and both keep the debt visible.
+
+### 10.3 Utilisation accounting
+
+```sh
+vc4infer util model.onnx [--imgsz N] [--reps N] [--json]
+```
+
+or `Engine.utilization(reps=3)`:
+
+| field | meaning |
+|---|---|
+| `arithmetic_on_vc4` | share of the graph's static MACs executed by QPU nodes (Conv/Gemm/MatMul/GAP); 100% under `device` |
+| `bytes_copied_by_host` | bytes of model/activation data the ARM moved (concat, resize, transpose, pad, layout copies), both directions, with a per-node/per-site breakdown |
+| `qpu_duty` | QPU busy time / wall time from the engine's pack+kernel counters; also per node |
+| `launches`, `launches_per_node` | launch count and launches per dispatched node |
+| `launch_path_ms`, `launch_path_pct` | wall time minus QPU busy time, i.e. the ARM/daemon round-trip share |
+| `host_compute_nodes` | runtime host-compute nodes; must be 0 under `device` |
+
+Measured on YOLOv8n 160x160, stock clocks, `vc4infer util --reps 3`:
+
+| metric | value |
+|---|---:|
+| nodes | 233 vc4 + 30 folded |
+| `host_compute_nodes` | **0** |
+| `arithmetic_on_vc4` | **100.0%** (273,249,600 / 273,249,600 MACs) |
+| `bytes_copied_by_host` | **17,077,040 B** (outstanding; see 10.4) |
+| `qpu_duty` | **48.7%** (302.9 / 622.4 ms) |
+| launches | 678 (3.85 per dispatched node) |
+| launch path | 319.5 ms (**51.3%** of wall) |
+
+The duty cycle is limited by launches and layout traffic, **not by
+arithmetic**: the graph is 100% QPU arithmetic but the QPU is idle while the
+ARM issues the next launch.  The honest statement is "100% of MACs on VC4,
+~49% QPU duty at 160x160".
+
+### 10.4 Host byte debt: what was eliminated, what remains
+
+Per-run host byte movement on YOLOv8n 160x160:
+
+| stage | bytes/run | note |
+|---|---:|---|
+| before this change | 38,410,632 | weight re-downloads + every layout copy |
+| after caching weights/bias panels in host arrays | **17,077,040** | -21.3 MB/run |
+
+Remaining per-op debt (YOLOv8n 160, device policy):
+
+| op | bytes/run | missing capability |
+|---|---:|---|
+| Conv | 8,683,728 | NHWC inputs arrive NCHW; a QPU NHWC<->NCHW layout copy is not wired into the conv prologue (and the first graph input conversion) |
+| Concat | 5,344,320 | pitched channel concat: `vc4_concat_nhwc` exists but needs a per-row/pitch wrapper for W not a multiple of 4 |
+| Split | 983,040 | channel-strided copy with `src pixel stride != Csrc*4` (split of a pitched tensor) |
+| Reshape | 826,080 | NHWC->NCHW logical reshape: QPU 2-D transpose exists but the head extents (e.g. 2100) are not multiples of 16 |
+| Softmax | 403,456 | channel-axis softmax needs a QPU layout copy to the last axis |
+| Transpose | 268,800 | arbitrary permutation (head `[0,2,1,3]`) |
+| MaxPool | 247,296 | -inf border is still a host fill; the pool kernel itself is QPU |
+| Slice | 25,200 | head slice on a channel axis |
+| Mul | 8,400 | broadcast constant expansion on the host |
+
+**The device byte invariant is not yet satisfied for YOLOv8n**: the reported
+`bytes_copied_by_host` is 17.08 MB/run and is printed as debt, not hidden.  The
+runtime host-compute invariant *is* satisfied (0 nodes).  Reducing this to zero
+is emulation work on VC4 - pitched concat/split copies, an NHWC<->NCHW layout
+kernel, an arbitrary-permute kernel and a channel-axis softmax - not a policy
+exemption.
+
+YOLOv8n at 320x320 does not fit the board's 72 MiB daemon arena with the
+current graph pool, so no 320 utilisation table is claimed.
+
+### 10.5 The per-node report and boundary copies
+
+`node_backends()` returns `[(name, op, backend, reason)]` for every node
+(actual verdict after a run, static partition before it).  `host_debt()`
+returns only `host-unwritten`.  In `structural`/`any` mode, crossing the
+boundary is counted per run (`host_to_vc4` + `vc4_to_host` tensors, plus the
+byte total above), and the summary prints the tier split and the host wall-time
+share.  Hybrid timings are never presented as VC4-only numbers.
+
+### 10.6 Tests
+
+`infer/tests/test_hybrid.py` covers:
+
+* device policy: `hybrid_meta` folds Shape/Gather/Slice/Mul/Concat and runs
+  with `host_compute_nodes == []`, output matching a full
+  `ReferenceEvaluator` run;
+* `Erf` and the mixed Split/Einsum/TopK/NonZero/LSTM model raise
+  `HostNotAllowed` under `device` and are listed by `vc4infer nodes
+  --host-policy device` (exit 4);
+* `If` raises `NeedsDeviceDispatch` under `device` and runs as `host-control`
+  under `structural`;
+* YOLOv8n: `host_compute_nodes == 0`, `arithmetic_on_vc4 == 100%`, identical
+  output to strict, and the utilisation/byte debt report above.

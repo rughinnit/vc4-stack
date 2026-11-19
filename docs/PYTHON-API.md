@@ -64,12 +64,15 @@ client never opens `/dev/mem`.
 | `vc4infer.__version__` | `"1.1.2"` |
 | `vc4infer.devices()` | `["vc4"]` |
 | `vc4infer.Device("vc4")` | the device object: `.name`, `.memory`, `.queue_depth`, `.ops`, `.supports(op)`, `.describe()` |
-| `vc4infer.Engine(model_path, device=None, *, arena_mb=None, cache_dir=None)` | the engine |
-| `vc4infer.TensorSpec`, `Plan`, `NodeInfo` | metadata dataclasses |
+| `vc4infer.Engine(model_path, device=None, *, mode="strict", host_policy="device", arena_mb=None, cache_dir=None)` | the engine |
+| `vc4infer.TensorSpec`, `Plan`, `NodeInfo`, `NodeBackend` | metadata dataclasses |
 | `vc4infer.postprocess` | `decode_yolo`, `nms`, `Detections`, `Letterbox`, `draw`, `COCO80` |
 | `vc4infer.yolo.Detector(engine_or_path, names=None, *, device="vc4")` | the YOLO adapter |
 | `vc4infer.contrib.ultralytics` | `register()`, `unregister()`, `is_registered()`, `VC4Backend` |
-| `vc4infer.UnsupportedNode(node, op, detail)` | unsupported operator/attribute/shape |
+| `vc4infer.UnsupportedNode(node, op, detail)` | unsupported operator/attribute/shape (strict) |
+| `vc4infer.HostNotAllowed(node, op, reason)` | hybrid `device`/`structural`: a numeric op with no VC4 kernel (host debt) |
+| `vc4infer.NeedsDeviceDispatch(node, op, feature)` | hybrid `device`: If/Loop/Scan need a persistent kernel + device-side queue |
+| `vc4infer.HostNodeError(node, op, detail)` | hybrid: the numpy reference evaluator failed on a host node |
 | `vc4infer.DeviceError` | device/engine cannot be opened (daemon, arena busy) |
 | `vc4infer.ShapeError` | feed name/shape/dtype mismatch (a `ValueError`) |
 | `vc4infer.Error`, `vc4infer.Unsupported` | raw `libvc4infer` errors |
@@ -91,16 +94,21 @@ client never opens `/dev/mem`.
 
 | member | returns / does |
 |---|---|
-| `Engine(path, device, arena_mb=, cache_dir=)` | loads the graph, opens one arena, uploads weights |
+| `Engine(path, device, *, mode="strict", host_policy="device", arena_mb=, cache_dir=)` | loads the graph, opens one arena, uploads weights |
+| `.mode`, `.host_policy` | the execution policy in force |
 | `.device` | the `Device` |
 | `.inputs`, `.outputs` | tuples of `TensorSpec(name, shape, dtype)`, resolved from the ONNX graph |
 | `.run(feeds, profile=False)` | `{output_name: np.ndarray}` — raw outputs, no post-processing |
 | `.nodes()` | list of `NodeInfo(name, op, supported, constraint)`; `supported` is `True`, `False`, or `None` for shape-dependent ("unverified") |
 | `.unsupported()` | the nodes with `supported is False` |
-| `.plan()` | strict `Plan`: raises `UnsupportedNode` on the first unsupported node, else returns inputs/outputs/nodes/dispatch count |
-| `.profile(reps=1, feeds=None)` | total mean/median/min ms, FPS, launches, GPU vs wall, per-node breakdown, memory |
+| `.plan()` | strict: raises `UnsupportedNode` on the first unsupported node. structural hybrid: raises `HostNotAllowed` on the first numeric host-debt node. Else returns a `Plan` |
+| `.node_backends()` | `[(name, op, backend, reason)]` for every node: `vc4`, `host-meta`, `host-control`, `host-unwritten`, `unsupported-graph` (actual verdict after a hybrid run) |
+| `.host_debt()` | only the `host-unwritten` nodes: numeric ops that still need a VC4 kernel |
+| `.host_compute_nodes()` | nodes that performed runtime CPU compute; `[]` under `device` |
+| `.utilization(reps=1, feeds=None)` | MAC share on VC4, host bytes (per site), QPU duty, launches/node and launch-path share |
+| `.profile(reps=1, feeds=None)` | total mean/median/min ms, FPS, launches, GPU vs wall, per-node backend/reason breakdown, tier split (`nodes_vc4`, `host_meta`, `host_control`, `host_unwritten`), boundary copies, memory |
 | `.memory()` | `{arena_bytes, arena_mb, pool_bytes, pool_mb, peak_bytes, peak_mb}` |
-| `.last_profile`, `.stats` | per-node timings and `{launches, gpu_ms}` of the last run |
+| `.last_profile`, `.last_boundary`, `.stats` | per-node timings/backend, `{tensors, host_to_vc4, vc4_to_host}`, and `{launches, gpu_ms}` of the last run |
 | `.close()` / `with` | release the arena |
 
 `feeds` is `{input_name: ndarray}`; for a single-input model a bare ndarray is
@@ -113,6 +121,16 @@ Static vs runtime: `nodes()`/`plan()` read the graph, attributes, initialiser
 shapes and shape inference; they catch an unsupported op before the GPU is
 touched.  `run()` is authoritative for a concrete input (a shape-dependent
 constraint can still raise there).
+
+Hybrid mode is opt-in and strict remains the default.  Hybrid defaults to
+`host_policy="device"`: the host only folds metadata at plan time and does
+orchestration; every runtime node must be VC4.  A numeric op without a kernel
+raises `HostNotAllowed`, and If/Loop/Scan raise `NeedsDeviceDispatch`.
+`host_policy="structural"` allows runtime metadata and control flow on the
+host; `host_policy="any"` additionally runs unwritten numeric ops in the numpy
+reference evaluator.  `utilization()` reports the MAC share on VC4, host byte
+movement and QPU duty; a hybrid number is never a VC4-only number.  See
+[ONNX.md](ONNX.md) section 10.
 
 ### `postprocess`
 

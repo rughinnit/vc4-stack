@@ -8,6 +8,8 @@
     eng.inputs, eng.outputs                   # TensorSpec(name, shape, dtype)
     out = eng.run({"images": x})              # {'output0': np.ndarray}, raw
     eng.plan()                                # strict pre-flight check
+    eng.node_backends()                       # [(name, op, backend, reason)]
+    eng.host_debt()                           # numeric ops with no VC4 kernel
     eng.profile(reps=3)                       # per-node + total ms, launches
     eng.memory()                              # arena / pool / peak
 
@@ -21,9 +23,14 @@ YOLO is a thin adapter on top:
     det = vc4infer.yolo.Detector(eng)         # or Detector("yolov8n.onnx")
     r = det.predict("bus.jpg", imgsz=160)     # Detection: boxes/scores/classes
 
-Every float operation of the graph runs on the QPUs through ``libvc4infer``.
-Unsupported nodes raise :class:`UnsupportedNode` naming the node and op; there
-is no CPU arithmetic fallback.
+Strict mode is the default: every float operation of the graph runs on the
+QPUs through ``libvc4infer`` and an unsupported node raises
+:class:`UnsupportedNode` naming the node and op; there is no CPU arithmetic
+fallback.  ``Engine(path, mode="hybrid")`` is the opt-in exception:
+``host_policy="structural"`` lets metadata (Shape/Constant) and control flow
+(If/Loop/Scan) use the numpy reference evaluator and raises
+:class:`HostNotAllowed` for numeric operators that still need a VC4 kernel;
+``host_policy="any"`` runs those too, for compatibility only.
 """
 
 __version__ = "1.1.2"
@@ -35,19 +42,21 @@ from ._binding import (                                        # noqa: F401
 )
 from ._errors import (                                          # noqa: F401
     Vc4InferError, DeviceError, ShapeError, UnsupportedNode,
+    HostNotAllowed, HostNodeError, NeedsDeviceDispatch,
 )
 from . import coverage                                          # noqa: F401
 from .device import Device, devices                             # noqa: F401
-from .engine import Engine, Plan, TensorSpec, NodeInfo          # noqa: F401
+from .engine import Engine, Plan, TensorSpec, NodeInfo, NodeBackend  # noqa: F401
 from . import postprocess                                       # noqa: F401
 from . import yolo                                              # noqa: F401
 
 __all__ = [
     "__version__",
     "devices", "Device",
-    "Engine", "Plan", "TensorSpec", "NodeInfo",
+    "Engine", "Plan", "TensorSpec", "NodeInfo", "NodeBackend",
     "postprocess", "yolo", "coverage",
     "Vc4InferError", "DeviceError", "ShapeError", "UnsupportedNode",
+    "HostNotAllowed", "HostNodeError", "NeedsDeviceDispatch",
     "Error", "Unsupported",
 ]
 

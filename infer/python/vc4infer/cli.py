@@ -14,7 +14,8 @@ import numpy as np
 
 from . import __version__, _binding, coverage, postprocess
 from . import _runtime as runtime
-from ._errors import ShapeError, UnsupportedNode
+from ._errors import (HostNodeError, HostNotAllowed, NeedsDeviceDispatch,
+                      ShapeError, UnsupportedNode)
 from .engine import Engine
 
 
@@ -43,6 +44,22 @@ def _json_default(o):
     if isinstance(o, np.ndarray):
         return o.tolist()
     raise TypeError(repr(o))
+
+
+def _tier_counts(backs):
+    out = {}
+    for b in backs:
+        out[b.backend] = out.get(b.backend, 0) + 1
+    return out
+
+
+def _tier_line(n, total):
+    """'237 vc4, 30 folded, ...' style summary of a backend list."""
+    c = _tier_counts(n)
+    order = ("vc4", "folded", "host-meta", "host-control", "host-unwritten",
+             "unsupported-graph")
+    parts = ["%d %s" % (c[t], t) for t in order if c.get(t)]
+    return ", ".join(parts) + (" of %d" % total if total else "")
 
 
 def _engine_info():
@@ -160,7 +177,8 @@ def cmd_run(args):
     if not os.path.isfile(args.input):
         _die("no such input: %s" % args.input)
 
-    with Engine(args.model, cache_dir=args.cache) as eng:
+    with Engine(args.model, mode=args.mode, host_policy=args.host_policy,
+                cache_dir=args.cache) as eng:
         spec = eng.inputs[0]
         x, meta, src = load_input(args.input, spec.shape, args.imgsz)
         t0 = time.perf_counter()
@@ -168,6 +186,11 @@ def cmd_run(args):
         wall_ms = (time.perf_counter() - t0) * 1e3
         gpu_ms = eng.stats["gpu_ms"]
         launches = eng.stats["launches"]
+        backs = eng.node_backends()
+        boundary = dict(eng.last_boundary)
+        host_compute = eng.host_compute_nodes()
+        host_bytes = int(eng._runner.host_bytes)
+        host_sites = eng._runner.host_copy_report()
         out_names = [o.name for o in eng.outputs]
 
     raw = outs[out_names[0]]
@@ -200,6 +223,8 @@ def cmd_run(args):
     doc = {
         "model": os.path.abspath(args.model),
         "input": src,
+        "mode": args.mode,
+        "host_policy": args.host_policy,
         "input_shape": list(spec.shape),
         "outputs": [{"name": n, "shape": list(np.asarray(outs[n]).shape),
                      "min": float(np.min(outs[n])),
@@ -207,7 +232,14 @@ def cmd_run(args):
                     for n in out_names],
         "timing": {"wall_ms": wall_ms, "gpu_ms": gpu_ms,
                    "launches": launches},
+        "boundary": boundary,
+        "backends": _tier_counts(backs),
     }
+    if args.mode == "hybrid":
+        doc["host_nodes"] = [
+            {"name": b.name, "op": b.op, "backend": b.backend,
+             "reason": b.reason} for b in backs if b.on_host]
+        doc["notice"] = ("hybrid run: host nodes are not VC4 performance")
     if dets is not None:
         doc["detections"] = dets.to_dict(names)
         doc["decode"] = {k: v for k, v in dets.meta.items()}
@@ -226,6 +258,25 @@ def cmd_run(args):
     print("run:    %.1f ms  (%.0f GPU ms, %d launches; first run in a "
           "process, so it includes the one-time weight-panel packs)"
           % (wall_ms, gpu_ms, launches))
+    print("mode:   %s%s" % (args.mode,
+                            "" if args.mode == "strict"
+                            else " (host_policy=%s)" % args.host_policy))
+    print("tiers:  %s" % _tier_line(backs, len(backs)))
+    print("host_compute_nodes=%d  bytes_copied_by_host=%d"
+          % (len(host_compute), host_bytes))
+    if host_sites:
+        for s in host_sites[:8]:
+            print("  host bytes: %-34s %-10s %-14s %8d B x%d"
+                  % (s["name"][:34], s["op"], s["site"], s["bytes"],
+                     s["count"]))
+    if args.mode == "hybrid":
+        print("boundary: %d tensor(s) copied across the VC4/host boundary "
+              "(%d host->VC4, %d VC4->host)"
+              % (boundary.get("tensors", 0), boundary.get("host_to_vc4", 0),
+                 boundary.get("vc4_to_host", 0)))
+        if any(b.backend != "vc4" for b in backs):
+            print("NOTE:   hybrid execution includes host nodes; these "
+                  "timings are not VC4 performance")
     if dets is not None:
         print("decode: %d anchors, %d classes, %s; %d above conf %.2f -> %d "
               "after NMS (IoU %.2f); boxes in %s"
@@ -257,7 +308,8 @@ def cmd_bench(args):
     runtime.prepare_env()
     if not os.path.isfile(args.model):
         _die("no such model: %s" % args.model)
-    with Engine(args.model, cache_dir=args.cache) as eng:
+    with Engine(args.model, mode=args.mode, host_policy=args.host_policy,
+                cache_dir=args.cache) as eng:
         feeds = None
         src = None
         if args.input:
@@ -280,6 +332,9 @@ def cmd_bench(args):
         return 0
     print("model:  %s" % args.model)
     print("input:  %s" % src)
+    print("mode:   %s%s" % (res["mode"],
+                            "" if res["mode"] == "strict"
+                            else " (host_policy=%s)" % res["host_policy"]))
     print("warm-up (kernel JIT + first run): %.1f ms" % res["warmup_ms"])
     print("runs:   %s ms" % " / ".join("%.1f" % t for t in res["runs_ms"]))
     print("%.1f ms/image (mean), %.1f ms (median), best %.1f ms"
@@ -289,6 +344,34 @@ def cmd_bench(args):
     print("%d launches/image, GPU %.1f ms (%.0f%% of wall), node wall sum %.1f "
           "ms" % (res["launches"], res["gpu_ms"],
                   100 * res["gpu_ms"] / res["mean_ms"], res["wall_sum_ms"]))
+    print("tiers:  vc4 %d, folded %d, host-meta %d, host-control %d, "
+          "host-unwritten %d, unsupported-graph %d"
+          % (res["nodes_vc4"], res.get("nodes_folded", 0),
+             res["nodes_host_meta"], res["nodes_host_control"],
+             res["nodes_host_unwritten"], res["nodes_unsupported_graph"]))
+    print("        %d/%d compute nodes on VC4 (%.1f%%), %.1f%% of node wall "
+          "time on host"
+          % (res["nodes_vc4"],
+             res["nodes_vc4"] + res["nodes_host_control"] +
+             res["nodes_host_unwritten"] + res["nodes_unsupported_graph"],
+             res["pct_compute_vc4"], res["pct_time_host"]))
+    print("util:   host_compute_nodes=%d  bytes_copied_by_host=%d  "
+          "arithmetic_on_vc4=%.1f%%  qpu_duty=%.1f%%"
+          % (res["host_compute_nodes"], res["bytes_copied_by_host"],
+             res["arithmetic_on_vc4"], res["qpu_duty"]))
+    print("        launches=%d (%.2f/node), launch path %.1f ms (%.1f%%)"
+          % (res["launches"], res["launches_per_node"],
+             res["launch_path_ms"], res["launch_path_pct"]))
+    if res["mode"] == "hybrid":
+        print("boundary: %d tensor(s) across the VC4/host boundary "
+              "(%d host->VC4, %d VC4->host)"
+              % (res["boundary"].get("tensors", 0),
+                 res["boundary"].get("host_to_vc4", 0),
+                 res["boundary"].get("vc4_to_host", 0)))
+        if res["nodes_host_control"] or res["nodes_host_unwritten"] or \
+                res["pct_time_host"] > 0.0:
+            print("NOTE:   hybrid execution includes host work; these are not "
+                  "VC4-only numbers")
     print("arena %.1f MiB mapped, graph pool %.1f MiB, peak %.1f MiB"
           % (res["arena_mb"], res["pool_mb"], res["peak_mb"]))
     return 0
@@ -299,11 +382,29 @@ def cmd_nodes(args):
     if not os.path.isfile(args.model):
         _die("no such model: %s" % args.model)
     rep = coverage.analyse(args.model)
+    folded = set()
+    if args.mode == "hybrid" and args.host_policy == "device":
+        import onnx as _onnx
+        folded, _vals = coverage.fold_metadata(_onnx.load(args.model), rep)
+    plan = coverage.backend_plan(rep, mode=args.mode,
+                                 host_policy=args.host_policy,
+                                 folded=folded)
+    by_index = {b["index"]: b for b in plan}
+    tiers = {t: 0 for t in ("vc4", "folded", "host-meta", "host-control",
+                            "host-unwritten", "unsupported-graph")}
+    for b in plan:
+        tiers[b["backend"]] = tiers.get(b["backend"], 0) + 1
     if args.json:
-        print(json.dumps(rep, indent=1, default=_json_default))
+        doc = dict(rep)
+        doc["mode"] = args.mode
+        doc["host_policy"] = args.host_policy
+        doc["backends"] = plan
+        doc["host_debt"] = [b for b in plan
+                            if b["backend"] == "host-unwritten"]
+        print(json.dumps(doc, indent=1, default=_json_default))
         return 0
     print("model:  %s  (%.1f MiB, opset %s, %s)"
-          % (args.model, rep["bytes"] / 2 ** 20, rep["opset"],
+          % (args.model, (rep["bytes"] or 0) / 2 ** 20, rep["opset"],
              rep["producer"] or "unknown producer"))
     for i in rep["inputs"]:
         print("input:  %s  %s %s" % (i["name"], _shape_str(i["shape"]),
@@ -314,37 +415,157 @@ def cmd_nodes(args):
     print("%d nodes: %d supported, %d unsupported, %d unverified"
           % (rep["total"], rep["supported"], rep["unsupported"],
              rep["unknown"]))
+    print("tiers:  %d vc4, %d folded, %d host-meta, %d host-control, "
+          "%d host-unwritten, %d unsupported-graph"
+          % (tiers["vc4"], tiers["folded"], tiers["host-meta"],
+             tiers["host-control"], tiers["host-unwritten"],
+             tiers["unsupported-graph"]))
+    print("policy: mode=%s host_policy=%s" % (args.mode, args.host_policy))
     if rep["silu_pairs"]:
         print("rewrites: %d Mul(x,Sigmoid(x)) pairs fuse into one SiLU launch "
               "(%d dispatches)" % (rep["silu_pairs"], rep["dispatches"]))
     print()
-    print("  %-22s %6s %6s %6s  %s" % ("op", "nodes", "ok", "bad",
-                                       "implementation"))
+    print("  %-22s %6s %6s %6s %6s %6s %6s  %s"
+          % ("op", "nodes", "vc4", "fold", "meta", "ctl", "unwr",
+             "implementation"))
+    tier_by_index = {b["index"]: b["backend"] for b in plan}
     for c in rep["counts"]:
-        if c["op"] not in coverage.OPS:
-            continue
-        print("  %-22s %6d %6d %6d  %s"
-              % (c["op"], c["nodes"], c["supported"], c["unsupported"],
-                 c["note"]))
+        ops = [n for n in rep["nodes"] if n["op"] == c["op"]]
+        n_vc4 = sum(1 for n in ops if tier_by_index[n["index"]] == "vc4")
+        n_fold = sum(1 for n in ops
+                     if tier_by_index[n["index"]] == "folded")
+        n_meta = sum(1 for n in ops
+                     if tier_by_index[n["index"]] == "host-meta")
+        n_ctl = sum(1 for n in ops
+                    if tier_by_index[n["index"]] == "host-control")
+        n_unwr = sum(1 for n in ops
+                     if tier_by_index[n["index"]] == "host-unwritten")
+        print("  %-22s %6d %6d %6d %6d %6d %6d  %s"
+              % (c["op"], c["nodes"], n_vc4, n_fold, n_meta, n_ctl, n_unwr,
+                 c["note"] or "no VC4 implementation"))
     bad = [n for n in rep["nodes"] if n["status"] == "unsupported"]
     unk = [n for n in rep["nodes"] if n["status"] == "unknown"]
+    debt = [b for b in plan if b["backend"] == "host-unwritten"]
     if bad:
-        print("\nunsupported nodes (%d):" % len(bad))
+        print("\nunsupported by the VC4 executor (%d):" % len(bad))
         for n in bad:
-            print("  %-40s %-12s %s" % (n["name"][:40], n["op"], n["reason"]))
+            b = by_index[n["index"]]
+            print("  %-40s %-12s %-16s %s"
+                  % (n["name"][:40], n["op"], b["backend"], b["reason"]))
     else:
-        print("\nunsupported nodes: none")
+        print("\nunsupported by the VC4 executor: none")
     if unk:
         print("\nunverified nodes (%d, shape-dependent constraint):" % len(unk))
         for n in unk:
             print("  %-40s %-12s %s" % (n["name"][:40], n["op"], n["reason"]))
+    host = [b for b in plan if b["backend"] in ("host-meta", "host-control")]
+    if host:
+        print("\nhost tiers (%d: %d metadata, %d control flow):"
+              % (len(host),
+                 sum(1 for b in host if b["backend"] == "host-meta"),
+                 sum(1 for b in host if b["backend"] == "host-control")))
+        for b in host:
+            print("  %-40s %-12s %-12s %s"
+                  % (b["name"][:40], b["op"], b["backend"], b["reason"]))
+    if debt:
+        print("\nhost DEBT (%d) - numeric op(s) with no VC4 kernel:" % len(debt))
+        for b in debt:
+            print("  %-40s %-12s %s" % (b["name"][:40], b["op"], b["reason"]))
+        if args.mode == "hybrid" and args.host_policy == "structural":
+            print("\nhost_policy=structural refuses these nodes: this model "
+                  "is NOT 100% VC4 and will raise HostNotAllowed.")
+        elif args.host_policy == "any":
+            print("\nhost_policy=any will run these in the numpy reference "
+                  "evaluator (compatibility only, not VC4 performance).")
+    else:
+        print("\nhost debt: none")
     if args.verbose:
-        print("\nall nodes:")
-        for n in rep["nodes"]:
-            print("  %4d %-44s %-12s %-11s %s"
-                  % (n["index"], n["name"][:44], n["op"], n["status"],
+        print("\nall nodes (backend = where the node runs in %s mode):"
+              % args.mode)
+        for n in plan:
+            print("  %4d %-44s %-12s %-18s %s"
+                  % (n["index"], n["name"][:44], n["op"], n["backend"],
                      n["reason"]))
     print("\nstatic report only; `vc4infer run` is authoritative")
+    remaining = [b for b in plan if b["backend"] in
+                 ("host-meta", "host-control", "host-unwritten")]
+    if remaining and args.mode == "hybrid" and \
+            args.host_policy in ("device", "structural"):
+        return 4
+    return 0
+
+
+# ---------------------------------------------------------------------- util
+def cmd_util(args):
+    runtime.prepare_env()
+    if not os.path.isfile(args.model):
+        _die("no such model: %s" % args.model)
+    with Engine(args.model, mode=args.mode, host_policy=args.host_policy,
+                cache_dir=args.cache) as eng:
+        feeds = None
+        src = None
+        if args.input:
+            spec = eng.inputs[0]
+            x, _meta, src = load_input(args.input, spec.shape, args.imgsz)
+            feeds = {spec.name: x}
+        res = eng.utilization(reps=args.reps, feeds=feeds)
+        if src is None:
+            src = "random normal (rng 0), %s" % _shape_str(
+                eng.inputs[0].shape)
+        backs = eng.node_backends()
+        debt = eng.host_debt()
+    if args.json:
+        doc = dict(res)
+        doc["backends"] = list(backs)
+        doc["host_debt"] = list(debt)
+        print(json.dumps(doc, indent=1, default=_json_default))
+        return 0
+    print("model:  %s" % args.model)
+    print("input:  %s" % src)
+    print("mode:   %s (host_policy=%s)" % (res["mode"], res["host_policy"]))
+    print("%.1f ms/image (mean), %.2f FPS over %d run(s)"
+          % (res["mean_ms"], res["fps_mean"], res["reps"]))
+    print()
+    print("  %-26s %s" % ("device invariant",
+                          "OK" if res["device_ok"] else "VIOLATED"))
+    print("  %-26s %d" % ("host_compute_nodes", res["host_compute_nodes"]))
+    print("  %-26s %d B" % ("bytes_copied_by_host",
+                            res["bytes_copied_by_host"]))
+    print("  %-26s %.1f%%  (%d/%d MACs)"
+          % ("arithmetic_on_vc4", res["arithmetic_on_vc4"],
+             res["macs_vc4"], res["macs_total"]))
+    print("  %-26s %.1f%%  (%.1f / %.1f ms)"
+          % ("qpu_duty", res["qpu_duty"], res["qpu_busy_ms"], res["mean_ms"]))
+    print("  %-26s %d  (%.2f per dispatched node)"
+          % ("launches", res["launches"], res["launches_per_node"]))
+    print("  %-26s %.1f ms  (%.1f%% of wall)"
+          % ("launch path", res["launch_path_ms"], res["launch_path_pct"]))
+    print("  %-26s %d vc4, %d folded, %d host-meta, %d host-control, "
+          "%d host-unwritten"
+          % ("nodes", res["nodes_vc4"], res["nodes_folded"],
+             res["nodes_host_meta"], res["nodes_host_control"],
+             res["nodes_host_unwritten"]))
+    sites = res.get("host_copy_sites") or []
+    if sites:
+        print("\nhost byte movement (%d site(s), %d B):"
+              % (len(sites), res["bytes_copied_by_host"]))
+        print("  %-38s %-10s %-16s %10s %6s"
+              % ("node", "op", "site", "bytes", "calls"))
+        for s in sites[:40]:
+            print("  %-38s %-10s %-16s %10d %6d"
+                  % (s["name"][:38], s["op"], s["site"], s["bytes"],
+                     s["count"]))
+        if len(sites) > 40:
+            print("  ... %d more" % (len(sites) - 40))
+    elif res["bytes_copied_by_host"] == 0:
+        print("\nhost byte movement: none")
+    if debt:
+        print("\nhost debt (numeric, no VC4 kernel):")
+        for b in debt:
+            print("  %-38s %-10s %s" % (b.name[:38], b.op, b.reason))
+    if res["mode"] == "hybrid" and not res["device_ok"]:
+        print("\nNOTE: this run does not satisfy the device invariant; the "
+              "numbers above are not a VC4-only utilisation figure.")
     return 0
 
 
@@ -468,6 +689,14 @@ def build_parser():
                    help="print one JSON document instead of a table")
     p.add_argument("--save-json", default=None,
                    help="also write the JSON document to this path")
+    p.add_argument("--mode", choices=("strict", "hybrid"), default="strict",
+                   help="strict (default) raises on nodes without a VC4 "
+                        "kernel; hybrid may use allowed host tiers")
+    p.add_argument("--host-policy", choices=("device", "structural", "any"),
+                   default="device",
+                   help="hybrid host policy: device (default) forbids runtime "
+                        "host compute, structural allows metadata/control, any "
+                        "also runs unwritten numeric ops")
     p.add_argument("--cache", default=None, help="kernel blob cache directory")
     p.set_defaults(func=cmd_run)
 
@@ -479,15 +708,38 @@ def build_parser():
     p.add_argument("--input", default=None,
                    help="optional real input (image/npy/csv) instead of rng")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--mode", choices=("strict", "hybrid"), default="strict",
+                   help="strict (default) or hybrid execution")
+    p.add_argument("--host-policy", choices=("device", "structural", "any"),
+                   default="device", help="hybrid host policy")
     p.add_argument("--cache", default=None, help="kernel blob cache directory")
     p.set_defaults(func=cmd_bench)
 
-    p = sub.add_parser("nodes", help="static node coverage report")
+    p = sub.add_parser("nodes", help="static node coverage and backend report")
     p.add_argument("model")
     p.add_argument("-v", "--verbose", action="store_true",
-                   help="list every node with its status")
+                   help="list every node with status, backend and reason")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--mode", choices=("strict", "hybrid"), default="hybrid",
+                   help="which policy the backend report describes")
+    p.add_argument("--host-policy", choices=("device", "structural", "any"),
+                   default="device",
+                   help="device/structural exit non-zero when host debt exists")
     p.set_defaults(func=cmd_nodes)
+
+    p = sub.add_parser("util", help="device-invariant utilisation accounting")
+    p.add_argument("model")
+    p.add_argument("--imgsz", type=int, default=None)
+    p.add_argument("--reps", type=int, default=3, help="timed runs (default 3)")
+    p.add_argument("--input", default=None,
+                   help="optional real input (image/npy/csv) instead of rng")
+    p.add_argument("--mode", choices=("strict", "hybrid"), default="hybrid",
+                   help="hybrid (default) or strict")
+    p.add_argument("--host-policy", choices=("device", "structural", "any"),
+                   default="device", help="hybrid host policy")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--cache", default=None, help="kernel blob cache directory")
+    p.set_defaults(func=cmd_util)
 
     p = sub.add_parser("selftest", help="run the shipped reference models")
     p.add_argument("--models", default=None, help="model directory")
@@ -506,6 +758,15 @@ def main(argv=None):
         return 2
     try:
         return args.func(args)
+    except NeedsDeviceDispatch as e:
+        sys.stderr.write("vc4infer: needs device dispatch: %s\n" % e)
+        return 6
+    except HostNotAllowed as e:
+        sys.stderr.write("vc4infer: host not allowed: %s\n" % e)
+        return 4
+    except HostNodeError as e:
+        sys.stderr.write("vc4infer: host node failed: %s\n" % e)
+        return 5
     except UnsupportedNode as e:
         sys.stderr.write("vc4infer: unsupported: %s\n" % e)
         return 3

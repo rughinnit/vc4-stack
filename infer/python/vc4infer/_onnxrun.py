@@ -1,16 +1,33 @@
 #!/usr/bin/env python3
 """onnxrun.py -- execute a small ONNX graph on the VideoCore IV QPUs.
 
-Every arithmetic node is dispatched to libvc4infer through its ctypes binding
-(``vc4infer.py``).  There is no CPU fallback: a node, attribute combination or
-shape the engine cannot do raises ``UnsupportedNode`` naming the node and its
-op type.  The only CPU work is byte movement that the engine itself also does
-on the ARM (padding, channel gathering, concat, nearest resize, transposes,
-compaction) plus integer bookkeeping (``Shape``/``Gather`` and the int64 shape
-arithmetic of the head's dynamic ``Reshape``).  No float multiply, add or
-divide of activations happens on the ARM: ``Div`` by a graph constant is a GPU
-``Mul`` by the folded reciprocal, ``Sub`` of a runtime tensor is GPU
-``Mul(-1)`` + GPU ``Add``.
+Strict mode (the default) dispatches every arithmetic node to libvc4infer
+through its ctypes binding (``vc4infer.py``).  There is no CPU fallback: a
+node, attribute combination or shape the engine cannot do raises
+``UnsupportedNode`` naming the node and its op type.  The only CPU work is byte
+movement that the engine itself also does on the ARM (padding, channel
+gathering, concat, nearest resize, transposes, compaction) plus integer
+bookkeeping (``Shape``/``Gather`` and the int64 shape arithmetic of the head's
+dynamic ``Reshape``).  No float multiply, add or divide of activations happens
+on the ARM: ``Div`` by a graph constant is a GPU ``Mul`` by the folded
+reciprocal, ``Sub`` of a runtime tensor is GPU ``Mul(-1)`` + GPU ``Add``.
+
+Hybrid mode (opt-in, ``mode="hybrid"``) adds a host tier for nodes VC4 cannot
+express.  The policy is explicit:
+
+    host_policy="structural" (default)
+        host-meta (Shape/Size/Constant and integer shape arithmetic) and
+        host-control (If/Loop/Scan) may use ``onnx.reference``.  A numeric
+        operator with no VC4 kernel (``host-unwritten``) raises
+        ``HostNotAllowed``: the debt stays visible.
+    host_policy="any"
+        host-unwritten nodes also run in the reference evaluator.  This is
+        compatibility mode, not a performance claim.
+
+``unsupported-graph`` (invalid domains/types) is refused under both policies.
+Crossing the boundary copies NCHW fp32 tensors between the arena and numpy;
+the copy count is part of the profile.  Strict mode is byte-for-byte the old
+executor and never consults the reference evaluator.
 
 Two conv paths
     NHWC (default)  ``vc4_conv_nhwc``: QPU im2col over [pixel][channel] rows +
@@ -82,8 +99,11 @@ def default_cache_dir():
 
 # The ctypes binding is a module of this package, so the executor and the
 # public API always share one Engine class (and one library handle).
+from . import coverage
 from . import _binding as vc4infer                      # noqa: E402
-from ._errors import UnsupportedNode                    # noqa: E402
+from ._errors import (HostNodeError, HostNotAllowed, NeedsDeviceDispatch,
+                      UnsupportedNode)                    # noqa: E402
+from ._hybrid import HostEvaluator, outer_refs             # noqa: E402
 
 # Kept for the scripts that print the engine directory.
 ENGINE = _first_dir(os.environ.get("VC4INFER_ENGINE"),
@@ -215,15 +235,36 @@ def _attr(node, name, default=None):
 
 
 class Runner:
-    def __init__(self, model_path, eng):
+    def __init__(self, model_path, eng, mode="strict", host_policy="device"):
+        if mode not in ("strict", "hybrid"):
+            raise ValueError("mode must be 'strict' or 'hybrid'")
+        if host_policy not in ("device", "structural", "any"):
+            raise ValueError("host_policy must be 'device', 'structural' "
+                             "or 'any'")
         self.path = model_path
         self.eng = eng
+        self.mode = mode
+        self.host_policy = host_policy
         self.model = onnx.load(model_path)
         self.graph = self.model.graph
         self.values = {}
         self.host = {}          # host copy of every initializer / Constant
         self.float_inputs = []
         self.profile = []
+        self.backend_report = []      # last run: index/name/op/backend/reason
+        self.boundary_uploads = 0     # host numpy -> arena (this run)
+        self.boundary_downloads = 0   # arena -> host numpy (this run)
+        self.host_bytes = 0           # bytes of model data moved by the ARM
+        self.host_sites = []          # [{node,op,site,bytes,count}, ...]
+        self._host_site_acc = {}
+        self._node_ctx = None
+        self._count_host = False
+        self._folded = {}             # name -> numpy, plan-time resolved
+        self._folded_idx = set()
+        self._prepared = False
+        self._host_eval = None
+        self._coverage_report = None
+        self._backends = None
         self._panels = {}       # packed NHWC weight panels, by node name
         # One pool per engine: libvc4infer cannot free, and running several
         # Runner objects on one Engine at the same time is not supported.
@@ -258,6 +299,206 @@ class Runner:
             else:
                 raise UnsupportedNode("graph input %s: only fp32 inputs" % inp.name)
         self._find_silu()
+
+    # ------------------------------------------------------ host-tier policy
+    def _fold_metadata(self):
+        """Resolve metadata nodes at plan time (device policy).
+
+        ``Shape``/``Size``/``Constant``/``ConstantOfShape`` and the integer
+        shape arithmetic feeding them are evaluated once, here, with the real
+        static shapes.  Their outputs enter ``self._consts`` and are never
+        executed at runtime.  Returns the set of folded node indices.
+        """
+        if self.mode != "hybrid" or self.host_policy != "device":
+            return set()
+        if self._prepared:
+            return self._folded_idx
+        rep = self.coverage_report()
+        folded, known = coverage.fold_metadata(self.model, rep)
+        self._folded_idx = set(folded)
+        for idx in self._folded_idx:
+            for name in self.graph.node[idx].output:
+                if not name or name not in known:
+                    continue
+                arr = np.asarray(known[name])
+                if arr.dtype.kind == "f":
+                    if name not in self.values:
+                        self.values[name] = self._constant(name, arr)
+                else:
+                    self.host[name] = arr
+                    self.values[name] = arr
+                self._folded[name] = arr
+                self._consts.add(name)
+        self._prepared = True
+        return self._folded_idx
+
+    def prepare(self):
+        """Plan-time work required by the policy (idempotent)."""
+        self._fold_metadata()
+        self.backend_plan()
+
+    def coverage_report(self):
+        """Cached static analysis (tiers included) of this model."""
+        if self._coverage_report is None:
+            self._coverage_report = coverage.analyse_model(self.model)
+        return self._coverage_report
+
+    def backend_plan(self):
+        """Static per-node backend verdict (no execution)."""
+        if self._backends is None:
+            rep = self.coverage_report()
+            self._backends = coverage.backend_plan(
+                rep, mode=self.mode, host_policy=self.host_policy,
+                silu_skip=self._silu_skip, silu_src=self._silu_src,
+                folded=self._folded_idx)
+        return self._backends
+
+    def host_compute_plan(self):
+        """Static nodes that would perform runtime host compute."""
+        return [n for n in self.backend_plan()
+                if n["backend"] in ("host-meta", "host-control",
+                                    "host-unwritten")]
+
+    def host_debt(self):
+        return [n for n in self.backend_plan()
+                if n["backend"] == "host-unwritten"]
+
+    def check_policy(self):
+        """Raise for node tiers the current policy refuses.
+
+        device: every runtime node must be VC4; host-unwritten raises
+        ``HostNotAllowed``, If/Loop/Scan raise ``NeedsDeviceDispatch``, and a
+        metadata node that could not be folded at plan time also raises.
+        structural: host-unwritten raises ``HostNotAllowed``.
+        unsupported-graph raises under every policy.
+        """
+        if self.mode != "hybrid":
+            return
+        self.prepare()
+        bad = [n for n in self.backend_plan()
+               if n["backend"] == "unsupported-graph"]
+        if bad:
+            n = bad[0]
+            raise UnsupportedNode(n["name"], n["op"], n["reason"])
+        if self.host_policy == "device":
+            ctl = [n for n in self.backend_plan()
+                   if n["backend"] == "host-control"]
+            if ctl:
+                n = ctl[0]
+                raise NeedsDeviceDispatch(
+                    n["name"], n["op"],
+                    "If/Loop/Scan branch execution on the device")
+            for n in self.backend_plan():
+                b = n["backend"]
+                if b == "host-unwritten":
+                    raise HostNotAllowed(n["name"], n["op"], n["reason"],
+                                         policy="device")
+                if b == "host-meta":
+                    raise HostNotAllowed(
+                        n["name"], n["op"],
+                        "metadata node could not be resolved at plan time "
+                        "(%s)" % n["reason"], policy="device")
+            return
+        if self.host_policy == "structural":
+            debt = self.host_debt()
+            if debt:
+                n = debt[0]
+                raise HostNotAllowed(n["name"], n["op"], n["reason"],
+                                     policy="structural")
+
+    # ------------------------------------------------- host byte accounting
+    def _charge_host(self, site, nbytes):
+        if not self._count_host or self._node_ctx is None:
+            return
+        idx, name, op = self._node_ctx
+        key = (idx, name, op, site)
+        acc = self._host_site_acc
+        e = acc.get(key)
+        if e is None:
+            e = acc[key] = {"index": idx, "name": name, "op": op,
+                            "site": site, "bytes": 0, "count": 0}
+        e["bytes"] += int(nbytes)
+        e["count"] += 1
+
+    def host_copy_report(self):
+        return sorted(self.host_sites, key=lambda e: -e["bytes"])
+
+    def host_compute_nodes(self):
+        """Nodes that performed runtime CPU compute in the last run."""
+        return [n for n in self.backend_report
+                if n["backend"] in ("host-meta", "host-control",
+                                    "host-unwritten")]
+
+    # ------------------------------------------------- host execution bits
+    def _node_name(self, idx, node):
+        return node.name or "%s_%d" % (node.op_type, idx)
+
+    def _promote(self, node):
+        """Upload host float intermediates as VC4 tensors (boundary copies)."""
+        n = 0
+        for name in node.input:
+            if not name:
+                continue
+            v = self.values.get(name)
+            if isinstance(v, np.ndarray) and v.dtype.kind == "f":
+                if v.dtype != np.float32:
+                    v = v.astype(np.float32)
+                self.values[name] = self.upload(np.ascontiguousarray(v))
+                n += 1
+        self.boundary_uploads += n
+        return n
+
+    def _host_feeds(self, node):
+        """numpy inputs for one node, including subgraph lexical captures."""
+        if self._host_eval is None:
+            self._host_eval = HostEvaluator(self.model)
+        names = [i for i in node.input if i]
+        for extra in self._host_eval.outer_refs(node):
+            if extra not in names:
+                names.append(extra)
+        feeds = {}
+        for name in names:
+            v = self.values.get(name)
+            if v is None:
+                raise HostNodeError(node.name, node.op_type,
+                                    "input %r has no value at this point"
+                                    % name)
+            if isinstance(v, Tensor):
+                feeds[name] = self.nchw(v)
+                self.boundary_downloads += 1
+            else:
+                feeds[name] = np.asarray(v)
+        return feeds
+
+    def _host_node(self, node, idx):
+        """Run one node in the numpy reference evaluator; store its outputs."""
+        feeds = self._host_feeds(node)
+        try:
+            outs = self._host_eval.run(node, feeds, idx)
+        except HostNodeError:
+            raise
+        except Exception as e:                       # noqa: BLE001
+            raise HostNodeError(node.name, node.op_type,
+                                "%s: %s" % (type(e).__name__, e)) from e
+        real = [i for i, o in enumerate(node.output) if o]
+        for k, pos in enumerate(real):
+            arr = outs[k]
+            if arr.dtype.kind == "f" and arr.dtype != np.float32:
+                arr = arr.astype(np.float32)
+            self.values[node.output[pos]] = arr
+        return len(real)
+
+    def _fallback_allowed(self, tier, node, err):
+        if self.mode != "hybrid":
+            return False
+        if str(err.detail).startswith("engine error") or \
+                "graph pool exhausted" in str(err.detail):
+            return False
+        if self.host_policy == "device":
+            return False
+        if self.host_policy == "any":
+            return True
+        return tier == "host-meta"
 
     # ------------------------------------------------------------- rewrites
     def _find_silu(self):
@@ -332,6 +573,7 @@ class Runner:
 
     def upload(self, arr):
         arr = np.ascontiguousarray(arr, dtype=np.float32)
+        self._charge_host("upload", arr.nbytes)
         buf = self._alloc(arr.size)
         self.eng.upload(arr.ravel(), buf)
         return Tensor(buf, arr.shape)
@@ -339,6 +581,7 @@ class Runner:
     def upload_nhwc(self, arr, shape, pitch=None):
         """arr is [n][H][W][C] contiguous -> Tensor with logical NCHW shape."""
         arr = np.ascontiguousarray(arr, dtype=np.float32)
+        self._charge_host("upload_nhwc", arr.nbytes)
         n, h, w, c = arr.shape
         buf = self.pool.alloc(int(arr.size) * 4)
         self.eng.upload(arr.ravel(), buf)
@@ -347,6 +590,7 @@ class Runner:
     def upload_pitched(self, arr, shape, pitch):
         """arr is [n][H][pitch][C] -> Tensor whose logical width is shape[3]."""
         arr = np.ascontiguousarray(arr, dtype=np.float32)
+        self._charge_host("upload_pitched", arr.nbytes)
         buf = self.pool.alloc(int(arr.size) * 4)
         self.eng.upload(arr.ravel(), buf)
         return Tensor(buf, shape, "nhwc", pitch)
@@ -358,11 +602,13 @@ class Runner:
         return self.upload_nhwc(self.download_nhwc(t), t.shape)
 
     def download(self, t):
+        self._charge_host("download", t.size * 4)
         x = self.eng.download(t.buf, t.size * 4)
         return np.asarray(x, dtype=np.float32).reshape(t.shape).copy()
 
     def download_nhwc(self, t):
         """-> [n][H][W][C] numpy of the *logical* extent (pitch removed)."""
+        self._charge_host("download_nhwc", t.size * 4)
         n, c, h, w = t.shape
         x = self.eng.download(t.buf, t.size * 4)
         a = np.asarray(x, dtype=np.float32).reshape(n, h, t.pitch, c)
@@ -538,8 +784,15 @@ class Runner:
 
         Cin = x.shape[1]
         Cout = w.shape[0]
-        wa = self.download(w)
-        ba = self.download(b) if b is not None else np.zeros(Cout, np.float32)
+        wa = self._hostconst(node.input[1])
+        wa = (np.asarray(wa, np.float32) if wa is not None
+              else self.download(w))
+        if b is not None:
+            ba = self._hostconst(node.input[2]) if len(node.input) > 2 else None
+            ba = (np.asarray(ba, np.float32) if ba is not None
+                  else self.download(b))
+        else:
+            ba = np.zeros(Cout, np.float32)
 
         grouped = (group > 1 and group != Cin and Cin % group == 0
                    and Cout % group == 0)
@@ -941,8 +1194,7 @@ class Runner:
             v = self.host.get(node.input[3], self.values.get(node.input[3]))
             sizes = np.asarray(v, dtype=np.int64)
         nhwc = x.layout == "nhwc"
-        a = self.download_nhwc(x) if nhwc else self.download(x)
-        h, w = (a.shape[1], a.shape[2]) if nhwc else (a.shape[2], a.shape[3])
+        h, w = (x.shape[2], x.shape[3])
         if sizes is not None:
             Ho, Wo = int(sizes[2]), int(sizes[3])
         elif scales is not None:
@@ -950,6 +1202,8 @@ class Runner:
             Wo = int(round(w * float(scales[3])))
         else:
             raise UnsupportedNode("Resize %s: no scales/sizes" % node.name)
+
+        a = self.download_nhwc(x) if nhwc else self.download(x)
 
         def axis(n_in, n_out):
             s = np.arange(n_out, dtype=np.float64)
@@ -1130,27 +1384,44 @@ class Runner:
         M, K = a.shape
         if tb:
             N, K2 = b.shape
-            ba = self.download(b).T.copy()
+            key = ("gemmT", node.name)
+            ba = self._panels.get(key)
+            if ba is None:
+                src = self._hostconst(node.input[1])
+                src = (np.asarray(src, np.float32) if src is not None
+                       else self.download(b))
+                ba = np.ascontiguousarray(np.asarray(src).T)
+                self._panels[key] = ba
         else:
             K2, N = b.shape
-            ba = self.download(b)
+            src = self._hostconst(node.input[1])
+            ba = (np.asarray(src, np.float32) if src is not None
+                  else self.download(b))
         if K != K2:
             raise UnsupportedNode("Gemm %s: K mismatch" % node.name)
-        bb = self.upload(np.ascontiguousarray(ba))
-        self._tmp(bb)
+        keyb = ("gemmB", node.name)
+        bb = self._panels.get(keyb)
+        if bb is None:
+            bb = self.upload(np.ascontiguousarray(ba))
+            self._panels[keyb] = bb
         out = self._alloc(M * N)
         self.eng.matmul(a.buf, bb.buf, out, M, N, K)
         t = Tensor(out, (M, N))
         if beta == 1.0 and len(node.input) > 2 and node.input[2]:
-            c = self._float(node.input[2])
-            ca = self.download(c)
-            if ca.size == N:
-                ca = np.broadcast_to(ca.reshape(1, N), (M, N))
-            elif ca.shape != (M, N):
-                raise UnsupportedNode("Gemm %s: C shape %s"
-                                      % (node.name, ca.shape))
-            cb = self.upload(np.ascontiguousarray(ca))
-            self._tmp(cb)
+            keyc = ("gemmC", node.name)
+            cb = self._panels.get(keyc)
+            if cb is None:
+                c = self._float(node.input[2])
+                ca = self._hostconst(node.input[2])
+                ca = (np.asarray(ca, np.float32) if ca is not None
+                      else self.download(c))
+                if ca.size == N:
+                    ca = np.broadcast_to(ca.reshape(1, N), (M, N))
+                elif ca.shape != (M, N):
+                    raise UnsupportedNode("Gemm %s: C shape %s"
+                                          % (node.name, ca.shape))
+                cb = self.upload(np.ascontiguousarray(ca))
+                self._panels[keyc] = cb
             o2 = self._alloc(M * N)
             self.eng.elementwise(vc4infer.OP_ADD, t.buf, o2, M * N, b=cb.buf)
             t = Tensor(o2, (M, N))
@@ -1379,6 +1650,77 @@ class Runner:
             raise UnsupportedNode(node.name if not e.node else e.node,
                                   op if not e.op else e.op, e.detail)
 
+    # ---------------------------------------------------------------- execute
+    def _drop_garbage(self):
+        """Release per-node temporaries left by a failed VC4 dispatch."""
+        live = set(v.buf.off for v in self.values.values()
+                   if isinstance(v, Tensor))
+        for t in self._garbage:
+            if isinstance(t, Tensor) and t.buf.off not in live:
+                self.pool.release(t.buf)
+        self._garbage = []
+
+    def _run_node_hybrid(self, idx, node, tier, reason):
+        """Execute one node under the hybrid policy.
+
+        Returns ``(out, backend, reason, assigned)``.  ``assigned`` is True when
+        the host evaluator already stored the outputs in ``self.values``.
+        """
+        if tier == "vc4":
+            self._promote(node)
+            try:
+                return self._dispatch(node), "vc4", reason, False
+            except UnsupportedNode as e:
+                if not self._fallback_allowed(tier, node, e):
+                    if self.host_policy == "structural" and \
+                            not str(e.detail).startswith("engine error"):
+                        raise HostNotAllowed(
+                            node.name or node.op_type, node.op_type,
+                            "VC4 cannot express this shape/attribute and "
+                            "host_policy='structural' forbids the numpy "
+                            "fallback (%s)" % e.detail) from e
+                    raise
+                self._drop_garbage()
+                self._host_node(node, idx)
+                return None, "host-unwritten", \
+                    "runtime fallback: %s" % e.detail, True
+
+        if tier == "host-meta":
+            # Metadata ops usually still have a cheap int64/byte host path in
+            # the executor; use it.  If the engine cannot dispatch the shape,
+            # the reference evaluator is allowed (still no activation math).
+            try:
+                return self._dispatch(node), "host-meta", reason, False
+            except UnsupportedNode as e:
+                if not self._fallback_allowed(tier, node, e):
+                    raise
+                self._drop_garbage()
+                self._host_node(node, idx)
+                return None, "host-meta", \
+                    "%s (reference evaluator)" % reason, True
+
+        if tier == "host-control":
+            if self.host_policy == "device":
+                raise NeedsDeviceDispatch(
+                    node.name or node.op_type, node.op_type,
+                    "If/Loop/Scan branch execution on the device")
+            self._host_node(node, idx)
+            return None, "host-control", reason, True
+
+        if tier == "host-unwritten":
+            if self.host_policy in ("device", "structural"):
+                raise HostNotAllowed(node.name or node.op_type, node.op_type,
+                                     reason, policy=self.host_policy)
+            self._host_node(node, idx)
+            return None, "host-unwritten", reason, True
+
+        if tier == "host-meta" and self.host_policy == "device":
+            raise HostNotAllowed(node.name or node.op_type, node.op_type,
+                                 "metadata node not folded at plan time: %s"
+                                 % reason, policy="device")
+
+        raise UnsupportedNode(node.name, node.op_type, reason)
+
     def _plan(self):
         """last consumer index of every tensor name (graph outputs: inf)."""
         last = {}
@@ -1386,42 +1728,104 @@ class Runner:
             for name in node.input:
                 if name:
                     last[name] = i
+            # subgraphs capture outer-scope values without listing them; keep
+            # those live until the control-flow node that uses them
+            for name in outer_refs(node):
+                last[name] = i
         for o in self.graph.output:
             last[o.name] = len(self.graph.node)
         self._last_use = last
 
     def run(self, feeds, profile=False):
+        self.check_policy()
         self.values = {k: v for k, v in self.values.items()
                        if k in self._consts}
+        self._count_host = False
+        self._node_ctx = None
+        self.host_bytes = 0
+        self._host_site_acc = {}
+        self.host_sites = []
+        self.boundary_uploads = 0
+        self.boundary_downloads = 0
         for name, arr in feeds.items():
             self.values[name] = self.upload(arr)
         if not self._last_use:
             self._plan()
         self.profile = []
+        self.backend_report = []
         skip = getattr(self, "_silu_skip", None) or set()
+        hybrid = self.mode == "hybrid"
+        plan = self.backend_plan() if hybrid else None
         for idx, node in enumerate(self.graph.node):
-            if idx in skip:
-                continue                       # fused into the consumer Mul
+            name = self._node_name(idx, node)
+            if idx in skip or (plan is not None and
+                              plan[idx]["backend"] == "folded"):
+                if hybrid:
+                    backend = "vc4" if idx in skip else "folded"
+                    reason = ("fused into the consumer Mul as one SiLU launch"
+                              if idx in skip else plan[idx]["reason"])
+                    self.backend_report.append({
+                        "index": idx, "name": name, "op": node.op_type,
+                        "backend": backend, "reason": reason,
+                        "wall_ms": 0.0, "gpu_ms": 0.0, "launches": 0})
+                    if profile:
+                        self.profile.append({
+                            "index": idx, "name": name, "op": node.op_type,
+                            "backend": backend, "reason": reason,
+                            "wall_ms": 0.0, "gpu_ms": 0.0, "launches": 0,
+                            "flops": 0, "macs": 0})
+                continue
             self._node_idx = idx
+            tier = plan[idx]["backend"] if hybrid else None
+            reason = plan[idx]["reason"] if hybrid else ""
             t0 = time.perf_counter()
             s0 = self.eng.stats
-            out = self._dispatch(node)
+            self._node_ctx = (idx, name, node.op_type)
+            self._count_host = True
+            try:
+                if hybrid:
+                    out, backend, reason, assigned = self._run_node_hybrid(
+                        idx, node, tier, reason)
+                else:
+                    out = self._dispatch(node)
+                    backend, assigned = None, False
+            finally:
+                self._count_host = False
             s1 = self.eng.stats
             dt = (time.perf_counter() - t0) * 1e3
             if profile:
                 gpu = (s1.pack_ns - s0.pack_ns + s1.kernel_ns - s0.kernel_ns) / 1e6
-                self.profile.append({
-                    "name": node.name or node.op_type,
+                entry = {
+                    "index": idx,
+                    "name": name,
                     "op": node.op_type,
                     "wall_ms": dt,
                     "gpu_ms": gpu,
                     "launches": s1.launches - s0.launches,
                     "flops": s1.flops - s0.flops,
-                })
-            outs = out if isinstance(out, list) else [out]
-            for i, name in enumerate(node.output):
-                if name:
-                    self.values[name] = outs[i] if i < len(outs) else outs[-1]
+                    "macs": int(plan[idx].get("macs", 0)) if hybrid else 0,
+                }
+                if hybrid:
+                    entry["backend"] = backend
+                    entry["reason"] = reason
+                self.profile.append(entry)
+            if assigned:
+                outs = []
+            else:
+                outs = out if isinstance(out, list) else [out]
+                for i, oname in enumerate(node.output):
+                    if oname:
+                        self.values[oname] = (outs[i] if i < len(outs)
+                                              else outs[-1])
+            if hybrid:
+                self.backend_report.append({
+                    "index": idx, "name": name, "op": node.op_type,
+                    "backend": backend, "reason": reason,
+                    "macs": int(plan[idx].get("macs", 0)),
+                    "wall_ms": dt,
+                    "gpu_ms": (s1.pack_ns - s0.pack_ns +
+                               s1.kernel_ns - s0.kernel_ns) / 1e6,
+                    "launches": s1.launches - s0.launches})
             # recycle: this node's inputs that nothing else reads, and any
             # temporary the op created for itself
             # views (Reshape/Flatten/Squeeze) share their input buffer, so
@@ -1438,12 +1842,14 @@ class Runner:
                     v = self.values.pop(name, None)
                     if isinstance(v, Tensor) and v.buf.off not in keep:
                         self.pool.release(v.buf)
+        self.host_sites = sorted(self._host_site_acc.values(),
+                                 key=lambda e: -e["bytes"])
+        self.host_bytes = sum(e["bytes"] for e in self.host_sites)
         res = []
         for o in self.graph.output:
             v = self.values[o.name]
-            if not isinstance(v, Tensor):
-                raise UnsupportedNode("output %s is not a tensor" % o.name)
-            res.append(self.nchw(v))
+            res.append(self.nchw(v) if isinstance(v, Tensor)
+                       else np.asarray(v))
         return res
 
 

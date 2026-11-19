@@ -70,9 +70,14 @@ part of this package — it is the board's privileged helper; see
 
 ```
 vc4infer --version
-vc4infer run  <model.onnx> --input <image|csv|npy> [--imgsz N] [--conf 0.25] [--iou 0.45] [--json]
-vc4infer bench <model.onnx> [--imgsz N] [--reps N] [--input <image|npy|csv>] [--json]
-vc4infer nodes <model.onnx> [-v] [--json]
+vc4infer run  <model.onnx> --input <image|csv|npy> [--imgsz N] [--conf 0.25] [--iou 0.45]
+              [--mode strict|hybrid] [--host-policy structural|any] [--json]
+vc4infer bench <model.onnx> [--imgsz N] [--reps N] [--input <image|npy|csv>]
+              [--mode strict|hybrid] [--host-policy structural|any] [--json]
+vc4infer nodes <model.onnx> [-v] [--mode strict|hybrid]
+              [--host-policy device|structural|any] [--json]
+vc4infer util <model.onnx> [--imgsz N] [--reps N]
+              [--mode strict|hybrid] [--host-policy device|structural|any] [--json]
 vc4infer selftest [--models DIR]
 ```
 
@@ -112,9 +117,23 @@ without the batch axis) and a `.csv` of floats that fills the input in NCHW
 order.  Non-detection models (classifiers) print the output statistics and the
 top-5 values instead of a detection table.
 
+`--mode strict` is the default and refuses any node without a VC4 kernel.
+`--mode hybrid` is opt-in and defaults to `--host-policy device`: the host does
+only plan-time constant/shape folding and orchestration, every runtime node
+must be VC4, a numeric op with no kernel raises `HostNotAllowed` (exit 4), and
+`If`/`Loop`/`Scan` raise `NeedsDeviceDispatch` (exit 6).  `--host-policy
+structural` allows metadata and control flow on the host at runtime;
+`--host-policy any` additionally runs unwritten numeric ops in the numpy
+reference evaluator (compatibility only).  The `tiers:` line reports the split,
+`host_compute_nodes` and `bytes_copied_by_host` are printed explicitly, and
+hybrid timings are *not* VC4-only numbers (see [ONNX.md](ONNX.md) section 10).
+
 ### `bench`
 
 One warm-up run performs the kernel JIT (not counted), then `--reps` timed runs.
+The `tiers:` line splits nodes into `vc4`, `host-meta`, `host-control` and
+`host-unwritten`; the next line gives the compute-node VC4 share and the wall
+time attributed to the host.  A hybrid timing is never a VC4-only figure.
 
 ```
 $ vc4infer bench yolov8n.onnx --reps 3
@@ -133,12 +152,39 @@ the whole `run()`, including the daemon round trips, the ARM-side store and the
 byte-only layout work.  The gap is launch overhead: at 160x160 the graph issues
 678 launches.
 
+### `util`
+
+Prints the device-invariant utilisation table: `host_compute_nodes`,
+`bytes_copied_by_host` (with the per-node/per-site byte debt), the share of
+graph MACs on the VC4 (`arithmetic_on_vc4`), QPU duty cycle (busy / wall), and
+the launch-path share.  `--json` includes the full site list.
+
+```
+$ vc4infer util yolov8n_160.onnx --reps 3
+...
+  device invariant           VIOLATED
+  host_compute_nodes         0
+  bytes_copied_by_host       17077040 B
+  arithmetic_on_vc4          100.0%  (273249600/273249600 MACs)
+  qpu_duty                   48.7%  (302.9 / 622.4 ms)
+  launches                   678  (3.85 per dispatched node)
+  launch path                319.5 ms  (51.3% of wall)
+```
+
+`device invariant` is `OK` only when both runtime host compute and host byte
+movement are zero.  The byte debt is listed by node, site and size.
+
 ### `nodes`
 
-A static coverage report — node counts per op, a verdict per node with the
-reason, and the number of `Mul(x, Sigmoid(x))` pairs that the executor fuses
-into one `Silu` launch.  It reads the graph, attributes, initialiser shapes and
-shape-inferred value_info; it does not run the model.  `-v` lists every node.
+A static coverage and backend report — node counts per op, a verdict per node
+with the reason, the execution tier of every node, host debt, and the number of
+`Mul(x, Sigmoid(x))` pairs that the executor fuses into one `Silu` launch.  It
+reads the graph, attributes, initialiser shapes and shape-inferred value_info;
+it does not run the model.  `-v` lists every node with its backend
+(`vc4`, `host-meta`, `host-control`, `host-unwritten`, `unsupported-graph`).
+With `--mode hybrid --host-policy device` a non-empty host-debt list (or any
+unfolded metadata/control node) makes the command exit 4, so a CI check cannot
+silently accept a model that is not 100% compute-on-VC4.
 
 ```
 $ vc4infer nodes yolov8n.onnx
@@ -148,12 +194,21 @@ output: output0  1x84x525 FLOAT
 263 nodes: 263 supported, 0 unsupported, 0 unverified
 rewrites: 57 Mul(x,Sigmoid(x)) pairs fuse into one SiLU launch (206 dispatches)
 
-  op                      nodes     ok    bad  implementation
-  Conv                       64     64      0  QPU conv: NHWC 1x1/3x3 s1/s2, depthwise s1; NCHW fallback
-  Mul                        60     60      0  QPU elementwise
-  Sigmoid                    58     58      0  QPU elementwise
+tiers:  233 vc4, 30 host-meta, 0 host-control, 0 host-unwritten, 0 unsupported-graph
+policy: mode=hybrid host_policy=structural
+
+  op                      nodes    vc4   meta    ctl   unwr  implementation
+  Conv                       64     64      0      0      0  QPU conv: NHWC 1x1/3x3 s1/s2, ...
+  Mul                        60     58      2      0      0  QPU elementwise
+  Sigmoid                    58     58      0      0      0  QPU elementwise
+  Constant                   24      0     24      0      0  initialiser
   ...
-unsupported nodes: none
+unsupported by the VC4 executor: none
+
+host tiers (30: 30 metadata, 0 control flow):
+  /model.22/Shape     Shape    host-meta   metadata: Shape (no activation arithmetic)
+  ...
+host debt: none
 
 static report only; `vc4infer run` is authoritative
 ```

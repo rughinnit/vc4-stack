@@ -109,6 +109,28 @@ class Engine:
                                       ctypes.c_uint32, ctypes.c_uint32,
                                       ctypes.POINTER(Buf)]
         L.vc4_softmax_fwd.restype = ctypes.c_int
+        L.vc4_conv_nhwc_wpanel_bytes.argtypes = [ctypes.c_int] * 5
+        L.vc4_conv_nhwc_wpanel_bytes.restype = ctypes.c_size_t
+        L.vc4_conv_nhwc_pack_w.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 4 + [ctypes.POINTER(Buf), ctypes.POINTER(Buf)]
+        L.vc4_conv_nhwc_pack_w.restype = ctypes.c_int
+        L.vc4_conv_nhwc.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 5 + [ctypes.POINTER(Buf)] + [ctypes.c_int] * 5 + \
+            [ctypes.POINTER(Buf), ctypes.POINTER(ctypes.c_int),
+             ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        L.vc4_conv_nhwc.restype = ctypes.c_int
+        L.vc4_maxpool_nhwc.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 7 + [ctypes.POINTER(Buf),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int)]
+        L.vc4_maxpool_nhwc.restype = ctypes.c_int
+        L.vc4_upsample2x_nhwc.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 6 + [ctypes.POINTER(Buf),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int)]
+        L.vc4_upsample2x_nhwc.restype = ctypes.c_int
         L.vc4_get_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(Stats)]
         L.vc4_get_stats.restype = None
         L.vc4_supported_ops.argtypes = [ctypes.POINTER(ctypes.c_size_t)]
@@ -212,6 +234,49 @@ class Engine:
         self._check(self.lib.vc4_softmax_fwd(
             self.ctx, ctypes.byref(x), rows, cols, ctypes.byref(out)),
             "softmax_fwd")
+
+    # ---- NHWC (the YOLO plane)
+    def conv_nhwc_wpanel_bytes(self, Cin, Cout, KH, KW, bias=True):
+        return int(self.lib.vc4_conv_nhwc_wpanel_bytes(Cin, Cout, KH, KW,
+                                                      1 if bias else 0))
+
+    def conv_nhwc_pack_w(self, wt, Cin, Cout, KH, KW, bias, wpanel):
+        self._check(self.lib.vc4_conv_nhwc_pack_w(
+            self.ctx, ctypes.byref(wt), Cin, Cout, KH, KW,
+            ctypes.byref(bias) if bias is not None else None,
+            ctypes.byref(wpanel)), "conv_nhwc_pack_w")
+
+    def conv_nhwc(self, x, nimg, Cin, H, W, in_pitch, wpanel, Cout, KH, KW,
+                  stride, pad, out):
+        ho = ctypes.c_int(0)
+        wo = ctypes.c_int(0)
+        op = ctypes.c_int(0)
+        self._check(self.lib.vc4_conv_nhwc(
+            self.ctx, ctypes.byref(x), nimg, Cin, H, W, in_pitch,
+            ctypes.byref(wpanel), Cout, KH, KW, stride, pad,
+            ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo),
+            ctypes.byref(op)), "conv_nhwc")
+        return ho.value, wo.value, op.value
+
+    def maxpool_nhwc(self, x, nimg, C, H, W, in_pitch, k, pad, out):
+        ho = ctypes.c_int(0)
+        wo = ctypes.c_int(0)
+        op = ctypes.c_int(0)
+        self._check(self.lib.vc4_maxpool_nhwc(
+            self.ctx, ctypes.byref(x), nimg, C, H, W, in_pitch, k, pad,
+            ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo),
+            ctypes.byref(op)), "maxpool_nhwc")
+        return ho.value, wo.value, op.value
+
+    def upsample2x_nhwc(self, x, nimg, C, H, W, in_pitch, out):
+        ho = ctypes.c_int(0)
+        wo = ctypes.c_int(0)
+        op = ctypes.c_int(0)
+        self._check(self.lib.vc4_upsample2x_nhwc(
+            self.ctx, ctypes.byref(x), nimg, C, H, W, in_pitch,
+            ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo),
+            ctypes.byref(op)), "upsample2x_nhwc")
+        return ho.value, wo.value, op.value
 
     @property
     def stats(self):

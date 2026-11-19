@@ -29,12 +29,15 @@ onnx/verify.py          3 runs per model, compares with the torch reference,
 onnx/export_yolo.py     real pretrained YOLOv8n -> ONNX (ultralytics)
 onnx/yolo_report.py     static op/attribute/shape coverage + a dynamic run
 onnx/tvshim/            name-only torchvision stand-in for the YOLO export
+onnx/ref_onnx.py        independent numpy ONNX evaluator (the CPU reference)
+onnx/yolo_bench.py      end-to-end benchmark + tolerance check + JSON report
 ```
 
 Generated artifacts live in `onnx/models/` (not committed; regenerate with
 `export_models.py`).  The engine additions are:
 
 ```
+src/vc4_nhwc.c      vc4_conv_nhwc/pack_w  NHWC channel-tiled conv (+ pool/up2/copy)
 src/vc4_convbwd.c   vc4_maxpooln          generic NxN / stride-S max pool
 src/vc4_train.c     vc4_softmax_fwd       forward softmax (fused kernel 'p' probe)
 tools/kgen.py       build_pooln           the generic pool kernel
@@ -74,8 +77,18 @@ the single 64 MiB arena.
 | `Conv` 3x3 stride 2 pad 1, group 1 | 4 phase images + one stride-1 `vc4_conv2d` | graph-level decomposition, 4x the MACs (see §6) |
 | `Conv` 1x1 stride 2 pad 0 | phase (0,0) + `vc4_conv2d` 1x1 | 4x fewer outputs; no extra MACs |
 | `Conv` depthwise (groups = Cin = Cout), stride 1 | block-diagonal dense weight + `vc4_conv2d` | Cout = Cin, stride 1; Cin x the MACs (see §6) |
-| `Relu`, `Add`, `Mul`, `Sigmoid` | `vc4_elementwise` | elementwise; `Add`/`Mul` require equal shapes |
+| `Conv` 3x3/1x1 stride 1/2 (NHWC, default) | `vc4_conv_nhwc` + `vc4_conv_nhwc_pack_w` | Cin/Cout%16, `stride*Cin*4 <= 8191`; **no plane-size limit** |
+| `Relu`, `Sigmoid` | `vc4_elementwise` | any layout |
+| `Add`, `Mul` | `vc4_elementwise` | equal shapes (layouts/pitches matched on the host) or a constant broadcast |
+| `Sub`, `Div` | GPU `Mul(-1)` + `Add`; `Div` by a constant -> GPU `Mul` | see section 7.1 |
+| `Split` | host byte gather | channel axis of a 4-D tensor |
+| `Slice` | host gather | any axis, int64 starts/ends/axes/steps |
+| `Transpose` | host permute | any permutation |
+| `Softmax` | `vc4_softmax_fwd` | any axis (host permute to the last), <=16 classes, rows%8 |
+| `Shape`, `Gather` | host int64 | static shapes |
+| `Squeeze`, `Unsqueeze`, `Cast`, `Flatten` | view / type change | fp32 targets |
 | `MaxPool` 2x2 stride 2 | `vc4_maxpooln` | native path is the general kernel |
+| `MaxPool` kxk stride 1 (NHWC, SPPF) | `vc4_maxpool_nhwc` | k in {3,5}; the -inf border is materialised on the host |
 | `MaxPool` NxN, any stride/pad | `vc4_maxpooln` (new QPU kernel) | border filled with `-inf` on host (bytes); output compacted |
 | `Concat` | host byte concat | channel axis of NCHW only |
 | `Resize` nearest | host byte gather | `mode=nearest`, `asymmetric` or `half_pixel`, integer or float scale |
@@ -91,9 +104,10 @@ Everything else fails loudly, e.g.:
 onnxrun.UnsupportedNode: node '/model.9/Split' (Split): unsupported op Split
 ```
 
-Inputs/outputs must be fp32; batch > 1, dynamic shapes, quantization, arbitrary
-permutations, `Slice`, `Shape`/`Gather`/`Expand`, `BatchNormalization`, `Pow`,
-`Div` and `LRN` are not implemented.
+Inputs/outputs must be fp32.  `Expand`, `BatchNormalization`, `Pow`, `LRN`,
+bilinear `Resize` and arbitrary `ConvTranspose` are not implemented;
+`Div`/`Sub` only in the lowered forms of section 7.  A shape or attribute
+combination outside the table above still raises `UnsupportedNode`.
 
 ## 4. Measured results
 
@@ -184,84 +198,184 @@ Rather than approximate or fall back to the CPU, the runner rewrites the node:
 The alternative — a CPU convolution or a "close enough" substitute — is not
 used anywhere.
 
-## 7. YOLOv8n
+## 7. YOLOv8n end to end at 160x160
 
-A real Ultralytics YOLOv8n was exported and fed to the runner.  Weights are
-the official `yolov8n.pt` COCO checkpoint (6.2 MB, 3,151,904 parameters,
-8.7 GFLOPs); nothing is synthetic.
-
-Export status: **feasible**, ONNX opset 13, 12.2 MiB.  Two shapes were
-exported: the standard `1x3x640x640` and `1x3x32x32` (to separate the engine's
-shape limit from the op gap).  The export ran on the same Pi with the venv's
-torch 2.15 CPU build.  Caveat: the venv's torchvision 0.29.2 wheel registers
-no ops against this custom torch build (`operator torchvision::nms does not
-exist`), so `onnx/export_yolo.py` substitutes the name-only shim in
-`onnx/tvshim/` when the real import fails.  A plain detection ONNX export
-uses no torchvision code; the shim raises if a transform or NMS is actually
-called.  The exported graph and weights are the real model.
-
-Graph: **263 nodes**, 127 initializers, one input `images`, one output
-`output0` (640: `1x84x8400`, 32: `1x84x21`).
-
-| op | nodes | runner op? |
-|---|---:|---|
-| Conv | 64 | yes (subject to the pitch limit) |
-| Mul | 60 | yes: 59 are SiLU `x*sigmoid(x)`, 1 broadcasts |
-| Sigmoid | 58 | yes |
-| Constant | 24 | yes |
-| Concat | 17 | 13 channel-axis NCHW; 4 are head concats on 3-D tensors (axis -1 / 1) |
-| Add | 9 | 8 equal-shape residuals; 1 broadcasts |
-| Split | 8 | **no** |
-| Reshape | 8 | yes |
-| MaxPool | 3 | yes (SPPF 5x5) |
-| Resize | 2 | yes (nearest 2x) |
-| Div | 2 | **no** |
-| Slice | 2 | **no** |
-| Sub | 2 | **no** |
-| Transpose | 1 | **no** |
-| Softmax | 1 | op exists, but this one is the DFL softmax over axis 1, not the last axis |
-| Shape | 1 | **no** |
-| Gather | 1 | **no** |
-
-**640x640.**  Static check: 224 / 263 nodes pass the runner's op/attribute/
-shape tests.  The dynamic run stops at the first node:
+The real Ultralytics YOLOv8n COCO checkpoint (3,151,904 parameters) exported
+with `onnx/export_yolo.py` at **1x3x160x160** (opset 13, 12.4 MiB, 263 nodes)
+now runs to completion on the QPUs and matches a CPU reference.
 
 ```
-FAILED: Conv /model.0/conv/Conv: padded plane 322x336 = 432768 B > 8191 B
-        (engine im2col VDR pitch limit)
+source /home/raspi/work/torch-vc4/.venv/bin/activate
+cd vc4-stack/onnx
+VC4INFER_DAEMON=1 python3 yolo_bench.py \
+    /home/raspi/work/onnx/models/yolov8n_160.onnx \
+    --input yolo160_in.npy --ref yolo160_ref.npy --repeat 3
 ```
 
-15 of the 64 convolutions exceed the pitch limit at 640 (the first layer's
-padded plane is 432 KB; the engine's VDR pitch field allows 8191 B).  This is
-a hard shape blocker independent of the op gap.
+### 7.1 What was added
 
-**32x32.**  Every conv now fits, the runner JIT-compiles and executes the
-first layers, and then stops at the first real op gap:
+**A channel-tiled conv path (the pitch limit is gone).**  `vc4_conv_nhwc`
+(the NHWC plane developed on the YOLO work) is now part of the engine: QPU
+`im2col_nhwc` over `[pixel][channel]` rows plus the QPU GEMM, output
+`[pixel][channel]`.  The im2col VDR pitch is `stride*Cin*4` bytes, not the
+whole plane, so a feature map no longer has to fit 8191 B - only `Cin` is
+limited (`Cin <= 2047` at stride 1, `<= 1023` at stride 2).  `Cin`/`Cout` are
+zero-padded to 16 channels (the first conv's 3 channels become 16, the DFL
+conv's 1 output channel is computed as 16 and sliced).  The NCHW path is kept
+only as a fallback for shapes NHWC does not take.
 
-```
-FAILED: node '/model.2/Split': unsupported op Split
-```
+**Layout bookkeeping.**  A 4-D fp32 tensor carries `layout` (nchw/nhwc) *and*
+the NHWC storage `pitch` (the conv writes `align16(wo)` columns).  Elementwise
+ops are layout-agnostic; every op that depends on the channel axis converts on
+the host.  Elementwise operands are matched on *pitch* as well as shape - two
+NHWC tensors of equal logical shape can still store their pixels at different
+strides, and a flat op over them silently mixes pixels (a real bug during
+bring-up, found by the per-node check).
 
-Static check: 239 / 263 nodes pass; 24 fail on op type or attribute.
-The remaining gap, in order of node count:
+**The missing ONNX nodes** (`onnxrun.py`):
 
-| gap | nodes | what it needs |
-|---|---:|---|
-| `Split` (channel halves of a Conv) | 8 | Slice/Split on axis 1 — a byte gather, the cheapest next step |
-| head `Concat` on 3-D tensors (axis -1 or 1) | 4 | Concat on rank-3 tensors (the runner only handles NCHW channel concat) |
-| `Div`, `Sub`, `Slice` (anchor/grid decode) | 6 | elementwise Sub/Div and Slice; decode is arithmetic, must be QPU |
-| broadcast `Add` / `Mul` | 2 | elementwise broadcast (or a host-side expand + GPU op) |
-| DFL `Softmax` on axis 2 | 1 | softmax over a non-last axis |
-| `Transpose` (DFL) | 1 | arbitrary 4-D permute (the engine has only 2-D dense transpose) |
-| `Shape` + `Gather` | 2 | constant-fold the static shapes (no GPU work needed) |
-| Conv pitch at 640 | 15 | channel tiling or an NHWC repack (engine change) |
+| node | implementation |
+|---|---|
+| `Split` (axis 1, 4-D) | host byte gather, keeps the source pitch |
+| `Concat` axis 1 (4-D) and axis 1/-1 (3-D) | host byte concat |
+| `Slice` | host gather, int64 starts/ends/axes/steps |
+| `Div` | GPU `Mul` by the reciprocal of a *graph constant* (folded) |
+| `Sub` | GPU `Mul(-1)` + GPU `Add`; `const - x` and `x - const` likewise |
+| broadcast `Add`/`Mul` | constant operand expanded on the host (bytes), GPU op |
+| `Softmax` any axis | host permute to the last axis, `vc4_softmax_fwd` (<= 16 classes, rows padded to 8), permute back - this is the DFL softmax on axis 1 |
+| `Transpose` | host permute |
+| `Shape`, `Gather` | int64 host tensors (static shapes) |
+| `Squeeze`, `Unsqueeze`, `Cast`, `Flatten` | view / type change |
 
-So the honest verdict is: **YOLOv8n does not run end-to-end on the VC4
-today.**  At 32x32 the graph is stopped by `Split` after the first few layers;
-at the standard 640x640 it is stopped earlier by the im2col pitch limit.  The
-24-node op gap is small and mostly byte-level or simple elementwise work, but
-the pitch limit is the structural blocker: no 640x640 convolution fits the
-current `(H+2p)*align16(W+2p)*4 <= 8191` constraint.
+`Shape`/`Gather` and the int64 arithmetic of the head's dynamic `Reshape` are
+the only things that compute on the ARM, and they compute *integers* (shape
+bookkeeping), never activation values.
+
+**A graph memory planner.**  `libvc4infer` has no `free()`, so the runner
+carves every activation out of one pool allocation and recycles it by ONNX
+liveness (last consumer).  YOLOv8n's peak pool use at 160x160 is **26.6 MiB**
+of a 40 MiB pool (12.3 MiB of that is the weights) instead of growing past the
+64 MiB arena.
+
+### 7.2 Engine bugs found and fixed on the way
+
+* `vc4_conv_nhwc_pack_w` builds the B panel with **CPU writes** (a zero fill,
+  then the bias rows).  Through vc4d a CPU-written persistent buffer must be
+  flushed to DRAM before the QPUs read it; the launch path only tracks the
+  per-op scratch.  Without the two `vc4__mark_dirty()` calls (one before the
+  pack kernel, one after the bias fill, which happens *after* that launch) the
+  GEMM read a stale panel: whole output-channel blocks lost their weights or
+  their bias, data-dependently.  This was the last correctness bug.
+* Kernel/program tables: a 263-node model needs ~100 distinct QPU blobs (one
+  GEMM per conv shape), but the client table held 32 and vc4d held 64
+  programs.  Both are 128 now (`engine/src/vc4_int.h`, `vc4d/src/vc4d.[ch]`,
+  code slot 16 KiB, client data base 3 MiB).
+* SPPF `MaxPool` pads with **-inf** in ONNX; the NHWC pool kernel pads with
+  zero, which biases every border window that is entirely negative (SiLU
+  outputs are).  Measured as a 0.11 absolute error.  The border is now
+  materialised as -inf on the host (a constant fill, no arithmetic) and the
+  kernel runs with pad 0.
+
+### 7.3 Measured result (stock clocks, `VC4INFER_DAEMON=1`)
+
+Input **1x3x160x160**, output **1x84x525** (P3 400 + P4 100 + P5 25 anchors),
+263 nodes.
+
+| | |
+|---|---:|
+| warm-up run (JIT of ~100 kernels) | 900 ms |
+| runs | 710.1 / 722.0 / 728.5 ms |
+| **mean** | **720.2 ms/image = 1.39 FPS** (best 710.1 ms = 1.41 FPS) |
+| spread over 9 runs (3 sessions) | 708.6 - 728.5 ms (1.37 - 1.41 FPS) |
+| launches/image | 1145 |
+| GPU time (pack + kernel) | 279.8 ms (39% of wall) |
+| node wall sum | 682.2 ms |
+| arena / graph pool / peak | 64.0 / 40.0 / 26.6 MiB |
+
+(JSON: `onnx/yolo160_bench.json`.  The per-op table below is from an earlier
+equivalent run, 663.2 ms node wall sum at 277.3 ms GPU.)
+
+Per op type (wall ms, GPU ms, launches):
+
+| op | nodes | wall | gpu | launches |
+|---|---:|---:|---:|---:|
+| Conv | 64 | 408.4 | 201.6 | 128 |
+| Sigmoid | 58 | 84.8 | 34.5 | 481 |
+| Mul (SiLU) | 60 | 82.8 | 34.8 | 468 |
+| Concat | 17 | 28.4 | 0 | 0 |
+| Split | 8 | 11.5 | 0 | 0 |
+| Reshape | 8 | 8.2 | 0 | 0 |
+| Add | 9 | 7.8 | 2.7 | 38 |
+| MaxPool | 3 | 7.7 | 1.7 | 3 |
+| Softmax (DFL) | 1 | 7.6 | 1.6 | 22 |
+| Constant | 24 | 6.3 | 0 | 0 |
+| Resize | 2 | 3.8 | 0 | 0 |
+| Sub | 2 | 2.4 | 0.3 | 4 |
+| Transpose | 1 | 1.5 | 0 | 0 |
+| Slice | 2 | 1.0 | 0 | 0 |
+| Div | 2 | 0.8 | 0.1 | 1 |
+| Shape, Gather | 2 | 0.3 | 0 | 0 |
+
+The heaviest single nodes are the stem (31.4 ms wall / 8.0 ms GPU) and the
+neck's 3x3 stride-2 convs (10-17 ms).  The elementwise SiLU pair costs 949 of
+the 1145 launches: `vc4_elementwise` issues one launch per 12 groups of 256
+floats, so a 20x20x128 SiLU is ~7 launches.  Batching those (or fusing
+Sigmoid+Mul into the engine's existing `OP_SILU`) is the cheapest win.
+
+### 7.4 Verification
+
+Reference: the **same ONNX graph** evaluated on the Pi by `onnx/ref_onnx.py`,
+an independent numpy float32 evaluator (float64 accumulation), cross-checked
+against the torch CPU export-mode forward of the same `yolov8n.pt` (they agree
+to 4.3e-4 absolute on this input).
+
+Tolerance `|got-ref| <= atol + rtol*max(|ref|,1)`:
+
+| atol/rtol | elements over tolerance | max abs | max rel |
+|---|---:|---:|---:|
+| 1e-4 | **99 / 44100 (0.22%)** | 0.0140 | 3.6e-4 |
+| 5e-4 | **0 / 44100** | 0.0140 | 3.6e-4 |
+| 1e-3 | 0 / 44100 | 0.0140 | 3.6e-4 |
+
+All 99 elements at 1e-4 are in the four **DFL box** rows; the 80 class rows
+(42000 elements) are inside 1e-4 everywhere.  The residual is fp32
+accumulation through 64 conv layers plus the 16-bin DFL softmax weighted sum,
+not a structural error.  The per-node check (each node evaluated from the
+VC4's *own* inputs) is clean to <= 1e-4 relative everywhere.
+
+`onnx/yolo_bench.py` reproduces all of this and writes the JSON report.
+
+### 7.5 320x320 does not fit (precise reason)
+
+`yolov8n_320.onnx` (1x84x2100) exports fine and every node passes the
+runner's checks, but the first conv already needs a 6.6 MB padded plane plus a
+16.4 MB im2col panel of scratch, and the activation working set is ~4x the
+160x160 one:
+
+* 160x160: pool peak **26.6 MiB**, of which 12.3 MiB weights -> ~14 MiB of
+  activations;
+* 320x320: ~4x that -> ~56 MiB activations + 12.3 MiB weights = **~68 MiB**
+  pool, plus >= 23 MiB of per-conv scratch = **~91 MiB**.
+
+vc4d serves a 72 MiB arena (`--arena-mb 72`; the client maps 64 MiB), so
+320x320 stops with `conv_nhwc: out of arena memory` on the first conv.  It
+would fit with `--arena-mb 192` and a client that maps it (CMA has 256 MiB
+total), a daemon restart away, but that was not needed for this milestone.
+This is a memory limit, not a pitch or op limit.
+
+### 7.6 Remaining gaps
+
+* Conv: 3x3/1x1 only, stride 1/2, symmetric pads, group 1 or depthwise
+  (depthwise as a block-diagonal dense weight).  No dilation, no arbitrary
+  kernels, no `ConvTranspose`.
+* `Softmax` needs <= 16 classes (the DFL fits exactly); `Resize` is nearest
+  only; `Slice`/`Concat`/`Split`/`Transpose`/`Reshape` are host byte work.
+* batch 1, fp32 only, static shapes.
+* 1145 launches/image at 160x160: the wall/GPU ratio (2.4x) is launch and
+  host-copy overhead, not arithmetic.
+* The verified run above uses `VC4INFER_DAEMON=1`.  Direct mode
+  (`VC4INFER_DAEMON=0`, root, under `/tmp/vc4-gpu.lock`) gives the identical
+  output (same 99/44100, same max abs), so the result is not mode-specific.
 
 ## 8. Limitations that matter for real models
 

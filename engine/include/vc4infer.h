@@ -138,6 +138,51 @@ vc4_status vc4_rsqrt(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t n);
 vc4_status vc4_relu_backward(vc4_ctx *ctx, const vc4_buf *a,
                              const vc4_buf *dy, vc4_buf *out, size_t n);
 
+/* ------------------------------------------------------------ NHWC plane */
+/*
+ * The YOLO path.  A tensor is [rows][pitch][C] fp32 contiguous, pixel p at
+ * p*C*4 bytes; `pitch` is the storage width and `w` the logical width.  The
+ * VDR pitch of a 16-pixel im2col row is stride*Cin*4 bytes (not the plane), so
+ * any feature map with <= 2047 channels works, and the GEMM's C[M][N] (M =
+ * pixels, N = channels) is exactly the NHWC output.  nimg batches are
+ * contiguous images; every op is one launch (conv = im2col + GEMM) for the
+ * whole batch.
+ */
+size_t vc4_conv_nhwc_wpanel_bytes(int Cin, int Cout, int KH, int KW, int bias);
+/* wt [Cout][Cin][KH][KW] (ci-major) + optional bias -> packed B panel */
+vc4_status vc4_conv_nhwc_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int Cin,
+                                int Cout, int KH, int KW, const vc4_buf *bias,
+                                vc4_buf *wpanel);
+/*
+ * out = conv(in) + bias, NHWC.  in [nimg][H][W][Cin] (row pitch in_pitch),
+ * out [nimg][ho][Wg][Cout] with Wg = align16(wo); the columns [wo, Wg) are
+ * junk (never read back).  stride in {1,2}, KH=KW in {1,3}, Cin/Cout % 16 == 0,
+ * stride*Cin*4 <= 8191 (VDR pitch).
+ */
+vc4_status vc4_conv_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
+                         int H, int W, int in_pitch, const vc4_buf *wpanel,
+                         int Cout, int KH, int KW, int stride, int pad,
+                         vc4_buf *out, int *ho, int *wo, int *opitch);
+/* depthwise 3x3 pad 1: wt [C][1][3][3] -> WP[tap][C] */
+size_t vc4_depthwise_wpanel_bytes(int C);
+vc4_status vc4_depthwise_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int C,
+                                vc4_buf *wp);
+vc4_status vc4_depthwise_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
+                              int H, int W, int in_pitch, const vc4_buf *wp,
+                              vc4_buf *out, int *ho, int *wo, int *opitch);
+/* max pool kxk stride 1 with zero padding (SPPF: k=5, pad=2) */
+vc4_status vc4_maxpool_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
+                            int H, int W, int in_pitch, int k, int pad,
+                            vc4_buf *out, int *ho, int *wo, int *opitch);
+/* nearest-neighbour 2x: [nimg][H][W][C] -> [nimg][2H][2W][C] */
+vc4_status vc4_upsample2x_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
+                               int H, int W, int in_pitch, vc4_buf *out,
+                               int *ho, int *wo, int *opitch);
+/* channel concat: nsrc sources of Csrc[i] channels, M pixels per image */
+vc4_status vc4_concat_nhwc(vc4_ctx *ctx, const vc4_buf *const *src,
+                           const int *Csrc, int nsrc, int nimg,
+                           size_t pixels_per_img, vc4_buf *out, int Cdst);
+
 /* ------------------------------------------------------- training primitives */
 /* Y = X^T (dense transpose, 16x16 tiles; both dims multiple of 16) */
 vc4_status vc4_transpose(vc4_ctx *ctx, const vc4_buf *in, vc4_buf *out,

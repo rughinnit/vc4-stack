@@ -22,9 +22,10 @@ from onnxrun import Runner, UnsupportedNode, _attr, ENGINE  # noqa: E402
 import vc4infer  # noqa: E402
 
 RUNNER_OPS = {
-    "Conv", "Relu", "Sigmoid", "Add", "Mul", "MaxPool", "Concat", "Resize",
-    "MatMul", "Gemm", "Softmax", "GlobalAveragePool", "Reshape", "Flatten",
-    "Identity", "Constant",
+    "Conv", "Relu", "Sigmoid", "Add", "Mul", "Sub", "Div", "MaxPool",
+    "Concat", "Split", "Slice", "Resize", "MatMul", "Gemm", "Softmax",
+    "Transpose", "GlobalAveragePool", "Reshape", "Flatten", "Squeeze",
+    "Unsqueeze", "Cast", "Identity", "Constant", "Shape", "Gather",
 }
 
 
@@ -72,37 +73,29 @@ def classify(node, vi, inits):
             return False, "depthwise multiplier"
         if group == shape[1] and sh != 1:
             return False, "stride-%d depthwise" % sh
-        if kh == 1 and kw == 1:
-            if pads != [0, 0, 0, 0]:
-                return False, "1x1 with padding"
+        if kh == kw and kh in (1, 3):
             if sh not in (1, 2):
-                return False, "1x1 stride %d" % sh
-        elif kh == 3 and kw == 3:
-            if sh == 2 and pads != [1, 1, 1, 1]:
-                return False, "3x3 stride 2 pads %s" % pads
-            if sh not in (1, 2):
-                return False, "3x3 stride %d" % sh
-            p = pads[0]
-            if pads != [p] * 4:
+                return False, "conv stride %d" % sh
+            if pads != [pads[0]] * 4:
                 return False, "asymmetric pads"
-            if sh == 1:
-                hp, wp = shape[2] + 2 * p, align16(shape[3] + 2 * p)
-            else:
-                hp = (shape[2] + 1) // 2 + 2
-                wp = align16(((shape[3] + 1) // 2) + 2)
-            if hp * wp * 4 > 8191:
-                return False, ("plane %dx%d = %d B > 8191 B pitch limit"
-                               % (hp, wp, hp * wp * 4))
-        else:
-            return False, "kernel %dx%d" % (kh, kw)
-        return True, ""
+            cin = align16(shape[1])
+            if cin > 2047 or sh * cin * 4 > 8191:
+                return False, ("stride*Cin*4 = %d B > 8191 B"
+                               % (sh * cin * 4))
+            return True, ""
+        return False, "kernel %dx%d" % (kh, kw)
     if op in ("Relu", "Sigmoid"):
         return True, ""
     if op in ("Add", "Mul"):
         a = vi.get(node.input[0])
         b = vi.get(node.input[1])
-        if a is None or b is None or a != b:
-            return False, "broadcast %s vs %s" % (a, b)
+        if a is None or b is None:
+            return False, "unknown shape"
+        if a != b and inits.get(node.input[1]) is None \
+                and inits.get(node.input[0]) is None:
+            return False, "broadcast %s vs %s (not a constant)" % (a, b)
+        return True, ""
+    if op in ("Sub", "Div"):
         return True, ""
     if op == "MaxPool":
         if int(_attr(node, "ceil_mode", 0)):
@@ -111,20 +104,20 @@ def classify(node, vi, inits):
             return False, "dilations"
         return True, ""
     if op == "Concat":
-        axis = int(_attr(node, "axis", 0))
-        if len(shape) != 4 or axis not in (1, -3):
-            return False, "axis %d" % axis
-        return True, ""
+        axis = int(_attr(node, "axis", 0)) % len(shape)
+        if len(shape) == 4 and axis == 1:
+            return True, ""
+        if len(shape) == 3 and axis in (1, 2):
+            return True, ""
+        return False, "axis %d of rank %d" % (axis, len(shape))
     if op == "Resize":
         if _attr(node, "mode", "nearest") != "nearest":
             return False, "mode=%s" % _attr(node, "mode")
         return True, ""
     if op == "Softmax":
-        axis = int(_attr(node, "axis", -1))
-        if axis not in (-1, len(shape) - 1):
-            return False, "axis %d" % axis
-        if shape[-1] > 16:
-            return False, "%d classes > 16" % shape[-1]
+        axis = int(_attr(node, "axis", -1)) % len(shape)
+        if shape[axis] > 16:
+            return False, "%d classes > 16" % shape[axis]
         return True, ""
     if op == "MatMul":
         if len(shape) != 2 or len(vi.get(node.input[1], [])) != 2:
@@ -152,6 +145,16 @@ def main(argv):
     g = model.graph
     vi = shapes_of(model)
     inits = {i.name: i for i in g.initializer}
+    # Constant nodes are graph constants too (they feed the head's broadcasts)
+    for n in g.node:
+        if n.op_type == "Constant":
+            v = _attr(n, "value")
+            if v is not None:
+                class _C:
+                    pass
+                c = _C()
+                c.dims = list(np.asarray(v).shape)
+                inits[n.output[0]] = c
 
     counts = Counter(n.op_type for n in g.node)
     print("graph: %d nodes, %d initializers, opset %s" %

@@ -517,14 +517,17 @@ only reached for non-square kernels/strides, and says so when batch > 1.
   an A-file pop into A27 followed by the next load wedged the TMU after the
   third load.  The verified dense block-diagonal expansion (Cin x the MACs)
   remains the dispatch.
-* **On-device NMS.**  Greedy NMS is sequential in a data-dependent kept set
-  (each kept box changes which later boxes survive), which the engine's
-  static task grid and one-launch-per-program model cannot express without
-  either materialising an N x N threshold matrix (17.6 MB at 2100 boxes) or a
-  persistent kernel.  The runner has no CPU fallback, so a `NonMaxSuppression`
-  node raises rather than computing on the ARM.  A host implementation is
-  therefore not benchmarked against a shipped GPU one; claiming a speedup
-  would be dishonest.
+* **On-device NMS.**  Not implemented.  The invariant that blocks the simple
+  form is that greedy NMS's kept set is **data-dependent and sequential**:
+  whether box j is suppressed depends on which earlier box survived, so a
+  static one-task-per-box grid cannot do the suppression pass.  The two exact
+  forms are (a) a persistent per-class QPU kernel with a serial loop over the
+  kept boxes (a much larger piece of QPU assembly than any op here), or (b)
+  materialise the N x N threshold matrix (17.6 MB at 2100 boxes) and run the
+  greedy selection on the ARM - which still sorts the scores on the ARM and
+  therefore breaks the strictness rule.  The runner has no CPU fallback, so a
+  `NonMaxSuppression` node raises.  With no shipped GPU NMS there is no honest
+  GPU-vs-host microbenchmark to report.
 
 ### 8.6 Bilinear resize (composition, no new kernel)
 

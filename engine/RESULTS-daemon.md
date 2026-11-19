@@ -46,7 +46,7 @@ Client evidence, captured while a suite client (`test_train`) was running:
 
 ```
 ```
-client pid=8557
+client pid=1312
 Uid:  1000 1000 1000 1000
 Gid:  1000 1000 1000 1000
 CapEff: 0000000000000000
@@ -56,7 +56,7 @@ open fds:
  1 -> /tmp/vc4-client-evidence.log
  2 -> /tmp/vc4-client-evidence.log
  3 -> /dev/null          (the dummy lock fd: the daemon owns the real lock)
- 4 -> socket:[35511]     (AF_UNIX to vc4d)
+ 4 -> socket:[11314]     (AF_UNIX to vc4d)
 PASS: uid 1000, CapEff=0, no /dev/mem
 ```
 
@@ -77,7 +77,7 @@ softmax+CE, 0 mismatches), `test_grad` GRADCHECK PASSED, `test_convgrad`
 CONV GRADCHECK PASSED (dW/dX 6×6 pad 0/1, pool fwd/bwd), `test_train --opt
 sgd|adam` 300 steps TRAIN PASSED, `test_convnet --opt sgd|adam` 150 steps
 CONV TRAIN PASSED, and `ALL TESTS PASSED` at the end.  Best suite numbers:
-256³ 8.13 GFLOP/s, 128³ 5.36 GFLOP/s (daemon, GPU time).
+256³ 8.44 GFLOP/s, 128³ 5.37 GFLOP/s (daemon, GPU time).
 ```
 
 ## Measurements
@@ -87,15 +87,15 @@ the engine's pack+kernel time; `wall` is what the caller waits for.
 
 | size | path | gpu ms | gpu GFLOP/s | wall ms | wall GFLOP/s | overhead (wall) |
 |---|---|---:|---:|---:|---:|---:|
-| 256³ | direct root | 3.949 | 8.50 | 3.976 | 8.44 | — |
-| 256³ | vc4d | 3.985 | 8.42 | 4.271 | 7.86 | **+0.295 ms, 7.4%** |
-| 128³ | direct root | 0.708 | 5.92 | 0.723 | 5.80 | — |
-| 128³ | vc4d | 0.770 | 5.45 | 0.941 | 4.46 | **+0.218 ms, 30%** |
+| 256³ | direct root | 3.962 | 8.47 | 3.980 | 8.43 | — |
+| 256³ | vc4d | 3.998 | 8.39 | 4.289 | 7.82 | **+0.309 ms, 7.8%** |
+| 128³ | direct root | 0.706 | 5.94 | 0.723 | 5.80 | — |
+| 128³ | vc4d | 0.771 | 5.44 | 0.942 | 4.45 | **+0.219 ms, 30%** |
 
 The GPU work is within 1% (256³) / 9% (128³) of the direct path; the wall
 difference is protocol plus cache maintenance.  Two launches cost two round
 trips at ~50 µs and one dirty-range clean (~1.5 MiB at 256³, ~320 KiB at
-128³).  At 256³ that is 7.4%; at 128³ the fixed cost is 30% of a 0.72 ms call,
+128³).  At 256³ that is 7.8%; at 128³ the fixed cost is 30% of a 0.72 ms call,
 which is launch-bound.  First 128³ run after boot is colder (1.25 ms wall).
 
 ## Findings worth keeping
@@ -122,9 +122,9 @@ which is launch-bound.  First 128³ run after boot is colder (1.25 ms wall).
   late.  The unit uses 72 MiB, which yields the client's full 64 MiB region
   and a few MiB spare.  A 128 MiB arena is not reliable at boot: contiguous
   CMA may have fragmented under the vc4 DRM driver, and the shrink ladder then
-  fell back to 64 MiB and reintroduced the failure.  The suite below ran with
-  the 64 MiB client region (daemon 128 at the time); 72 MiB produces the same
-  region and was re-verified with `test_convgrad`.
+  fell back to 64 MiB and reintroduced the failure.  The final suite ran with the
+  64 MiB client region and the 72 MiB daemon; `test_convgrad` was also verified
+  separately against this exact unit.
 - Lock topology: in daemon mode the daemon takes `/tmp/vc4-gpu.lock` per
   launch, so the tests must not hold it (otherwise both wait and the launch
   fails as busy).  The engine retries `E_BUSY` for a minute, which is what let

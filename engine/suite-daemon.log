@@ -77,18 +77,18 @@ quantize/dequantize  NO     -                        not written
 -- 21 of 34 entries dispatchable on the GPU
 PASS dispatch
 === unprivileged client evidence
-  client pid=8557
+  client pid=1312
   Uid:	1000	1000	1000	1000
   Gid:	1000	1000	1000	1000
   CapEff:	0000000000000000
   NoNewPrivs:	0
   open fds:
     total 0
-    lr-x------ 1 raspi raspi 64 Nov 19 16:04 0 -> /dev/null
-    l-wx------ 1 raspi raspi 64 Nov 19 16:04 1 -> /tmp/vc4-client-evidence.log
-    l-wx------ 1 raspi raspi 64 Nov 19 16:04 2 -> /tmp/vc4-client-evidence.log
-    lr-x------ 1 raspi raspi 64 Nov 19 16:04 3 -> /dev/null
-    lrwx------ 1 raspi raspi 64 Nov 19 16:04 4 -> socket:[35511]
+    lr-x------ 1 raspi raspi 64 Nov 19 16:20 0 -> /dev/null
+    l-wx------ 1 raspi raspi 64 Nov 19 16:20 1 -> /tmp/vc4-client-evidence.log
+    l-wx------ 1 raspi raspi 64 Nov 19 16:20 2 -> /tmp/vc4-client-evidence.log
+    lr-x------ 1 raspi raspi 64 Nov 19 16:20 3 -> /dev/null
+    lrwx------ 1 raspi raspi 64 Nov 19 16:20 4 -> socket:[11314]
   PASS: uid 1000, CapEff=0, no /dev/mem
   quantize/dequantize  NO     -                        not written
   -- 21 of 34 entries dispatchable on the GPU
@@ -175,43 +175,43 @@ V3D_ERRORS= 0x00001000
 STATE: LIVE
 === test_matmul  (reps=5)
 libvc4infer 0.1.0  arena 64.0 MiB  reps=5
-  M=128 N=128 K=128 rep0: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.788 ms = pack 0.152 + gemm 0.636  5.32 GFLOP/s (gemm-only 6.60, wall 1.880 ms)
-  M=128 N=128 K=128 rep1: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.783 ms = pack 0.149 + gemm 0.633  5.36 GFLOP/s (gemm-only 6.62, wall 1.032 ms)
-  M=128 N=128 K=128 rep2: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.813 ms = pack 0.155 + gemm 0.658  5.16 GFLOP/s (gemm-only 6.37, wall 1.088 ms)
-  M=128 N=128 K=128 rep3: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.854 ms = pack 0.151 + gemm 0.703  4.91 GFLOP/s (gemm-only 5.97, wall 1.099 ms)
-  M=128 N=128 K=128 rep4: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.867 ms = pack 0.157 + gemm 0.710  4.84 GFLOP/s (gemm-only 5.91, wall 1.235 ms)
-PASS 128x128x128: 5/5 clean, best 0.783 ms = 5.36 GFLOP/s
-  M=256 N=256 K=256 rep0: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 4.157 ms = pack 0.432 + gemm 3.725  8.07 GFLOP/s (gemm-only 9.01, wall 5.376 ms)
-  M=256 N=256 K=256 rep1: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 4.217 ms = pack 0.441 + gemm 3.776  7.96 GFLOP/s (gemm-only 8.89, wall 4.619 ms)
-  M=256 N=256 K=256 rep2: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 4.202 ms = pack 0.439 + gemm 3.763  7.99 GFLOP/s (gemm-only 8.92, wall 4.658 ms)
-  M=256 N=256 K=256 rep3: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 4.129 ms = pack 0.432 + gemm 3.697  8.13 GFLOP/s (gemm-only 9.08, wall 4.509 ms)
-  M=256 N=256 K=256 rep4: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 4.144 ms = pack 0.431 + gemm 3.713  8.10 GFLOP/s (gemm-only 9.04, wall 4.524 ms)
-PASS 256x256x256: 5/5 clean, best 4.129 ms = 8.13 GFLOP/s
-  M= 64 N= 48 K= 32 rep0: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.154 ms = pack 0.079 + gemm 0.076  1.27 GFLOP/s (gemm-only 2.60, wall 1.015 ms)
-  M= 64 N= 48 K= 32 rep1: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.147 ms = pack 0.075 + gemm 0.072  1.34 GFLOP/s (gemm-only 2.73, wall 0.351 ms)
-  M= 64 N= 48 K= 32 rep2: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.146 ms = pack 0.074 + gemm 0.072  1.35 GFLOP/s (gemm-only 2.73, wall 0.345 ms)
-  M= 64 N= 48 K= 32 rep3: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.148 ms = pack 0.074 + gemm 0.073  1.33 GFLOP/s (gemm-only 2.68, wall 0.342 ms)
-  M= 64 N= 48 K= 32 rep4: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.146 ms = pack 0.074 + gemm 0.072  1.35 GFLOP/s (gemm-only 2.74, wall 0.343 ms)
-PASS 64x48x32: 5/5 clean, best 0.146 ms = 1.35 GFLOP/s
-  M= 20 N= 36 K= 44 rep0: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.152 ms = pack 0.077 + gemm 0.075  0.42 GFLOP/s (gemm-only 0.84, wall 1.003 ms)
-  M= 20 N= 36 K= 44 rep1: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.145 ms = pack 0.074 + gemm 0.071  0.44 GFLOP/s (gemm-only 0.89, wall 0.327 ms)
-  M= 20 N= 36 K= 44 rep2: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.148 ms = pack 0.076 + gemm 0.072  0.43 GFLOP/s (gemm-only 0.88, wall 0.319 ms)
-  M= 20 N= 36 K= 44 rep3: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.148 ms = pack 0.072 + gemm 0.076  0.43 GFLOP/s (gemm-only 0.84, wall 0.314 ms)
-  M= 20 N= 36 K= 44 rep4: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.143 ms = pack 0.072 + gemm 0.071  0.44 GFLOP/s (gemm-only 0.89, wall 0.308 ms)
-PASS 20x36x44: 5/5 clean, best 0.143 ms = 0.44 GFLOP/s
-  M= 16 N= 16 K= 16 rep0: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.151 ms = pack 0.075 + gemm 0.076  0.05 GFLOP/s (gemm-only 0.11, wall 0.875 ms)
-  M= 16 N= 16 K= 16 rep1: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.144 ms = pack 0.072 + gemm 0.072  0.06 GFLOP/s (gemm-only 0.11, wall 0.277 ms)
-  M= 16 N= 16 K= 16 rep2: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.147 ms = pack 0.075 + gemm 0.072  0.06 GFLOP/s (gemm-only 0.11, wall 0.340 ms)
-  M= 16 N= 16 K= 16 rep3: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.145 ms = pack 0.073 + gemm 0.072  0.06 GFLOP/s (gemm-only 0.11, wall 0.284 ms)
-  M= 16 N= 16 K= 16 rep4: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.147 ms = pack 0.074 + gemm 0.072  0.06 GFLOP/s (gemm-only 0.11, wall 0.301 ms)
-PASS 16x16x16: 5/5 clean, best 0.144 ms = 0.06 GFLOP/s
-  M=512 N= 64 K=288 rep0: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.598 ms = pack 0.987 + gemm 1.611  7.27 GFLOP/s (gemm-only 11.72, wall 4.022 ms)
-  M=512 N= 64 K=288 rep1: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.605 ms = pack 0.998 + gemm 1.608  7.24 GFLOP/s (gemm-only 11.74, wall 2.941 ms)
-  M=512 N= 64 K=288 rep2: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.594 ms = pack 0.995 + gemm 1.600  7.28 GFLOP/s (gemm-only 11.80, wall 2.941 ms)
-  M=512 N= 64 K=288 rep3: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.640 ms = pack 0.992 + gemm 1.648  7.15 GFLOP/s (gemm-only 11.45, wall 2.967 ms)
-  M=512 N= 64 K=288 rep4: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.673 ms = pack 1.000 + gemm 1.672  7.06 GFLOP/s (gemm-only 11.29, wall 3.020 ms)
-PASS 512x64x288: 5/5 clean, best 2.594 ms = 7.28 GFLOP/s
-stats: launches=60 pack=9.03 ms kernel=31.25 ms flops=0.285 GFLOP
+  M=128 N=128 K=128 rep0: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.780 ms = pack 0.149 + gemm 0.631  5.38 GFLOP/s (gemm-only 6.65, wall 1.729 ms)
+  M=128 N=128 K=128 rep1: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.774 ms = pack 0.142 + gemm 0.632  5.42 GFLOP/s (gemm-only 6.64, wall 0.947 ms)
+  M=128 N=128 K=128 rep2: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.813 ms = pack 0.141 + gemm 0.672  5.16 GFLOP/s (gemm-only 6.24, wall 0.987 ms)
+  M=128 N=128 K=128 rep3: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.770 ms = pack 0.142 + gemm 0.628  5.44 GFLOP/s (gemm-only 6.68, wall 0.945 ms)
+  M=128 N=128 K=128 rep4: mismatches=0/16384 maxabs=5.17e-05 maxrel=2.3e-05 | gpu 0.770 ms = pack 0.142 + gemm 0.629  5.44 GFLOP/s (gemm-only 6.67, wall 0.940 ms)
+PASS 128x128x128: 5/5 clean, best 0.770 ms = 5.44 GFLOP/s
+  M=256 N=256 K=256 rep0: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 3.992 ms = pack 0.433 + gemm 3.559  8.41 GFLOP/s (gemm-only 9.43, wall 5.016 ms)
+  M=256 N=256 K=256 rep1: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 4.022 ms = pack 0.430 + gemm 3.591  8.34 GFLOP/s (gemm-only 9.34, wall 4.323 ms)
+  M=256 N=256 K=256 rep2: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 4.022 ms = pack 0.430 + gemm 3.592  8.34 GFLOP/s (gemm-only 9.34, wall 4.306 ms)
+  M=256 N=256 K=256 rep3: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 3.977 ms = pack 0.427 + gemm 3.550  8.44 GFLOP/s (gemm-only 9.45, wall 4.263 ms)
+  M=256 N=256 K=256 rep4: mismatches=0/65536 maxabs=0.000148 maxrel=8.3e-05 | gpu 4.027 ms = pack 0.432 + gemm 3.595  8.33 GFLOP/s (gemm-only 9.33, wall 4.323 ms)
+PASS 256x256x256: 5/5 clean, best 3.977 ms = 8.44 GFLOP/s
+  M= 64 N= 48 K= 32 rep0: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.149 ms = pack 0.078 + gemm 0.072  1.32 GFLOP/s (gemm-only 2.75, wall 0.975 ms)
+  M= 64 N= 48 K= 32 rep1: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  1.38 GFLOP/s (gemm-only 2.76, wall 0.312 ms)
+  M= 64 N= 48 K= 32 rep2: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  1.38 GFLOP/s (gemm-only 2.76, wall 0.311 ms)
+  M= 64 N= 48 K= 32 rep3: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  1.38 GFLOP/s (gemm-only 2.77, wall 0.305 ms)
+  M= 64 N= 48 K= 32 rep4: mismatches=0/3072 maxabs=6.05e-06 maxrel=2.6e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  1.39 GFLOP/s (gemm-only 2.77, wall 0.308 ms)
+PASS 64x48x32: 5/5 clean, best 0.142 ms = 1.39 GFLOP/s
+  M= 20 N= 36 K= 44 rep0: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  0.45 GFLOP/s (gemm-only 0.89, wall 0.747 ms)
+  M= 20 N= 36 K= 44 rep1: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  0.45 GFLOP/s (gemm-only 0.90, wall 0.291 ms)
+  M= 20 N= 36 K= 44 rep2: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.143 ms = pack 0.072 + gemm 0.071  0.44 GFLOP/s (gemm-only 0.89, wall 0.307 ms)
+  M= 20 N= 36 K= 44 rep3: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  0.45 GFLOP/s (gemm-only 0.89, wall 0.295 ms)
+  M= 20 N= 36 K= 44 rep4: mismatches=0/720 maxabs=7.87e-06 maxrel=3.4e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  0.45 GFLOP/s (gemm-only 0.90, wall 0.287 ms)
+PASS 20x36x44: 5/5 clean, best 0.142 ms = 0.45 GFLOP/s
+  M= 16 N= 16 K= 16 rep0: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  0.06 GFLOP/s (gemm-only 0.12, wall 0.683 ms)
+  M= 16 N= 16 K= 16 rep1: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.143 ms = pack 0.072 + gemm 0.071  0.06 GFLOP/s (gemm-only 0.12, wall 0.265 ms)
+  M= 16 N= 16 K= 16 rep2: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  0.06 GFLOP/s (gemm-only 0.12, wall 0.259 ms)
+  M= 16 N= 16 K= 16 rep3: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  0.06 GFLOP/s (gemm-only 0.12, wall 0.259 ms)
+  M= 16 N= 16 K= 16 rep4: mismatches=0/256 maxabs=1.45e-06 maxrel=1e-06 | gpu 0.142 ms = pack 0.071 + gemm 0.071  0.06 GFLOP/s (gemm-only 0.11, wall 0.262 ms)
+PASS 16x16x16: 5/5 clean, best 0.142 ms = 0.06 GFLOP/s
+  M=512 N= 64 K=288 rep0: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.596 ms = pack 0.985 + gemm 1.611  7.27 GFLOP/s (gemm-only 11.71, wall 3.835 ms)
+  M=512 N= 64 K=288 rep1: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.592 ms = pack 0.986 + gemm 1.606  7.28 GFLOP/s (gemm-only 11.75, wall 2.857 ms)
+  M=512 N= 64 K=288 rep2: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.602 ms = pack 0.985 + gemm 1.616  7.25 GFLOP/s (gemm-only 11.68, wall 2.849 ms)
+  M=512 N= 64 K=288 rep3: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.623 ms = pack 0.994 + gemm 1.628  7.20 GFLOP/s (gemm-only 11.59, wall 2.887 ms)
+  M=512 N= 64 K=288 rep4: mismatches=0/32768 maxabs=0.000198 maxrel=8.8e-05 | gpu 2.559 ms = pack 0.984 + gemm 1.576  7.37 GFLOP/s (gemm-only 11.98, wall 2.839 ms)
+PASS 512x64x288: 5/5 clean, best 2.559 ms = 7.37 GFLOP/s
+stats: launches=60 pack=8.88 ms kernel=30.18 ms flops=0.285 GFLOP
 
 libvc4infer 0.1.0 -- op registry (strict dispatch, no CPU fallback)
 op                   gpu    backend                  constraints / reason
@@ -257,42 +257,42 @@ V3D_ERRORS= 0x00001000
 STATE: LIVE
 === test_conv  (reps=5)
 libvc4infer 0.1.0 conv2d  arena 64.0 MiB  reps=5
-  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep0: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.926 ms 1.27 GFLOP/s (wall 2.767 ms)
-  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep1: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.846 ms 1.39 GFLOP/s (wall 1.466 ms)
-  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep2: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.923 ms 1.28 GFLOP/s (wall 1.532 ms)
-  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep3: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.842 ms 1.40 GFLOP/s (wall 1.444 ms)
-  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep4: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.863 ms 1.37 GFLOP/s (wall 1.458 ms)
-PASS conv 16x16x16->16x16x16 k3 pad1+bias: 5/5 clean, best 0.842 ms 1.40 GFLOP/s
-  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep0: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.999 ms 3.15 GFLOP/s (wall 6.368 ms)
-  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep1: mismatches=0/16384 maxabs=4.03e-05 | gpu 3.041 ms 3.10 GFLOP/s (wall 4.833 ms)
-  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep2: mismatches=0/16384 maxabs=4.03e-05 | gpu 3.014 ms 3.13 GFLOP/s (wall 4.763 ms)
-  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep3: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.911 ms 3.24 GFLOP/s (wall 4.738 ms)
-  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep4: mismatches=0/16384 maxabs=4.03e-05 | gpu 3.072 ms 3.07 GFLOP/s (wall 4.914 ms)
-PASS conv 32x16x32->32x16x32 k3 pad1+bias: 5/5 clean, best 2.911 ms 3.24 GFLOP/s
-  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep0: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.220 ms 0.30 GFLOP/s (wall 1.247 ms)
-  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep1: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.214 ms 0.31 GFLOP/s (wall 0.460 ms)
-  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep2: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.214 ms 0.31 GFLOP/s (wall 0.443 ms)
-  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep3: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.214 ms 0.31 GFLOP/s (wall 0.443 ms)
-  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep4: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.214 ms 0.31 GFLOP/s (wall 0.438 ms)
-PASS conv 16x8x16->16x8x16 k1 pad0: 5/5 clean, best 0.214 ms 0.31 GFLOP/s
-  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep0: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.292 ms 0.67 GFLOP/s (wall 1.305 ms)
-  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep1: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.286 ms 0.69 GFLOP/s (wall 0.644 ms)
-  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep2: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.263 ms 0.75 GFLOP/s (wall 0.613 ms)
-  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep3: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.284 ms 0.69 GFLOP/s (wall 0.633 ms)
-  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep4: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.284 ms 0.69 GFLOP/s (wall 0.627 ms)
-PASS conv 32x8x24->16x8x24 k1 pad0+bias: 5/5 clean, best 0.263 ms 0.75 GFLOP/s
-  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep0: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.362 ms 1.27 GFLOP/s (wall 1.099 ms)
-  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep1: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.376 ms 1.23 GFLOP/s (wall 0.739 ms)
-  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep2: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.355 ms 1.30 GFLOP/s (wall 0.692 ms)
-  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep3: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.359 ms 1.28 GFLOP/s (wall 0.734 ms)
-  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep4: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.356 ms 1.29 GFLOP/s (wall 0.699 ms)
-PASS conv 16x12x12->16x10x10 k3 pad0+bias: 5/5 clean, best 0.355 ms 1.30 GFLOP/s
-  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep0: mismatches=0/4096 maxabs=0.000104 | gpu 2.485 ms 1.90 GFLOP/s (wall 4.655 ms)
-  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep1: mismatches=0/4096 maxabs=0.000104 | gpu 2.438 ms 1.94 GFLOP/s (wall 3.646 ms)
-  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep2: mismatches=0/4096 maxabs=0.000104 | gpu 2.382 ms 1.98 GFLOP/s (wall 3.543 ms)
-  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep3: mismatches=0/4096 maxabs=0.000104 | gpu 2.378 ms 1.98 GFLOP/s (wall 3.584 ms)
-  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep4: mismatches=0/4096 maxabs=0.000104 | gpu 2.511 ms 1.88 GFLOP/s (wall 4.051 ms)
-PASS conv 64x8x16->32x8x16 k3 pad1+bias: 5/5 clean, best 2.378 ms 1.98 GFLOP/s
+  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep0: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.851 ms 1.39 GFLOP/s (wall 4.152 ms)
+  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep1: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.810 ms 1.46 GFLOP/s (wall 1.410 ms)
+  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep2: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.841 ms 1.40 GFLOP/s (wall 1.422 ms)
+  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep3: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.841 ms 1.40 GFLOP/s (wall 1.409 ms)
+  conv 16x16x16 -> 16x16x16 k3x3 pad1 +bias rep4: mismatches=0/4096 maxabs=1.27e-05 | gpu 0.850 ms 1.39 GFLOP/s (wall 1.425 ms)
+PASS conv 16x16x16->16x16x16 k3 pad1+bias: 5/5 clean, best 0.810 ms 1.46 GFLOP/s
+  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep0: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.808 ms 3.36 GFLOP/s (wall 7.630 ms)
+  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep1: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.797 ms 3.37 GFLOP/s (wall 4.387 ms)
+  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep2: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.799 ms 3.37 GFLOP/s (wall 4.314 ms)
+  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep3: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.793 ms 3.38 GFLOP/s (wall 4.328 ms)
+  conv 32x16x32 -> 32x16x32 k3x3 pad1 +bias rep4: mismatches=0/16384 maxabs=4.03e-05 | gpu 2.799 ms 3.37 GFLOP/s (wall 4.346 ms)
+PASS conv 32x16x32->32x16x32 k3 pad1+bias: 5/5 clean, best 2.793 ms 3.38 GFLOP/s
+  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep0: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.224 ms 0.29 GFLOP/s (wall 2.990 ms)
+  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep1: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.214 ms 0.31 GFLOP/s (wall 0.468 ms)
+  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep2: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.213 ms 0.31 GFLOP/s (wall 0.435 ms)
+  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep3: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.213 ms 0.31 GFLOP/s (wall 0.432 ms)
+  conv 16x8x16 -> 16x8x16 k1x1 pad0 no-bias rep4: mismatches=0/2048 maxabs=4.78e-07 | gpu 0.213 ms 0.31 GFLOP/s (wall 0.430 ms)
+PASS conv 16x8x16->16x8x16 k1 pad0: 5/5 clean, best 0.213 ms 0.31 GFLOP/s
+  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep0: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.287 ms 0.68 GFLOP/s (wall 2.624 ms)
+  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep1: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.291 ms 0.68 GFLOP/s (wall 0.632 ms)
+  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep2: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.224 ms 0.88 GFLOP/s (wall 0.545 ms)
+  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep3: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.284 ms 0.69 GFLOP/s (wall 0.597 ms)
+  conv 32x8x24 -> 16x8x24 k1x1 pad0 +bias rep4: mismatches=0/3072 maxabs=1.47e-06 | gpu 0.283 ms 0.70 GFLOP/s (wall 0.602 ms)
+PASS conv 32x8x24->16x8x24 k1 pad0+bias: 5/5 clean, best 0.224 ms 0.88 GFLOP/s
+  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep0: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.356 ms 1.29 GFLOP/s (wall 1.481 ms)
+  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep1: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.353 ms 1.30 GFLOP/s (wall 0.686 ms)
+  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep2: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.348 ms 1.32 GFLOP/s (wall 0.691 ms)
+  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep3: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.353 ms 1.31 GFLOP/s (wall 0.679 ms)
+  conv 16x12x12 -> 16x10x10 k3x3 pad0 +bias rep4: mismatches=0/1600 maxabs=1.18e-05 | gpu 0.353 ms 1.30 GFLOP/s (wall 0.677 ms)
+PASS conv 16x12x12->16x10x10 k3 pad0+bias: 5/5 clean, best 0.348 ms 1.32 GFLOP/s
+  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep0: mismatches=0/4096 maxabs=0.000104 | gpu 2.389 ms 1.98 GFLOP/s (wall 6.207 ms)
+  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep1: mismatches=0/4096 maxabs=0.000104 | gpu 2.379 ms 1.98 GFLOP/s (wall 3.492 ms)
+  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep2: mismatches=0/4096 maxabs=0.000104 | gpu 2.372 ms 1.99 GFLOP/s (wall 3.443 ms)
+  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep3: mismatches=0/4096 maxabs=0.000104 | gpu 2.376 ms 1.99 GFLOP/s (wall 3.450 ms)
+  conv 64x8x16 -> 32x8x16 k3x3 pad1 +bias rep4: mismatches=0/4096 maxabs=0.000104 | gpu 2.353 ms 2.01 GFLOP/s (wall 3.423 ms)
+PASS conv 64x8x16->32x8x16 k3 pad1+bias: 5/5 clean, best 2.353 ms 2.01 GFLOP/s
 PASS unsupported 5x5 -> unsupported by the GPU backend (strict dispatch)
 PASS unsupported stride 2 -> unsupported by the GPU backend (strict dispatch)
 
@@ -432,20 +432,20 @@ libvc4infer 0.1.0 toy trainer: 64-32-10, opt=sgd, seed=12345, arena 64.0 MiB
 PASS optimizer step (sgd) vs CPU oracle: worst_rel=6.88e-08
 initial: train loss=2.321555 acc=12.03%  test loss=2.319536 acc=10.00%
 step    1: loss=2.321555138 acc=12.03%
-step   25: loss=0.025709569 acc=100.00%
-step   50: loss=0.008870122 acc=100.00%
-step   75: loss=0.005126418 acc=100.00%
-step  100: loss=0.003540701 acc=100.00%
-step  125: loss=0.002678141 acc=100.00%
-step  150: loss=0.002141007 acc=100.00%
-step  175: loss=0.001777340 acc=100.00%
-step  200: loss=0.001512052 acc=100.00%
-step  225: loss=0.001315576 acc=100.00%
-step  250: loss=0.001163838 acc=100.00%
-step  275: loss=0.001038258 acc=100.00%
-step  300: loss=0.000936311 acc=100.00%
-final: train loss=0.000932784 acc=100.00%  test loss=0.000884297 acc=100.00%
-time 3.870 s for 300 steps, 77.52 steps/s, 49610 samples/s
+step   25: loss=0.030246863 acc=100.00%
+step   50: loss=0.008668912 acc=100.00%
+step   75: loss=0.005040627 acc=100.00%
+step  100: loss=0.003500930 acc=100.00%
+step  125: loss=0.002656637 acc=100.00%
+step  150: loss=0.002121936 acc=100.00%
+step  175: loss=0.001761844 acc=100.00%
+step  200: loss=0.001502080 acc=100.00%
+step  225: loss=0.001306422 acc=100.00%
+step  250: loss=0.001155166 acc=100.00%
+step  275: loss=0.001031815 acc=100.00%
+step  300: loss=0.000932185 acc=100.00%
+final: train loss=0.000928648 acc=100.00%  test loss=0.000880046 acc=100.00%
+time 4.139 s for 300 steps, 72.48 steps/s, 46390 samples/s
 TRAIN PASSED
 --- board:
 SRQCS     = 0x00010100  (queue_len=0 queue_full=0 requests=1 completed=1 error=0)
@@ -456,20 +456,20 @@ libvc4infer 0.1.0 toy trainer: 64-32-10, opt=adam, seed=12345, arena 64.0 MiB
 PASS optimizer step (adam) vs CPU oracle: worst_rel=8.12e-08
 initial: train loss=2.321555 acc=12.03%  test loss=2.319536 acc=10.00%
 step    1: loss=2.321555138 acc=12.03%
-step   25: loss=0.000929847 acc=100.00%
-step   50: loss=0.000069502 acc=100.00%
-step   75: loss=0.000049211 acc=100.00%
-step  100: loss=0.000044200 acc=100.00%
-step  125: loss=0.000040958 acc=100.00%
-step  150: loss=0.000038291 acc=100.00%
-step  175: loss=0.000036025 acc=100.00%
-step  200: loss=0.000034061 acc=100.00%
-step  225: loss=0.000032337 acc=100.00%
-step  250: loss=0.000030785 acc=100.00%
-step  275: loss=0.000029379 acc=100.00%
-step  300: loss=0.000028206 acc=100.00%
-final: train loss=0.000028185 acc=100.00%  test loss=0.000026682 acc=100.00%
-time 5.141 s for 300 steps, 58.35 steps/s, 37343 samples/s
+step   25: loss=0.000747452 acc=100.00%
+step   50: loss=0.000067972 acc=100.00%
+step   75: loss=0.000049381 acc=100.00%
+step  100: loss=0.000044805 acc=100.00%
+step  125: loss=0.000041745 acc=100.00%
+step  150: loss=0.000039155 acc=100.00%
+step  175: loss=0.000036895 acc=100.00%
+step  200: loss=0.000034936 acc=100.00%
+step  225: loss=0.000033172 acc=100.00%
+step  250: loss=0.000031543 acc=100.00%
+step  275: loss=0.000030116 acc=100.00%
+step  300: loss=0.000028819 acc=100.00%
+final: train loss=0.000028776 acc=100.00%  test loss=0.000027381 acc=100.00%
+time 4.915 s for 300 steps, 61.04 steps/s, 39063 samples/s
 TRAIN PASSED
 --- board:
 SRQCS     = 0x00010100  (queue_len=0 queue_full=0 requests=1 completed=1 error=0)
@@ -479,15 +479,15 @@ STATE: LIVE
 libvc4infer 0.1.0 conv-net trainer: conv3x3(1->8)-relu-pool-fc(512->10), opt=sgd seed=12345 batch=16 arena 64.0 MiB
 initial: train loss=2.305825 acc=12.50% (batch of 16)
 step    1: loss=2.305825472 acc=12.50%
-step   25: loss=1.039442778 acc=100.00%
-step   50: loss=0.017775437 acc=100.00%
-step   75: loss=0.011165869 acc=100.00%
-step  100: loss=0.006612397 acc=100.00%
-step  125: loss=0.006108258 acc=100.00%
-step  150: loss=0.004084520 acc=100.00%
-final: train loss=0.004229272 acc=100.00%  test loss=0.004189285 acc=100.00%
-weights hash conv=e546a788fffdc303 fc=bd59a6e193ab75cd
-time 25.206 s for 150 steps, 5.95 steps/s, 95 samples/s (batch 16)
+step   25: loss=0.271085352 acc=100.00%
+step   50: loss=0.033222415 acc=100.00%
+step   75: loss=0.016128542 acc=100.00%
+step  100: loss=0.008894280 acc=100.00%
+step  125: loss=0.007693674 acc=100.00%
+step  150: loss=0.005012973 acc=100.00%
+final: train loss=0.005134606 acc=100.00%  test loss=0.005072847 acc=100.00%
+weights hash conv=a96bb77744a95b1a fc=57f2688aac2cb621
+time 24.198 s for 150 steps, 6.20 steps/s, 99 samples/s (batch 16)
 CONV TRAIN PASSED
 --- board:
 SRQCS     = 0x00010100  (queue_len=0 queue_full=0 requests=1 completed=1 error=0)
@@ -497,15 +497,15 @@ STATE: LIVE
 libvc4infer 0.1.0 conv-net trainer: conv3x3(1->8)-relu-pool-fc(512->10), opt=adam seed=12345 batch=16 arena 64.0 MiB
 initial: train loss=2.305825 acc=12.50% (batch of 16)
 step    1: loss=2.305825472 acc=12.50%
-step   25: loss=0.086646922 acc=100.00%
-step   50: loss=0.001605965 acc=100.00%
-step   75: loss=0.001090530 acc=100.00%
-step  100: loss=0.000621138 acc=100.00%
-step  125: loss=0.000743061 acc=100.00%
-step  150: loss=0.000517005 acc=100.00%
-final: train loss=0.000539291 acc=100.00%  test loss=0.000552781 acc=100.00%
-weights hash conv=db70ddabd5e52d76 fc=4531059359d5124e
-time 25.890 s for 150 steps, 5.79 steps/s, 93 samples/s (batch 16)
+step   25: loss=0.095007196 acc=100.00%
+step   50: loss=0.001730708 acc=100.00%
+step   75: loss=0.000948091 acc=100.00%
+step  100: loss=0.000520735 acc=100.00%
+step  125: loss=0.000652317 acc=100.00%
+step  150: loss=0.000459840 acc=100.00%
+final: train loss=0.000474058 acc=100.00%  test loss=0.000487706 acc=100.00%
+weights hash conv=6eeaa091874943bb fc=7245ab396dd235a5
+time 27.631 s for 150 steps, 5.43 steps/s, 87 samples/s (batch 16)
 CONV TRAIN PASSED
 --- board:
 SRQCS     = 0x00010100  (queue_len=0 queue_full=0 requests=1 completed=1 error=0)

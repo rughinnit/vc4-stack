@@ -442,10 +442,10 @@ reps, best wall):
 
 | size | path | gpu ms | gpu GFLOP/s | wall ms | wall GFLOP/s | wall overhead |
 |---|---|---:|---:|---:|---:|---:|
-| 256³ | direct root | 3.949 | 8.50 | 3.976 | 8.44 | — |
-| 256³ | through vc4d | 3.985 | 8.42 | 4.271 | 7.86 | **+0.295 ms (7.4%)** |
-| 128³ | direct root | 0.708 | 5.92 | 0.723 | 5.80 | — |
-| 128³ | through vc4d | 0.770 | 5.45 | 0.941 | 4.46 | **+0.218 ms (30%)** |
+| 256³ | direct root | 3.962 | 8.47 | 3.980 | 8.43 | — |
+| 256³ | through vc4d | 3.998 | 8.39 | 4.289 | 7.82 | **+0.309 ms (7.8%)** |
+| 128³ | direct root | 0.706 | 5.94 | 0.723 | 5.80 | — |
+| 128³ | through vc4d | 0.771 | 5.44 | 0.942 | 4.45 | **+0.219 ms (30%)** |
 
 Both paths ran the same `bench_matmul` binary in the same boot, five reps,
 best.  The QPU work is within 1% at 256³; the wall difference is two round

@@ -94,13 +94,13 @@ clean would cost milliseconds; a 256³ matmul dirties ~1.5 MiB.
 
 | size | path | gpu ms | gpu GFLOP/s | wall ms | wall GFLOP/s | wall overhead |
 |---|---|---:|---:|---:|---:|---:|
-| 256³ | direct root | 3.949 | 8.50 | 3.976 | 8.44 | — |
-| 256³ | through vc4d | 3.985 | 8.42 | 4.271 | 7.86 | **+0.295 ms (7.4%)** |
-| 128³ | direct root | 0.708 | 5.92 | 0.723 | 5.80 | — |
-| 128³ | through vc4d | 0.770 | 5.45 | 0.941 | 4.46 | **+0.218 ms (30%)** |
+| 256³ | direct root | 3.962 | 8.47 | 3.980 | 8.43 | — |
+| 256³ | through vc4d | 3.998 | 8.39 | 4.289 | 7.82 | **+0.309 ms (7.8%)** |
+| 128³ | direct root | 0.706 | 5.94 | 0.723 | 5.80 | — |
+| 128³ | through vc4d | 0.771 | 5.44 | 0.942 | 4.45 | **+0.219 ms (30%)** |
 
 At 256³ the QPU work is within 1% of the direct path and the caller-visible
-wall time is 7.4% higher: two launches = two round trips (~50 µs each) plus a
+wall time is 7.8% higher: two launches = two round trips (~50 µs each) plus a
 ~1.5 MiB dirty-range clean.  At 128³ the same fixed cost is 30% of a 0.72 ms
 call (two round trips + ~320 KiB of cache maintenance, both size-independent),
 so the 15% target is met for the size the engine is actually used at; 128³ is

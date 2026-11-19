@@ -35,6 +35,8 @@ INFO = {
                   32 * 16 * 16 * 9 * 32, 32 * 16 * 16 * 9 * 32),
     "stride2": ("Conv 32->32 3x3 s=2 p=1", "4 phase images + stride-1 conv",
                 32 * 16 * 16 * 32 * 9, 4 * 32 * 16 * 16 * 32 * 9),
+    "bilinear": ("Conv 8->16 3x3 + Resize 2x linear", "mode=linear (raised)",
+                 16 * 12 * 12 * 8 * 9 + 7 * 16 * 24 * 24, 0),
 }
 
 
@@ -78,8 +80,9 @@ def main(argv):
             print("           runs %s  mean %.1f ms  launches %d  gpu %.1f ms"
                   % (", ".join("%.1f" % t for t in times), sum(times) / len(times),
                      launches, gpu))
-            print("           MACs now %d vs %-10d before (%s): x%.2f"
-                  % (mnow, mbefore, prev, mbefore / max(mnow, 1)))
+            ratio = ("x%.2f" % (mbefore / max(mnow, 1))) if mbefore else "n/a"
+            print("           MACs now %d vs %-10d before (%s): %s"
+                  % (mnow, mbefore, prev, ratio))
             assert over == 0, "%s: %d over tolerance" % (name, over)
     finally:
         eng.close()

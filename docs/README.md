@@ -8,7 +8,8 @@
 | `REFERENCES.md` | every external source used, with URL, purpose, status; claims -> source table; Emma Anholt's work |
 | `XCHECK.md` | independent decoder cross-validation (5,329 words, 0 unknown; 33/33 bit-exact rotates; corrections) |
 | `NUMERICS.md` | the QPU FPU truncates (round toward zero); 3-word dependent chains; register/field rules |
-| `CLOCK-VARIANCE.md` | core clock droops 400->250 MHz under load; always record cycles, not just wall time |
+| `BUILD.md` | build parallelism on 1 GB: engine -j4 safe, VC4C -j2/-j1, ccache, `build-fast.sh` |
+| `CLOCK-VARIANCE.md` | core clock drooped 400->250 MHz under load *before* the fan; 89/89 samples at 400 MHz with it |
 | `TRAINING.md` | training design, backward kernels, capacity limits |
 | `TRAINING-RESULTS.md` | MLP 64-32-10 at 100% on SGD/Adam, gradchecks, throughput |
 | `CONV-RESULTS.md` | col2im, im2col-row, maxpool fwd/bwd, conv dX/dW, conv-net at 100% |

@@ -16,6 +16,9 @@ plane only (framework, allocation, I/O); there is no CPU compute fallback.
 - `training/` forward+backward kernels and a toy trainer (MLP/conv) demonstrating
               gradient computation on the VC4 data plane
 - `docs/`     measurements, ceilings, coverage tables, per-track results
+- `vc4d/`     privileged helper daemon (protocol v2): /dev/mem and V3D
+              dispatch in one small root process that drops capabilities, so
+              the engine can run as an ordinary user (`docs/DAEMON.md`)
 - `tools/`    QPU encoder/launcher, verification harnesses, and
               `qpu_disasm.py` (blob disassembler that fails on unknown opcodes)
 

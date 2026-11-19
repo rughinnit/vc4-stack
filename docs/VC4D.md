@@ -1,7 +1,7 @@
 # vc4d — privileged helper for unprivileged VC4 compute
 
-Source tree: `/home/raspi/work/vc4d`. Installed as `vc4d.service` (active,
-protocol version 2).
+Source tree: `/home/raspi/work/vc4d`, mirrored in this repo as `vc4d/`.
+Installed as `vc4d.service` (active, protocol version 2).
 
 Goal: move `/dev/mem` and V3D dispatch out of client processes, so engines and
 tools run unprivileged without raw memory access.

@@ -1,0 +1,94 @@
+/*
+ * vc4_api.c - the op registry and the coverage table.
+ *
+ * STRICT DISPATCH: this table is the single source of truth.  An op that is
+ * not implemented on the GPU is listed with supported = 0 and the entry point
+ * returns VC4_ERR_UNSUPPORTED.  Nothing falls back to the CPU.
+ */
+#define _GNU_SOURCE
+#include "vc4_int.h"
+
+#include <string.h>
+
+static const vc4_op_info OPS[] = {
+    /* implemented */
+    { "matmul", "qpu gemm(asm10) + qpu pack",
+      1, "f32 row-major; M,N,K any size (8/64/16 tiles internally)" },
+    { "conv2d/3x3", "qpu im2col + qpu gemm(asm10)",
+      1, "f32 NCHW; stride 1; pad 0..; Cin%16==0; Cout%16==0; Hp*Wp*4<=8191" },
+    { "conv2d/1x1", "qpu im2col + qpu gemm(asm10)",
+      1, "f32 NCHW; stride 1; pad 0; Cin%16==0; Cout%16==0; H*Wp*4<=8191" },
+    { "add", "qpu elementwise", 1, "f32, exact IEEE; n rounded to 256 internally" },
+    { "mul", "qpu elementwise", 1, "f32, exact IEEE; n rounded to 256 internally" },
+    { "relu", "qpu elementwise", 1, "f32, exact IEEE" },
+    { "sigmoid", "qpu elementwise", 1,
+      "f32; 2^f degree-5 poly + 3x Newton rcp; |err| < 1e-6 (measured)" },
+    { "silu", "qpu elementwise", 1,
+      "f32; x*sigmoid(x); |err| < 1e-6 (measured)" },
+    /* not implemented -- listed so the table is an honest coverage statement */
+    { "conv2d/5x5", "-", 0, "no kernel; would need another im2col tap schedule" },
+    { "conv2d/stride2", "-", 0,
+      "the VDR loads 16 consecutive pixels; stride 2 needs a decimation pass" },
+    { "conv2d/depthwise", "-", 0, "needs a per-channel schedule, not a GEMM" },
+    { "conv2d/grouped", "-", 0, "needs one GEMM per group (trivial extension)" },
+    { "matmul/f16", "-", 0, "kernels are fp32 only" },
+    { "matmul/f32x4-tile", "-", 0, "4-column register tile: the documented next speed step" },
+    { "batched-matmul", "-", 0, "N launches; not yet fused" },
+    { "maxpool", "-", 0, "not written" },
+    { "softmax", "-", 0, "needs a reduction (max+sum) kernel" },
+    { "layernorm", "-", 0, "needs reduction + rsqrt kernel" },
+    { "concat/slice", "-", 0, "pure data movement; no GPU kernel yet" },
+    { "transpose/permute", "-", 0, "the pack kernel does 8-row x k-major panels only" },
+    { "upsample", "-", 0, "not written" },
+    { "quantize/dequantize", "-", 0, "not written" },
+};
+
+const vc4_op_info *vc4_supported_ops(size_t *count)
+{
+    if (count)
+        *count = sizeof(OPS) / sizeof(OPS[0]);
+    return OPS;
+}
+
+const char *vc4_op_name(vc4_op op)
+{
+    switch (op) {
+    case VC4_OP_MATMUL:  return "matmul";
+    case VC4_OP_CONV2D:  return "conv2d/3x3";
+    case VC4_OP_ADD:     return "add";
+    case VC4_OP_MUL:     return "mul";
+    case VC4_OP_RELU:    return "relu";
+    case VC4_OP_SIGMOID: return "sigmoid";
+    case VC4_OP_SILU:    return "silu";
+    default:             return "?";
+    }
+}
+
+int vc4_op_supported(vc4_op op)
+{
+    const char *n = vc4_op_name(op);
+    size_t cnt = 0;
+    const vc4_op_info *t = vc4_supported_ops(&cnt);
+    for (size_t i = 0; i < cnt; ++i)
+        if (strcmp(t[i].name, n) == 0)
+            return t[i].supported;
+    return 0;
+}
+
+void vc4_print_supported_ops(FILE *f)
+{
+    size_t cnt = 0;
+    const vc4_op_info *t = vc4_supported_ops(&cnt);
+    fprintf(f, "\nlibvc4infer %s -- op registry (strict dispatch, no CPU fallback)\n",
+            VC4INFER_VERSION_STRING);
+    fprintf(f, "%-20s %-6s %-24s %s\n", "op", "gpu", "backend", "constraints / reason");
+    fprintf(f, "%-20s %-6s %-24s %s\n", "--------------------", "------",
+            "------------------------", "------------------------------");
+    int nsup = 0;
+    for (size_t i = 0; i < cnt; ++i) {
+        fprintf(f, "%-20s %-6s %-24s %s\n", t[i].name,
+                t[i].supported ? "yes" : "NO", t[i].backend, t[i].note);
+        nsup += t[i].supported ? 1 : 0;
+    }
+    fprintf(f, "-- %d of %zu entries dispatchable on the GPU\n", nsup, cnt);
+}

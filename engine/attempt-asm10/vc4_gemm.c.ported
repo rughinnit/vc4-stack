@@ -1,0 +1,204 @@
+/*
+ * vc4_gemm.c - vc4_matmul on the asm10 hand-written QPU GEMM.
+ *
+ * Two launches per matmul, in one process and one arena:
+ *   1. tools/kgen.py's "pack" kernel (asm10/pack10.py): the panel builder that
+ *      transposes A into the 8-row k-major panel
+ *      PANEL[(rb*K + k)*8 + r] = A[rb*8+r][k]
+ *      with VDR loads and 8x8-word VDMs (no ALU data movement), assigned
+ *      grid-stride to 4 QPUs.
+ *   2. the asm10 GEMM (asm10/gemm6.py): 8x64 C tile per request, three B
+ *      vector sets and a 6-phase (3 k pair) k loop, 16 lanes = 16 of the 64
+ *      columns, A broadcast with the hardware rotate+replicate, VPM->DMA
+ *      store of 4 column chunks x 2 row halves.
+ *
+ * Shapes are rounded up to 8 rows / 64 columns / 16 k.  The rounding is
+ * *byte* work (zero fill and a row copy on the ARM); no multiply-accumulate
+ * ever runs on the CPU.
+ */
+#define _GNU_SOURCE
+#include "vc4_int.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Build the 8-row k-major A panel from a [rowblocks*8][rowlen] row-major
+ * source whose row pitch is rowlen floats and whose 8-row block stride is
+ * 32*rowlen bytes (true for a contiguous Mp x Kp padded copy).
+ *
+ * The packer works on 8-row "work units" (32*K bytes of source and of panel)
+ * assigned grid-stride: QPU i takes units i, i+pnq, i+2*pnq, ...  asm10
+ * measured that this alone is worth 17 % over contiguous slabs (the four
+ * concurrent read streams stay 8 KB apart instead of 64 KB apart).
+ */
+vc4_status vc4__pack_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen,
+                         uint32_t dst_bus, uint32_t rowblocks)
+{
+    if (rowlen % 16 || rowblocks < 1)
+        return VC4_ERR_INVAL;
+    const uint32_t K = rowlen;
+    const uint32_t unitb = 32u * K;          /* bytes per 8-row work unit */
+    const uint32_t units = rowblocks;
+    int pnq = units < 4u ? (int)units : 4;   /* every QPU must get >= 1 unit */
+
+    char nk[16];
+    char pname[48], *pargv[] = { (char *)"pack", (char *)"--k", nk, NULL };
+    snprintf(nk, sizeof(nk), "%u", K);
+    snprintf(pname, sizeof(pname), "pack10_%u", K);
+    vc4_kernel *k = NULL;
+    vc4_status st = vc4__kernel(ctx, pname, pargv, pnq, &k);
+    if (st != VC4_OK)
+        return st;
+
+    for (int i = 0; i < pnq; ++i) {
+        uint32_t *u = vc4__uni(ctx, k, i);
+        u[0] = K;                                        /* row length (floats) */
+        u[1] = (uint32_t)i * unitb;                      /* first unit offset   */
+        u[2] = src_bus;
+        u[3] = unitb;                                    /* unit byte stride    */
+        u[4] = dst_bus;
+        u[5] = (units - (uint32_t)i + (uint32_t)pnq - 1u) / (uint32_t)pnq;
+        u[6] = (uint32_t)i;                              /* VPM row base = 8*q  */
+        u[7] = unitb * (uint32_t)pnq;                    /* unit byte step      */
+    }
+    uint64_t ns = 0;
+    st = vc4__launch(ctx, k, pnq, &ns);
+    ctx->st.pack_ns += ns;
+    return st;
+}
+
+vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
+                         uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus)
+{
+    if (M % 8 || N % 64 || K % 16)
+        return VC4_ERR_INVAL;
+    const uint32_t tr = M / 8;                 /* 8-row row blocks */
+    int nq = tr < VC4_MAX_QPU ? (int)tr : VC4_MAX_QPU;
+
+    char name[80], nm[16], nn[16], nk[16], nkpu[8];
+    char *argv[] = { (char *)"gemm", (char *)"--M", nm, (char *)"--N", nn,
+                     (char *)"--K", nk, (char *)"--nqpu", nkpu, NULL };
+    snprintf(nm, sizeof(nm), "%u", M);
+    snprintf(nn, sizeof(nn), "%u", N);
+    snprintf(nk, sizeof(nk), "%u", K);
+    snprintf(nkpu, sizeof(nkpu), "%d", nq);
+    snprintf(name, sizeof(name), "gemm10_%u_%u_%u_q%d", M, N, K, nq);
+
+    vc4_kernel *k = NULL;
+    vc4_status st = vc4__kernel(ctx, name, argv, nq, &k);
+    if (st != VC4_OK)
+        return st;
+
+    const uint32_t a_rb = 32u * K;             /* one 8-row panel block     */
+    const uint32_t c_rb = 8u * N * 4u;         /* 8 C rows                  */
+    for (int i = 0; i < nq; ++i) {
+        uint32_t *u = vc4__uni(ctx, k, i);
+        u[0] = panel_bus;
+        u[1] = c_bus;
+        u[2] = b_bus;
+        u[3] = (uint32_t)i * a_rb;
+        u[4] = (uint32_t)nq * a_rb;
+        u[5] = (uint32_t)i * c_rb;
+        u[6] = (uint32_t)nq * c_rb;
+        u[7] = (uint32_t)i;       /* first row block this QPU owns */
+    }
+    uint64_t ns = 0;
+    st = vc4__launch(ctx, k, nq, &ns);
+    ctx->st.kernel_ns += ns;
+    if (st == VC4_OK)
+        ctx->st.flops += 2ull * M * N * K;
+    return st;
+}
+
+/* zero-fill helper for padded scratch copies */
+static void zero(uint8_t *p, size_t bytes) { memset(p, 0, bytes); }
+
+vc4_status vc4_matmul(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
+                      vc4_buf *C, uint32_t M, uint32_t N, uint32_t K,
+                      vc4_layout layout)
+{
+    if (!ctx || !A || !B || !C || !M || !N || !K)
+        return VC4_ERR_INVAL;
+    if (ctx->dead)
+        return VC4_ERR_TIMEOUT;
+    if (layout != VC4_LAYOUT_ROW_MAJOR)
+        return VC4_ERR_UNSUPPORTED;
+    if (A->bytes < (size_t)M * K * 4 || B->bytes < (size_t)N * K * 4 ||
+        C->bytes < (size_t)M * N * 4) {
+        vc4__set_err(ctx, "matmul: buffer too small for %ux%ux%u", M, N, K);
+        return VC4_ERR_INVAL;
+    }
+
+    const uint32_t Mp = vc4__align8(M), Np = vc4__align64(N),
+                   Kp = vc4__align16(K);
+    const uint32_t a_bus = vc4_bus_addr(ctx, A);
+    const uint32_t b_bus = vc4_bus_addr(ctx, B);
+    const uint32_t c_bus = vc4_bus_addr(ctx, C);
+
+    vc4__scratch_reset(ctx);
+
+    /* A panel (always scratch: it is the coalesced copy the GEMM reads) */
+    vc4_buf pb;
+    uint8_t *panel = vc4__scratch_alloc(ctx, (size_t)Mp * Kp * 4, &pb);
+    if (!panel) {
+        vc4__set_err(ctx, "matmul: no room for a %ux%u panel", Mp, Kp);
+        return VC4_ERR_NOMEM;
+    }
+
+    /* A: the packer reads 8-row units of K floats with a constant pitch, so it
+     * needs M 8-aligned and K 16-aligned. */
+    uint32_t a_src_bus = a_bus;
+    if (Mp != M || Kp != K) {
+        float *ap = vc4__scratch_alloc(ctx, (size_t)Mp * Kp * 4, NULL);
+        if (!ap)
+            return VC4_ERR_NOMEM;
+        zero((uint8_t *)ap, (size_t)Mp * Kp * 4);
+        for (uint32_t r = 0; r < M; ++r)
+            memcpy((uint8_t *)ap + (size_t)r * Kp * 4,
+                   ctx->arena + A->off + (size_t)r * K * 4, (size_t)K * 4);
+        a_src_bus = ctx->gpu_bus + (uint32_t)((uint8_t *)ap - ctx->arena);
+    }
+
+    /* B: read row-major with row stride N*4; needs K 16-aligned and N
+     * 64-aligned (one 64-column tile). */
+    uint32_t b_src_bus = b_bus;
+    if (Kp != K || Np != N) {
+        float *bp = vc4__scratch_alloc(ctx, (size_t)Kp * Np * 4, NULL);
+        if (!bp)
+            return VC4_ERR_NOMEM;
+        zero((uint8_t *)bp, (size_t)Kp * Np * 4);
+        for (uint32_t r = 0; r < K; ++r)
+            memcpy((uint8_t *)bp + (size_t)r * Np * 4,
+                   ctx->arena + B->off + (size_t)r * N * 4, (size_t)N * 4);
+        b_src_bus = ctx->gpu_bus + (uint32_t)((uint8_t *)bp - ctx->arena);
+    }
+
+    /* C: the GEMM writes full 8x64 tiles */
+    uint32_t c_dst_bus = c_bus;
+    float *c_tmp = NULL;
+    if (Mp != M || Np != N) {
+        c_tmp = vc4__scratch_alloc(ctx, (size_t)Mp * Np * 4, NULL);
+        if (!c_tmp)
+            return VC4_ERR_NOMEM;
+        memset((uint8_t *)c_tmp, 0, (size_t)Mp * Np * 4);
+        c_dst_bus = ctx->gpu_bus + (uint32_t)((uint8_t *)c_tmp - ctx->arena);
+    }
+
+    vc4_status st = vc4__pack_run(ctx, a_src_bus, Kp, ctx->gpu_bus + pb.off,
+                                  Mp / 8);
+    if (st != VC4_OK) {
+        vc4__scratch_reset(ctx);
+        return st;
+    }
+    st = vc4__gemm_run(ctx, Mp, Np, Kp, b_src_bus, c_dst_bus,
+                       ctx->gpu_bus + pb.off);
+    if (st == VC4_OK && c_tmp) {
+        vc4__l2_flush(ctx);
+        for (uint32_t r = 0; r < M; ++r)
+            memcpy(ctx->arena + C->off + (size_t)r * N * 4,
+                   (uint8_t *)c_tmp + (size_t)r * Np * 4, (size_t)N * 4);
+    }
+    vc4__scratch_reset(ctx);
+    return st;
+}

@@ -19,9 +19,10 @@ Every external source used by this work, with what it was used for and its statu
 
 | source | URL | used for | status |
 |---|---|---|---|
-| hermanhermitage/videocoreiv | https://github.com/hermanhermitage/videocoreiv | `videocoreiv.arch`, `tinyasm`, IDA plugin, bare-metal samples; docs above | in use (xcheck) |
+| hermanhermitage/videocoreiv | https://github.com/hermanhermitage/videocoreiv | `videocoreiv.arch` and `tinyasm` are the **32-bit scalar VPU**, not the QPU; IDA plugin, bare-metal samples; docs above | reviewed; not a QPU oracle |
 | hermanhermitage/videocoreiv-qpu | https://github.com/hermanhermitage/videocoreiv-qpu | QPU instruction-set documentation (rotations, pack/unpack, small immediates) | in use (xcheck) |
-| itszor/vc4-toolchain | https://github.com/itszor/vc4-toolchain | GNU binutils port with a vc4 assembler/disassembler for byte-level cross-validation | in use (xcheck) |
+| itszor/vc4-toolchain | https://github.com/itszor/vc4-toolchain | GNU binutils port for the **32-bit scalar VPU** (ELF32, `fadd$alu32cond`), not the 64-bit QPU word; `gas` builds but is not a QPU oracle | reviewed in `docs/XCHECK.md`; not used |
+| maazl/vc4asm | https://github.com/maazl/vc4asm | independent QPU macro assembler/disassembler with constraint checker; source of the `r5rep`/`r5quad` names and the rotate/constant aliasing notes | in use (xcheck) |
 | anholt/vc4-gpu-tools | https://github.com/anholt/vc4-gpu-tools | Broadcom-copyrighted `vc4_qpu_defines.h` (opcode/register enums), `vc4_packet.h`, `vc4_qpu_disasm.c` disassembler, `vc4_dump_hang_state.c` hang parser | in use (xcheck) |
 | Raspberry Pi firmware/userland (`bcm_host`) | bookworm `libraspberrypi-dev` packages (see `README.debian13.md`) | required by VC4CL and V3DLib on Debian 13, which dropped it | in use |
 | Mesa `vc4` gallium driver | https://gitlab.freedesktop.org/mesa/mesa (`src/gallium/drivers/vc4`) | reference for the CL submission UAPI and QPU encoding | referenced |
@@ -62,7 +63,8 @@ Every external source used by this work, with what it was used for and its statu
 | L2 128 KB, GPU-only, outside the ARM MMU, hence physical DMA addressing | BCM2835 Overview |
 | FP results take 3 cycles; two consumers must not follow immediately | Performance Considerations (patent quote) + our 3-word chains |
 | VPM/VDW store semantics (DEPTH=4, UNITS, stride as gap) | AG100-R + our probes |
-| Rotate range and `rep` ws semantics | under test in `docs/XCHECK.md` (anholt/vc4-gpu-tools + tinyasm) |
+| Rotate codes: 48 = rotate by r5, 49..63 = rotate 1..15; 48..63 alias constants -16..-1 | confirmed in `docs/XCHECK.md` (vc4asm, qpuasm, AG100-R addendum) |
+| `rep` ws semantics: ws=1 = `r5rep` (16 lanes), ws=0 = `r5quad` (per quad) | confirmed in `docs/XCHECK.md` (vc4asm parser tables, qpuasm tables, AG100-R addendum) |
 
 ## Emma Anholt — author of the open VC4/V3D stack
 

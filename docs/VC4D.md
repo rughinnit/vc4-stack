@@ -1,7 +1,7 @@
 # vc4d — privileged helper for unprivileged VC4 compute
 
-Source tree: `/home/raspi/work/vc4d`, mirrored in this repo as `vc4d/`.
-Installed as `vc4d.service` (active, protocol version 2).
+Source tree: `/home/raspi/work/vc4d`. Installed as `vc4d.service` (active,
+protocol version 2).
 
 Goal: move `/dev/mem` and V3D dispatch out of client processes, so engines and
 tools run unprivileged without raw memory access.
@@ -60,11 +60,11 @@ client has uid 1000, CapEff=0 and no `/dev/mem`.  See `docs/DAEMON.md`.
 
 | path | GPU ms | GFLOP/s (GPU) | wall ms | GFLOP/s (wall) | overhead |
 |---|---|---|---|---|---|
-| direct root | 3.949 | 8.50 | 3.976 | 8.44 | — |
-| via vc4d | 3.985 | 8.42 | 4.271 | 7.86 | +0.295 ms (7.4%) |
+| direct root | 3.962 | 8.47 | 3.980 | 8.43 | — |
+| via vc4d | 3.998 | 8.39 | 4.289 | 7.82 | +0.309 ms (7.8%) |
 
-128³: direct 0.708 ms / 5.80 GFLOP/s wall, daemon 0.770 ms GPU / 0.941 ms
-wall / 4.46 GFLOP/s, i.e. +0.218 ms (30%) — two round trips plus the
+128³: direct 0.706 ms / 5.80 GFLOP/s wall, daemon 0.771 ms GPU / 0.942 ms
+wall / 4.45 GFLOP/s, i.e. +0.219 ms (30%) — two round trips plus the
 fixed-size cache maintenance on a 0.72 ms call.  The QPU work itself is
 within 1% (256³) and 9% (128³) of the direct path.  The demo (six messages
 per GEMM iteration) measures 5–13% at 256³; the engine's one-round-trip

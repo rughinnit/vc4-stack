@@ -262,25 +262,35 @@ vc4_status vc4__pack3_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen,
     return st;
 }
 
-vc4_status vc4__gemm3_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
-                         int bmode, uint32_t b_bus, uint32_t c_bus,
-                         uint32_t panel_bus)
+vc4_status vc4__gemm3_run_c(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
+                            int bmode, uint32_t b_bus, uint32_t c_bus,
+                            uint32_t panel_bus, uint32_t cstride)
 {
     if (M % 16 || N % 16 || K % 16)
+        return VC4_ERR_INVAL;
+    if (cstride == 0)
+        cstride = N;
+    if (cstride < N || cstride % 16)
         return VC4_ERR_INVAL;
     const uint32_t tr = M / 16;
     int nq = tr < VC4_MAX_QPU ? (int)tr : VC4_MAX_QPU;
 
-    char name[80], nm[16], nn[16], nk[16], nb[8], nkpu[8];
+    char name[96], nm[16], nn[16], nk[16], nb[8], nkpu[8], ncs[16];
     char *argv[] = { (char *)"gemm3", (char *)"--M", nm, (char *)"--N", nn,
                      (char *)"--K", nk, (char *)"--nqpu", nkpu,
-                     (char *)"--bmode", nb, NULL };
+                     (char *)"--bmode", nb, (char *)"--cstride", ncs, NULL };
     snprintf(nm, sizeof(nm), "%u", M);
     snprintf(nn, sizeof(nn), "%u", N);
     snprintf(nk, sizeof(nk), "%u", K);
     snprintf(nkpu, sizeof(nkpu), "%d", nq);
     snprintf(nb, sizeof(nb), "%d", bmode ? 1 : 0);
-    snprintf(name, sizeof(name), "gemm_%u_%u_%u_b%d_q%d", M, N, K, bmode ? 1 : 0, nq);
+    snprintf(ncs, sizeof(ncs), "%u", cstride);
+    if (cstride == N)
+        snprintf(name, sizeof(name), "gemm_%u_%u_%u_b%d_q%d", M, N, K,
+                 bmode ? 1 : 0, nq);
+    else
+        snprintf(name, sizeof(name), "gemm_%u_%u_%u_b%d_q%d_cs%u", M, N, K,
+                 bmode ? 1 : 0, nq, cstride);
 
     vc4_kernel *k = NULL;
     vc4_status st = vc4__kernel(ctx, name, argv, nq, &k);
@@ -288,7 +298,7 @@ vc4_status vc4__gemm3_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
         return st;
 
     const uint32_t a_rb = 64u * K;
-    const uint32_t c_rb = 16u * N * 4u;
+    const uint32_t c_rb = 16u * cstride * 4u;
     for (int i = 0; i < nq; ++i) {
         uint32_t *u = vc4__uni(ctx, k, i);
         u[0] = panel_bus;
@@ -306,6 +316,13 @@ vc4_status vc4__gemm3_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
     if (st == VC4_OK)
         ctx->st.flops += 2ull * M * N * K;
     return st;
+}
+
+vc4_status vc4__gemm3_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
+                          int bmode, uint32_t b_bus, uint32_t c_bus,
+                          uint32_t panel_bus)
+{
+    return vc4__gemm3_run_c(ctx, M, N, K, bmode, b_bus, c_bus, panel_bus, N);
 }
 
 /* zero3-fill helper for padded scratch copies */

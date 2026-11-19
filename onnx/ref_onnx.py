@@ -27,15 +27,16 @@ def _attr(node, name, default=None):
     return default
 
 
-def conv(x, w, b, pads, strides, group):
+def conv(x, w, b, pads, strides, group, dil=(1, 1)):
     n, c, h, wd = x.shape
     cout, cg, kh, kw = w.shape
     ph, pw = pads[0], pads[1]
     sh, sw = strides
+    dh, dw = int(dil[0]), int(dil[1])
     xp = np.pad(x.astype(np.float64), ((0, 0), (0, 0), (ph, pads[2]),
                                        (pw, pads[3])))
-    ho = (h + ph + pads[2] - kh) // sh + 1
-    wo = (wd + pw + pads[3] - kw) // sw + 1
+    ho = (h + ph + pads[2] - (kh - 1) * dh - 1) // sh + 1
+    wo = (wd + pw + pads[3] - (kw - 1) * dw - 1) // sw + 1
     out = np.zeros((n, cout, ho, wo))
     og = cout // group
     for g in range(group):
@@ -44,7 +45,9 @@ def conv(x, w, b, pads, strides, group):
         acc = np.zeros((n, og, ho, wo))
         for ky in range(kh):
             for kx in range(kw):
-                patch = xg[:, :, ky:ky + sh * ho:sh, kx:kx + sw * wo:sw]
+                y0 = ky * dh
+                x0 = kx * dw
+                patch = xg[:, :, y0:y0 + sh * ho:sh, x0:x0 + sw * wo:sw]
                 acc += np.einsum("nchw,oc->nohw", patch, wg[:, :, ky, kx])
         out[:, g * og:(g + 1) * og] = acc
     if b is not None:
@@ -81,7 +84,8 @@ def eval_node(node, ins, vals=None):
     elif op == "Conv":
         out = conv(ins[0], ins[1], ins[2] if len(ins) > 2 else None,
                    a(node, "pads", [0, 0, 0, 0]),
-                   a(node, "strides", [1, 1]), int(a(node, "group", 1)))
+                   a(node, "strides", [1, 1]), int(a(node, "group", 1)),
+                   a(node, "dilations", [1, 1]))
     elif op == "Relu":
         out = np.maximum(ins[0], 0)
     elif op == "Sigmoid":
@@ -181,7 +185,8 @@ def run_model(path, feeds, want=None):
         elif op == "Conv":
             out = conv(ins[0], ins[1], ins[2] if len(ins) > 2 else None,
                        a(node, "pads", [0, 0, 0, 0]),
-                       a(node, "strides", [1, 1]), int(a(node, "group", 1)))
+                       a(node, "strides", [1, 1]), int(a(node, "group", 1)),
+                       a(node, "dilations", [1, 1]))
         elif op == "Relu":
             out = np.maximum(ins[0], 0)
         elif op == "Sigmoid":

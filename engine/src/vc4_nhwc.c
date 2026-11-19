@@ -43,17 +43,20 @@ static void nhwc_split(int units, int maxq, int rows, int *splits, int *ubatch)
     *ubatch = units <= maxq ? units : maxq;
 }
 
-/* zero-padded NHWC image [nimg][H+2p][W+2p][C]; returns the host pointer and
- * the GPU bus address of image 0. */
-static float *pad_copy(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
-                       int H, int W, int in_pitch, int pad, uint32_t *bus,
-                       size_t *img_bytes)
+/* one zero-padded NHWC image set, shared by every group of a grouped conv */
+typedef struct {
+    uint32_t bus;         /* GPU bus of image 0 */
+    size_t   img_bytes;   /* bytes per image */
+} nhwc_pad;
+
+static int nhwc_pad_image(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
+                          int H, int W, int in_pitch, int pad, nhwc_pad *pd)
 {
     const int hp = H + 2 * pad, wp = W + 2 * pad;
     const size_t per = (size_t)hp * wp * C * 4u;
     float *p = vc4__scratch_alloc(ctx, per * (size_t)nimg + NHWC_SLACK, NULL);
     if (!p)
-        return NULL;
+        return 0;
     memset((uint8_t *)p, 0, per * (size_t)nimg + NHWC_SLACK);
     for (int n = 0; n < nimg; ++n) {
         const uint8_t *src = ctx->arena + in->off +
@@ -63,11 +66,9 @@ static float *pad_copy(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
             memcpy(dst + ((size_t)(y + pad) * wp + pad) * C * 4u,
                    src + (size_t)y * in_pitch * C * 4u, (size_t)W * C * 4u);
     }
-    if (bus)
-        *bus = ctx->gpu_bus + (uint32_t)((uint8_t *)p - ctx->arena);
-    if (img_bytes)
-        *img_bytes = per;
-    return p;
+    pd->bus = ctx->gpu_bus + (uint32_t)((uint8_t *)p - ctx->arena);
+    pd->img_bytes = per;
+    return 1;
 }
 
 /* --------------------------------------------------------------- conv 2d */
@@ -139,74 +140,184 @@ vc4_status vc4_conv_nhwc_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int Cin,
     return st;
 }
 
-vc4_status vc4_conv_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
-                         int H, int W, int in_pitch, const vc4_buf *wpanel,
-                         int Cout, int KH, int KW, int stride, int pad,
-                         vc4_buf *out, int *ho_out, int *wo_out,
-                         int *opitch_out)
+/*
+ * One im2col + GEMM pass.
+ *
+ * `Cin` channels of a pixel that stores `Cin_pitch` channels are read,
+ * starting at byte `cin_off` (a grouped conv selects one channel block).
+ * The VDR pitch and the 16-pixel block step use Cin_pitch, the tap step and
+ * the channel-block count use Cin.  The padded image and the activation
+ * panel are owned by the caller, so a grouped conv pads once and reuses the
+ * panel for every group.
+ */
+static vc4_status nhwc_conv_pass(vc4_ctx *ctx, const nhwc_pad *pd, int nimg,
+                                 int cin_off, int Cin, int Cin_pitch, int W,
+                                 int KH, int KW, int stride, int pad,
+                                 int dilation, const vc4_buf *wpanel,
+                                 int Cout, int cstride, int cout_off,
+                                 uint32_t out_bus, int ho, int Wg,
+                                 const vc4_buf *pb)
 {
-    if (!ctx || !in || !wpanel || !out || !ho_out || !wo_out || !opitch_out ||
-        nimg < 1)
+    const int nx = Wg / 16;
+    const uint32_t M = (uint32_t)ho * (uint32_t)Wg;
+    const uint32_t nk = (uint32_t)(wpanel->bytes / ((size_t)Cout * 4u));
+
+    char ncin[16], nkh[8], nkw[8], nst[8], ndl[8], name[96];
+    char *argv[] = { (char *)"im2col_nhwc", (char *)"--cin", ncin,
+                     (char *)"--kh", nkh, (char *)"--kw", nkw,
+                     (char *)"--stride", nst, (char *)"--dil", ndl, NULL };
+    snprintf(ncin, sizeof(ncin), "%d", Cin);
+    snprintf(nkh, sizeof(nkh), "%d", KH);
+    snprintf(nkw, sizeof(nkw), "%d", KW);
+    snprintf(nst, sizeof(nst), "%d", stride);
+    snprintf(ndl, sizeof(ndl), "%d", dilation);
+    snprintf(name, sizeof(name), "im2col_nhwc2_%d_%d_%d_s%d_d%d", Cin, KH, KW,
+             stride, dilation);
+
+    vc4_kernel *k = NULL;
+    vc4_status st = vc4__kernel(ctx, name, argv, NHWC_IM2COL_QPU, &k);
+    if (st != VC4_OK)
+        return st;
+    const uint32_t row_pitch = (uint32_t)(W + 2 * pad) * Cin_pitch * 4u;
+    const uint32_t blk_step = 16u * (uint32_t)stride * Cin_pitch * 4u;
+    const uint32_t dst_step = 64u * nk;
+    const int chunk = nimg > NHWC_IM2COL_QPU ? NHWC_IM2COL_QPU : nimg;
+    for (int base = 0; base < nimg && st == VC4_OK; base += chunk) {
+        int nb = nimg - base;
+        if (nb > chunk)
+            nb = chunk;
+        int splits = NHWC_IM2COL_QPU / nb;
+        if (splits < 1)
+            splits = 1;
+        if (splits > ho)
+            splits = ho;
+        int nq = nb * splits;
+        int q = 0;
+        for (int n = 0; n < nb; ++n) {
+            int per = ho / splits, rem = ho % splits;
+            for (int s = 0; s < splits; ++s, ++q) {
+                int row0 = s * per + (s < rem ? s : rem);
+                int cnt = per + (s < rem ? 1 : 0);
+                uint32_t *u = vc4__uni(ctx, k, q);
+                u[0] = pd->bus + (uint32_t)((size_t)(base + n) * pd->img_bytes)
+                       + (uint32_t)cin_off * 4u;
+                u[1] = ctx->gpu_bus + pb->off +
+                       (uint32_t)((size_t)(base + n) * M * nk * 4u);
+                u[2] = blk_step;
+                u[3] = dst_step;
+                u[4] = (uint32_t)cnt;
+                u[5] = (uint32_t)(row0 * stride) * row_pitch;
+                u[6] = (uint32_t)row0 * (uint32_t)nx * dst_step;
+                u[7] = (uint32_t)stride * Cin_pitch * 4u;
+                u[8] = (uint32_t)q;
+                u[9] = row_pitch;
+                u[10] = (uint32_t)nx;
+                u[11] = (uint32_t)stride * row_pitch;
+                u[12] = (uint32_t)Cin_pitch * 4u * (uint32_t)dilation;
+            }
+        }
+        uint64_t ns = 0;
+        st = vc4__launch(ctx, k, nq, &ns);
+        ctx->st.pack_ns += ns;
+    }
+    if (st != VC4_OK)
+        return st;
+
+    /* GEMM: N = Cout, K = nk (bias folded), C row stride = cstride and the
+     * output channel block starts at cout_off. */
+    return vc4__gemm3_run_c(ctx, (uint32_t)nimg * M, (uint32_t)Cout, nk, 1,
+                            vc4_bus_addr(ctx, wpanel), out_bus + cout_off * 4u,
+                            ctx->gpu_bus + pb->off, (uint32_t)cstride);
+}
+
+static vc4_status conv_nhwc_common(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                                   int Cin, int H, int W, int in_pitch,
+                                   const vc4_buf *const *wpanel, int Cout,
+                                   int groups, int KH, int KW, int stride,
+                                   int pad, int dilation, vc4_buf *out,
+                                   int *ho_out, int *wo_out, int *opitch_out)
+{
+    if (!ctx || !in || !wpanel || !wpanel[0] || !out || !ho_out || !wo_out ||
+        !opitch_out || nimg < 1 || groups < 1)
         return VC4_ERR_INVAL;
     if (ctx->dead)
         return VC4_ERR_TIMEOUT;
     if (Cin <= 0 || H <= 0 || W <= 0 || in_pitch < W || Cout <= 0) {
-        vc4__set_err(ctx, "conv_nhwc: bad dims in=%dx%dx%d p%d out=%d", Cin, H, W,
-                     in_pitch, Cout);
+        vc4__set_err(ctx, "conv_nhwc: bad dims in=%dx%dx%d p%d out=%d", Cin, H,
+                     W, in_pitch, Cout);
         return VC4_ERR_INVAL;
     }
-    if (Cin % 16 || Cout % 16) {
-        vc4__set_err(ctx, "conv_nhwc: Cin/Cout must be multiples of 16 (%d/%d)",
-                     Cin, Cout);
+    if (Cin % groups || Cout % groups) {
+        vc4__set_err(ctx, "conv_nhwc: groups %d does not divide %d/%d",
+                     groups, Cin, Cout);
         return VC4_ERR_UNSUPPORTED;
     }
-    if (!((KH == 3 && KW == 3) || (KH == 1 && KW == 1))) {
-        vc4__set_err(ctx, "conv_nhwc: only 3x3 and 1x1 (%dx%d)", KH, KW);
+    const int Cin_g = Cin / groups, Cout_g = Cout / groups;
+    if (Cin_g % 16 || Cout_g % 16) {
+        vc4__set_err(ctx, "conv_nhwc: per-group Cin/Cout must be multiples "
+                     "of 16 (%d/%d)", Cin_g, Cout_g);
         return VC4_ERR_UNSUPPORTED;
     }
-    if ((stride != 1 && stride != 2) || pad < 0) {
-        vc4__set_err(ctx, "conv_nhwc: stride %d pad %d", stride, pad);
+    if (!((KH == 1 || KH == 3 || KH == 5) &&
+          (KW == 1 || KW == 3 || KW == 5))) {
+        vc4__set_err(ctx, "conv_nhwc: only 1/3/5-wide kernels (%dx%d)", KH, KW);
         return VC4_ERR_UNSUPPORTED;
     }
-    const int wo = (W + 2 * pad - KW) / stride + 1;
-    const int ho = (H + 2 * pad - KH) / stride + 1;
+    if ((stride != 1 && stride != 2) || pad < 0 ||
+        dilation < 1 || dilation > 8) {
+        vc4__set_err(ctx, "conv_nhwc: stride %d pad %d dil %d", stride, pad,
+                     dilation);
+        return VC4_ERR_UNSUPPORTED;
+    }
+    const int effh = (KH - 1) * dilation + 1;
+    const int effw = (KW - 1) * dilation + 1;
+    const int wo = (W + 2 * pad - effw) / stride + 1;
+    const int ho = (H + 2 * pad - effh) / stride + 1;
     if (wo <= 0 || ho <= 0)
         return VC4_ERR_INVAL;
     const int Wg = (int)al16((uint32_t)wo);
-    const int nx = Wg / 16;
     const uint32_t M = (uint32_t)ho * (uint32_t)Wg;
-    const uint32_t K = (uint32_t)Cin * (uint32_t)(KH * KW);
+    const uint32_t K = (uint32_t)Cin_g * (uint32_t)(KH * KW);
     const uint32_t Kp = al16(K);
-    if (Kp != K)
-        return VC4_ERR_UNSUPPORTED;                /* im2col fills k < K only */
-    const uint32_t nk = (uint32_t)(wpanel->bytes / ((size_t)Cout * 4u));
-    if (nk != Kp && nk != Kp + 16u) {
-        vc4__set_err(ctx, "conv_nhwc: wpanel nk=%u (Kp=%u)", nk, Kp);
-        return VC4_ERR_INVAL;
+    if (Kp != K) {
+        vc4__set_err(ctx, "conv_nhwc: per-group K=%u not 16-aligned", K);
+        return VC4_ERR_UNSUPPORTED;
     }
+    if ((uint32_t)stride * (uint32_t)Cin * 4u > 8191u) {
+        vc4__set_err(ctx, "conv_nhwc: VDR pitch %u B > 8191 B (stride %d, "
+                     "Cin %d)", (uint32_t)stride * Cin * 4u, stride, Cin);
+        return VC4_ERR_UNSUPPORTED;
+    }
+    for (int g = 0; g < groups; ++g) {
+        const uint32_t nk = (uint32_t)(wpanel[g]->bytes /
+                                       ((size_t)Cout_g * 4u));
+        if (nk != Kp && nk != Kp + 16u) {
+            vc4__set_err(ctx, "conv_nhwc: group %d wpanel nk=%u (Kp=%u)", g,
+                         nk, Kp);
+            return VC4_ERR_INVAL;
+        }
+    }
+    const uint32_t nk = (uint32_t)(wpanel[0]->bytes / ((size_t)Cout_g * 4u));
     if (in->bytes < (size_t)nimg * H * in_pitch * Cin * 4) {
         vc4__set_err(ctx, "conv_nhwc: input %zu B < %zu B", in->bytes,
                      (size_t)nimg * H * in_pitch * Cin * 4);
         return VC4_ERR_INVAL;
     }
     if (out->bytes < (size_t)nimg * M * Cout * 4) {
-        vc4__set_err(ctx, "conv_nhwc: output %zu B < %zu B (M=%u nk=%u)", out->bytes,
-                     (size_t)nimg * M * Cout * 4, M, nk);
+        vc4__set_err(ctx, "conv_nhwc: output %zu B < %zu B (M=%u nk=%u)",
+                     out->bytes, (size_t)nimg * M * Cout * 4, M, nk);
         return VC4_ERR_INVAL;
     }
 
-    /* 1. zero-padded NHWC copy (bytes only) */
+    /* 1. zero-padded NHWC copy of the whole input (bytes only) */
     vc4__scratch_reset(ctx);
-    uint32_t src_bus = 0;
-    size_t img_bytes = 0;
-    float *pad_img = pad_copy(ctx, in, nimg, Cin, H, W, in_pitch, pad,
-                              &src_bus, &img_bytes);
-    if (!pad_img) {
+    nhwc_pad pd;
+    if (!nhwc_pad_image(ctx, in, nimg, Cin, H, W, in_pitch, pad, &pd)) {
         vc4__scratch_reset(ctx);
         return VC4_ERR_NOMEM;
     }
 
-    /* 2. panel (scratch; the im2col writes k < K, the bias row is 1.0) */
+    /* 2. activation panel, reused by every group */
     vc4_buf pb;
     size_t panel_bytes = (size_t)nimg * M * nk * 4u;
     float *panel = vc4__scratch_alloc(ctx, panel_bytes, &pb);
@@ -223,76 +334,11 @@ vc4_status vc4_conv_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
         }
     }
 
-    /* 3. im2col: up to 4 QPUs (16 VPM rows each); split rows per image */
-    {
-        char ncin[16], nkh[8], nkw[8], nst[8], name[80];
-        char *argv[] = { (char *)"im2col_nhwc", (char *)"--cin", ncin,
-                         (char *)"--kh", nkh, (char *)"--kw", nkw,
-                         (char *)"--stride", nst, NULL };
-        snprintf(ncin, sizeof(ncin), "%d", Cin);
-        snprintf(nkh, sizeof(nkh), "%d", KH);
-        snprintf(nkw, sizeof(nkw), "%d", KW);
-        snprintf(nst, sizeof(nst), "%d", stride);
-        snprintf(name, sizeof(name), "im2col_nhwc_%d_%d_%d_s%d", Cin, KH, KW,
-                 stride);
-
-        vc4_kernel *k = NULL;
-        vc4_status st = vc4__kernel(ctx, name, argv, NHWC_IM2COL_QPU, &k);
-        if (st != VC4_OK) {
-            vc4__scratch_reset(ctx);
-            return st;
-        }
-        const uint32_t row_pitch = (uint32_t)(W + 2 * pad) * Cin * 4u;
-        const uint32_t blk_step = 16u * (uint32_t)stride * Cin * 4u;
-        const uint32_t dst_step = 64u * nk;
-        const int chunk = nimg > NHWC_IM2COL_QPU ? NHWC_IM2COL_QPU : nimg;
-        for (int base = 0; base < nimg && st == VC4_OK; base += chunk) {
-            int nb = nimg - base;
-            if (nb > chunk)
-                nb = chunk;
-            int splits = NHWC_IM2COL_QPU / nb;
-            if (splits < 1)
-                splits = 1;
-            if (splits > ho)
-                splits = ho;
-            int nq = nb * splits;
-            int q = 0;
-            for (int n = 0; n < nb; ++n) {
-                int per = ho / splits, rem = ho % splits;
-                for (int s = 0; s < splits; ++s, ++q) {
-                    int row0 = s * per + (s < rem ? s : rem);
-                    int cnt = per + (s < rem ? 1 : 0);
-                    uint32_t *u = vc4__uni(ctx, k, q);
-                    u[0] = src_bus + (uint32_t)((size_t)(base + n) * img_bytes);
-                    u[1] = ctx->gpu_bus + pb.off +
-                           (uint32_t)((size_t)(base + n) * M * nk * 4u);
-                    u[2] = blk_step;
-                    u[3] = dst_step;
-                    u[4] = (uint32_t)cnt;
-                    u[5] = (uint32_t)(row0 * stride) * row_pitch;
-                    u[6] = (uint32_t)row0 * (uint32_t)nx * dst_step;
-                    u[7] = (uint32_t)stride * Cin * 4u;
-                    u[8] = (uint32_t)q;
-                    u[9] = row_pitch;
-                    u[10] = (uint32_t)nx;
-                    u[11] = (uint32_t)stride * row_pitch;
-                }
-            }
-            uint64_t ns = 0;
-            st = vc4__launch(ctx, k, nq, &ns);
-            ctx->st.pack_ns += ns;
-        }
-        if (st != VC4_OK) {
-            vc4__scratch_reset(ctx);
-            return st;
-        }
-    }
-
-    /* 4. GEMM: M rows per image, N = Cout, K = nk (bias folded) */
-    vc4_status st = vc4__gemm3_run(ctx, (uint32_t)nimg * M, (uint32_t)Cout, nk,
-                                   1, vc4_bus_addr(ctx, wpanel),
-                                   vc4_bus_addr(ctx, out),
-                                   ctx->gpu_bus + pb.off);
+    vc4_status st = VC4_OK;
+    for (int g = 0; g < groups && st == VC4_OK; ++g)
+        st = nhwc_conv_pass(ctx, &pd, nimg, g * Cin_g, Cin_g, Cin, W, KH, KW,
+                            stride, pad, dilation, wpanel[g], Cout_g, Cout,
+                            g * Cout_g, vc4_bus_addr(ctx, out), ho, Wg, &pb);
     vc4__scratch_reset(ctx);
     if (st == VC4_OK) {
         *ho_out = ho;
@@ -302,6 +348,39 @@ vc4_status vc4_conv_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
     return st;
 }
 
+vc4_status vc4_conv_nhwc_dil(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
+                             int H, int W, int in_pitch,
+                             const vc4_buf *wpanel, int Cout, int KH, int KW,
+                             int stride, int pad, int dilation, vc4_buf *out,
+                             int *ho_out, int *wo_out, int *opitch_out)
+{
+    return conv_nhwc_common(ctx, in, nimg, Cin, H, W, in_pitch, &wpanel, Cout,
+                            1, KH, KW, stride, pad, dilation, out, ho_out,
+                            wo_out, opitch_out);
+}
+
+vc4_status vc4_conv_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
+                         int H, int W, int in_pitch, const vc4_buf *wpanel,
+                         int Cout, int KH, int KW, int stride, int pad,
+                         vc4_buf *out, int *ho_out, int *wo_out,
+                         int *opitch_out)
+{
+    return vc4_conv_nhwc_dil(ctx, in, nimg, Cin, H, W, in_pitch, wpanel, Cout,
+                             KH, KW, stride, pad, 1, out, ho_out, wo_out,
+                             opitch_out);
+}
+
+vc4_status vc4_conv_nhwc_group(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                               int Cin, int H, int W, int in_pitch,
+                               const vc4_buf *const *wpanel, int Cout,
+                               int groups, int KH, int KW, int stride, int pad,
+                               int dilation, vc4_buf *out, int *ho_out,
+                               int *wo_out, int *opitch_out)
+{
+    return conv_nhwc_common(ctx, in, nimg, Cin, H, W, in_pitch, wpanel, Cout,
+                            groups, KH, KW, stride, pad, dilation, out, ho_out,
+                            wo_out, opitch_out);
+}
 /* ------------------------------------------------------------- depthwise */
 /*
  * A 3x3 depthwise conv is a 3x3 conv whose weight matrix is block diagonal:
@@ -391,10 +470,8 @@ vc4_status vc4_maxpool_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
         return VC4_ERR_INVAL;
 
     vc4__scratch_reset(ctx);
-    uint32_t src_bus = 0;
-    size_t img_bytes = 0;
-    if (!pad_copy(ctx, in, nimg, C, H, W, in_pitch, pad, &src_bus,
-                  &img_bytes)) {
+    nhwc_pad pd;
+    if (!nhwc_pad_image(ctx, in, nimg, C, H, W, in_pitch, pad, &pd)) {
         vc4__scratch_reset(ctx);
         return VC4_ERR_NOMEM;
     }
@@ -427,7 +504,7 @@ vc4_status vc4_maxpool_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
                 int row0 = sp * per + (sp < rem ? sp : rem);
                 int cnt = per + (sp < rem ? 1 : 0);
                 uint32_t *u = vc4__uni(ctx, k, q);
-                u[0] = src_bus + (uint32_t)((size_t)n * img_bytes) +
+                u[0] = pd.bus + (uint32_t)((size_t)n * pd.img_bytes) +
                        (uint32_t)cb * 64u;
                 u[1] = vc4_bus_addr(ctx, out) + (uint32_t)((size_t)n * dst_img);
                 u[2] = (uint32_t)cnt;

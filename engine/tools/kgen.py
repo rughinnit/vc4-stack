@@ -366,11 +366,16 @@ def emit_store16(p, stride_bytes, cstep_reg=B_CSTEP):
         p.emit(add_(ADD_ADD, A_CADR, areg(A_CADR), (REGB, cstep_reg)))
 
 
-def build_gemm(M, N, K, nqpu, bmode=0, depth=3):
+def build_gemm(M, N, K, nqpu, bmode=0, depth=3, cstride=None):
     TR, TC = M // 16, N // 16
     assert M % 16 == 0 and N % 16 == 0 and K % 16 == 0, "shapes must be 16-aligned"
     assert TR >= 1 and TC >= 1 and 1 <= nqpu <= 12
-    stride = (N - 16) * 4
+    # C row pitch in floats.  The default is N (a plain [M][N] result); a
+    # grouped conv passes the full output channel count so each group's GEMM
+    # can write its channel block straight into one [M][Cout] image.
+    CS = N if cstride is None else cstride
+    assert CS >= N and CS % 16 == 0, "C stride must be >= N and 16-aligned"
+    stride = (CS - 16) * 4
     tr_neg = (0 - TR) & 0xFFFFFFFF
     b = Builder()
     p = b.p
@@ -398,7 +403,7 @@ def build_gemm(M, N, K, nqpu, bmode=0, depth=3):
     b.e(add_(ADD_SHL, B_ALANE, ws=1, a=areg(A_LANE), b=imm(2)))
     b.e(add_(ADD_SHL, B_BLANE, ws=1, a=areg(A_LANE), b=imm(2)))
     b.e(ldi(N * 4 if bmode == 0 else 64, B_BST, ws=1))
-    b.e(ldi(4 * N * 4, B_CSTEP, ws=1))
+    b.e(ldi(4 * CS * 4, B_CSTEP, ws=1))
     b.e(ldi(64, B_CBSTEP, ws=1))
     b.e(ldi(64, B_ASTEP, ws=1))
     # column-block stride in B: 16 floats for row-major B, a whole k-major
@@ -2149,7 +2154,7 @@ def _tmu_load_b(b, tmu, addr_reg, dst):
     b.e(add_or(dst, acc(4), acc(4), ws=1))
 
 
-def build_im2col_nhwc(Cin, KH, KW, stride=1, vpitch=1):
+def build_im2col_nhwc(Cin, KH, KW, stride=1, vpitch=1, dilation=1):
     """K-major GEMM panel straight from a zero-padded NHWC image.
 
     One row block = 16 consecutive OUTPUT pixels of one output row, so the
@@ -2162,6 +2167,13 @@ def build_im2col_nhwc(Cin, KH, KW, stride=1, vpitch=1):
     loops over the Cin/16 channel blocks; nx (16-pixel blocks per row) and the
     rows per QPU are uniforms, so one blob serves every spatial size.
 
+    ``stride`` decimates on the QPU: the VDR reads 16 output pixels whose
+    source pixels are ``stride`` apart (pitch ``stride*Cin*4``) and the row
+    advance is ``stride`` input rows, so a stride-2 conv uses the plain
+    kernel - no phase images.  ``dilation`` (compile-time, 1..4) spaces the
+    taps of one kernel row by ``dilation`` pixels and the kernel rows by
+    ``dilation`` input rows.
+
     KERNEL ABI (u0..u10)
       u0 src base bus                       u1 panel base bus
       u2 src 16-pixel block step (16*stride*Cin*4)
@@ -2172,6 +2184,7 @@ def build_im2col_nhwc(Cin, KH, KW, stride=1, vpitch=1):
       u7 VDR pitch (stride*Cin*4)           u8 QPU index
       u9 padded-image row stride            u10 nx (blocks per row)
       u11 source advance per output row (stride*row stride)
+      u12 pixel step in bytes (Cin_pitch*4*dilation)
     """
     assert Cin % 16 == 0
     nseg = KH * KW
@@ -2196,6 +2209,7 @@ def build_im2col_nhwc(Cin, KH, KW, stride=1, vpitch=1):
     b.read_uni(B['PLANE'], ws=1)                        # u9
     b.read_uni(B['NX'], ws=1)                           # u10
     b.read_uni(B['RADV'], ws=1)                         # u11 stride*row_pitch
+    b.read_uni(B['C4'], ws=1)                           # u12 pixel step*dil
 
     b.e(ldi(V.vdr_basic(0, vpitch), A['VDRW']), nop())
     b.e(ldi(V.vdw_basic(0, 16, 16, horizontal=0), A['VDWW']), nop())
@@ -2208,7 +2222,9 @@ def build_im2col_nhwc(Cin, KH, KW, stride=1, vpitch=1):
     b.e(ldi(V.vdw_stride(0), A['VDWS']), nop())
     b.e(ldi(64, B['C64'], ws=1), nop())
     b.e(ldi(1024, B['D1K'], ws=1), nop())
-    b.e(ldi(Cin * 4, B['C4'], ws=1), nop())     # per-kx tap step (compile-time)
+    # u12 is the per-kx pixel step: Cin_pitch*4*dilation.  It is a uniform,
+    # not a constant, because a grouped conv reads Cin/groups of the
+    # Cin_pitch channels that a pixel actually stores.
     b.e(add_(ADD_ADD, A['SRC'], areg(A['SRCB']), breg(B['SOFF'])), nop())
     b.e(add_(ADD_ADD, A['DSTX'], areg(A['PB']), breg(B['DOFF'])), nop(), nop())
 
@@ -2220,7 +2236,7 @@ def build_im2col_nhwc(Cin, KH, KW, stride=1, vpitch=1):
     for s in range(nseg):
         ky, kx = divmod(s, KW)
         b.e(add_or(A['SEGSRC'], areg(A['SEG0']), areg(A['SEG0'])), nop())
-        for _ in range(ky):
+        for _ in range(ky * dilation):
             b.e(add_(ADD_ADD, A['SEGSRC'], areg(A['SEGSRC']), breg(B['PLANE'])))
         for _ in range(kx):
             b.e(add_(ADD_ADD, A['SEGSRC'], areg(A['SEGSRC']), breg(B['C4'])))
@@ -3300,7 +3316,7 @@ def main(argv):
                          opts.get('probe'), bool(g('single', 0)))
     elif kind == 'gemm3':
         p = build_gemm(g('M'), g('N'), g('K'), g('nqpu', 12), g('bmode', 0),
-                       g('depth', 3))
+                       g('depth', 3), g('cstride', None))
     elif kind == 'pack':
         p = build_pack10(g('k'))
     elif kind == 'pack3':
@@ -3316,7 +3332,8 @@ def main(argv):
     elif kind == 'pooln':
         p = build_pooln(g('n'), g('s'), g('wp'), g('op'))
     elif kind == 'im2col_nhwc':
-        p = build_im2col_nhwc(g('cin'), g('kh'), g('kw'), g('stride', 1))
+        p = build_im2col_nhwc(g('cin'), g('kh'), g('kw'), g('stride', 1),
+                              dilation=g('dil', 1))
     elif kind == 'probe_lane':
         p = build_probe_lane()
     elif kind == 'probe_lane_b':

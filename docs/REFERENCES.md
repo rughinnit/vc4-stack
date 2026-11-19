@@ -127,3 +127,26 @@ She built the open source Linux graphics stack for VideoCore IV at Broadcom
   vc4asm, qpuasm, vc4dis) and a good candidate to extend `docs/XCHECK.md`; `sgemm.py` is a
   reference implementation for comparison; the DSL is a model for ergonomic kernel writing.
 - Related: `Idein/py-videocore6` targets the Pi 4 V3D.
+
+## Pete Warden (jetpacapp) — QPU assembler and GPU-accelerated CNN on VC4
+
+| work | link | what it is / relevance |
+|---|---|---|
+| **`jetpacapp/qpu-asm`** | https://github.com/jetpacapp/qpu-asm | Macro assembler for the VideoCore IV QPU, with macros/functions and DMA-controller macros. It is the direct ancestor of **`maazl/vc4asm`**, one of the four independent assemblers used in `docs/XCHECK.md`. Our encoder validation chain runs through his work. |
+| **`jetpacapp/DeepBeliefSDK`** | https://github.com/jetpacapp/DeepBeliefSDK | Jetpac's CNN inference framework (AlexNet architecture from Krizhevsky et al.) for iOS/Android/Linux/OSX/**Raspberry Pi**. The Pi build uses the **QPUs for a large part of the calculation** and must run as root. Reported: **~5 s per image on a stock Pi, ~3 s with a boosted GPU clock** (2014). |
+| "Deep learning on the Raspberry Pi!" | https://petewarden.com/2014/06/09/deep-learning-on-the-raspberry-pi | Write-up of the port; explains the GPU offload and the open-sourced QPU/DMA macros. |
+| "How to optimize Raspberry Pi code using its GPU" | https://petewarden.com/2014/08/07/how-to-optimize-raspberry-pi-code-using-its-gpu | Practical QPU optimisation notes; builds on Eman's assembler work. |
+| Raspberry Pi Foundation news | "More QPU magic from Pete Warden" and "New QPU macro assembler" | The Foundation's own summary: his Deep Belief port provided an **accelerated GEMM matrix-multiply on the QPUs**. |
+
+### Why this matters here
+
+- **Historical precedent for exactly our goal:** a full CNN ran on the VC4 QPUs in 2014 with a
+  QPU GEMM, at ~5 s/image (~3 s with a GPU overclock) on a stock Pi. That is the same order as
+  our measured band for a synthetic 160x160 forward (202.6 ms) and our estimate for small models;
+  DeepBelief's network is AlexNet-scale, far larger than YOLOv8n's per-image work at low resolution.
+- **Toolchain lineage:** qpu-asm -> vc4asm -> our cross-validation oracles. Our encoder is checked
+  against the descendents of his assembler.
+- **Caveat:** the DeepBelief Pi library is shipped as a prebuilt 32-bit Raspbian `.so`
+  (`RaspberryPiLibrary`), with the network implementation not open; it is not directly runnable on
+  our arm64 trixie board and cannot be used as a component. The value is the assembler, the
+  technique notes, and the historical baseline.

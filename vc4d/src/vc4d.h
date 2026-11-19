@@ -23,18 +23,18 @@
 /* arena layout (offsets inside the dma-buf) */
 #define A_HDR_BASE      0x000000u
 #define A_CODE_BASE     0x001000u
-#define A_CODE_SLOTS    64u
+#define A_CODE_SLOTS    128u
 #define A_CODE_SLOT     0x4000u          /* 16 KiB per program */
-#define A_UNI_BASE      0x110000u
+#define A_UNI_BASE      0x210000u
 #define A_UNI_SLOT      0x1000u          /* 12 QPUs x 64 B */
-#define A_DATA_BASE     0x200000u        /* client-allocatable heap */
+#define A_DATA_BASE     0x300000u        /* client-allocatable heap */
 
 #define MAX_CLIENTS     8
 #define MAX_REGIONS     64
 /* One client may cache up to all the daemon's program slots (64): the engine
  * uploads one program per kernel shape, and a test that runs several conv
  * shapes legitimately needs ~25.  MAX_PROGS_SLOTS bounds the total. */
-#define MAX_PROGS_CLI   64
+#define MAX_PROGS_CLI   128
 #define MAX_FREEBLK     64
 
 /* V3D registers used by name */

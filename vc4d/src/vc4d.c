@@ -51,7 +51,7 @@
 #define DEFAULT_SOCKET   "/run/vc4d.sock"
 #define DEFAULT_TIMEOUT  2000u
 #define MAX_TIMEOUT      10000u
-#define MAX_PROGS_SLOTS  64
+#define MAX_PROGS_SLOTS  128
 #define DEFAULT_GPU_LOCK "/tmp/vc4-gpu.lock"
 #define MAX_DENIALS_LOG  20
 

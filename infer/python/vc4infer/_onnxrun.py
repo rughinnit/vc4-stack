@@ -634,6 +634,55 @@ class Runner:
         return self.host.get(name)
 
     # ------------------------------------------------------------- utilities
+    # ------------------------------------------------- device layout copies
+    def _x(self, src, dst, rows, vpr, srow, drow, svec, dvec, slane,
+           nlane=16, nblk=1, sbstep=64, dbstep=64, units=None, depth=16):
+        """One vc4_copy2d_x call.  src/dst are arena Bufs (views are fine)."""
+        if units is None:
+            units = 4 if vpr % 4 == 0 else (2 if vpr % 2 == 0 else 1)
+        if depth < 16 and nlane == 16:
+            # a partial store moves `depth` words, so only that many lanes may
+            # be read (the rest are clamped to the vector base)
+            nlane = depth
+        self.eng.copy2d_x(src, dst, rows, vpr, srow, drow, svec, dvec, slane,
+                          nlane, nblk, sbstep, dbstep, units, depth)
+
+    def _buf_at(self, t, off):
+        """t's arena buffer (a Tensor or a Buf), shifted by `off` bytes."""
+        b = t.buf if isinstance(t, Tensor) else t
+        return vc4infer.Buf(b.off + int(off), b.bytes - int(off))
+
+    def _runs(self, src, dst, rows, n, srow, drow, svec=64, dvec=64,
+              slane=4, units=4):
+        """`rows` runs of `n` contiguous floats: whole vectors, then the
+        ~4-vector tail that ends at the end of each run (identical overlap),
+        then a k-word partial store when n is not a multiple of 16 floats."""
+        nv = n // 16
+        rem = n % 16
+        if rem:
+            off = (n - rem) * 4
+            self._x(self._buf_at(src, off), self._buf_at(dst, off), rows, 1,
+                    srow, drow, 64, 64, slane, 16, 1, 64, 64, 1, rem)
+        if nv >= 4:
+            full = (nv // 4) * 4
+            self._x(src, dst, rows, full, srow, drow, svec, dvec, slane, 16,
+                    1, 64, 64, 4, 16)
+            if nv % 4:
+                k = (nv - 4) * 16 * 4
+                self._x(self._buf_at(src, k), self._buf_at(dst, k), rows, 4,
+                        srow, drow, svec, dvec, slane, 16, 1, 64, 64, 4, 16)
+        elif nv:
+            self._x(src, dst, rows, nv, srow, drow, svec, dvec, slane, 16, 1,
+                    64, 64, 1, 16)
+
+    def _alloc_t(self, shape, layout="nchw", pitch=None, extra=0):
+        """An activation buffer from the pool, released after this node
+        unless it is one of the node's outputs."""
+        n = int(np.prod(shape)) if layout != "nhwc" else \
+            int(shape[0] * shape[2] * (pitch or shape[3]) * shape[1])
+        return self._tmp(Tensor(self.pool.alloc((n + extra) * 4 + 64), shape,
+                                layout, pitch))
+
     def nchw(self, t):
         """Host numpy array of a Tensor in ONNX (NCHW) order."""
         if t.layout == "nhwc":
@@ -642,20 +691,36 @@ class Runner:
         return self.download(t)
 
     def to_nhwc(self, t, cpad=None):
-        """Tensor in NHWC layout (host transpose if needed; C padded to 16)."""
-        a = self.nchw(t)
-        if len(a.shape) != 4:
-            raise UnsupportedNode("to_nhwc: rank %d" % len(a.shape))
-        c = a.shape[1]
+        """Tensor in NHWC layout, done on the QPUs.
+
+        An NHWC tensor whose channel count already matches is returned as is
+        (the old code downloaded it first and then threw the copy away, 6.5 MB
+        per YOLOv8n run).  An NCHW source becomes NHWC with one copy2d_x call:
+        the destination vector is one pixel's 16 channels and the 16 lanes are
+        the channels, so lane stride = H*W*4 for the source plane and the
+        lanes past Cin store zero (the conv's channel padding).
+        """
+        if len(t.shape) != 4:
+            raise UnsupportedNode("to_nhwc: rank %d" % len(t.shape))
+        n, c, h, w = t.shape
         cp = _align16(c) if cpad is None else int(cpad)
-        if cp != c:
-            b = np.zeros((a.shape[0], cp) + a.shape[2:], np.float32)
-            b[:, :c] = a
-            a = b
-        if t.layout == "nhwc" and c == cp and t.shape == a.shape:
+        if t.layout == "nhwc" and cp == t.shape[1] and w == t.shape[3]:
             return t
-        return self.upload_nhwc(np.ascontiguousarray(a.transpose(0, 2, 3, 1)),
-                                (a.shape[0], cp, a.shape[2], a.shape[3]))
+        if t.layout == "nhwc" and cp == c:
+            return t
+        out = self._alloc_t((n, cp, h, w), "nhwc", w)
+        if t.layout == "nhwc":
+            # same layout, different channel padding: not reachable from the
+            # conv path (it always pads to 16 before the first call)
+            raise UnsupportedNode("to_nhwc: NHWC re-pad C%d -> %d"
+                                  % (c, cp))
+        units = 4 if w % 4 == 0 else (2 if w % 2 == 0 else 1)
+        for i in range(n):
+            self._x(self._buf_at(t, i * c * h * w * 4),
+                    self._buf_at(out, i * h * w * cp * 4),
+                    h, w, w * 4, w * cp * 4, 4, cp * 4, h * w * 4,
+                    nlane=c, units=units)
+        return out
 
     def _prepad(self, x, pads, value=0.0):
         """pads = [top, left, bottom, right]; returns a new NCHW tensor."""
@@ -826,9 +891,9 @@ class Runner:
             t = self._conv_nhwc(node, xn, wa, ba, kh, kw, sh, int(pads[0]),
                                 dilv, 1 if depthwise else group)
             if t.shape[1] != w.shape[0]:
-                a = self.download_nhwc(t)[:, :, :, :w.shape[0]]
-                t = self.upload_nhwc(np.ascontiguousarray(a),
-                                     (N, w.shape[0], t.shape[2], t.shape[3]))
+                # Cout is padded to 16 for the GEMM; take the real channels
+                # back on the QPUs (the DFL head's 1-channel conv)
+                t = self._slice_ch(t, 0, int(w.shape[0]))
             return t
 
         # ---------------- legacy NCHW path (non-square kernels, etc.) -------
@@ -968,17 +1033,30 @@ class Runner:
         return b
 
     def _expand_to(self, name, ref, layout="nchw"):
-        """Broadcast a graph constant to `ref`'s logical shape (host expand)."""
+        """Broadcast a graph constant to `ref`'s logical shape.
+
+        This is plan-time constant folding, not activation movement: the
+        expanded operand depends only on the constant and the static shape, so
+        it is built once and kept like a packed weight panel (a per-run
+        expansion was 8.4 kB/run of host bytes on YOLOv8n's `Mul_2`).
+        """
         c = self._hostconst(name)
         if c is None:
             raise UnsupportedNode("broadcast operand %s is not a constant"
                                   % name)
+        key = ("expand", name, tuple(ref.shape), layout)
+        t = self._panels.get(key)
+        if t is not None:
+            return t
         b = np.ascontiguousarray(
             np.broadcast_to(np.asarray(c, np.float32), ref.shape))
         if layout == "nhwc":
-            return self.upload_nhwc(np.ascontiguousarray(b.transpose(0, 2, 3, 1)),
-                                    ref.shape)
-        return self.upload(b)
+            t = self.upload_nhwc(
+                np.ascontiguousarray(b.transpose(0, 2, 3, 1)), ref.shape)
+        else:
+            t = self.upload(b)
+        self._panels[key] = t
+        return t
 
     def _bin(self, a, b, op):
         b = self._same_layout(a, b)
@@ -996,10 +1074,11 @@ class Runner:
             which = 1 if self._hostconst(node.input[1]) is not None else 0
             if which == 1:
                 b = self._expand_to(node.input[1], a, a.layout)
-                self._tmp(b)
             else:
                 a = self._expand_to(node.input[0], b, b.layout)
-                self._tmp(a)
+            # the expansion is a cached plan-time constant: it must not be
+            # registered as a per-node temporary, or the pool would recycle
+            # (and clobber) it for the next node and for the next run
         return self._bin(a, b, op)
 
     def _scaled(self, t, k):
@@ -1150,16 +1229,27 @@ class Runner:
             if s == 1 and n in (3, 5) and list(pads) == [(n - 1) // 2] * 4:
                 pad = (n - 1) // 2
                 # ONNX MaxPool pads with -inf, the NHWC kernel with zero, so
-                # the border is materialised on the host (a constant fill)
+                # the border is materialised on the QPUs: fill the whole
+                # padded plane, then copy the interior back in
                 if pad:
-                    a = self.download_nhwc(x)
-                    a = np.pad(a, ((0, 0), (pad, pad), (pad, pad), (0, 0)),
-                               constant_values=-np.inf)
-                    x = self.upload_nhwc(np.ascontiguousarray(a),
-                                         (N, C, H + 2 * pad, W + 2 * pad))
+                    h2, w2 = H + 2 * pad, W + 2 * pad
+                    op2 = _align16(w2)
+                    y = self._alloc_t((N, C, h2, w2), "nhwc", op2)
+                    nfl = N * h2 * op2 * C
+                    self.eng.fill2d(y.buf, nfl // 16 // 4, 4, 256, 64,
+                                    -np.inf)
+                    vpr = W * C // 16
+                    units = 4 if vpr % 4 == 0 else (2 if vpr % 2 == 0 else 1)
+                    for i in range(N):
+                        self._x(
+                            self._buf_at(x, i * H * x.pitch * C * 4),
+                            self._buf_at(y, (i * h2 * op2 + pad * op2 + pad)
+                                         * C * 4),
+                            H, vpr, x.pitch * C * 4, op2 * C * 4, 64, 64, 4,
+                            16, 1, 64, 64, units, 16)
+                    x = y
                     self._tmp(x)
-                    H += 2 * pad
-                    W += 2 * pad
+                    H, W = h2, w2
                     pad = 0
                 ho, wo = H - n + 1, W - n + 1
                 op = _align16(wo)
@@ -1204,19 +1294,64 @@ class Runner:
             axis += rank
         if rank == 4 and axis == 1:
             if all(t.layout == "nhwc" for t in ts):
+                # pitched channel concat on the QPUs: one call per input, the
+                # destination vector is one pixel's 16-channel block, `nblk`
+                # walks the >16-channel inputs
                 for t in ts:
                     if t.shape[0] != shape[0] or t.shape[2:] != shape[2:]:
                         raise UnsupportedNode("Concat %s: shape mismatch"
                                               % node.name)
-                a = np.concatenate([self.download_nhwc(t) for t in ts], axis=3)
-                return self.upload_nhwc(np.ascontiguousarray(a),
-                                        (a.shape[0], a.shape[3], shape[2],
-                                         shape[3]))
+                n, _, h, w = shape
+                ct = sum(t.shape[1] for t in ts)
+                out = self._alloc_t((n, ct, h, w), "nhwc", w)
+                coff = 0
+                for t in ts:
+                    cs = t.shape[1]
+                    if cs % 16 == 0:
+                        units = 4 if w % 4 == 0 else \
+                            (2 if w % 2 == 0 else 1)
+                        nb, dp, nl = cs // 16, 16, 16
+                    else:
+                        units, nb, dp, nl = 1, 1, cs, cs
+                    for i in range(n):
+                        self._x(
+                            self._buf_at(t, i * h * t.pitch * cs * 4),
+                            self._buf_at(out, (i * h * w * ct + coff) * 4),
+                            h, w, t.pitch * cs * 4, w * ct * 4, cs * 4,
+                            ct * 4, 4, nl, nb, 64, 64, units, dp)
+                    coff += cs
+                return out
             a = np.concatenate([self.nchw(t) for t in ts], axis=1)
             return self.upload(np.ascontiguousarray(a))
         if rank == 3 and axis in (1, 2):
-            a = np.concatenate([self.nchw(t) for t in ts], axis=axis)
-            return self.upload(np.ascontiguousarray(a))
+            # channel-major concat: `rows` runs of L floats each, placed at a
+            # channel offset (axis 1) or a position offset inside every row
+            # (axis 2), all on the QPUs
+            n = shape[0]
+            cl = sum(t.shape[axis] for t in ts)
+            out_shape = list(shape)
+            out_shape[axis] = cl
+            out = self._alloc_t(out_shape)
+            coff = loff = 0
+            for t in ts:
+                ci, li = t.shape[1], t.shape[2]
+                if axis == 1:
+                    base = coff * li * 4
+                    rows, run = ci, li
+                else:
+                    base = loff * 4
+                    rows, run = ci, li
+                for i in range(n):
+                    self._runs(self._buf_at(t, i * ci * li * 4),
+                               self._buf_at(out, i * cl * (out_shape[2]) * 4
+                                            + base),
+                               rows, run, li * 4, out_shape[2] * 4, 64, 64,
+                               4)
+                if axis == 1:
+                    coff += ci
+                else:
+                    loff += li
+            return out
         raise UnsupportedNode("Concat %s: axis %d of rank %d"
                               % (node.name, axis, rank))
 
@@ -1242,23 +1377,36 @@ class Runner:
         if sum(sizes) != x.shape[1]:
             raise UnsupportedNode("Split %s: sizes %s vs C=%d"
                                   % (node.name, sizes, x.shape[1]))
+        n, c, h, w = x.shape
         outs = []
         if x.layout == "nhwc":
-            n, c, h, w = x.shape
-            full = self.eng.download(x.buf, x.size * 4).reshape(
-                n, h, x.pitch, c)
+            # channel-strided copy on the QPUs, keeping the source pitch
             off = 0
-            for s in sizes:
-                part = np.ascontiguousarray(full[:, :, :, off:off + s])
-                outs.append(self.upload_pitched(part, (n, s, h, w), x.pitch))
-                off += s
+            for sz in sizes:
+                out = self._alloc_t((n, sz, h, w), "nhwc", x.pitch)
+                if sz % 16 == 0:
+                    units = 4 if w % 4 == 0 else (2 if w % 2 == 0 else 1)
+                    nb, dp, nl = sz // 16, 16, 16
+                else:
+                    units, nb, dp, nl = 1, 1, sz, sz
+                for i in range(n):
+                    self._x(self._buf_at(x, (i * h * x.pitch * c + off) * 4),
+                            self._buf_at(out, i * h * x.pitch * sz * 4),
+                            h, w, x.pitch * c * 4, x.pitch * sz * 4,
+                            c * 4, sz * 4, 4, nl, nb, 64, 64, units, dp)
+                outs.append(out)
+                off += sz
         else:
-            a = self.download(x)
+            cl = int(np.prod(x.shape[2:]))
             off = 0
-            for s in sizes:
-                outs.append(self.upload(
-                    np.ascontiguousarray(a[:, off:off + s])))
-                off += s
+            for sz in sizes:
+                out = self._alloc_t((n, sz) + tuple(x.shape[2:]))
+                for i in range(n):
+                    self._runs(self._buf_at(x, (i * c + off) * cl * 4),
+                               self._buf_at(out, i * sz * cl * 4), sz, cl,
+                               cl * 4, cl * 4)
+                outs.append(out)
+                off += sz
         return outs
 
     def _resize(self, node):
@@ -1287,8 +1435,6 @@ class Runner:
         else:
             raise UnsupportedNode("Resize %s: no scales/sizes" % node.name)
 
-        a = self.download_nhwc(x) if nhwc else self.download(x)
-
         def axis(n_in, n_out):
             s = np.arange(n_out, dtype=np.float64)
             if coord == "asymmetric":
@@ -1308,15 +1454,53 @@ class Runner:
         iy0, iy1, wy = axis(h, Ho)
         ix0, ix1, wx = axis(w, Wo)
         if mode == "nearest":
+            if nhwc and Ho == 2 * h and Wo == 2 * w and \
+                    coord == "asymmetric":
+                # exact 2x, the shape both YOLOv8n resizes have: the NHWC
+                # upsample kernel does the pixel duplication on the QPU
+                op = _align16(Wo)
+                out = self._alloc_t((x.shape[0], x.shape[1], Ho, op), "nhwc",
+                                    op)
+                ho, wo, gp = self.eng.upsample2x_nhwc(
+                    x.buf, x.shape[0], x.shape[1], h, w, x.pitch, out.buf)
+                if (ho, wo, gp) != (Ho, Wo, op):
+                    raise UnsupportedNode("Resize %s: up2 returned %dx%d/%d"
+                                          % (node.name, ho, wo, gp))
+                return Tensor(out.buf, (x.shape[0], x.shape[1], Ho, Wo),
+                              "nhwc", op)
             if nhwc:
-                y = np.ascontiguousarray(a[:, iy0][:, :, ix0])
-                return self.upload_nhwc(y, (a.shape[0], x.shape[1], Ho, Wo))
+                # general nearest: one call per destination row parity, the
+                # lanes are the C/16 blocks of a pixel (the source pixel is
+                # duplicated per axis, which a single affine stride cannot
+                # express, so this is the per-parity form)
+                out = self._alloc_t((x.shape[0], x.shape[1], Ho, Wo), "nhwc",
+                                    Wo)
+                ch = x.shape[1]
+                sy, sx = np.asarray(sizes if sizes is not None else
+                                    [x.shape[2] * 2, x.shape[3] * 2])
+                for i in range(x.shape[0]):
+                    for y in range(Ho):
+                        syi = min(int(np.floor(y * (h / float(Ho)))), h - 1)
+                        for xd in range(Wo):
+                            sxi = min(int(np.floor(xd * (w / float(Wo)))),
+                                      w - 1)
+                            self._x(
+                                self._buf_at(x, ((i * h + syi) * x.pitch
+                                                 + sxi) * ch * 4),
+                                self._buf_at(out, ((i * Ho + y) * Wo + xd)
+                                             * ch * 4),
+                                1, 1, 0, 0, 0, 0, 4, 16, 1, 64, 64, 1, 16)
+                return out
+            a = self.download(x)
+            y = np.ascontiguousarray(a[:, :, iy0][:, :, :, ix0])
+            return self.upload(y)
             y = np.ascontiguousarray(a[:, :, iy0][:, :, :, ix0])
             return self.upload(y)
 
         # Bilinear.  The ARM only gathers the four neighbours and builds the
         # coordinate weights; the four multiplies and three adds that touch
         # the activations run on the QPUs (vc4_elementwise MUL/ADD).
+        a = self.download_nhwc(x) if nhwc else self.download(x)
         if nhwc:
             taps = [a[:, iy0][:, :, ix0], a[:, iy0][:, :, ix1],
                     a[:, iy1][:, :, ix0], a[:, iy1][:, :, ix1]]
@@ -1372,6 +1556,13 @@ class Runner:
         return out
 
     def _slice(self, node):
+        """Slice, on the QPUs.
+
+        The affine copy covers one sliced axis followed only by full axes,
+        which makes every output row a contiguous run of the source: that is
+        every Slice in YOLOv8n (the head's channel pairs).  Anything else
+        names the missing capability instead of falling back.
+        """
         x = self._float(node.input[0])
 
         def val(i, dflt=None):
@@ -1386,18 +1577,45 @@ class Runner:
         steps = val(4, None)
         if starts is None or ends is None:
             raise UnsupportedNode("Slice %s: no starts/ends" % node.name)
-        a = self.nchw(x)
         if axes is None:
             axes = list(range(len(starts)))
         if steps is None:
             steps = [1] * len(starts)
-        sl = [slice(None)] * a.ndim
-        for s, e, ax, st in zip(starts, ends, axes, steps):
-            ax = int(ax) % a.ndim
-            e = int(e)
-            sl[ax] = slice(int(s), None if e >= 2 ** 31 else e, int(st))
-        y = np.ascontiguousarray(a[tuple(sl)])
-        return self.upload(y)
+        if x.layout != "nchw":
+            raise UnsupportedNode("Slice %s: needs the compact NCHW source"
+                                  % node.name)
+        shp = list(x.shape)
+        cut = None
+        for st, en, ax, sp in zip(starts, ends, axes, steps):
+            if int(sp) != 1:
+                raise UnsupportedNode("Slice %s: step %d" % (node.name, sp))
+            ax = int(ax) % len(shp)
+            en = shp[ax] if int(en) >= 2 ** 31 else int(en)
+            st = int(st)
+            if st < 0:
+                st += shp[ax]
+            if en < 0:
+                en += shp[ax]
+            if st < 0 or en > shp[ax] or en < st:
+                raise UnsupportedNode("Slice %s: [%d:%d] of dim %d"
+                                      % (node.name, st, en, ax))
+            if st == 0 and en == shp[ax]:
+                continue
+            if cut is not None:
+                raise UnsupportedNode("Slice %s: two sliced axes" % node.name)
+            cut = (ax, st, en)
+        if cut is None:
+            return x
+        ax, st, en = cut
+        inner = int(np.prod(shp[ax + 1:]))
+        out_shape = list(shp)
+        out_shape[ax] = en - st
+        out = self._alloc_t(out_shape)
+        rows = int(np.prod(shp[:ax])) if ax else 1
+        run = (en - st) * inner
+        self._runs(self._buf_at(x, st * inner * 4), out.buf, rows, run,
+                   shp[ax] * inner * 4, run * 4)
+        return out
 
     def _softmax(self, node):
         x = self._float(node.input[0])
@@ -1409,34 +1627,94 @@ class Runner:
         if c > 16:
             raise UnsupportedNode("Softmax %s: %d classes (max 16)"
                                   % (node.name, c))
-        a = self.nchw(x)
-        ashape = a.shape
-        perm = None
-        if axis != rank - 1:
-            perm = [i for i in range(rank) if i != axis] + [axis]
-            a = np.ascontiguousarray(a.transpose(perm))
-        rows = a.size // c
+        if x.layout == "nhwc" and axis == 1:
+            # already [pixel][class] with pitch == W: the rows the fused
+            # kernel wants are the pixels, and its output is the same layout
+            if x.pitch != x.shape[3]:
+                raise UnsupportedNode("Softmax %s: pitched NHWC %d != W %d"
+                                      % (node.name, x.pitch, x.shape[3]))
+            rows = x.shape[0] * x.shape[2] * x.shape[3]
+            rp = (rows + 7) & ~7
+            inb = self._alloc_t(x.shape, "nhwc", x.shape[3],
+                                extra=(rp - rows) * c)
+            out = self._alloc_t(x.shape, "nhwc", x.shape[3],
+                                extra=(rp - rows) * c)
+            self._x(x.buf, inb.buf, 1, rows,
+                    0, 0, 64, 64, 4, 16, 1, 64, 64,
+                    4 if rows % 4 == 0 else (2 if rows % 2 == 0 else 1), 16)
+            self.eng.softmax_fwd(inb.buf, out.buf, rp, c)
+            return out
+        if c != 16:
+            raise UnsupportedNode("Softmax %s: axis %d of %d classes needs the "
+                                  "NHWC layout (16 classes)"
+                                  % (node.name, axis, c))
+        # NCHW -> NHWC on the QPUs, one vector per pixel, then the kernel
+        n, _, h, w = x.shape
+        rows = n * h * w
         rp = (rows + 7) & ~7
-        flat = a.reshape(rows, c)
-        if rp != rows:
-            flat = np.concatenate([flat, np.zeros((rp - rows, c), np.float32)])
-        zb = self.upload(np.ascontiguousarray(flat))
-        out = self.pool.alloc(rp * c * 4 + 64)
-        self.eng.softmax_fwd(zb.buf, out, rp, c)
-        y = np.asarray(self.eng.download(out, rp * c * 4)[:rows * c],
-                       np.float32).reshape(rows, c)
-        y = y.reshape(a.shape)
-        if perm is not None:
-            y = np.ascontiguousarray(y.transpose(np.argsort(perm)))
-        return self.upload(np.ascontiguousarray(y))
+        inb = self._alloc_t((n, c, h, w), "nhwc", w, extra=(rp - rows) * c)
+        out = self._alloc_t((n, c, h, w), "nhwc", w, extra=(rp - rows) * c)
+        for i in range(n):
+            self._x(self._buf_at(x, i * c * h * w * 4),
+                    self._buf_at(inb, i * h * w * c * 4), 1, h * w, 0, 0, 4,
+                    64, h * w * 4, 16, 1, 64, 64,
+                    4 if (h * w) % 4 == 0 else (2 if (h * w) % 2 == 0 else 1),
+                    16)
+        self.eng.softmax_fwd(inb.buf, out.buf, rp, c)
+        return out
 
     def _transpose(self, node):
+        """Arbitrary permutation, on the QPUs.
+
+        The copy2d_x block loop covers exactly the permutations a layout op
+        needs: for perm [0,2,1,3] on [1][J][K][W] the vector is 16 consecutive
+        W positions, the row is K (the outer swapped axis) and the block is J,
+        with the two streams advancing by different block steps.
+        """
         x = self._float(node.input[0])
         perm = _attr(node, "perm", None)
-        a = self.nchw(x)
+        shp = x.shape
         if perm is None:
-            perm = list(range(a.ndim))[::-1]
-        return self.upload(np.ascontiguousarray(a.transpose(perm)))
+            perm = list(range(len(shp)))[::-1]
+        perm = [int(p) % len(shp) for p in perm]
+        if sorted(perm) != list(range(len(shp))):
+            raise UnsupportedNode("Transpose %s: perm %s" % (node.name, perm))
+        if x.layout != "nchw":
+            raise UnsupportedNode("Transpose %s: needs the compact NCHW "
+                                  "source" % node.name)
+        oshp = [shp[p] for p in perm]
+        # only a 2-axis swap of the form [0] + swapped pair + [W] is affine in
+        # the vector decomposition; everything else is refused
+        if len(shp) != 4 or perm != [0, 2, 1, 3]:
+            raise UnsupportedNode("Transpose %s: perm %s needs a general "
+                                  "permute kernel (the affine copy covers the "
+                                  "head's [0,2,1,3])" % (node.name, perm))
+        n, a, b, w = shp                 # source [n][a][b][w] -> [n][b][a][w]
+        out = self._alloc_t((n, b, a, w))
+        nv = w // 16
+        rem = w % 16
+        for i in range(n):
+            sb = self._buf_at(x, i * a * b * w * 4)
+            db = self._buf_at(out, i * a * b * w * 4)
+            if nv:
+                full = (nv // 4) * 4
+                if full:
+                    self._x(sb, db, b, full, w * 4, a * w * 4, 64, 64, 4, 16,
+                            a, b * w * 4, w * 4, 4, 16)
+                if nv % 4:
+                    k = (nv - 4) * 16 * 4
+                    self._x(self._buf_at(sb, k), self._buf_at(db, k), b, 4,
+                            w * 4, a * w * 4, 64, 64, 4, 16, a, b * w * 4,
+                            w * 4, 4, 16)
+                elif full == 0:
+                    self._x(sb, db, b, nv, w * 4, a * w * 4, 64, 64, 4, 16,
+                            a, b * w * 4, w * 4, 1, 16)
+            if rem:
+                k = (w - rem) * 4
+                self._x(self._buf_at(sb, k), self._buf_at(db, k), b, 1,
+                        w * 4, a * w * 4, 64, 64, 4, 16, a, b * w * 4,
+                        w * 4, 1, rem)
+        return out
 
     def _matmul(self, node):
         a = self._float(node.input[0])
@@ -1549,8 +1827,72 @@ class Runner:
             raise UnsupportedNode("Reshape %s: %s -> %s"
                                   % (node.name, x.shape, out))
         if x.layout == "nhwc":
-            return Tensor(self.upload(self.nchw(x)).buf, out)
+            return Tensor(self._to_nchw_buf(x).buf, out)
         return Tensor(x.buf, out)
+
+    def _to_nchw_buf(self, x, shape=None):
+        """NHWC tensor -> a compact NCHW buffer, on the QPUs.
+
+        A destination vector is 16 consecutive NCHW words.  When the source
+        is compact (pitch == W) those are 16 consecutive pixels of one
+        channel (lane stride C*4); when it is pitched they are one source row
+        of W words, so the lanes are the W columns (a W-word partial store).
+        """
+        n, c, h, w = x.shape
+        tgt = shape or x.shape
+        out = self._alloc_t(tgt)
+        hw = h * w
+        for i in range(n):
+            sb = self._buf_at(x, i * h * x.pitch * c * 4)
+            db = self._buf_at(out, i * hw * c * 4)
+            if x.pitch == w:
+                nv = hw // 16
+                rem = hw % 16
+                if nv >= 4:
+                    self._x(sb, db, c, (nv // 4) * 4, 4, hw * 4, 16 * c * 4,
+                            64, c * 4, 16, 1, 64, 64, 4, 16)
+                    if nv % 4:
+                        ks = (nv - 4) * 16 * c * 4
+                        kd = (nv - 4) * 16 * 4
+                        self._x(self._buf_at(sb, ks), self._buf_at(db, kd),
+                                c, 4, 4, hw * 4, 16 * c * 4, 64, c * 4, 16,
+                                1, 64, 64, 4, 16)
+                elif nv:
+                    self._x(sb, db, c, nv, 4, hw * 4, 16 * c * 4, 64, c * 4,
+                            16, 1, 64, 64, 1, 16)
+                if rem:
+                    k = (hw - rem) * 4
+                    self._x(self._buf_at(sb, k), self._buf_at(db, k), c, 1,
+                            4, hw * 4, c * 4, 64, c * 4, 16, 1, 64, 64, 1,
+                            rem)
+            elif w <= 16:
+                self._x(sb, db, c, h, 4, hw * 4, x.pitch * c * 4, w * 4,
+                        c * 4, w, 1, 64, 64, 1, w)
+            else:
+                for w0 in range(0, w, 16):
+                    k = min(16, w - w0)
+                    self._x(self._buf_at(sb, w0 * c * 4),
+                            self._buf_at(db, w0 * 4), c, h, 4, hw * 4,
+                            x.pitch * c * 4, w * 4, c * 4, k, 1, 64, 64, 1,
+                            k)
+        return out
+
+    def _slice_ch(self, x, c0, cn):
+        """x's channels [c0, c0+cn) as a new NHWC tensor, on the QPUs."""
+        n, c, h, w = x.shape
+        out = self._alloc_t((n, cn, h, w), "nhwc", w)
+        units = 4 if w % 4 == 0 else (2 if w % 2 == 0 else 1)
+        if cn % 16 == 0:
+            nb, dp, nl = cn // 16, 16, 16
+        else:
+            units, nb, dp, nl = 1, 1, cn, cn
+        for i in range(n):
+            self._x(self._buf_at(x, (i * h * x.pitch * c + c0) * 4),
+                    out.buf if n == 1 else self._buf_at(out, i * h * w * cn
+                                                       * 4),
+                    h, w, x.pitch * c * 4, w * cn * 4, c * 4, cn * 4, 4, nl,
+                    nb, 64, 64, units, dp)
+        return out
 
     def _flatten(self, node):
         x = self._float(node.input[0])
@@ -1560,7 +1902,7 @@ class Runner:
         before = int(np.prod(x.shape[:axis])) if axis else 1
         after = int(np.prod(x.shape[axis:]))
         if x.layout == "nhwc":
-            return Tensor(self.upload(self.nchw(x)).buf, (before, after))
+            return Tensor(self._to_nchw_buf(x).buf, (before, after))
         return Tensor(x.buf, (before, after))
 
     def _squeeze(self, node):
@@ -1569,7 +1911,7 @@ class Runner:
         if len(node.input) > 1 and node.input[1]:
             v = self.host.get(node.input[1], self.values.get(node.input[1]))
             axes = np.asarray(v).ravel().tolist()
-        a = self.nchw(x) if x.layout == "nhwc" else None
+        nb = self._to_nchw_buf(x) if x.layout == "nhwc" else None
         shape = list(x.shape)
         if axes is None:
             shape = [d for d in shape if d != 1]
@@ -1581,8 +1923,8 @@ class Runner:
                                           % (node.name, ax))
                 shape[ax] = 0
             shape = [d for d in shape if d != 0]
-        if a is not None:
-            return Tensor(self.upload(a).buf, shape)
+        if nb is not None:
+            return Tensor(nb.buf, shape)
         return Tensor(x.buf, shape)
 
     def _unsqueeze(self, node):
@@ -1593,8 +1935,8 @@ class Runner:
         shape = list(x.shape)
         for ax in axes:
             shape.insert(ax, 1)
-        if a is not None:
-            return Tensor(self.upload(a).buf, shape)
+        if nb is not None:
+            return Tensor(nb.buf, shape)
         return Tensor(x.buf, shape)
 
     def _cast(self, node):

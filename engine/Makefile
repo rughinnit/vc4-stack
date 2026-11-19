@@ -7,10 +7,10 @@ LDLIBS  = -lm
 BUILD = build
 LIB   = $(BUILD)/libvc4infer.a
 SRC   = src/vc4_dev.c src/vc4_kern.c src/vc4_gemm.c src/vc4_ew.c \
-        src/vc4_conv.c src/vc4_api.c src/vc4_train.c
+        src/vc4_conv.c src/vc4_convbwd.c src/vc4_api.c src/vc4_train.c
 OBJ   = $(SRC:src/%.c=$(BUILD)/%.o)
 
-TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_train_ops $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_grad $(BUILD)/test_train
+TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_train_ops $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_grad $(BUILD)/test_train $(BUILD)/test_convgrad $(BUILD)/test_convnet
 
 all: $(LIB) $(BUILD)/libvc4infer.so $(TESTS)
 

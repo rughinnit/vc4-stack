@@ -115,17 +115,57 @@ uniforms, wherever they drive DMA.  Both rules exist because a wrong counter
 in a panel builder turns a 64-tile transpose into an unbounded VPM DMA march
 over physical memory — see `RESULTS.md`.
 
+## conv2d backward, col2im and pooling
+
+The training path now covers a small convolutional net:
+
+* `vc4_im2col` writes the row-major im2col matrix `A[M][Cin*KH*KW]`
+  (`vout='r'`: the same VDR/VPM gather with a vertical VDW, i.e. `[pixel][k]`
+  instead of the GEMM's `[k][pixel]` panel).
+* `vc4_col2im` scatters the im2col gradient back into the padded input image.
+  The kernel is a **branch-free, one-task-per-QPU** kernel: a task owns one
+  (row block, channel block) 16x16 destination tile, accumulates the taps in
+  fixed order in 16 registers and stores once with the verified 4-chunk
+  VPM->DMA store.  There is no read-modify-write and no cross-QPU
+  accumulation, so the result does not depend on QPU scheduling.  The
+  overlapping-patch sum is fp32 with the QPU's truncating `fadd`; it is
+  deterministic but not IEEE (see NUMERICS.md).  Guard row blocks of zeros
+  around the packed panel make the source gather legal at the image border.
+* `vc4_conv2d_backward` = row-major im2col (dW path) + `gemm3` for
+  `dA = dY*W^T` and `dW = dY^T*A` + `transpose` + `col2im` for `dX`.
+  Bias gradients are not implemented (the conv bias is forward-only).
+* `vc4_maxpool2x2` / `..._backward`: 2x2 stride 2 over `[C][H][W]`
+  (`H % 8 == 0`, `W % 16 == 0`), four rows per task so the store is the
+  verified 4-row VPM->DMA shape.  The backward routes `dy` to the 2x2 group
+  maximum (ties share the gradient, a valid subgradient).  The forward output
+  row pitch is a multiple of 16 (lanes past `W/2` are zero), because the DMA
+  writes full 64 B rows.
+
+Both new kernel families are **branch-free** and take one task per QPU; the
+host enumerates tasks and launches ceil(tasks/12) times.  That shape was
+adopted after a counter loop around a long body hung the V3D (softmax notes)
+and after a wrapper bug (a missing uniform word) produced a wild TMU address
+and killed the queue.  The kernels are also exercised offline against
+`asmq/vsim.py` before running on the board.
+
+## Results
+
+`RESULTS-conv.md` has the measured conv-backward gradient checks and the toy
+conv-net training curve / throughput (SGD and Adam, bit-identical across two
+runs).
+
 ## Op coverage (strict dispatch)
 
 `vc4_print_supported_ops()` prints the table; `src/vc4_api.c` is the single
 source of truth.  Supported: `matmul`, `conv2d/3x3`, `conv2d/1x1`, `add`,
 `mul`, `relu`, `sigmoid`, `silu`, `relu_bwd`, `rsqrt`, `transpose`,
 `matmul_bt` (C = A*B^T), `softmax_ce_bwd` (fused softmax + cross-entropy
-gradient), `softmax`.  Explicitly unsupported (and listed as such, so the
+gradient), `softmax`, `im2col`, `col2im`, `conv2d/bwd_dx`, `conv2d/bwd_dw`,
+`maxpool/2x2s2`, `maxpool_bwd` (21 of 34 rows).  Explicitly unsupported (and listed as such, so the
 table is an honest coverage statement): `conv2d/5x5`, `conv2d/stride2`,
 `conv2d/depthwise`, `conv2d/grouped`, `matmul/f16`, `batched-matmul`,
-`maxpool`, `layernorm`, `concat/slice`, arbitrary `permute`, `upsample`,
-`quantize/dequantize`.
+`maxpool/3x3`, `avgpool`, `layernorm`, `concat/slice`, arbitrary `permute`,
+`upsample`, `quantize/dequantize`.
 
 ## Training path
 

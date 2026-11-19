@@ -65,6 +65,11 @@ typedef enum {
     VC4_OP_SILU,
     VC4_OP_RELU_BWD,        /* out = b if a > 0 else 0 (masked copy)         */
     VC4_OP_RSQRT,           /* out = 1/sqrt(a), a > 0 (Adam)                 */
+    VC4_OP_CONV2D_BWD,      /* conv dX + dW (im2col_r, gemm3, col2im)        */
+    VC4_OP_COL2IM,          /* scatter-add the im2col gradient                */
+    VC4_OP_IM2COL,          /* row-major im2col matrix                        */
+    VC4_OP_MAXPOOL,         /* 2x2 stride-2 max                              */
+    VC4_OP_MAXPOOL_BWD,     /* 2x2 stride-2 argmax-mask backward             */
     VC4_OP_COUNT
 } vc4_op;
 
@@ -148,6 +153,54 @@ vc4_status vc4_matmul_bt(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
 vc4_status vc4_softmax_ce(vc4_ctx *ctx, const vc4_buf *logits,
                           const vc4_buf *labels, vc4_buf *dlogits,
                           vc4_buf *partial, uint32_t rows, float inv_batch);
+
+/* ---------------------------------------------- conv / pool backward */
+/*
+ * A = im2col(X), row-major [M][K], M = ho*align16(W+2*pad), K = Cin*KH*KW,
+ * k = tap*Cin + ci (the same tap-major order vc4_conv2d builds internally).
+ * Same shape constraints as vc4_conv2d.  out must hold M*K*4 bytes.
+ */
+vc4_status vc4_im2col(vc4_ctx *ctx, const vc4_buf *in, int Cin, int H, int W,
+                      int KH, int KW, int pad, vc4_buf *out, int *rows);
+
+/*
+ * dXpad = col2im(dA): accumulates the overlapping 3x3/1x1 patches.
+ *   dA   [HO*Wp][K] row-major, K = Cin*KH*KW  (the im2col ordering)
+ *   dXpad [Cin][HO+KH-1][Wp] zero-initialised, Wp = align16(WO+KW-1)
+ * The QPU accumulates the taps in fixed order (deterministic); see
+ * docs/NUMERICS.md for the fp32 truncation caveat.  The buffer needs 64 B of
+ * slack after the last element.
+ */
+vc4_status vc4_col2im(vc4_ctx *ctx, const vc4_buf *dA, int Cin, int K,
+                      int KH, int KW, int HO, int WO, vc4_buf *dXpad,
+                      int *Hp, int *Wp);
+
+/*
+ * Conv2d backward (stride 1, KH == KW in {1,3}, Cin % 16 == 0, Cout % 16 == 0).
+ *   dy   [Cout][ho][wo]     gradient of the conv output (NCHW)
+ *   dW   [Cout][Cin][KH][KW]  (ci-major, same layout as wt)
+ *   dX   [Cin][H][W]
+ * Everything that computes runs on the QPU: im2col(row-major), gemm3
+ * (dA = dY*W^T and dW = dY^T*A), and col2im.  Bias gradients are not
+ * implemented (no extra kernel); conv bias itself is forward-only.
+ */
+vc4_status vc4_conv2d_backward(vc4_ctx *ctx,
+                               const vc4_buf *in, int Cin, int H, int W,
+                               const vc4_buf *wt, int Cout, int KH, int KW,
+                               const vc4_buf *dy, int pad,
+                               vc4_buf *dW, vc4_buf *dX);
+
+/*
+ * 2x2 stride-2 max pool over [C][H][W] (H, W even, W % 16 == 0).
+ * The output row pitch is out_pitch (>= W/2, a multiple of 16; lanes past
+ * W/2 are zero).  in needs 64 B of slack (the 2x2 gathers over-read a row).
+ */
+vc4_status vc4_maxpool2x2(vc4_ctx *ctx, const vc4_buf *in, int C, int H, int W,
+                          int out_pitch, vc4_buf *out, int *Ho, int *Wo);
+/* dx[c][i][x] = dy[c][i/2][x/2] when x is a 2x2 group maximum (ties share) */
+vc4_status vc4_maxpool2x2_backward(vc4_ctx *ctx, const vc4_buf *in,
+                                   const vc4_buf *dy, int C, int H, int W,
+                                   int dy_pitch, vc4_buf *dx);
 
 /* ---------------------------------------------------------------- registry */
 typedef struct {

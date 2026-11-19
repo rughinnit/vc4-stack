@@ -39,7 +39,7 @@ int main(void)
 
     /* the unsupported rows must be present and marked as such */
     const char *must_be_absent[] = { "conv2d/5x5", "conv2d/stride2", "layernorm",
-                                     "maxpool", "matmul/f16" };
+                                     "maxpool/3x3", "matmul/f16" };
     for (size_t i = 0; i < sizeof(must_be_absent) / sizeof(*must_be_absent); ++i) {
         int found = 0;
         for (size_t j = 0; j < n; ++j)

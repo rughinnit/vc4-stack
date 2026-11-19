@@ -1628,7 +1628,7 @@ def build_pack10(K, vpitch=1):
 
 
 # =============================================================== im2col
-def build_im2col(Cin, K, KH, KW, vpitch=1):
+def build_im2col(Cin, K, KH, KW, vpitch=1, vout="k"):
     """Build the packed A panel straight from a padded NCHW image.
 
     One row block = 16 output pixels that are contiguous in the padded image.
@@ -1673,11 +1673,15 @@ def build_im2col(Cin, K, KH, KW, vpitch=1):
     # horizontal: the VDR rows are the channels (the panel's k) and the columns
     # are the 16 pixels (the panel's r), so the panel must not be transposed.
     # (A vertical VDW would store it as [pixel][channel].)
-    b.e(ldi(V.vdw_basic(0, 16, 16, horizontal=1), A['VDWW']), nop())
+    # vout=k writes the k-major GEMM panel [k][r]; vout=r writes the
+    # row-major im2col matrix [r][k] (the dW path needs that form).
+    b.e(ldi(V.vdw_basic(0, 16, 16, horizontal=(1 if vout == "k" else 0)),
+            A['VDWW']), nop())
     b.e(add_(ADD_ADD, A['VDWW'], areg(A['VDWW']), (REGB, B['T'])), nop(), nop())
     b.e(ldi(V.vdr_stride(0) & ~0xFFF, A['TMP']), nop(), nop())
     b.e(add_(ADD_ADD, A['VDRS'], areg(A['TMP']), (REGB, B['PIT'])), nop())
-    b.e(ldi(V.vdw_stride(0), A['VDWS']), nop())
+    b.e(ldi(V.vdw_stride(0 if vout == "k" else (K * 4 - 64)),
+            A['VDWS']), nop())
     b.e(add_(ADD_ADD, A['SRC'], areg(A['SRCB']), (REGB, B['OFF'])), nop())
     # the destination row block is a full k-major panel (64*nk bytes), so its
     # offset is independent of the 64-byte source row block
@@ -1716,6 +1720,315 @@ def build_im2col(Cin, K, KH, KW, vpitch=1):
     b.e(add_(ADD_ADD, A['CNT'], (REGB, B['NEG1']), areg(A['CNT']), sf=1))
     p.branch_to('rb', cond=BR_ALL_Z_CLEAR)
     b.e(nop(), nop(), nop())
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
+# =============================================================== col2im
+def _read_uni_b(b, dst):
+    """Read the next uniform word into a B-file register."""
+    b.e(dict(add_op=ADD_OR, add_out=dst, ws=1,
+             add_a=areg(R_UNIF), add_b=areg(R_UNIF)))
+    b.e(nop(), nop())
+
+
+def _tmu_issue(b, tmu, addr_reg):
+    """Issue one TMU request and hold the address register for two words."""
+    b.e(add_or(W_TMU0_S if tmu == 0 else W_TMU1_S,
+               areg(addr_reg), areg(addr_reg), ws=1))
+    b.e(nop(), nop())
+
+
+def _tmu_load(b, tmu, addr_reg, dst):
+    """One serialised TMU load: issue, wait 8 words, pop into dst.
+
+    dst < 6 is an accumulator (rN); dst >= 6 is an A-file register.
+    """
+    sig = SIG_LOAD_TMU0 if tmu == 0 else SIG_LOAD_TMU1
+    b.e(add_or(W_TMU0_S if tmu == 0 else W_TMU1_S,
+               areg(addr_reg), areg(addr_reg), ws=1))
+    b.e(nop(), nop(), nop(), nop(), nop(), nop(), nop(), nop())
+    b.e(alu(sig=sig, cond_add=COND_NEVER, cond_mul=COND_NEVER))
+    if dst < 6:
+        b.e(add_or(32 + dst, acc(4), acc(4)))
+    else:
+        b.e(add_or(dst, acc(4), acc(4)))
+
+
+def _store4(b, vpmq4, vpmq9, dst_reg, stride):
+    """The verified 4-row VPM->DMA store (emit_store16, one chunk).
+
+    Writes VPM rows [4q..4q+3] (already filled) to four consecutive 64 B rows
+    at dst_reg, `stride` bytes between rows (0 = contiguous).
+    """
+    b.e(ldi(0x1A00, R5, ws=1))
+    b.e(dict(add_op=ADD_ADD, add_out=W_VPW_SETUP, ws=1,
+             add_a=acc(5), add_b=breg(vpmq4)))
+    for r in range(4):
+        b.e(add_or(W_VPM, areg(r), areg(r)))
+    b.e(ldi((2 << 30) | (4 << 23) | (16 << 16) | (1 << 14), R5, ws=1))
+    b.e(dict(add_op=ADD_ADD, add_out=W_VPW_SETUP, ws=1,
+             add_a=acc(5), add_b=breg(vpmq9)))
+    b.e(ldi(0xC0010000 | (stride & 0xFFFF), W_VPW_SETUP, ws=1))
+    b.e(add_or(W_VPW_ADDR, areg(dst_reg), areg(dst_reg), ws=1))
+    b.e(add_or(W_NOP, breg(R_VPW_WAIT), breg(R_VPW_WAIT)))
+    b.e(nop(), nop(), nop(), nop())
+
+
+def build_col2im(Cin, K, KH, KW, Wp, Hp):
+    """Scatter-add the im2col gradient back into the padded input image.
+
+    One QPU = one (row-block, channel-block) task; no loop, no branch.  The
+    host launches ceil(tasks/12) times (the softmax kernel's shape).
+
+    The forward im2col panel is PANEL[(rb*K + k)*16 + r] = A[rb*16+r][k] with
+    k = tap*Cin + ci.  conv's dX is dXpad[ci][d] = sum_tap dA[d-tap_off][k].
+    For one tap the 16 source pixels are contiguous, shifted by kx, so each
+    (channel, tap) row is one 64 B gather; kx != 0 makes lane L < kx read the
+    previous 16-pixel block (one AND with a per-lane mask).
+
+    Each task owns a disjoint 16x16 destination block and accumulates the taps
+    in fixed order in registers, then stores once (the verified 4-chunk store).
+    Deterministic, no read-modify-write, no cross-QPU accumulation.
+
+    ABI: u0 panel task base, u1 destination block base, u2 qpu index.
+    compile-time: Cin, K, KH, KW, Wp, Hp
+    """
+    assert Cin % 16 == 0 and K == Cin * KH * KW, "col2im expects K = Cin*KH*KW"
+    assert Wp % 16 == 0
+    taps = KH * KW
+    K64 = 64 * K
+    plane = Hp * Wp * 4
+
+    ACC = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    A_PANEL, A_DST, A_QID, A_ADDR, A_RB, A_LANE = 17, 18, 19, 20, 21, 22
+    A_DC = 23
+    B_DELTA, B_64, B_OFF, B_4PL, B_V4, B_V9, B_L4 = 0, 1, 2, 3, 4, 5, 6
+    B_M1, B_M2 = 7, 8
+
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))                    # tmu_noswap
+    b.read_uni(A_PANEL)
+    b.read_uni(A_DST)
+    b.read_uni(A_QID)
+
+    b.e(add_or(A_LANE, areg(R_ELEM_NUM), areg(R_ELEM_NUM)), nop())
+    b.e(add_(ADD_SHL, 32 + 0, areg(A_LANE), imm(2)))           # lane*4
+    b.e(add_or(B_L4, ws=1, a=acc(0), b=acc(0)))
+    b.e(ldi((64 - K64) & 0xFFFFFFFF, B_DELTA, ws=1))
+    b.e(ldi(64, B_64, ws=1))
+    b.e(ldi(4 * plane, B_4PL, ws=1))
+    for kx, reg in ((1, B_M1), (2, B_M2)):
+        b.e(add_(ADD_SUB, 32 + 0, areg(A_LANE), imm(kx)))
+        b.e(add_(ADD_ASR, 32 + 0, acc(0), imm(31)))
+        b.e(add_(ADD_AND, reg, ws=1, a=acc(0), b=breg(B_DELTA)))
+    b.e(add_(ADD_SHL, B_V4, ws=1, a=areg(A_QID), b=imm(2)))    # 4q
+    b.e(add_(ADD_SHL, B_V9, ws=1, a=areg(A_QID), b=imm(9)))    # 4q<<7
+    b.e(nop(), nop())
+
+    p._builder = b
+    for r in ACC:
+        b.e(add_or(r, imm(0), imm(0)))
+    b.e(add_or(A_RB, areg(A_PANEL), areg(A_PANEL)))
+    b.e(add_or(A_DC, areg(A_DST), areg(A_DST)))
+    b.e(nop(), nop())
+
+    for s in range(taps):
+        ky, kx = divmod(s, KW)
+        off = s * Cin * 64 - ky * (Wp // 16) * K64 - kx * 4
+        b.e(ldi(off & 0xFFFFFFFF, B_OFF, ws=1))
+        b.e(add_(ADD_ADD, A_ADDR, areg(A_RB), breg(B_OFF)))
+        b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_L4)))
+        if kx:
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR),
+                     breg(B_M1 if kx == 1 else B_M2)))
+        for _ in range(3):
+            _tmu_issue(b, 0, A_ADDR)
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_64)))
+        b.e(nop(), nop(), nop())
+        for c in range(16):
+            b.e(alu(sig=SIG_LOAD_TMU0, cond_add=COND_NEVER, cond_mul=COND_NEVER))
+            b.e(dict(add_op=ADD_FADD, add_out=ACC[c],
+                     add_a=areg(ACC[c]), add_b=acc(4)))
+            if c + 3 < 16:
+                _tmu_issue(b, 0, A_ADDR)
+                b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_64)))
+            else:
+                b.e(nop(), nop())
+    # verified 4-chunk store: rows 12..15, 8..11, 4..7, 0..3 (memory ascending)
+    for chunk in range(4):
+        b.e(ldi(0x1A00, R5, ws=1))
+        b.e(dict(add_op=ADD_ADD, add_out=W_VPW_SETUP, ws=1,
+                 add_a=acc(5), add_b=breg(B_V4)))
+        for k in range(4):
+            r = ACC[4 * chunk + k]
+            b.e(add_or(W_VPM, areg(r), areg(r)))
+        b.e(ldi((2 << 30) | (4 << 23) | (16 << 16) | (1 << 14), R5, ws=1))
+        b.e(dict(add_op=ADD_ADD, add_out=W_VPW_SETUP, ws=1,
+                 add_a=acc(5), add_b=breg(B_V9)))
+        b.e(ldi(0xC0010000 | ((plane - 64) & 0xFFFF), W_VPW_SETUP, ws=1))
+        b.e(add_or(W_VPW_ADDR, areg(A_DC), areg(A_DC), ws=1))
+        b.e(add_or(W_NOP, breg(R_VPW_WAIT), breg(R_VPW_WAIT)))
+        b.e(nop(), nop(), nop(), nop())
+        b.e(add_(ADD_ADD, A_DC, areg(A_DC), breg(B_4PL)))
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
+# =============================================================== maxpool 2x2/2
+def build_pool(H, W, op, mode):
+    """2x2 stride-2 max pool ('fwd') and its argmax-mask backward ('bwd').
+
+    One QPU = one task of FOUR 64 B rows (4 output rows forward, 4 input rows
+    backward).  Computing four rows at once lets the kernel use the verified
+    4-row VPM->DMA store (emit_store16's shape) instead of an unproven
+    single-row DMA.  No loop, no branch; the host enumerates the tasks.
+
+      fwd: out[c][y][x0..x0+15] = max of the 2x2 group; lanes past Wo are 0.
+      bwd: dx[c][i][x] = dy[c][i/2][x/2] at the group maximum (ties share).
+
+    Forward ABI: u0 input group base (row 4*ry), u1 output base (row 4*ry),
+                 u2 q, u3 chunk
+    Backward ABI: u0 pair-row base (row 4*r), u1 own-row base (row 4*r),
+                  u2 q, u3 dy base (row 2*r), u4 chunk, u5 dx base (row 4*r)
+    compile-time: H, W, op, mode
+    """
+    Ho, Wo = H // 2, W // 2
+    assert W % 2 == 0 and H % 2 == 0
+
+    b = Builder()
+    p = b.p
+    A_IN, A_OUT, A_Q, A_CHUNK = 17, 18, 19, 20
+    A_LANE, A_ADDR, A_MASK, A_OWN, A_VAL = 21, 22, 23, 24, 25
+    A_SADR, A_MX, A_DY, A_DX = 26, 27, 16, 28
+    A_V0, A_T1, A_T2, A_T3 = 0, 13, 14, 15
+    A_OWNAD, A_DYAD = 29, 30
+
+    B_L4, B_L8, B_L24, B_CWM, B_C64, B_C32, B_V4, B_V9 = \
+        0, 1, 2, 3, 4, 5, 6, 7
+    B_OM1 = 9
+
+    b.e(add_or(36, imm(1), imm(1)))                    # tmu_noswap
+    b.read_uni(A_IN)
+    b.read_uni(A_OUT)
+    b.read_uni(A_Q)
+    if mode == 'fwd':
+        b.read_uni(A_CHUNK)                            # u3
+    else:
+        b.read_uni(A_DY)                               # u3
+        b.read_uni(A_CHUNK)                            # u4
+        b.read_uni(A_DX)                               # u5
+    b.e(add_or(A_LANE, areg(R_ELEM_NUM), areg(R_ELEM_NUM)), nop())
+    for sh, dst in ((2, B_L4), (3, B_L8)):
+        b.e(add_(ADD_SHL, 32 + 0, areg(A_LANE), imm(sh)))
+        b.e(add_or(dst, ws=1, a=acc(0), b=acc(0)))
+    b.e(add_(ADD_SHR, 32 + 0, areg(A_LANE), imm(1)))
+    b.e(add_(ADD_SHL, 32 + 0, acc(0), imm(2)))
+    b.e(add_or(B_L24, ws=1, a=acc(0), b=acc(0)))
+    b.e(ldi(W * 4 - 4, B_CWM, ws=1))
+    b.e(ldi(64, B_C64, ws=1))
+    b.e(ldi(32, B_C32, ws=1))
+    b.e(add_(ADD_SHL, B_V4, ws=1, a=areg(A_Q), b=imm(2)))      # 4q
+    b.e(add_(ADD_SHL, B_V9, ws=1, a=areg(A_Q), b=imm(9)))      # 4q<<7
+
+    if mode == 'fwd':
+        b.e(nop(), nop())
+        # active mask: lane < Wo - chunk*16
+        b.e(add_(ADD_SHL, 32 + 0, areg(A_CHUNK), imm(4)))      # chunk*16
+        b.e(add_(ADD_SUB, 32 + 1, imm(Wo - 1), acc(0)))
+        b.e(add_(ADD_SUB, 32 + 0, acc(1), areg(A_LANE)))
+        b.e(add_(ADD_ASR, 32 + 0, acc(0), imm(31)))
+        b.e(add_(ADD_NOT, A_MASK, acc(0), acc(0)))
+        b.e(nop(), nop())
+        p._builder = b
+        for j in range(4):
+            # group base = u0 + j*2*W*4 + chunk*128 + lane*8
+            b.e(add_(ADD_SHL, 32 + 0, areg(A_CHUNK), imm(7)))  # chunk*128
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_IN), acc(0)))
+            if j:
+                b.e(ldi(j * 2 * W * 4, B_C64, ws=1))
+                b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_C64)))
+                b.e(ldi(64, B_C64, ws=1))
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_L8)))
+            _tmu_load(b, 0, A_ADDR, 0)
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), imm(4)))
+            _tmu_load(b, 0, A_ADDR, 1)
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_CWM)))
+            _tmu_load(b, 0, A_ADDR, 2)
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), imm(4)))
+            _tmu_load(b, 0, A_ADDR, 3)
+            # r4 is the TMU result register (the ALU cannot write it): keep
+            # the running max in r0 after consuming the four loads.
+            b.e(add_(ADD_FMAX, 32 + 0, acc(0), acc(1)))
+            b.e(add_(ADD_FMAX, 32 + 0, acc(0), acc(2)))
+            b.e(add_(ADD_FMAX, 32 + 0, acc(0), acc(3)))
+            b.e(add_(ADD_AND, 32 + j, acc(0), areg(A_MASK)))
+            b.e(add_or(A_V0 + j, acc(j), acc(j)))
+            b.e(nop(), nop())
+        b.e(add_or(A_SADR, areg(A_OUT), areg(A_OUT)))
+        _store4(b, B_V4, B_V9, A_SADR, op * 4 - 64)
+    else:
+        assert mode == 'bwd'
+        b.e(nop(), nop())
+        p._builder = b
+        for j in range(4):
+            # own: u1 + j*W*4 + lane*4
+            b.e(add_or(A_OWNAD, areg(A_OUT), areg(A_OUT)))
+            if j:
+                b.e(ldi(j * W * 4, B_C64, ws=1))
+                b.e(add_(ADD_ADD, A_OWNAD, areg(A_OWNAD), breg(B_C64)))
+                b.e(ldi(64, B_C64, ws=1))
+            b.e(add_(ADD_ADD, A_OWNAD, areg(A_OWNAD), breg(B_L4)))
+            # dy: u3 + (j/2)*op*4 + chunk*32 + (lane/2)*4
+            b.e(add_(ADD_SHL, 32 + 0, areg(A_CHUNK), imm(5)))
+            b.e(add_(ADD_ADD, A_DYAD, areg(A_DY), acc(0)))
+            if j >= 2:
+                b.e(ldi(op * 4, B_C32, ws=1))
+                b.e(add_(ADD_ADD, A_DYAD, areg(A_DYAD), breg(B_C32)))
+                b.e(ldi(32, B_C32, ws=1))
+            b.e(add_(ADD_ADD, A_DYAD, areg(A_DYAD), breg(B_L24)))
+            # group: u0 + (j&~1)*W*4 + chunk*64 + (lane&~1)*4
+            b.e(add_(ADD_SHL, 32 + 0, areg(A_CHUNK), imm(6)))
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_IN), acc(0)))
+            if j >= 2:
+                b.e(ldi(2 * W * 4, B_C64, ws=1))
+                b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_C64)))
+                b.e(ldi(64, B_C64, ws=1))
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_L4)))
+            b.e(ldi(0xFFFFFFFB, B_OM1, ws=1))
+            b.e(add_(ADD_AND, A_ADDR, areg(A_ADDR), breg(B_OM1)))
+            _tmu_load(b, 0, A_ADDR, A_MX)
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), imm(4)))
+            _tmu_load(b, 0, A_ADDR, A_T1)
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_CWM)))
+            _tmu_load(b, 0, A_ADDR, A_T2)
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), imm(4)))
+            _tmu_load(b, 0, A_ADDR, A_T3)
+            b.e(add_or(32 + 0, areg(A_T1), areg(A_T1)))
+            b.e(add_or(32 + 1, areg(A_T2), areg(A_T2)))
+            b.e(add_or(32 + 2, areg(A_T3), areg(A_T3)))
+            b.e(nop(), nop())
+            b.e(add_(ADD_FMAX, A_MX, areg(A_MX), acc(0)))
+            b.e(add_(ADD_FMAX, A_MX, areg(A_MX), acc(1)))
+            b.e(add_(ADD_FMAX, A_MX, areg(A_MX), acc(2)))
+            _tmu_load(b, 0, A_OWNAD, A_OWN)
+            _tmu_load(b, 0, A_DYAD, A_VAL)
+            b.e(add_or(32 + 0, areg(A_MX), areg(A_MX)))
+            b.e(nop(), nop())
+            b.e(add_(ADD_XOR, 32 + 1, areg(A_OWN), acc(0)))
+            b.e(add_(ADD_SUB, 32 + 2, imm(0), acc(1)))
+            b.e(add_(ADD_OR, 32 + 1, acc(1), acc(2)))
+            b.e(add_(ADD_SHR, 32 + 1, acc(1), imm(31)))
+            b.e(add_(ADD_SUB, 32 + 1, acc(1), imm(1)))
+            b.e(add_(ADD_AND, 32 + 3, areg(A_VAL), acc(1)))
+            b.e(add_or(A_V0 + j, acc(3), acc(3)))
+            b.e(nop(), nop())
+        b.e(add_or(A_SADR, areg(A_DX), areg(A_DX)))
+        _store4(b, B_V4, B_V9, A_SADR, W * 4 - 64)
+
     b.e(end_program())
     b.e(nop(), nop(), nop())
     return p
@@ -2360,7 +2673,13 @@ def main(argv):
     elif kind == 'pack3':
         p = build_pack(g('kblocks'), g('vpitch', 1), g('dstride', 0))
     elif kind == 'im2col':
-        p = build_im2col(g('cin'), g('k'), g('kh'), g('kw'), g('vpitch', 1))
+        p = build_im2col(g('cin'), g('k'), g('kh'), g('kw'), g('vpitch', 1),
+                         opts.get('vout', 'k'))
+    elif kind == 'col2im':
+        p = build_col2im(g('cin'), g('k'), g('kh'), g('kw'),
+                         g('wp'), g('hp'))
+    elif kind == 'pool':
+        p = build_pool(g('h'), g('w'), g('op'), opts.get('mode', 'fwd'))
     elif kind == 'ew':
         p = build_ew(g('op'))
     elif kind == 'softmax':

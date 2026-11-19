@@ -42,9 +42,19 @@ echo "=== test_grad (finite differences)"
 timeout -k 5 600 sudo -n env VC4INFER_TMO_MS=20000 ./build/test_grad 1
 board
 
+echo "=== test_convgrad (conv dX/dW, pool; finite differences)"
+timeout -k 5 900 sudo -n env VC4INFER_TMO_MS=20000 ./build/test_convgrad 1
+board
+
 for o in sgd adam; do
     echo "=== test_train --opt $o (300 steps)"
     timeout -k 5 600 sudo -n env VC4INFER_TMO_MS=20000 ./build/test_train --opt $o --steps 300
+    board
+done
+
+for o in sgd adam; do
+    echo "=== test_convnet --opt $o (150 steps)"
+    timeout -k 5 900 sudo -n env VC4INFER_TMO_MS=20000 ./build/test_convnet --opt $o --steps 150
     board
 done
 

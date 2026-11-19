@@ -35,6 +35,20 @@ static const vc4_op_info OPS[] = {
       "C = A*B^T, f32; M,N,K % 16 == 0 (training dW / dX path)" },
     { "softmax_ce_bwd", "qpu fused row kernel", 1,
       "rows % 8 == 0; 16 padded classes; returns dlogits=(p-onehot)/B, loss, argmax count" },
+    { "im2col", "qpu im2col (row-major)", 1,
+      "f32 NCHW; stride 1; KH=KW in {1,3}; Cin%16==0; Hp*Wp*4<=8191" },
+    { "col2im", "qpu scatter-add (fixed tap order)", 1,
+      "dA [HO*Wp][Cin*KH*KW] -> padded dX; Cin%16==0; deterministic fp32" },
+    { "conv2d/bwd_dx", "qpu im2col_r + gemm3 + qpu col2im", 1,
+      "dy+W -> dX; stride 1; KH=KW in {1,3}; Cin,Cout%16==0; no bias grad" },
+    { "conv2d/bwd_dw", "qpu im2col_r + qpu transpose + gemm3", 1,
+      "dy+A -> dW (ci-major); stride 1; KH=KW in {1,3}; Cin,Cout%16==0" },
+    { "maxpool/2x2s2", "qpu max + store", 1,
+      "f32 NCHW; H,W even; W%16==0; out row pitch padded to 16" },
+    { "maxpool_bwd", "qpu argmax mask", 1,
+      "dy routed to the group maximum; ties share the gradient" },
+    { "maxpool/3x3", "-", 0, "only 2x2 stride 2 has a kernel" },
+    { "avgpool", "-", 0, "not written" },
     /* not implemented -- listed so the table is an honest coverage statement */
     { "conv2d/5x5", "-", 0, "no kernel; would need another im2col tap schedule" },
     { "conv2d/stride2", "-", 0,
@@ -44,7 +58,6 @@ static const vc4_op_info OPS[] = {
     { "matmul/f16", "-", 0, "kernels are fp32 only" },
     { "matmul/f32x4-tile", "-", 0, "4-column register tile: the documented next speed step" },
     { "batched-matmul", "-", 0, "N launches; not yet fused" },
-    { "maxpool", "-", 0, "not written" },
     { "softmax", "qpu fused row kernel", 1,
       "forward probabilities are an intermediate of softmax_ce_bwd; 16 padded classes" },
     { "layernorm", "-", 0, "needs reduction + rsqrt kernel" },
@@ -74,6 +87,11 @@ const char *vc4_op_name(vc4_op op)
     case VC4_OP_SILU:    return "silu";
     case VC4_OP_RELU_BWD:return "relu_bwd";
     case VC4_OP_RSQRT:   return "rsqrt";
+    case VC4_OP_CONV2D_BWD: return "conv2d/bwd_dx";
+    case VC4_OP_COL2IM:  return "col2im";
+    case VC4_OP_IM2COL:  return "im2col";
+    case VC4_OP_MAXPOOL: return "maxpool/2x2s2";
+    case VC4_OP_MAXPOOL_BWD: return "maxpool_bwd";
     default:             return "?";
     }
 }

@@ -91,6 +91,10 @@ static inline uint32_t vc4__align64(uint32_t v) { return (v + 63u) & ~63u; }
 
 #endif
 
+/* vc4_train.c: dense transpose (VDR + strided VDW) */
+vc4_status vc4__tpose_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rows,
+                          uint32_t cols, uint32_t dst_bus);
+
 /* the asm3 packer/GEMM (conv path) */
 vc4_status vc4__pack3_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen_floats,
                           uint32_t src_rb_stride, uint32_t dst_bus,

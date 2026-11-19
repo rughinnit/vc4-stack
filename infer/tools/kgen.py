@@ -3362,6 +3362,8 @@ def main(argv):
                          g('wp'), g('hp'))
     elif kind == 'pool':
         p = build_pool(g('h'), g('w'), g('op'), _opt('mode', 'fwd'))
+        g('c', 0)        # the caller also passes the channel count; the kernel
+                         # is per image and the launch loop owns C
     elif kind == 'pooln':
         p = build_pooln(g('n'), g('s'), g('wp'), g('op'))
     elif kind == 'im2col_nhwc':

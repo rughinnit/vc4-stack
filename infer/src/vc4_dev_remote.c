@@ -282,13 +282,10 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
         fprintf(stderr, "[vc4] vc4d arena: off=0x%x len=0x%zx bus=0x%08x map=%p\n",
                 r->region.off, r->region.len, r->region.bus, r->region.map);
 
-    const char *cd = cache_dir;
-    if (!cd) {
-        cd = getenv("VC4INFER_CACHE");
-        if (!cd)
-            cd = "kcache";
-    }
-    snprintf(ctx->cache_dir, sizeof(ctx->cache_dir), "%s", cd);
+    if (cache_dir)
+        snprintf(ctx->cache_dir, sizeof(ctx->cache_dir), "%s", cache_dir);
+    else
+        vc4__default_cache_dir(ctx->cache_dir, sizeof(ctx->cache_dir));
     ctx->allow_jit = getenv("VC4INFER_NO_JIT") ? 0 : 1;
 
     *out = ctx;

@@ -461,13 +461,10 @@ vc4_status vc4_init(vc4_ctx **out, const char *cache_dir, size_t arena_bytes)
     }
     mbox_enable_qpu();
 
-    const char *cd = cache_dir;
-    if (!cd) {
-        cd = getenv("VC4INFER_CACHE");
-        if (!cd)
-            cd = "kcache";
-    }
-    snprintf(ctx->cache_dir, sizeof(ctx->cache_dir), "%s", cd);
+    if (cache_dir)
+        snprintf(ctx->cache_dir, sizeof(ctx->cache_dir), "%s", cache_dir);
+    else
+        vc4__default_cache_dir(ctx->cache_dir, sizeof(ctx->cache_dir));
     ctx->allow_jit = getenv("VC4INFER_NO_JIT") ? 0 : 1;
 
     /* some ERRSTAT bits read as set on an idle GPU right after boot; they are

@@ -26,11 +26,53 @@
 #define VC4_KGEN_DEFAULT "/home/raspi/work/vc4-stack/infer/tools/kgen.py"
 #endif
 
+/* Default blob cache: never the caller's cwd (a system-installed client may run
+ * from /), and created on demand so a clean install can JIT.  $HOME/.cache is
+ * user-writable, which matters because vc4d clients run unprivileged. */
+void vc4__default_cache_dir(char *out, size_t n)
+{
+    const char *e = getenv("VC4INFER_CACHE");
+    if (e && *e) {
+        snprintf(out, n, "%s", e);
+    } else {
+        const char *xdg  = getenv("XDG_CACHE_HOME");
+        const char *home = getenv("HOME");
+        if (xdg && *xdg)
+            snprintf(out, n, "%s/vc4infer/kcache", xdg);
+        else if (home && *home)
+            snprintf(out, n, "%s/.cache/vc4infer/kcache", home);
+        else
+            snprintf(out, n, "/tmp/vc4infer-kcache");
+    }
+    /* mkdir -p */
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", out);
+    for (char *p = tmp + 1; *p; ++p)
+        if (*p == '/') { *p = 0; mkdir(tmp, 0777); *p = '/'; }
+    mkdir(tmp, 0777);
+}
+
 static vc4_status jit(vc4_ctx *ctx, char *const gen_argv[], const char *path)
 {
+    /* Resolution order: explicit override, then the path baked at build time
+     * (correct for a source tree), then the copy the .deb installs.  Without
+     * this, a package built in a dev tree carries a path that no longer exists
+     * once the tree moves, and every uncached kernel fails to JIT. */
+    char kbuf[512];
     const char *kgen = getenv("VC4INFER_KGEN");
-    if (!kgen)
-        kgen = VC4_KGEN_DEFAULT;
+    if (!kgen || !*kgen) {
+        if (access(VC4_KGEN_DEFAULT, R_OK) == 0) {
+            kgen = VC4_KGEN_DEFAULT;
+        } else if (access("/usr/lib/vc4infer/kgen/kgen.py", R_OK) == 0) {
+            kgen = "/usr/lib/vc4infer/kgen/kgen.py";
+        } else {
+            snprintf(kbuf, sizeof(kbuf), "%s", VC4_KGEN_DEFAULT);
+            kgen = kbuf;
+            vc4__set_err(ctx, "no kernel generator: tried $VC4INFER_KGEN, %s and "
+                              "/usr/lib/vc4infer/kgen/kgen.py", VC4_KGEN_DEFAULT);
+            return VC4_ERR_KERNEL;
+        }
+    }
 
     pid_t pid = fork();
     if (pid < 0) {

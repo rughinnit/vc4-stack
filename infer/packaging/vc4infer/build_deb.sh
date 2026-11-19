@@ -8,7 +8,9 @@
 # the Python package (CLI + API + executor + binding), the engine .so + header,
 # the kernel JIT and the selftest models.
 #
-# The engine library must be built first (make -C infer); the script fails if
+# The engine library must be built first (make -C infer), with KGEN_DEFAULT
+# pointing at the installed generator so the shipped .so carries no build-tree
+# path.  The script fails if
 # infer/build/libvc4infer.so is missing rather than shipping a stale one.
 set -eu
 

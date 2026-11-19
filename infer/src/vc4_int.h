@@ -83,6 +83,8 @@ void       vc4__remote_l2_flush(vc4_ctx *ctx);
 void       vc4__remote_mark(vc4_ctx *ctx, uint32_t off, size_t bytes);
 void       vc4__remote_scratch_reset(vc4_ctx *ctx);
 void       vc4__mark_dirty(vc4_ctx *ctx, uint32_t off, size_t bytes);
+/* resolves $VC4INFER_CACHE, else $XDG_CACHE_HOME|$HOME/.cache, and mkdir -p's it */
+void       vc4__default_cache_dir(char *out, size_t n);
 
 /* ---- vc4_kern.c --------------------------------------------------------- */
 /* gen_argv[0] is the kernel kind, the rest are the kgen.py flags. */

@@ -6,6 +6,10 @@ VC4D_DIR ?= /home/raspi/work/vc4d
 CPPFLAGS = -Iinclude -Isrc -Itests -I../training/src -I$(VC4D_DIR)/include
 LDLIBS  = -lm $(VC4D_DIR)/build/libvc4client.a
 
+# Path baked into the library for the kernel generator.  A source-tree build
+# gets the local tools/kgen.py; the .deb build passes the installed path.
+KGEN_DEFAULT ?= $(CURDIR)/tools/kgen.py
+
 BUILD = build
 LIB   = $(BUILD)/libvc4infer.a
 # The backward/training kernels live in ../training/src but are part of the
@@ -24,10 +28,10 @@ $(BUILD):
 	mkdir -p $(BUILD) kcache
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DVC4_KGEN_DEFAULT='"$(CURDIR)/tools/kgen.py"' -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DVC4_KGEN_DEFAULT='"$(KGEN_DEFAULT)"' -c $< -o $@
 
 $(BUILD)/%.o: ../training/src/%.c | $(BUILD)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DVC4_KGEN_DEFAULT='"$(CURDIR)/tools/kgen.py"' -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DVC4_KGEN_DEFAULT='"$(KGEN_DEFAULT)"' -c $< -o $@
 
 $(LIB): $(OBJ) $(VC4D_DIR)/build/libvc4client.a
 	$(AR) rcs $@ $^

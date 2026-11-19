@@ -89,3 +89,38 @@ softmax kernel looks the way it does.
   word in an early pool wrapper produced a wild TMU address and killed the
   V3D queue (board LIVE, `SRQCS` done never increments, reboot required);
   every address is now checked in `asmq/vsim.py` before hardware runs.
+
+## NHWC / YOLO path (added 2026-11-19, `~/work/yolo`)
+
+Measured while bringing up the NHWC data plane and the synthetic YOLO forward.
+Kernel source: `tools/kgen.py` (`im2col_nhwc`, `pool_nhwc`, `up2`, `copy`);
+offline checker: `tools/qsim_nhwc.py` (decodes the generated words, runs the
+integer/control flow on lane 0 and reconstructs every VDR/TMU/store address).
+
+- **`r4` is the TMU result register *and* the TMU configuration latch.**  The
+  `tmu_noswap` word writes `r4 = 1`.  A mul (or any ALU op) that writes `r4`
+  between gathers changes the per-lane address mode of every later load: the
+  measured per-lane byte step went from 4 (one word per lane) to 24, i.e. the
+  16 channels of a pixel were read as a stride-6 float pattern.  Keep products
+  in `r5` (or re-latch the config) in any kernel that gathers and multiplies.
+- **`r5` is clobbered by the verified 4-row VPM->DMA store** (`ldi 0x1A00, r5`).
+  A value that must survive a store cannot live in `r5`: the first 5x5 pool
+  used `r5 = lane*4` and every quad of lanes then read its leader's channel
+  (out[c] = in[c & ~3]).
+- **TMU gathers pop into either file.**  A pop is a normal ALU write selected
+  by `ws`, so `add_or(Bn, acc(4), acc(4), ws=1)` is a valid way to keep 16
+  channel values in the B file (used by the pool fmax and the depthwise mul).
+- **A transposed (horizontal=0) 16x16 VDW block with stride 0 is a legal 1 KB
+  panel write.**  Combined with a VDR over `[pixel][channel]` (rows = 16
+  consecutive output pixels at pitch `stride*Cin*4`) it produces the k-major
+  GEMM panel directly, with no im2col matrix and no ALU data movement.
+- **A 16-row VDR tile per QPU needs 16 VPM rows**, so an im2col launch is
+  capped at 4 QPUs (64 VPM rows); 12-QPU kernels must fit 4 rows per QPU
+  (the 4-row store shape).
+- **conv stride 2** is the same panel builder with the VDR pitch set to
+  `2*Cin*4` and the tap offsets `kx*Cin*4`: consecutive output pixels are two
+  source pixels apart, and the row step is `stride*row_pitch` (using the row
+  pitch for the row step is the bug the simulator caught).
+- Verification: every NHWC op 0 mismatches over 5 runs against a float64
+  oracle (conv max rel 5.2e-5 at k=576, pool/concat/upsample byte-exact); the
+  160x160 synthetic forward is 0 mismatches on 13 stages, max rel 2.3e-7.

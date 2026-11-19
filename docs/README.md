@@ -14,5 +14,6 @@
 | `VC4D.md` | privileged helper: protocol, security model, 82/82 hostile cases, 5-13% overhead |
 | `VC4MON.md` | read-only V3D sysfs module: 78 registers, no /dev/mem, exact parity with drm/vc4 debugfs, ioread32 vs memcpy_fromio |
 | `V3DLIB.md` | V3DLib build/correctness, KMS and gpu_mem blockers, verdict, how to measure on a dedicated board |
+| `REFERENCES.md` (QPULib, py-videocore) | QPULib is the dormant predecessor of V3DLib (examples + perf notes); py-videocore is a maintained MIT Python QPU DSL with a fourth independent encoder and an SGEMM example, but its VCSM path is dead on this kernel |
 | `int8-RESULTS.md` | int8: no exact packed byte MAC, int8 MAC/s == fp32 |
 | `STATUS.md` | current state of the work |

@@ -96,3 +96,34 @@ She built the open source Linux graphics stack for VideoCore IV at Broadcom
   why our compute kernels cannot hide latency with a second thread.
 - The Mesa `vc4` compiler is the mature version of what VC4C does; its scheduler and
   register allocator are the reference for any further compiler work.
+
+## QPULib and py-videocore (checked 2026-11-19)
+
+### mn416/QPULib — https://github.com/mn416/QPULib
+
+- 439 stars, C++, v0.1.0, **experimental and no longer under development** (last push 2020-12).
+- The direct predecessor of V3DLib: a C++ embedded DSL compiled at runtime to QPU programs,
+  with interpreter/emulator backends and worked examples (Euclid, 3D rotation with unrolling
+  and non-blocking loads, 2D convolution/heat transfer) plus **performance sections** in its
+  README.
+- Runs on the Pi ARM and offloads to the QPUs; needs root and the same QPU ownership as
+  V3DLib (KMS/`QPU_ENABLE` conflict applies).
+- **Use:** historical reference and technique source (unrolling, non-blocking loads, multi-QPU
+  dispatch), and a second correctness oracle. Not a runtime candidate (superseded by V3DLib,
+  same blockers).
+
+### Idein/py-videocore — https://github.com/Idein/py-videocore
+
+- 813 stars, Python, **MIT**, actively maintained (last push 2024-03).
+- A Python internal DSL for QPU assembly: host and GPU code in one script, no ahead-of-time
+  compilation. Package modules: `assembler.py`, `encoding.py`, `driver.py`, `mailbox.py`,
+  `vinstr.py`, `checker.py`, `v3d.py` (V3D support for newer Pis).
+- Examples include **`sgemm.py` and `sgemm_1thread.py`** — a full SGEMM in the DSL, the most
+  directly comparable third-party implementation to our hand-written GEMM.
+- `driver.py` allocates through **VCSM** (`rpi_vcsm.VCSM`) and talks to `/dev/vcio`; on this
+  kernel the legacy VCSM/VCHI path is dead (`vc_sm_cma_vchi_init: failed to open VCHI service`),
+  the same blocker V3DLib hit. So it is not usable as a runtime here as-is.
+- **Use:** its `encoding.py`/`assembler.py` are a **fourth independent QPU encoder** (after
+  vc4asm, qpuasm, vc4dis) and a good candidate to extend `docs/XCHECK.md`; `sgemm.py` is a
+  reference implementation for comparison; the DSL is a model for ergonomic kernel writing.
+- Related: `Idein/py-videocore6` targets the Pi 4 V3D.

@@ -63,3 +63,34 @@ Every external source used by this work, with what it was used for and its statu
 | FP results take 3 cycles; two consumers must not follow immediately | Performance Considerations (patent quote) + our 3-word chains |
 | VPM/VDW store semantics (DEPTH=4, UNITS, stride as gap) | AG100-R + our probes |
 | Rotate range and `rep` ws semantics | under test in `docs/XCHECK.md` (anholt/vc4-gpu-tools + tinyasm) |
+
+## Emma Anholt — author of the open VC4/V3D stack
+
+Profile and resume: https://www.anholt.net/resume.html · https://github.com/anholt
+
+She built the open source Linux graphics stack for VideoCore IV at Broadcom
+(2014-2019), then the initial V3D driver for the Pi 4, and is now at Igalia.
+
+| work | URL | relevance to this project |
+|---|---|---|
+| **`drm/vc4` kernel driver** (command execution, memory management, HDMI/DPI/DSI display, bcm2835 platform drivers) | https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/gpu/drm/vc4 | THE reference for the root-removal design. VC4 has no MMU between the 3D engine and main memory, so the driver validates shader programs in the kernel; that is the model a safe compute UAPI must follow. |
+| **Mesa `vc4` Gallium driver** | https://docs.mesa3d.org/drivers/vc4.html · https://gitlab.freedesktop.org/mesa/mesa/-/tree/main/src/gallium/drivers/vc4 | Reference QPU compiler: `vc4_qpu.c/h`, `vc4_qpu_emit.c`, `vc4_qpu_schedule.c`, `vc4_qpu_validate.c`, `vc4_register_allocate.c`, `vc4_qir_*` | 
+| **`anholt/mesa` (archived)** | https://github.com/anholt/mesa | historical vc4/v3d branches; the repo itself says use GitLab |
+| **`anholt/vc4-gpu-tools`** | https://github.com/anholt/vc4-gpu-tools | Broadcom QPU enums, packet headers, disassembler, hang-state parser; used for encoder cross-validation |
+| **V3D driver (Pi 4)** | Mesa `src/gallium/drivers/v3d` + `drivers/gpu/drm/v3d` | model for a BO/submit/fence UAPI with an MMU |
+| **`anholt/twivc4` — "This Week in VC4"** | https://github.com/anholt/twivc4 · https://anholt.livejournal.com | developer notes: TMU latency ~20 QPU instructions, cooperative hyperthreading only for fragment shaders, delay-slot/TLB_Z scheduling, dmabuf fencing |
+| **`anholt/libepoxy`** | https://github.com/anholt/libepoxy | GL dispatch library (not used here) |
+| **`anholt/hash_table`**, **`anholt/drm-v4l2-test`** | https://github.com/anholt/hash_table · https://github.com/anholt/drm-v4l2-test | small C utilities; dmabuf sharing demo (context for our dma-buf use) |
+| **bcm2835 platform drivers** | kernel `drivers/clk/bcm`, `drivers/soc/bcm`, `drivers/firmware/raspberrypi.c`, dmaengine/spi/i2c/uart/gpio/mmc/thermal | the platform plumbing a compute UAPI would have to cooperate with |
+
+### What her work confirms for us
+
+- **No MMU on VC4** between 3D/QPU and shared main memory. She solved the security
+  problem with kernel-side validation of idiomatic shader assembly. That is exactly the
+  argument for a validated helper/UAPI rather than granting `/dev/mem`.
+- **TMU latency ~20 QPU instructions** (her blog), consistent with our measured 2-deep
+  TMU limit and the need for 3-phase pipelining to cover it.
+- **Cooperative thread switching exists only for threadable fragment shaders**, which is
+  why our compute kernels cannot hide latency with a second thread.
+- The Mesa `vc4` compiler is the mature version of what VC4C does; its scheduler and
+  register allocator are the reference for any further compiler work.

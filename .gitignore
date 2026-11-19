@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 engine/kcache/
 onnx/models/
+/build/
+/dist/
+*.whl
+vc4infer.egg-info/

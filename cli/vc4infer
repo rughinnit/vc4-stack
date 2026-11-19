@@ -1,0 +1,18 @@
+#!/usr/bin/python3
+"""vc4infer - run fixed-shape fp32 ONNX graphs on the VideoCore IV QPUs.
+
+Installed entry point; the implementation is the ``vc4infer`` package
+(/usr/lib/python3/dist-packages/vc4infer, or the repo root in a checkout).
+"""
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_root = os.path.dirname(_here)
+if os.path.isdir(os.path.join(_root, "vc4infer")):          # in-tree run
+    sys.path.insert(0, _root)
+
+from vc4infer.cli import main                                # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

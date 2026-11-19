@@ -1,0 +1,24 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: vc4-stack
+Source: https://github.com/rughinnit/vc4-stack
+
+Files: *
+Copyright: 2026 rughinnit <rughinnit@users.noreply.github.com>
+License: GPL-3+
+ The vc4-stack source tree carries no per-file license header.  This package is
+ published from the same archive and with the same signing key as vc4top, whose
+ source is GPL-3+, and is released under those terms.
+ .
+ On Debian systems the complete text of the GNU General Public License version 3
+ is in /usr/share/common-licenses/GPL-3.
+
+Files: usr/share/vc4infer/models/yolov8n_160.onnx
+Copyright: 2023 Ultralytics
+License: AGPL-3.0
+ The YOLOv8n checkpoint (yolov8n.pt) is the official Ultralytics COCO model,
+ exported to ONNX with ultralytics' own exporter.  It is included unmodified as
+ the selftest's real-model case.  The stored input and reference tensors are
+ generated locally by this project.
+ .
+ On Debian systems the text of the GNU Affero General Public License version 3
+ is in /usr/share/common-licenses/AGPL-3.

@@ -44,7 +44,7 @@ src/vc4_convbwd.c   vc4_maxpooln          generic NxN / stride-S max pool
 src/vc4_train.c     vc4_softmax_fwd       forward softmax (fused kernel 'p' probe)
 tools/kgen.py       build_pooln           the generic pool kernel
 tests/test_onnxops.c CPU-oracle check of both
-python/vc4infer.py  binding for both ops, vc4_get_stats, and a conv2d argtypes fix
+vc4infer/_binding.py ctypes binding for both ops, vc4_get_stats, and a conv2d argtypes fix
 ```
 
 ## 2. Running a model
@@ -180,7 +180,8 @@ dominated by the 64-column pad of a 10-wide output.
   Uses the fused training kernel's `p` probe (same degree-5 `2^f` polynomial
   and 3x Newton reciprocal); the host pads to 16 classes with `-1e30` and
   compacts the result.  Measured error ≤ 3.4e-07.
-* `python/vc4infer.py` gained `maxpooln`, `softmax_fwd`, `stats`, and a
+* The Python binding (`vc4infer/_binding.py`, formerly `python/vc4infer.py`)
+  gained `maxpooln`, `softmax_fwd`, `stats`, and a
   corrected `vc4_conv2d` ctypes signature (the old one had the wrong number
   and order of argument types, so `conv2d` could not be called from Python).
 * The op table now lists `maxpool/NxNsS` as supported.

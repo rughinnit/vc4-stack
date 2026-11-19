@@ -1,0 +1,186 @@
+.TH VC4INFER 1 "2026-11-20" "vc4infer 1.1.1" "User Commands"
+.SH NAME
+vc4infer \- run fixed-shape fp32 ONNX graphs on the VideoCore IV QPUs
+.SH SYNOPSIS
+.B vc4infer
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B vc4infer
+executes a fixed-shape, batch-1, fp32 ONNX graph on the VideoCore IV (V3D)
+QPUs of a Raspberry Pi 1/2/3, Zero or CM1/CM3.
+Every float operation (convolutions, GEMMs, elementwise, pooling, softmax) is
+dispatched to
+.BR libvc4infer ;
+the ARM cores only move bytes, pad, gather, concatenate and perform integer
+shape bookkeeping.
+An operator, attribute or shape the engine cannot dispatch raises
+.B UnsupportedNode
+naming the node and its ONNX op type.
+There is no CPU arithmetic fallback.
+.PP
+Unprivileged runs go through the
+.B vc4d
+helper daemon on
+.IR /run/vc4d.sock ,
+which owns
+.I /dev/mem
+and the V3D register window.
+The client opens neither.
+.SH COMMANDS
+.TP
+.B run \fImodel.onnx\fR \-\-input \fIimage|csv|npy\fR [\-\-imgsz N] [\-\-conf 0.25] [\-\-iou 0.45] [\-\-json]
+Run one inference.
+Images (JPEG/PNG/BMP/WebP) are letterboxed to the model input size, converted
+to RGB/fp32 and normalised to [0,1].
+A YOLOv8/YOLO11 detection head is decoded on the host (boxes from the
+cx,cy,w,h rows, best class, confidence threshold, class-aware NMS) and the
+boxes are mapped back to the original image pixels.
+An annotated image is written next to the input unless
+.B \-\-no\-save
+is given.
+With
+.B \-\-json
+the command prints a single JSON document: model, input, timings, decoded
+detections and the annotated image path.
+.TP
+.B bench \fImodel.onnx\fR [\-\-imgsz N] [\-\-reps N]
+Time the graph end to end.
+One warm-up run performs the kernel JIT and is reported separately, then
+.B \-\-reps
+(default 3) timed runs.
+Prints milliseconds per image (mean, median, best), FPS, launches per image,
+GPU (pack + kernel) time as a fraction of wall time, and arena / graph-pool /
+peak memory.
+.TP
+.B nodes \fImodel.onnx\fR [\-v]
+Static coverage report: node counts per ONNX op, a supported/unsupported
+verdict for every node, the names and reasons for the unsupported ones, and the
+number of
+.B Mul(x, Sigmoid(x))
+pairs that fuse into a single SiLU launch.
+The executor stays authoritative:
+.B nodes
+reads the graph, attributes and initialiser shapes; it does not run it.
+.TP
+.B selftest
+Run the shipped reference models (modelA, modelB, modelC and the real YOLOv8n
+COCO export at 160x160) against their stored CPU references with
+atol = rtol = 5e-4.
+Exits 0 when every element of every output is inside tolerance, 1 otherwise.
+.SH OPTIONS
+.TP
+.B \-\-version
+Print the version, the resolved engine library, the onnx/numpy versions, the
+backend and the kernel-cache path.
+.TP
+.BI \-\-conf " x"
+Confidence threshold for detections (default 0.25).
+.TP
+.BI \-\-iou " x"
+NMS IoU threshold (default 0.45).
+.TP
+.BI \-\-imgsz " N"
+Letterbox size.
+It must match the model's static input size; the model cannot be resized at
+run time.
+.TP
+.BI \-\-cache " dir"
+Kernel blob cache.
+Default
+.IR $XDG_CACHE_HOME/vc4infer/kcache
+(or
+.IR ~/.cache/vc4infer/kcache ).
+The first run JIT-compiles the kernels for the graph (about a second) and
+stores them there.
+.SH ENVIRONMENT
+.TP
+.B VC4INFER_DAEMON
+1 (the default set by the CLI) uses vc4d; 0 uses the direct
+.I /dev/mem
+backend and needs root.
+.TP
+.B VC4INFER_ARENA_MB
+Arena size to request from vc4d (default 64, daemon-capped).
+.TP
+.B VC4_POOL_RESERVE_MB
+Bytes kept free for per-convolution scratch (default 24; use 40 for 320x320).
+.TP
+.B VC4INFER_CACHE
+Kernel blob cache directory.
+.TP
+.B VC4INFER_KGEN
+Alternative
+.I kgen.py
+kernel generator (default
+.IR /usr/lib/vc4infer/kgen/kgen.py ).
+.TP
+.B VC4_NO_SILU_FUSE
+1 disables the
+.B Mul(x, Sigmoid(x)) -> Silu
+graph rewrite (A/B measurement only; about 15% slower).
+.SH SUPPORTED NODES
+Conv (1x1/3x3, stride 1/2, group 1 or depthwise), Relu, Sigmoid, Silu, Add,
+Mul, Sub, Div (by a constant), MaxPool, Concat, Split, Slice, Resize (nearest),
+Transpose, Softmax (<= 16 classes), MatMul, Gemm, GlobalAveragePool, Reshape,
+Flatten, Squeeze, Unsqueeze, Cast, Identity, Constant, Shape, Gather.
+Batch 1 and fp32 only.
+.SH FILES
+.TP
+.I /usr/lib/aarch64-linux-gnu/libvc4infer.so.1
+The engine.
+.TP
+.I /usr/include/vc4infer.h
+The C API.
+.TP
+.I /usr/lib/python3/dist-packages/vc4infer.py
+The ctypes binding.
+.TP
+.I /usr/lib/vc4infer/kgen/
+The QPU kernel generator used to JIT blobs.
+.TP
+.I /usr/share/vc4infer/models/
+The selftest models and their stored inputs and references.
+.SH EXAMPLES
+.PP
+.nf
+vc4infer nodes yolov8n.onnx
+vc4infer run yolov8n.onnx --input bus.jpg --imgsz 160
+vc4infer run yolov8n.onnx --input bus.jpg --imgsz 160 --json
+vc4infer bench yolov8n.onnx --reps 5
+vc4infer selftest
+.fi
+.SH EXIT STATUS
+0 on success.
+1 when selftest reports a mismatch.
+2 on a usage error.
+3 when the model needs an unsupported node or shape.
+.SH PYTHON API
+The same engine is importable:
+.B import vc4infer
+provides
+.B Engine
+(raw numpy outputs, plan, profile, memory),
+.B Device
+and a thin
+.B yolo.Detector
+on top of
+.B postprocess.decode_yolo
+and
+.BR postprocess.nms .
+The wheel is pure Python and uses the engine library installed by this package:
+.RS
+.nf
+pip install https://rughinnit.github.io/vc4top/pip/vc4infer-1.1.1-py3-none-any.whl
+.fi
+.RE
+See
+.I /usr/share/doc/vc4infer/PYTHON-API.md
+and the examples in
+.IR /usr/share/doc/vc4infer/ .
+.SH SEE ALSO
+.BR vc4top (1)
+.PP
+.I /usr/share/doc/vc4infer/README.md
+for measured performance, the supported-node table, the 320x320 arena recipe
+and the known limits.

@@ -1242,7 +1242,162 @@ def build_cumsum(k):
     return p
 
 
+# ------------------------------------------------------------------ copy2d
+# The layout workhorse: a 3-level affine copy.  One vector is 16 *consecutive
+# destination words* (the verified VPM->DMA store), and its 16 source words
+# are read one per lane from src + lane*slane, so slane=4 is a contiguous
+# copy and any other stride is a gather (channel plane <-> pixel-major,
+# NHWC <-> NCHW, channel slice/split/concat, transpose).
+#
+#   row   (vpr vectors, each a 16-word vector, `units` vectors per store)
+#     block (nblk blocks, `bstep` bytes apart in both streams)
+#
+# The block level exists because a channel concat of 32..256 channels is
+# 2..16 consecutive 16-channel blocks per pixel: inside a row the block step
+# is 64 B, while the step to the next row is a different constant.  QPU q
+# takes rows q, q+nqpu, ...  Lanes >= nlane (and every lane when nlane==0)
+# store the fill value instead of the source word, which gives the -inf
+# MaxPool border, the zero channel padding of the first conv, and the short
+# (< 16 words) column runs of a pitched NHWC->NCHW reshape.
+#
+# ABI (16 words per QPU)
+#   u0  src bus (this QPU's first row)     u1  dst bus
+#   u2  rows this QPU handles              u3  src row advance (nqpu*srow)
+#   u4  dst row advance (nqpu*drow)        u5  vectors per row
+#   u6  src vector advance                 u7  dst vector advance
+#   u8  src lane advance                   u9  4*qid
+#   u10 (4*qid)<<7                         u11 lanes to copy (0..16, 0 = none)
+#   u12 blocks per row                     u13 src block advance (bytes)
+#   u14 dst block advance (bytes)          u15 DMA row stride (dvec - 64)
+# The fill value is a *compile-time* option (--fill <float bits>), not a
+# uniform: any float whose bits are >= 0xC0000000 (e.g. -inf, 0xFF800000) is
+# refused by vc4d's uniform policy because it looks like a GPU bus address.
+A_SRC, A_DST, A_ROWS = 16, 17, 18
+A_SB, A_DB, A_S, A_D, A_VCNT, A_BCNT = 19, 20, 21, 22, 23, 24
+A_TA, A_CADR = 26, 27
+A_MASK, A_NMASK, A_FILLN, A_STRCO = 28, 29, 30, 31
+B_SVEC, B_DVEC, B_SLANE, B_SSTEP, B_DSTEP = 0, 1, 2, 3, 4
+B_C4D, B_STRIDE, B_VPMQ, B_VPMQ7, B_FILL, B_C64, B_VPR = 5, 6, 7, 8, 9, 10, 11
+B_NLANE, B_NBLK, B_SBSTEP, B_DBSTEP, B_LV = 12, 13, 14, 15, 16
+
+
+def _ushift(units):
+    assert units in (1, 2, 4)
+    return {1: 0, 2: 1, 4: 2}[units]
+
+
+def _store_var(b, k, cadr, vpmq, vpmq7, strco, stride, units=4, depth=16):
+    """kgen._store4 with the row stride and the chunk step in registers.
+
+    The VDW stride field is "memory step between the rows minus 64", so a row
+    stride of dvec bytes needs dvec-64 in a B register; the constant
+    0xC0010000 (VDW, block mode) lives in an A register because the ALU can
+    read one A and one B file per word.  ``units`` is the number of 16-word
+    vectors per store and ``depth`` the number of words per vector, so
+    units=1, depth=k stores the k-word tail of a row that is not a multiple
+    of 16 floats (the head's 25/100-wide extents).
+    """
+    assert units in (1, 2, 4) and 1 <= depth <= 16
+    b.e(k.ldi(0x1A00, 37, ws=1))                 # ACC5 = vpw_generic(row 0)
+    b.e(dict(add_op=k.ADD_ADD, add_out=k.W_VPW_SETUP, ws=1,
+             add_a=k.acc(5), add_b=k.breg(vpmq)))
+    for r in range(units):
+        b.e(k.add_or(k.W_VPM, k.areg(r), k.areg(r)))
+    b.e(k.ldi((2 << 30) | (units << 23) | (depth << 16) | (1 << 14), 37,
+              ws=1))
+    b.e(dict(add_op=k.ADD_ADD, add_out=k.W_VPW_SETUP, ws=1,
+             add_a=k.acc(5), add_b=k.breg(vpmq7)))
+    b.e(dict(add_op=k.ADD_ADD, add_out=k.W_VPW_SETUP, ws=1,
+             add_a=k.areg(strco), add_b=k.breg(stride)))
+    b.e(k.add_or(k.W_VPW_ADDR, k.areg(cadr), k.areg(cadr), ws=1))
+    b.e(k.add_or(k.W_NOP, k.breg(k.R_VPW_WAIT), k.breg(k.R_VPW_WAIT)))
+    b.e(k.nop(), k.nop(), k.nop(), k.nop())
+
+
+def build_copy2d(k, fill=0, units=4, depth=16):
+    b, p = _head(k, 16, True, {})
+    b.read_uni(A_SRC)                    # u0
+    b.read_uni(A_DST)                    # u1
+    b.read_uni(A_ROWS)                   # u2
+    b.read_uni(B_SSTEP, ws=1)            # u3
+    b.read_uni(B_DSTEP, ws=1)            # u4
+    b.read_uni(B_VPR, ws=1)              # u5
+    b.read_uni(B_SVEC, ws=1)             # u6
+    b.read_uni(B_DVEC, ws=1)             # u7
+    b.read_uni(B_SLANE, ws=1)            # u8
+    b.read_uni(B_VPMQ, ws=1)             # u9
+    b.read_uni(B_VPMQ7, ws=1)            # u10
+    b.read_uni(B_NLANE, ws=1)            # u11
+    b.read_uni(B_NBLK, ws=1)             # u12
+    b.read_uni(B_SBSTEP, ws=1)           # u13
+    b.read_uni(B_DBSTEP, ws=1)           # u14
+    b.read_uni(B_STRIDE, ws=1)           # u15
+    # ACC2 = dvec, reused for the derived words (chunk step, store stride)
+    b.e(k.ldi(fill & M32, B_FILL, ws=1))
+    b.e(k.ldi(0xC0010000, A_STRCO))
+    b.e(k.add_or(34, k.breg(B_DVEC), k.breg(B_DVEC)))
+    b.e(k.add_(k.ADD_SHL, B_C4D, k.acc(2), k.imm(_ushift(units)), ws=1))
+    # lane mask: mask = -1 for lane < nlane, 0 otherwise
+    b.e(k.add_(k.ADD_SUB, A_TA, k.areg(k.R_ELEM_NUM), k.breg(B_NLANE)))
+    b.e(k.add_(k.ADD_ASR, A_MASK, k.areg(A_TA), k.imm(31)))
+    b.e(k.add_(k.ADD_NOT, A_NMASK, k.areg(A_MASK), k.areg(A_MASK)))
+    b.e(k.add_(k.ADD_AND, A_FILLN, k.breg(B_FILL), k.areg(A_NMASK)))
+    # lane * slane, in the B file so a vector address is one A + one B read
+    b.e(k.add_(k.ADD_OR, 33, k.areg(k.R_ELEM_NUM),
+               k.areg(k.R_ELEM_NUM)))                          # ACC1 = lane
+    b.e(dict(mul_op=k.MUL_MUL24, mul_out=32 + 2, mul_a=k.acc(1),
+             mul_b=k.breg(B_SLANE), ws=0, sig=k.SIG_NONE))
+    b.e(k.add_or(B_LV, k.acc(2), k.acc(2), ws=1))
+    p.label('row')
+    b.e(k.add_or(A_SB, k.areg(A_SRC), k.areg(A_SRC)))
+    b.e(k.add_or(A_DB, k.areg(A_DST), k.areg(A_DST)))
+    b.e(k.add_or(A_BCNT, k.breg(B_NBLK), k.breg(B_NBLK)))
+    p.label('blk')
+    b.e(k.add_or(A_S, k.areg(A_SB), k.areg(A_SB)))
+    b.e(k.add_or(A_D, k.areg(A_DB), k.areg(A_DB)))
+    b.e(k.add_or(A_VCNT, k.breg(B_VPR), k.breg(B_VPR)))
+    p.label('chunk')
+    b.e(k.add_or(A_CADR, k.areg(A_D), k.areg(A_D)))
+    for r in range(units):
+        # lanes >= nlane read at the vector base instead of past the source
+        b.e(k.add_(k.ADD_AND, 33, k.breg(B_LV), k.areg(A_MASK)))
+        b.e(k.add_(k.ADD_ADD, A_TA, k.acc(1), k.areg(A_S)))
+        b.e(k.add_or(k.W_TMU0_S, k.areg(A_TA), k.areg(A_TA), ws=1))
+        b.e(k.nop(), k.nop(), k.nop(), k.nop())
+        b.e(k.nop(), k.nop(), k.nop(), k.nop())
+        b.e(k.alu(sig=k.SIG_LOAD_TMU0, cond_add=k.COND_NEVER,
+                  cond_mul=k.COND_NEVER))
+        b.e(k.add_or(32, k.acc(4), k.acc(4)))          # ACC0 = src word
+        b.e(k.add_(k.ADD_AND, 33, k.acc(0), k.areg(A_MASK)))
+        b.e(k.add_or(35, k.acc(1), k.areg(A_FILLN)))
+        b.e(k.add_or(r, k.acc(3), k.acc(3)))           # store row r
+        b.e(k.add_(k.ADD_ADD, A_S, k.areg(A_S), k.breg(B_SVEC)))
+    _store_var(b, k, A_CADR, B_VPMQ, B_VPMQ7, A_STRCO, B_STRIDE,
+               units, depth)
+    b.e(k.add_(k.ADD_ADD, A_D, k.areg(A_D), k.breg(B_C4D)))
+    b.e(k.add_(k.ADD_SUB, A_VCNT, k.areg(A_VCNT), k.imm(units), sf=1))
+    p.branch_to('chunk', cond=k.BR_ALL_Z_CLEAR)
+    b.e(k.nop(), k.nop(), k.nop())
+    b.e(k.add_(k.ADD_ADD, A_SB, k.areg(A_SB), k.breg(B_SBSTEP)))
+    b.e(k.add_(k.ADD_ADD, A_DB, k.areg(A_DB), k.breg(B_DBSTEP)))
+    b.e(k.add_(k.ADD_SUB, A_BCNT, k.areg(A_BCNT), k.imm(1), sf=1))
+    p.branch_to('blk', cond=k.BR_ALL_Z_CLEAR)
+    b.e(k.nop(), k.nop(), k.nop())
+    b.e(k.add_(k.ADD_ADD, A_SRC, k.areg(A_SRC), k.breg(B_SSTEP)))
+    b.e(k.add_(k.ADD_ADD, A_DST, k.areg(A_DST), k.breg(B_DSTEP)))
+    b.e(k.add_(k.ADD_SUB, A_ROWS, k.areg(A_ROWS), k.imm(1), sf=1))
+    p.branch_to('row', cond=k.BR_ALL_Z_CLEAR)
+    b.e(k.nop(), k.nop(), k.nop())
+    b.e(k.end_program())
+    b.e(k.nop(), k.nop(), k.nop())
+    return p
+
+
 def build(k, kind, opts):
+    if kind == 'copy2d':
+        return build_copy2d(k, int(opts.get('fill', 0)),
+                            int(opts.get('units', 4)),
+                            int(opts.get('depth', 16)))
     if kind == 'uop':
         nv = opts.get('nvec')
         return build_uop(k, opts.get('op'), int(nv) if nv else None)

@@ -342,6 +342,50 @@ vc4_status vc4_gather(vc4_ctx *ctx, const vc4_buf *tab, vc4_buf *out,
 /* Contiguous 64 B-granular copy (no table); bytes % 64 == 0. */
 vc4_status vc4_blit(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t bytes);
 /*
+ * The affine layout copy: the QPU's layout workhorse (pad, channel concat,
+ * split, slice, NHWC<->NCHW, transpose, nearest resize, broadcast expand).
+ *
+ * A *vector* is 16 consecutive destination words (64 B, the verified 4-row
+ * VPM->DMA store) and its 16 source words are read one per lane from
+ * ``src + lane*slane``, so ``slane == 4`` is a contiguous copy and any other
+ * value is a strided gather.  A *row* is ``vpr`` vectors (a multiple of 4);
+ * QPU q handles rows q, q+nqpu, ...  ``srow``/``drow`` are the byte steps
+ * between consecutive rows and ``svec``/``dvec`` between consecutive vectors.
+ * ``dvec`` is the stored row stride of the 16 destination words and must be a
+ * 4-byte multiple in 64..65535.
+ *
+ * Nothing here is element arithmetic: the host passes byte strides, the QPUs
+ * move the data.  Element-verified against a CPU oracle (tests/test_copyops.c)
+ * for contiguous, pitched, channel-strided, laned (transpose) and 4-byte
+ * lane-gather shapes, including W not a multiple of 4 and odd extents.
+ */
+vc4_status vc4_copy2d(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
+                      uint32_t rows, uint32_t vpr, uint32_t srow,
+                      uint32_t drow, uint32_t svec, uint32_t dvec,
+                      uint32_t slane);
+/* As vc4_copy2d, with `units` vectors per DMA store (1, 2 or 4) and `depth`
+ * words per vector (1..16).  units=1, depth=k moves a row of k < 16 floats
+ * without writing past it. */
+vc4_status vc4_copy2d_n(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
+                        uint32_t rows, uint32_t vpr, uint32_t srow,
+                        uint32_t drow, uint32_t svec, uint32_t dvec,
+                        uint32_t slane, uint32_t nlane, uint32_t units,
+                        uint32_t depth);
+/* The general form: `nblk` blocks per row, `sbstep`/`dbstep` bytes apart in
+ * the two streams (a channel concat/split of more than 16 channels per
+ * pixel: the step inside a row is 64 B while the step to the next row is a
+ * different constant, so the two cannot be one affine stride), with the
+ * store shape (units vectors x depth words) and a lane count. */
+vc4_status vc4_copy2d_x(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
+                        uint32_t rows, uint32_t vpr, uint32_t srow,
+                        uint32_t drow, uint32_t svec, uint32_t dvec,
+                        uint32_t slane, uint32_t nlane, uint32_t nblk,
+                        uint32_t sbstep, uint32_t dbstep, uint32_t units,
+                        uint32_t depth);
+/* out[rows][vpr*16] = value (the -inf MaxPool border, zero channel padding). */
+vc4_status vc4_fill2d(vc4_ctx *ctx, vc4_buf *out, uint32_t rows, uint32_t vpr,
+                      uint32_t drow, uint32_t dvec, float value);
+/*
  * out[o] = reduce over a[o*red .. o*red+red) for o < outer.
  * ARGMAX/ARGMIN write raw int32 indices into `out` (interpret with a
  * .view(int32)); the value ops write fp32.

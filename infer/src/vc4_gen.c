@@ -394,6 +394,168 @@ vc4_status vc4_blit(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t bytes)
     return st;
 }
 
+/* ------------------------------------------------------------------ copy2d */
+/* One launch covers every row: QPU q takes rows q, q+nqpu, ...  A row is
+ * `nblk` blocks (bstep bytes apart in both streams) of `vpr` 16-word
+ * vectors.  u3/u4 are the per-QPU row advances, i.e. nqpu*row - nblk*bstep,
+ * because the block loop has already added nblk*bstep. */
+static vc4_status copy2d_run(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
+                             uint32_t rows, uint32_t vpr, uint32_t srow,
+                             uint32_t drow, uint32_t svec, uint32_t dvec,
+                             uint32_t slane, uint32_t nlane, uint32_t nblk,
+                             uint32_t sbstep, uint32_t dbstep, float vfill,
+                             uint32_t units, uint32_t depth)
+{
+    if (!ctx || !out || !rows || !vpr)
+        return VC4_ERR_INVAL;
+    if (units != 1 && units != 2 && units != 4)
+        return VC4_ERR_INVAL;
+    if (depth < 1 || depth > 16)
+        return VC4_ERR_INVAL;
+    if (nlane > 16)
+        return VC4_ERR_INVAL;
+    if (!nblk)
+        nblk = 1;
+    if (!sbstep)
+        sbstep = 64;
+    if (!dbstep)
+        dbstep = 64;
+    if (vpr % units) {
+        vc4__set_err(ctx, "vc4_copy2d: vpr=%u is not a multiple of units=%u "
+                     "(one DMA store is units vectors)", vpr, units);
+        return VC4_ERR_UNSUPPORTED;
+    }
+    if (dvec < 4 || dvec > 0xFFFF || (dvec & 3) || (units > 1 && dvec < 64)) {
+        vc4__set_err(ctx, "vc4_copy2d: dvec=%u must be a 4-byte multiple in "
+                     "4..65535 (>= 64 unless units==1, whose store has no "
+                     "row stride)", dvec);
+        return VC4_ERR_UNSUPPORTED;
+    }
+    if (nlane && nlane != 16 && (uint64_t)15 * slane >= (1u << 24)) {
+        vc4__set_err(ctx, "vc4_copy2d: lane stride %u * 15 overflows the "
+                     "24-bit address multiply", slane);
+        return VC4_ERR_UNSUPPORTED;
+    }
+    if (ctx->dead)
+        return VC4_ERR_TIMEOUT;
+    const uint64_t s_ext = (uint64_t)(rows - 1) * srow +
+                           (uint64_t)(nblk - 1) * sbstep +
+                           (uint64_t)(vpr - 1) * svec +
+                           (uint64_t)(nlane ? nlane - 1 : 0) * slane + 4;
+    const uint64_t d_ext = (uint64_t)(rows - 1) * drow +
+                           (uint64_t)(nblk - 1) * dbstep +
+                           (uint64_t)(vpr - 1) * dvec +
+                           (uint64_t)depth * 4;
+    if (nlane && a && s_ext > a->bytes) {
+        vc4__set_err(ctx, "vc4_copy2d: source extent %llu B > buffer %u B "
+                     "(rows=%u vpr=%u nblk=%u)", (unsigned long long)s_ext,
+                     a->bytes, rows, vpr, nblk);
+        return VC4_ERR_INVAL;
+    }
+    if (d_ext > out->bytes) {
+        vc4__set_err(ctx, "vc4_copy2d: dest extent %llu B > buffer %u B "
+                     "(rows=%u vpr=%u nblk=%u depth=%u)",
+                     (unsigned long long)d_ext, out->bytes, rows, vpr, nblk,
+                     depth);
+        return VC4_ERR_INVAL;
+    }
+
+    uint32_t fillbits;
+    char fillbuf[16], unitbuf[8], depthbuf[8];
+    memcpy(&fillbits, &vfill, 4);
+    snprintf(fillbuf, sizeof(fillbuf), "%u", fillbits);
+    snprintf(unitbuf, sizeof(unitbuf), "%u", units);
+    snprintf(depthbuf, sizeof(depthbuf), "%u", depth);
+    char *argv[] = { (char *)"copy2d", (char *)"--fill", fillbuf,
+                     (char *)"--units", unitbuf, (char *)"--depth", depthbuf,
+                     NULL };
+    char name[64];
+    int nq = rows < (uint32_t)VC4_MAX_QPU ? (int)rows : VC4_MAX_QPU;
+    vc4_kernel *k = NULL;
+    snprintf(name, sizeof(name), "copy2d_v1_f%08x_u%u_d%u_q%d", fillbits,
+             units, depth, nq);
+    vc4_status st = vc4__kernel(ctx, name, argv, nq, &k);
+    if (st != VC4_OK)
+        return st;
+    const uint32_t src_bus = nlane && a ? vc4_bus_addr(ctx, a)
+                                        : vc4_bus_addr(ctx, out);
+    const uint32_t dst_bus = vc4_bus_addr(ctx, out);
+    for (int i = 0; i < nq; ++i) {
+        uint32_t *u = vc4__uni(ctx, k, i);
+        memset(u, 0, VC4_UNI_WORDS * sizeof(uint32_t));
+        u[0] = src_bus + (uint32_t)((uint64_t)i * srow);
+        u[1] = dst_bus + (uint32_t)((uint64_t)i * drow);
+        u[2] = 1 + (rows - 1 - (uint32_t)i) / (uint32_t)nq;
+        u[3] = (uint32_t)nq * srow;
+        u[4] = (uint32_t)nq * drow;
+        u[5] = vpr;
+        u[6] = svec;
+        u[7] = dvec;
+        u[8] = slane;
+        u[9] = 4u * (uint32_t)i;
+        u[10] = (4u * (uint32_t)i) << 7;
+        u[11] = nlane;
+        u[12] = nblk;
+        u[13] = sbstep;
+        u[14] = dbstep;
+        u[15] = units > 1 ? dvec - 64 : 0;
+    }
+    uint64_t ns = 0;
+    st = vc4__launch(ctx, k, nq, &ns);
+    ctx->st.kernel_ns += ns;
+    if (st == VC4_OK)
+        ctx->st.flops += (uint64_t)rows * nblk * vpr * 16;
+    return st;
+}
+
+vc4_status vc4_copy2d(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
+                      uint32_t rows, uint32_t vpr, uint32_t srow,
+                      uint32_t drow, uint32_t svec, uint32_t dvec,
+                      uint32_t slane)
+{
+    if (!a || !slane)
+        return VC4_ERR_INVAL;
+    return copy2d_run(ctx, a, out, rows, vpr, srow, drow, svec, dvec, slane,
+                      16, 1, 64, 64, 0.0f, 4, 16);
+}
+
+/* Same, with an explicit store shape (units vectors x depth words) and a
+ * lane count: units=1, depth=k moves a row of k < 16 floats without writing
+ * past it; nlane < 16 zero-pads channels. */
+vc4_status vc4_copy2d_n(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
+                        uint32_t rows, uint32_t vpr, uint32_t srow,
+                        uint32_t drow, uint32_t svec, uint32_t dvec,
+                        uint32_t slane, uint32_t nlane, uint32_t units,
+                        uint32_t depth)
+{
+    if (!a || !slane || !nlane || nlane > 16)
+        return VC4_ERR_INVAL;
+    return copy2d_run(ctx, a, out, rows, vpr, srow, drow, svec, dvec, slane,
+                      nlane, 1, 64, 64, 0.0f, units, depth);
+}
+
+/* Same, with `nblk` 16-channel blocks per row, `bstep` bytes apart in both
+ * streams: the channel concat/split of more than 16 channels per pixel. */
+vc4_status vc4_copy2d_x(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
+                        uint32_t rows, uint32_t vpr, uint32_t srow,
+                        uint32_t drow, uint32_t svec, uint32_t dvec,
+                        uint32_t slane, uint32_t nlane, uint32_t nblk,
+                        uint32_t sbstep, uint32_t dbstep, uint32_t units,
+                        uint32_t depth)
+{
+    if (!a || !slane)
+        return VC4_ERR_INVAL;
+    return copy2d_run(ctx, a, out, rows, vpr, srow, drow, svec, dvec, slane,
+                      nlane, nblk, sbstep, dbstep, 0.0f, units, depth);
+}
+
+vc4_status vc4_fill2d(vc4_ctx *ctx, vc4_buf *out, uint32_t rows, uint32_t vpr,
+                      uint32_t drow, uint32_t dvec, float value)
+{
+    return copy2d_run(ctx, NULL, out, rows, vpr, 0, drow, 0, dvec, 0, 0, 1,
+                      64, 64, value, 4, 16);
+}
+
 /* ------------------------------------------------------------------ reduce */
 struct red_base {
     uint32_t a, o, red, op, vstr, ingap, lanestride;

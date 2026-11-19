@@ -3340,7 +3340,7 @@ def main(argv):
 
     def _opt(k, d=None):
         used.add(k)
-        return _opt(k, d)
+        return opts.get(k, d)
 
     if kind == 'gemm':
         # the asm10 kernel: 8x64 tiles, 3-phase k loop (build_gemm above is the
@@ -3383,12 +3383,13 @@ def main(argv):
         p = build_copy_nhwc(g('cin'), g('cout'))
     elif kind == 'ew':
         p = build_ew(g('op'))
-    elif kind in ('uop', 'sel3', 'gather', 'blit', 'reduce', 'cumsum'):
+    elif kind in ('uop', 'sel3', 'gather', 'blit', 'reduce', 'cumsum',
+                  'copy2d'):
         # generic kernels for the numeric op long tail (kops.py): they reuse
         # build_ew's verified harness and only replace the body.
         import kops
         p = kops.build(sys.modules[__name__], kind, opts)
-        used.update(('op', 'nvec'))
+        used.update(('op', 'nvec', 'fill', 'units', 'depth'))
     elif kind == 'softmax':
         pr = _opt('probe')
         p = build_softmax(probe=None if pr in (None, 'full') else pr)

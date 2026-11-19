@@ -101,6 +101,10 @@ echo "=== test_onnxops (generic maxpool, forward softmax)"
 timeout -k 5 300 $RUN ./build/test_onnxops
 board
 
+echo "=== test_copyops (layout copy kernels, byte-exact)"
+timeout -k 5 300 $RUN ./build/test_copyops
+board
+
 echo "=== test_train_ops (training primitives)"
 timeout -k 5 300 $RUN ./build/test_train_ops
 board

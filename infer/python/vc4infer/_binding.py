@@ -214,6 +214,21 @@ class Engine:
         L.vc4_blit.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
                                ctypes.POINTER(Buf), ctypes.c_size_t]
         L.vc4_blit.restype = ctypes.c_int
+        L.vc4_copy2d.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
+                                 ctypes.POINTER(Buf)] + \
+            [ctypes.c_uint32] * 7
+        L.vc4_copy2d.restype = ctypes.c_int
+        L.vc4_copy2d_n.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
+                                   ctypes.POINTER(Buf)] + \
+            [ctypes.c_uint32] * 10
+        L.vc4_copy2d_n.restype = ctypes.c_int
+        L.vc4_copy2d_x.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
+                                   ctypes.POINTER(Buf)] + \
+            [ctypes.c_uint32] * 13
+        L.vc4_copy2d_x.restype = ctypes.c_int
+        L.vc4_fill2d.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
+            [ctypes.c_uint32] * 4 + [ctypes.c_float]
+        L.vc4_fill2d.restype = ctypes.c_int
         L.vc4_reduce.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
                                  ctypes.POINTER(Buf), ctypes.c_uint32,
                                  ctypes.c_uint32, ctypes.c_int]
@@ -363,6 +378,35 @@ class Engine:
     def blit(self, a, out, nbytes):
         self._check(self.lib.vc4_blit(self.ctx, ctypes.byref(a),
                                       ctypes.byref(out), int(nbytes)), "blit")
+
+    def copy2d(self, a, out, rows, vpr, srow, drow, svec, dvec, slane):
+        """16-lane vector copy: dst[rows][vpr][16] <- src at lane*slane."""
+        self._check(self.lib.vc4_copy2d(
+            self.ctx, ctypes.byref(a), ctypes.byref(out), int(rows), int(vpr),
+            int(srow), int(drow), int(svec), int(dvec), int(slane)),
+            "copy2d")
+
+    def copy2d_n(self, a, out, rows, vpr, srow, drow, svec, dvec, slane,
+                 nlane, units, depth):
+        """copy2d with an explicit store shape and lane count."""
+        self._check(self.lib.vc4_copy2d_n(
+            self.ctx, ctypes.byref(a), ctypes.byref(out), int(rows), int(vpr),
+            int(srow), int(drow), int(svec), int(dvec), int(slane),
+            int(nlane), int(units), int(depth)), "copy2d_n")
+
+    def copy2d_x(self, a, out, rows, vpr, srow, drow, svec, dvec, slane,
+                 nlane=16, nblk=1, sbstep=64, dbstep=64, units=4, depth=16):
+        """The general layout copy (see vc4infer.h)."""
+        self._check(self.lib.vc4_copy2d_x(
+            self.ctx, ctypes.byref(a), ctypes.byref(out), int(rows), int(vpr),
+            int(srow), int(drow), int(svec), int(dvec), int(slane),
+            int(nlane), int(nblk), int(sbstep), int(dbstep), int(units),
+            int(depth)), "copy2d_x")
+
+    def fill2d(self, out, rows, vpr, drow, dvec, value=0.0):
+        self._check(self.lib.vc4_fill2d(
+            self.ctx, ctypes.byref(out), int(rows), int(vpr), int(drow),
+            int(dvec), float(value)), "fill2d")
 
     def reduce(self, a, out, outer, red, op):
         self._check(self.lib.vc4_reduce(self.ctx, ctypes.byref(a),

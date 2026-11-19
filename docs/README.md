@@ -3,6 +3,8 @@
 | document | contents |
 |---|---|
 | `../README.md` | project overview, measured ceilings, scope |
+| `SOURCES-VERIFICATION.md` | link -> claim -> how we verified -> evidence -> status |
+| `FINDINGS.md` | consolidated catalogue of everything measured, with what remains unproven |
 | `REFERENCES.md` | every external source used, with URL, purpose, status; claims -> source table; Emma Anholt's work |
 | `XCHECK.md` | independent decoder cross-validation (5,329 words, 0 unknown; 33/33 bit-exact rotates; corrections) |
 | `NUMERICS.md` | the QPU FPU truncates (round toward zero); 3-word dependent chains; register/field rules |

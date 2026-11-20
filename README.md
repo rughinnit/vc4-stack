@@ -5,6 +5,17 @@ clocks** (core 400 MHz / V3D 300 MHz).  Everything that computes runs on the
 VC4 QPUs.  The ARM cores run the control plane only (allocation, I/O, byte
 movement); there is no CPU arithmetic fallback anywhere in this stack.
 
+## Install
+
+```sh
+curl -fsSL https://rughinnit.github.io/vc4-apt/install.sh | sudo sh
+```
+
+One command: signed apt source, the whole stack, the `vc4d` helper, group
+membership, and a verification pass. `--fast` builds for speed on the board,
+`--torch` adds the PyTorch backend, `--pin-clocks` floors the core at its stock
+400 MHz, `--uninstall` removes it. Details: [`docs/INSTALL.md`](docs/INSTALL.md).
+
 ## This is the main repository
 
 The whole VideoCore IV project is organised around this repo: the engine, the

@@ -1,5 +1,29 @@
 # Installing the VideoCore IV stack
 
+## The one-liner
+
+```sh
+curl -fsSL https://rughinnit.github.io/vc4-apt/install.sh | sudo sh
+```
+
+That adds the signed key and apt source, installs `vc4-toolkit`, enables the
+`vc4d` helper, adds you to the `vc4` group, and then *verifies* the result with
+`vc4-query`, `vc4-smi`, `vc4infer selftest` and `vc4train`.  It is idempotent,
+never restarts a healthy daemon, and writes a log to `/var/log/vc4-install.log`.
+
+| flag | effect |
+|---|---|
+| `--fast` | install `vc4-toolkit-fast` (rebuilt on the board, prewarmed kernel cache, 150 MiB arena drop-in) |
+| `--torch` | also `pip install torch-vc4` (needs torch already importable) |
+| `--pin-clocks` | set `core_freq=400` / `core_freq_min=400` — the **stock** maximum, not an overclock; without it the firmware can drop the core to 250 MHz mid-run (see `docs/CLOCK-VARIANCE.md`) |
+| `--no-verify` | skip the selftest |
+| `--dry-run` | print the commands |
+| `--uninstall` | purge the packages and remove the source |
+
+The same script lives at the root of this repository (`./install.sh`).
+
+## The two paths in detail
+
 Two install paths, one repository:
 
 | path | command | what you get |

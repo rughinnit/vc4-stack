@@ -11,6 +11,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 ver=${1:-1.0.0}
+CFLAGS="${CFLAGS:-} -DVC4_QUERY_VERSION=\"$ver\""
 out=$root/dist
 stage=$root/build/vc4-query-deb
 build=$root/build/vc4-query
@@ -25,7 +26,7 @@ cp "$root/vc4d/proto/vc4d_proto.h" "$build/vc4d_proto.h"
 	exit 1
 }
 
-gcc -O2 -g -Wall -Wextra -std=gnu11 \
+gcc -O2 -g -Wall -Wextra -std=gnu11 $CFLAGS \
 	-I"$root/infer/include" -I"$build" \
 	-o "$build/vc4-query" "$here/vc4-query.c" \
 	-L"$root/infer/build" -l:libvc4infer.so -lm

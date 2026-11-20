@@ -413,7 +413,8 @@ int main(int argc, char **argv)
 			 o ? ", " : "", PF_NAMES[i], pf_ver[i]);
 	}
 
-	printf("vc4-query 1.0.0 -- VideoCore IV device query\n");
+	printf("vc4-query %s -- VideoCore IV device query\n",
+	       VC4_QUERY_VERSION);
 	printf("--------------------------------------------------------------\n");
 	printf("engine:          libvc4infer.so.1 (API %s)\n",
 	       VC4INFER_VERSION_STRING);

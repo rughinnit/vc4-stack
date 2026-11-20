@@ -80,8 +80,8 @@ connection (the client library is synchronous).
 | 1 | `HELLO` | `{version, flags}` | `{version, arena_bytes, data_base, page_size, max_msg, max_qpu, max_uni, max_prog, flags, ident0, ident1, ...}` |
 | 2 | `ALLOC` | `{bytes, flags}` | `{handle, off, len, bus}` **+ dma-buf fd via SCM_RIGHTS** (`bus` = GPU bus address of the region) |
 | 3 | `FREE` | `{handle}` | — |
-| 4 | `UPLOAD` | `{bytes, max_qpu, nuni, flags}` + program bytes | `{prog, code_off, words}` |
-| 5 | `LAUNCH` | `{prog, timeout_ms, nqpu, nuni, flags, uni_handle, uni_off}` + `nqpu*nuni` entries, or none with `UNI_IN_ARENA` | `{launch, nqpu}`, or `{launch, errs, wall_ns, cycles}` with `WAIT` |
+| 4 | `UPLOAD` | `{bytes, max_qpu, nuni, flags}` + program bytes [+ name bytes with `VC4D_UPLOAD_NAMED`] | `{prog, code_off, words}` |
+| 5 | `LAUNCH` | `{prog, timeout_ms, nqpu, nuni, flags, uni_handle, uni_off, uni_addr}` + `nqpu*nuni` entries, or none with `UNI_IN_ARENA` | `{launch, nqpu}`, or `{launch, errs, wall_ns, cycles}` with `WAIT` |
 | 6 | `WAIT` | — | `{launch, errs, wall_ns, cycles}` |
 | 7 | `READ_REGS` | `{off, count}` | `count == 0`: `struct vc4d_regs` snapshot; else `{off,count}` + `count` words |
 | 8 | `WRITEREG` | `{off, val}` | `detail0` = previous value |
@@ -120,12 +120,37 @@ already materialised the uniform words in its own mapped region.  The request
 ends after the 32-byte `vc4d_launch_req`; `uni_handle` names the region,
 `uni_off` is the 64-byte-aligned first QPU block, and QPU *q* reads
 `[uni_off+64q, +64)`.  The daemon checks the region belongs to the caller,
-`uni_off % 64 == 0`, `uni_off + 64*nqpu ≤ region.len`, then validates every
-declared word as "a bus address inside this arena" or "a literal outside the
-bus/arena/MMIO windows" and points `SRQUA` straight at the block.  Containment
-is per-arena instead of per-buffer; `UNI_PTR` stays the stricter interface.
-A program can only read words up to its declared `nuni`, so the tail of the
-64-byte block is not a way around the check.
+`uni_off % 64 == 0`, `uni_off + 64*nqpu ≤ region.len`, then validates the words
+and points `SRQUA` straight at the block.  Containment is per-arena instead of
+per-buffer; `UNI_PTR` stays the stricter interface.  A program can only read
+words up to its declared `nuni`, so the tail of the 64-byte block is not a way
+around the check.
+
+**UNI_MASK** (`flags & VC4D_LAUNCH_UNI_MASK`, 1.2.7): `vc4d_launch_req.uni_addr`
+(a field that used to be `pad`, so the message size is unchanged) is a bitmask
+over the uniform slots: bit *u* set means "word *u* is a GPU bus address this
+program consumes".  Each declared address must lie inside the caller's arena;
+a word whose bit is clear is a **value** and is not compared with any address
+window, which is what makes `-2.0f` (`0xC0000000`), `-3.0f` (`0xC0400000`),
+`-inf` and every other float ≤ −2.0 usable as a parameter.  Bits ≥ `nuni` must
+be zero.  A launch that sends no flag keeps the older rule ("inside this arena,
+or a literal outside the bus/arena/MMIO windows"), so 1.2.6 clients are
+unaffected.  The engine sets the mask on every launch: a word is declared an
+address exactly when it points into the client's arena.
+
+The mask is a correctness aid, not a security boundary.  A client that marks a
+real address as a value can already make the QPU read anywhere by putting the
+address in the instruction stream (§3, "What it cannot do"); what the mask
+removes is the daemon's inability to tell a *legitimate* float from an address.
+
+**Named programs** (`UPLOAD.flags & VC4D_UPLOAD_NAMED`, 1.2.7): the payload is
+`vc4d_upload_req + code + name`, name 1..63 printable bytes, no NUL.  The name
+keys the program-slot LRU: re-uploading a name reuses its slot, and when all
+127 client slots are in use the least recently used one that is not executing
+is freed (the daemon's probe slot and the in-flight program are never
+evicted).  A client that sends no name is keyed by the code's SHA-256, which
+behaves the same for repeated uploads.  `STATS.evictions` counts the frees;
+`--verbose` logs each one with the name.
 
 **LAUNCH_WAIT** (`flags & VC4D_LAUNCH_WAIT`): kick, poll to idle, record the
 counters and L2 write-back, all in one round trip.  The reply is
@@ -187,6 +212,9 @@ listener is the unix socket.
 | per-op exact payload size | every `handle_*` |
 | region handle ownership, `off+len` inside the region, 4-byte alignment | `handle_launch` |
 | literal uniforms may not be bus/arena/MMIO addresses | `literal_forbidden` |
+| with `UNI_MASK`, declared addresses must be inside the arena; value words are not compared with address windows | `arena_addr_ok`, `handle_launch` |
+| program slots: LRU keyed by name, probe and in-flight never evicted | `prog_slot_for` |
+| the arena is retried, then degraded loudly, and restored when idle | `arena_open`, `arena_maybe_restore` |
 | `nqpu ≤ declared max_qpu`, `nuni == declared nuni` | `handle_launch` |
 | one launch in flight; `WAIT` only by the owner | `handle_launch`/`wait` |
 | timeout bounded by `--max-timeout-ms`; then a context reset that must pass a probe launch, or the daemon exits 75 | `try_recover`, `gpu_recover` |

@@ -296,19 +296,33 @@ int vc4c_free(vc4c_conn *c, vc4c_buf *b)
 int vc4c_upload(vc4c_conn *c, const void *code, size_t bytes,
                 unsigned max_qpu, unsigned nuni, vc4c_prog *out)
 {
-    if (!c || !code || !out || !bytes ||
-        sizeof(struct vc4d_upload_req) + bytes > VC4D_MAX_MSG)
+    return vc4c_upload_named(c, NULL, code, bytes, max_qpu, nuni, out);
+}
+
+int vc4c_upload_named(vc4c_conn *c, const char *name, const void *code,
+                      size_t bytes, unsigned max_qpu, unsigned nuni,
+                      vc4c_prog *out)
+{
+    if (!c || !code || !out || !bytes)
         return -VC4D_E_INVAL;
-    uint8_t *pl = malloc(sizeof(struct vc4d_upload_req) + bytes);
+    size_t nlen = (name && *name) ? strlen(name) : 0;
+    if (nlen >= VC4D_NAME_MAX)
+        return -VC4D_E_INVAL;
+    if (sizeof(struct vc4d_upload_req) + bytes + nlen > VC4D_MAX_MSG)
+        return -VC4D_E_INVAL;
+    uint8_t *pl = malloc(sizeof(struct vc4d_upload_req) + bytes + nlen);
     if (!pl)
         return -VC4D_E_NOMEM;
     struct vc4d_upload_req q = { .bytes = (uint32_t)bytes,
-                                 .max_qpu = max_qpu, .nuni = nuni, .flags = 0 };
+                                 .max_qpu = max_qpu, .nuni = nuni,
+                                 .flags = nlen ? VC4D_UPLOAD_NAMED : 0 };
     memcpy(pl, &q, sizeof(q));
     memcpy(pl + sizeof(q), code, bytes);
+    if (nlen)
+        memcpy(pl + sizeof(q) + bytes, name, nlen);
     struct vc4d_upload_rsp r;
     size_t n = 0;
-    int rc = xfer(c, VC4D_OP_UPLOAD, pl, sizeof(q) + bytes, -1, NULL,
+    int rc = xfer(c, VC4D_OP_UPLOAD, pl, sizeof(q) + bytes + nlen, -1, NULL,
                   &r, sizeof(r), &n, NULL, NULL);
     free(pl);
     if (rc != 0)
@@ -372,22 +386,47 @@ int vc4c_launch(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
     return n == sizeof(r) ? 0 : -VC4D_E_PROTO;
 }
 
-int vc4c_launch_arena(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
-                      const vc4c_buf *uniforms, unsigned uni_off,
-                      unsigned timeout_ms)
+/* One implementation for the four public forms.  use_mask=0 sends no
+ * VC4D_LAUNCH_UNI_MASK at all, so a daemon that predates it keeps its old
+ * per-word heuristic (and an old daemon does not see an unknown flag). */
+static int launch_arena_impl(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
+                             const vc4c_buf *uniforms, unsigned uni_off,
+                             unsigned timeout_ms, vc4c_result *out,
+                             uint32_t uni_addr, int use_mask, int wait)
 {
     if (!c || !p || !uniforms || !uniforms->map || !nqpu ||
         nqpu > VC4D_MAX_QPU || (uni_off & 63u))
         return -VC4D_E_INVAL;
     if (!p->nuni || p->nuni > VC4D_MAX_UNI)
         return -VC4D_E_INVAL;
+    if (use_mask && (uni_addr >> p->nuni))
+        return -VC4D_E_INVAL;
     if ((uint64_t)uni_off + 64ull * nqpu > uniforms->len)
         return -VC4D_E_INVAL;
     struct vc4d_launch_req q = { .prog = p->handle, .timeout_ms = timeout_ms,
                                  .nqpu = nqpu, .nuni = p->nuni,
-                                 .flags = VC4D_LAUNCH_UNI_ARENA,
+                                 .flags = VC4D_LAUNCH_UNI_ARENA |
+                                          (wait ? VC4D_LAUNCH_WAIT : 0) |
+                                          (use_mask ? VC4D_LAUNCH_UNI_MASK : 0),
                                  .uni_handle = uniforms->handle,
-                                 .uni_off = uni_off };
+                                 .uni_off = uni_off,
+                                 .uni_addr = use_mask ? uni_addr : 0 };
+    if (wait) {
+        struct vc4d_wait_rsp r;
+        memset(&r, 0, sizeof(r));
+        size_t n = 0;
+        int rc = xfer(c, VC4D_OP_LAUNCH, &q, sizeof(q), -1, NULL,
+                      &r, sizeof(r), &n, NULL, NULL);
+        if (out && n >= sizeof(r)) {
+            out->launch = r.launch;
+            out->errs = r.errs;
+            out->wall_ns = r.wall_ns;
+            out->cycles = r.cycles;
+        }
+        if (rc != 0)
+            return rc;
+        return n == sizeof(r) ? 0 : -VC4D_E_PROTO;
+    }
     struct vc4d_launch_rsp r;
     size_t n = 0;
     int rc = xfer(c, VC4D_OP_LAUNCH, &q, sizeof(q), -1, NULL,
@@ -397,37 +436,37 @@ int vc4c_launch_arena(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
     return n == sizeof(r) ? 0 : -VC4D_E_PROTO;
 }
 
+int vc4c_launch_arena(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
+                      const vc4c_buf *uniforms, unsigned uni_off,
+                      unsigned timeout_ms)
+{
+    return launch_arena_impl(c, p, nqpu, uniforms, uni_off, timeout_ms, NULL,
+                             0, 0, 0);
+}
+
+int vc4c_launch_arena_u(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
+                        const vc4c_buf *uniforms, unsigned uni_off,
+                        unsigned timeout_ms, uint32_t uni_addr)
+{
+    return launch_arena_impl(c, p, nqpu, uniforms, uni_off, timeout_ms, NULL,
+                             uni_addr, 1, 0);
+}
+
 int vc4c_launch_wait(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
                      const vc4c_buf *uniforms, unsigned uni_off,
                      unsigned timeout_ms, vc4c_result *out)
 {
-    if (!c || !p || !uniforms || !uniforms->map || !nqpu ||
-        nqpu > VC4D_MAX_QPU || (uni_off & 63u))
-        return -VC4D_E_INVAL;
-    if (!p->nuni || p->nuni > VC4D_MAX_UNI)
-        return -VC4D_E_INVAL;
-    if ((uint64_t)uni_off + 64ull * nqpu > uniforms->len)
-        return -VC4D_E_INVAL;
-    struct vc4d_launch_req q = { .prog = p->handle, .timeout_ms = timeout_ms,
-                                 .nqpu = nqpu, .nuni = p->nuni,
-                                 .flags = VC4D_LAUNCH_UNI_ARENA |
-                                          VC4D_LAUNCH_WAIT,
-                                 .uni_handle = uniforms->handle,
-                                 .uni_off = uni_off };
-    struct vc4d_wait_rsp r;
-    memset(&r, 0, sizeof(r));
-    size_t n = 0;
-    int rc = xfer(c, VC4D_OP_LAUNCH, &q, sizeof(q), -1, NULL,
-                  &r, sizeof(r), &n, NULL, NULL);
-    if (out && n >= sizeof(r)) {
-        out->launch = r.launch;
-        out->errs = r.errs;
-        out->wall_ns = r.wall_ns;
-        out->cycles = r.cycles;
-    }
-    if (rc != 0)
-        return rc;
-    return n == sizeof(r) ? 0 : -VC4D_E_PROTO;
+    return launch_arena_impl(c, p, nqpu, uniforms, uni_off, timeout_ms, out,
+                             0, 0, 1);
+}
+
+int vc4c_launch_wait_u(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
+                       const vc4c_buf *uniforms, unsigned uni_off,
+                       unsigned timeout_ms, vc4c_result *out,
+                       uint32_t uni_addr)
+{
+    return launch_arena_impl(c, p, nqpu, uniforms, uni_off, timeout_ms, out,
+                             uni_addr, 1, 1);
 }
 
 int vc4c_flush(vc4c_conn *c, const vc4c_buf *b, unsigned dir)

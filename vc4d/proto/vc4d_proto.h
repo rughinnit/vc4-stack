@@ -16,7 +16,13 @@
 #include <stdint.h>
 
 #define VC4D_MAGIC      0x44344356u   /* "VC4D" */
-/* 2: launch_req grew flags/uni_handle/uni_off (UNI_IN_ARENA mode). */
+/* 2: launch_req grew flags/uni_handle/uni_off (UNI_IN_ARENA mode).
+ *
+ * Version 2 is kept for the G3/G4 additions below: they are opt-in, so a
+ * client that sends neither a program name nor a uniform address mask sees
+ * exactly the old behaviour (and a new client can check the HELLO flags
+ * before using either).  Bumping the version would have made every old
+ * client fail at HELLO instead. */
 #define VC4D_VERSION    2u
 
 #define VC4D_MAX_MSG    (64u * 1024u) /* hard cap on one message             */
@@ -44,6 +50,19 @@ enum {
 /* HELLO flags */
 #define VC4D_F_RAW_SRQ      (1u << 0)  /* raw SRQ / VPMBASE writes allowed */
 #define VC4D_F_ALLOWLIST    (1u << 1)  /* UPLOAD hashes are pinned         */
+#define VC4D_F_NAMED_PROGS  (1u << 2)  /* UPLOAD may carry a program name  */
+#define VC4D_F_UNI_MASK     (1u << 3)  /* LAUNCH may declare address slots */
+#define VC4D_F_ARENA_RESTORE (1u << 4) /* a degraded arena is restored when
+                                        * CMA recovers and the daemon is idle */
+
+/* UPLOAD flags.  NAMED: the payload is
+ *     struct vc4d_upload_req, code bytes, name bytes (no NUL)
+ * where the name is 1..VC4D_NAME_MAX-1 printable bytes.  The name is the key
+ * of the program-slot LRU: re-uploading the same name reuses the slot, and an
+ * eviction frees the least recently used one.  Without the flag the daemon
+ * falls back to the code sha256 as the key. */
+#define VC4D_UPLOAD_NAMED   (1u << 0)
+#define VC4D_NAME_MAX       64u
 
 /* ALLOC flags */
 #define VC4D_ALLOC_ZERO     (1u << 0)  /* daemon zeroes the region         */
@@ -133,10 +152,24 @@ struct vc4d_uni { uint32_t kind; uint32_t handle; uint32_t off; uint32_t len; };
  *             engine uses: it removes the LAUNCH/WAIT pair and the explicit
  *             SYNC round trips (the client mapping is write-combining, so
  *             there is nothing to clean on the CPU side).
+ *
+ * flags & VC4D_LAUNCH_UNI_MASK (UNI_IN_ARENA only): launch_req.uni_addr is
+ *             authoritative instead of the daemon's heuristic.  Bit u means
+ *             "uniform word u is a GPU bus address the program consumes", and
+ *             the daemon requires it to lie inside this client's arena; a word
+ *             whose bit is clear is a *value* and is not compared with the bus
+ *             window at all.  This is what makes a float whose bit pattern is
+ *             >= 0xC0000000 (-2.0f and everything below it) legal: the old
+ *             per-word guess could not tell such a value from an address.  It
+ *             is a per-slot mask rather than a per-word kind because every QPU
+ *             block has the same layout, so 16 bits cover all 12 QPUs.
+ *             Bits >= nuni must be zero.
  */
 #define VC4D_LAUNCH_UNI_ARENA  (1u << 0)
 #define VC4D_LAUNCH_WAIT       (1u << 1)
-#define VC4D_LAUNCH_FLAGS_ALL  (VC4D_LAUNCH_UNI_ARENA | VC4D_LAUNCH_WAIT)
+#define VC4D_LAUNCH_UNI_MASK   (1u << 2)
+#define VC4D_LAUNCH_FLAGS_ALL  (VC4D_LAUNCH_UNI_ARENA | VC4D_LAUNCH_WAIT | \
+                                VC4D_LAUNCH_UNI_MASK)
 
 struct vc4d_launch_req {
     uint32_t prog;
@@ -146,7 +179,7 @@ struct vc4d_launch_req {
     uint32_t flags;        /* VC4D_LAUNCH_* */
     uint32_t uni_handle;   /* UNI_ARENA: client region holding the uniforms */
     uint32_t uni_off;      /* UNI_ARENA: byte offset, 64-byte aligned */
-    uint32_t pad;
+    uint32_t uni_addr;     /* UNI_MASK: bit u = uniform word u is an address */
 };
 struct vc4d_launch_rsp { uint32_t launch; uint32_t nqpu; uint32_t pad0; uint32_t pad1; };
 
@@ -176,11 +209,15 @@ struct vc4d_stats_rsp {
     uint64_t launches, launches_failed, bytes_uploaded, reg_writes;
     uint64_t rejects, arena_bytes, arena_used, gpu_ns;
     uint32_t clients, max_clients, programs, dead;
+    uint64_t evictions;     /* program slots freed by the LRU             */
+    uint32_t arena_want;    /* size requested at startup                  */
+    uint32_t arena_degraded;/* 1: CMA refused arena_want, using less      */
 };
 
 _Static_assert(sizeof(struct vc4d_hdr) == 28, "hdr");
 _Static_assert(sizeof(struct vc4d_uni) == 16, "uni");
 _Static_assert(sizeof(struct vc4d_launch_req) == 32, "launch_req");
+_Static_assert(sizeof(struct vc4d_stats_rsp) == 96, "stats_rsp");
 _Static_assert(sizeof(struct vc4d_regs) == 72, "regs");
 
 #endif /* VC4D_PROTO_H */

@@ -29,6 +29,14 @@ typedef struct {
     uint32_t code_words;
     uint32_t nqpu;
     int      used;
+    /* G3: the daemon evicts program slots LRU-wise, so a launch can come back
+     * E_NOENT for a kernel the client still knows.  The remote backend keeps
+     * the code words to re-upload it without a JIT round trip; `used_at` is
+     * this cache's own LRU stamp, and `slot` is the index in ctx->k[] (the
+     * remote program table is parallel to it). */
+    uint8_t *code;
+    uint32_t code_len;
+    uint64_t used_at;
 } vc4_kernel;
 
 struct vc4_ctx {
@@ -52,6 +60,7 @@ struct vc4_ctx {
 
     vc4_kernel k[VC4_MAX_KERNELS];
     int      nkern;
+    uint64_t kern_clock;     /* LRU stamp for the kernel cache (G3) */
     char     cache_dir[256];
     int      allow_jit;
 
@@ -101,6 +110,11 @@ vc4_status vc4__kernel(vc4_ctx *ctx, const char *name, char *const gen_argv[],
 vc4_status vc4__kernel_load_file(vc4_ctx *ctx, const char *name,
                                  const uint8_t *words, size_t bytes,
                                  int nqpu, vc4_kernel **out);
+/* The cache entry a newly uploaded kernel goes in: a free one, or - when all
+ * VC4_MAX_KERNELS are live - the least recently used one, whose code/uniform
+ * area is then reused.  Shared with the remote backend so both paths have the
+ * same behaviour when a session touches more kernels than the cache holds. */
+vc4_kernel *vc4__kern_slot(vc4_ctx *ctx);
 
 /* ---- vc4_gemm.c --------------------------------------------------------- */
 /* one work unit = 8 rows x rowlen floats; grid-strided over 4 QPUs */
@@ -124,8 +138,6 @@ vc4_status vc4__ew_run(vc4_ctx *ctx, vc4_op op, uint64_t n,
 int        vc4__unverified_allowed(void);
 vc4_status vc4__refuse_unverified(vc4_ctx *ctx, const char *what,
                                   const char *why);
-vc4_status vc4__check_uniform_value(vc4_ctx *ctx, const char *what,
-                                     float v);
 
 /* ---- vc4_ew.c: generic binary/backward elementwise ---------------------- */
 /* A kernel from kops' EWB family: out = f(a, b) with p0/p1 as attributes.

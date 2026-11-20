@@ -68,6 +68,15 @@ eng = vc4infer.Engine("model.onnx", arena_mb=64)
 `vc4-smi` shows the daemon and the GPU; `vc4infer --version` prints which
 backend the process would use.
 
+One historical reason to pick `direct` is gone: before `vc4d` 1.2.7 a scalar
+parameter at or below −2.0 (`LeakyRelu(-2)`, `Clip(-3,3)`) was refused in
+managed mode, because its fp32 bit pattern (≥ `0xC0000000`) looks like a GPU bus
+address and the protocol carried no way to say "this uniform word is a value".
+`LAUNCH` now carries a per-slot address mask (`VC4D_LAUNCH_UNI_MASK`), the
+engine sets it on every launch, and the two backends accept the same parameter
+range.  Old clients that send no mask keep the old behaviour, so a 1.2.6
+client against a 1.2.7 daemon is unchanged.
+
 ## Why `managed` is the default
 
 The daemon is not overhead for its own sake. It is what makes the GPU usable

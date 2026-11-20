@@ -1205,6 +1205,13 @@ static void ref_pad(const float *x, double *y, const void *pv)
 {
     const pad_p *p = pv;
     const int Hp = p->H + 2 * p->pt, Wp = p->W + 2 * p->pl;
+    /* the border is zero padding: write all of y, not just the inner region.
+     * Leaving it untouched made the finite-difference loss depend on whatever
+     * the malloc block held (uninitialised doubles, sometimes NaN), which is
+     * how this case passed or failed depending on the process's heap layout
+     * (found while adding the G4 uniform mask: a 19-byte longer UPLOAD was
+     * enough to flip it). */
+    memset(y, 0, (size_t)p->N * p->C * Hp * Wp * sizeof(double));
     for (int n = 0; n < p->N; ++n)
         for (int c = 0; c < p->C; ++c)
             for (int yy = 0; yy < p->H; ++yy)

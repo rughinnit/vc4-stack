@@ -19,6 +19,9 @@ layout from [TUTORIAL.md](TUTORIAL.md): `/home/raspi/work/vc4-stack`, user
 | output changes between runs, more elements over tolerance on repeats | 5 |
 | `graph pool exhausted`, `conv_nhwc: out of arena memory` | 6 |
 | `cma_heap_allocate` page-allocation failure, `vc4d` restart loop | 7 |
+| `ARENA DEGRADED`, arena smaller than `--arena-mb` | 7 |
+| `parameter -2 has bit pattern 0xc0000000` | 7a |
+| `kernel cache full (128 entries)`, `out of arena/slots` | 7b |
 | last bits differ from a CPU/float64 reference | 8 |
 | build or venv dies from RAM, `/tmp` fills | 9 |
 | `vc4_init` ok but the client arena is exactly 3 MiB (`VC4_DATA_BASE`) and `vc4_alloc` fails `have 0 B` | 14 |
@@ -459,6 +462,99 @@ share.  A 150 MiB block needs an unusually clean boot.
    The daemon's shrink ladder tries 32/16/8 MiB if the requested size fails;
    a client that asks for 64 MiB will then fail with `E_NOMEM` even though the
    daemon is "running".
+
+   Since `vc4d` 1.2.7 the requested size is retried (0/200/400 ms) and only
+   then does the daemon fall back, with a line that names the size obtained,
+   the size requested and `CmaTotal`/`CmaFree`:
+
+   ```
+   vc4d: arena attempt 1/3 for 96 MiB: 96 MiB: cma_heap_allocate failed
+         (Cannot allocate memory; CmaFree 19 MiB of 256 MiB)
+   vc4d: ARENA DEGRADED: obtained 32 MiB of the 96 MiB requested.
+   vc4d:   CMA: 19 MiB free of 256 MiB total (/proc/meminfo); CMA is one
+   ...
+   ```
+
+   **The degraded arena is no longer permanent.**  Once the arena is idle and
+   CMA has the full block again, the daemon exits 75 and systemd restarts it
+   with the requested size:
+
+   ```
+   vc4d: arena was 32 MiB of the 96 MiB requested; CMA now has 180 MiB free and
+         the arena is idle - exiting so a fresh daemon claims the full block
+         (no reboot needed)
+   vc4d: exit: restarting ...
+   vc4d: restart reason: the arena was degraded and CMA has recovered
+   ```
+
+   If CMA never recovers the daemon stays up at the smaller size and logs that
+   it is waiting, instead of looping — free CMA (steps 1-3) and it restores
+   itself.  Repeated failed attempts are spaced out (1 min doubling to 6 h):
+
+   ```
+   vc4d: arena restore: 1 attempt(s) already failed; next try in 55 s (a
+         fragmented CMA can refuse the full block even when enough is free in
+         pieces).  Stop the other CMA user and restart vc4d to retry now.
+   ```
+
+   To retry immediately, free CMA and run `sudo systemctl restart vc4d` (a
+   restart clears the stamp).  The state is one file per requested size,
+   `/run/vc4d/arena-restore-<MiB>.state`; delete it to clear the backoff by
+   hand.  A board whose CMA is fragmented so that the block cannot be had at
+   any `CmaFree` value (measured here: 107 MiB free, a 96 MiB block refused)
+   needs a reboot — CMA fragmentation is not defragmentable from user space.
+
+## 7a. A parameter of −2.0 or below is refused in managed mode
+
+**Symptom (before `vc4d` 1.2.7).** Any op whose scalar attribute is at or below
+−2.0 fails in managed mode while the same call works with `--backend direct`:
+
+```
+vc4infer: unsupported: LeakyRelu: unary: vc4_unary leakyrelu: parameter -2 has
+  bit pattern 0xc0000000, which vc4d refuses as a possible GPU bus address
+  (every float <= -2.0 is in 0xC0000000..0xFFFFFFFF) ...
+vc4infer: unsupported: Clip: unary: vc4_unary clip: parameter -3 has bit
+  pattern 0xc0400000 ...
+```
+
+**Cause.** Every fp32 value ≤ −2.0 has a bit pattern ≥ `0xC0000000`, which is
+the GPU bus window.  The daemon validated each materialised uniform word as
+"inside this arena, or not an address", so it could not tell `-2.0f` from a bus
+address; the engine refused the call first so the message would be honest.
+
+**Fix.** Upgrade to `vc4d`/`vc4infer` 1.2.7 or later and restart the daemon
+(`sudo systemctl restart vc4d`).  `LAUNCH` now carries a per-slot address mask
+(`VC4D_LAUNCH_UNI_MASK`): the engine marks the uniform slots that hold GPU
+addresses, the daemon range-checks exactly those, and every other word is a
+value.  Old clients that send no mask keep the old behaviour unchanged.
+
+## 7b. `kernel cache full (128 entries)` or `out of arena/slots`
+
+**Symptom.** A long session — `vc4infer util model.onnx` on a full YOLO graph,
+a training run, a benchmark over many shapes — fails on a shape it has not run
+before:
+
+```
+vc4infer: unsupported: ... UPLOAD: out of arena/slots
+kernel cache full (128 entries)
+```
+
+and every later shape fails too, until `sudo systemctl restart vc4d` (or a new
+process).  The shapes that were already loaded keep working, which makes it look
+like a model problem.
+
+**Cause (before 1.2.7).** Both caches were fixed arrays with no eviction: the
+daemon had 128 program slots (127 usable, one is the recovery probe) and the
+engine a 128-entry kernel table.  "More distinct kernels than slots" was
+therefore a permanent failure instead of a cache miss.
+
+**Fix.** Upgrade to 1.2.7 or later.  Program slots are an LRU keyed by the
+kernel name, the engine's kernel table is an LRU that keeps each kernel's code,
+and a launch whose daemon slot was evicted re-uploads it transparently.  The
+daemon counts evictions in `STATS.evictions` and logs them at `--verbose`.  A
+session may now touch hundreds of distinct shapes; the cost is a re-upload per
+evicted kernel, not a restart.  If you still see `kernel cache full`, the client
+is older than the daemon: `vc4infer --version` shows both versions.
 
 ## 8. FPU truncation and denormal flushing
 

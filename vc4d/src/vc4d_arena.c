@@ -181,6 +181,127 @@ static int verify_phys(int mem, uint8_t *unc, uint32_t phys, size_t len,
     return 0;
 }
 
+void arena_cma_info(size_t *total, size_t *free_bytes)
+{
+    if (total)
+        *total = 0;
+    if (free_bytes)
+        *free_bytes = 0;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f)
+        return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long kb;
+        if (sscanf(line, "CmaTotal: %lu kB", &kb) == 1) {
+            if (total)
+                *total = (size_t)kb << 10;
+        } else if (sscanf(line, "CmaFree: %lu kB", &kb) == 1) {
+            if (free_bytes)
+                *free_bytes = (size_t)kb << 10;
+        }
+    }
+    fclose(f);
+}
+
+/* One attempt at exactly `len`.  On failure nothing is left behind: the
+ * dma-buf is closed (which returns the CMA reservation immediately) and every
+ * mapping is unmapped before the caller retries or falls back. */
+static int arena_try(struct arena *a, size_t len, char *err, size_t errn)
+{
+    int heap = open("/dev/dma_heap/linux,cma", O_RDWR | O_CLOEXEC);
+    if (heap < 0) {
+        snprintf(err, errn, "open /dev/dma_heap/linux,cma: %s", strerror(errno));
+        return -1;
+    }
+    struct dma_heap_allocation_data d;
+    memset(&d, 0, sizeof(d));
+    d.len = len;
+    d.fd_flags = O_RDWR | O_CLOEXEC;
+    int rc = ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &d);
+    close(heap);
+    if (rc != 0) {
+        size_t total = 0, cfree = 0;
+        arena_cma_info(&total, &cfree);
+        snprintf(err, errn, "%zu MiB: cma_heap_allocate failed (%s; CmaFree %zu MiB "
+                 "of %zu MiB)", len >> 20, strerror(errno), cfree >> 20, total >> 20);
+        return -1;
+    }
+
+    uint8_t *cached = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, (int)d.fd, 0);
+    if (cached == MAP_FAILED) {
+        snprintf(err, errn, "%zu MiB: mmap: %s", len >> 20, strerror(errno));
+        close((int)d.fd);
+        return -1;
+    }
+    uint32_t phys = 0;
+    int fr = find_phys(cached, len, &phys, err, errn);
+    munmap(cached, len);
+    if (fr != 0) {
+        close((int)d.fd);
+        return -1;
+    }
+
+    int mem = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+    if (mem < 0) {
+        snprintf(err, errn, "open /dev/mem: %s", strerror(errno));
+        close((int)d.fd);
+        return -1;
+    }
+    void *unc = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, mem, (off_t)phys);
+    if (unc == MAP_FAILED) {
+        snprintf(err, errn, "mmap arena at 0x%08x: %s", phys, strerror(errno));
+        close(mem);
+        close((int)d.fd);
+        return -1;
+    }
+    if (verify_phys(mem, unc, phys, len, err, errn) != 0) {
+        munmap(unc, len);
+        close(mem);
+        close((int)d.fd);
+        return -1;
+    }
+    close(mem);
+
+    a->fd = (int)d.fd;
+    a->map = unc;
+    a->phys = phys;
+    a->bus = phys | 0xC0000000u;
+    a->bytes = len;
+    memset(a->map, 0, A_DATA_BASE);       /* header, code and uni areas */
+    a->npages = (uint32_t)((len - A_DATA_BASE) / ARENA_PAGE);
+    a->bits = calloc((a->npages + 31u) / 32u, sizeof(uint32_t));
+    if (!a->bits) {
+        munmap(unc, len);
+        close((int)d.fd);
+        a->fd = -1;
+        a->map = NULL;
+        snprintf(err, errn, "out of memory for a %u-page arena bitmap",
+                 a->npages);
+        return -1;
+    }
+    a->hint = 0;
+    a->used = 0;
+    return 0;
+}
+
+/*
+ * Open the arena at `want`, and only shrink if the full block cannot be had.
+ *
+ * The old code went straight from one failed allocation to half the size (and
+ * then a quarter, an eighth) and kept the result for the daemon's lifetime, so
+ * a transient block of CMA pressure - another client exiting, the DRM driver
+ * holding scanout buffers for a moment - silently halved the arena until the
+ * next reboot (G2).  Now:
+ *
+ *   1. the requested size is retried three times over ~600 ms, each attempt
+ *      closing its dma-buf so the CMA reservation is dropped before the retry;
+ *   2. only then does the ladder try half/quarter/eighth, and that is logged
+ *      loudly with the sizes and the current CmaFree, because it changes what
+ *      a client can run;
+ *   3. A.degraded records it so the daemon can restore the full block once CMA
+ *      has recovered and no client is using the arena (see main()).
+ */
 int arena_open(struct arena *a, size_t want, char *err, size_t errn)
 {
     memset(a, 0, sizeof(*a));
@@ -189,82 +310,54 @@ int arena_open(struct arena *a, size_t want, char *err, size_t errn)
     if (want < ARENA_MIN)
         want = ARENA_MIN;
     want &= ~4095ul;
+    a->want = want;
 
-    static const size_t shrink[] = { 1, 1, 1, 2, 4, 8 };
-    for (size_t si = 0; si < sizeof(shrink) / sizeof(shrink[0]); ++si) {
-        size_t len = want / shrink[si];
-        if (len < ARENA_MIN)
-            break;
-        if (si)
-            usleep(200 * 1000);   /* let a just-exited user's CMA drain */
-        int heap = open("/dev/dma_heap/linux,cma", O_RDWR | O_CLOEXEC);
-        if (heap < 0) {
-            snprintf(err, errn, "open /dev/dma_heap/linux,cma: %s", strerror(errno));
-            return -1;
+    static const unsigned retry_ms[] = { 0, 200, 400 };
+    char last[256] = "";
+    for (size_t i = 0; i < sizeof(retry_ms) / sizeof(retry_ms[0]); ++i) {
+        if (retry_ms[i])
+            usleep(retry_ms[i] * 1000u);
+        char e2[256] = "";
+        if (arena_try(a, want, e2, sizeof(e2)) == 0) {
+            a->degraded = 0;
+            if (i)
+                fprintf(stderr, "vc4d: arena: full %zu MiB obtained on attempt "
+                        "%zu/%zu (CMA was released in between)\n", want >> 20,
+                        i + 1, sizeof(retry_ms) / sizeof(retry_ms[0]));
+            return 0;
         }
-        struct dma_heap_allocation_data d;
-        memset(&d, 0, sizeof(d));
-        d.len = len;
-        d.fd_flags = O_RDWR | O_CLOEXEC;
-        int rc = ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &d);
-        close(heap);
-        if (rc != 0)
-            continue;
+        /* Every failed attempt is worth a line: it is the difference between
+         * "the board is full" and "a client was exiting at the wrong moment". */
+        fprintf(stderr, "vc4d: arena attempt %zu/%zu for %zu MiB: %s\n",
+                i + 1, sizeof(retry_ms) / sizeof(retry_ms[0]), want >> 20, e2);
+        snprintf(last, sizeof(last), "%s", e2);
+        snprintf(err, errn, "%s", e2);
+    }
 
-        uint8_t *cached = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, (int)d.fd, 0);
-        if (cached == MAP_FAILED) {
-            close((int)d.fd);
-            continue;
+    for (size_t len = want / 2; len >= ARENA_MIN; len /= 2) {
+        char e2[256] = "";
+        if (arena_try(a, len, e2, sizeof(e2)) == 0) {
+            size_t total = 0, cfree = 0;
+            arena_cma_info(&total, &cfree);
+            a->degraded = 1;
+            fprintf(stderr,
+                "vc4d: ARENA DEGRADED: obtained %zu MiB of the %zu MiB requested.\n"
+                "vc4d:   %s\n"
+                "vc4d:   CMA: %zu MiB free of %zu MiB total (/proc/meminfo); CMA is one\n"
+                "vc4d:   contiguous pool shared by every GPU client, so a large block can\n"
+                "vc4d:   fail while plenty of CMA is free in smaller pieces.\n"
+                "vc4d:   Until the full block is available a model whose client arena\n"
+                "vc4d:   needs more than %zu MiB fails with `pool exhausted`.\n"
+                "vc4d:   What to do: stop the other GPU client (another vc4d, VC4CL, a\n"
+                "vc4d:   camera/KMS buffer) and the daemon restores the full arena by\n"
+                "vc4d:   itself as soon as it is idle - no reboot needed.  Or restart it\n"
+                "vc4d:   now: sudo systemctl restart vc4d\n",
+                len >> 20, want >> 20, last, cfree >> 20, total >> 20,
+                (len - A_DATA_BASE) >> 20);
+            return 0;
         }
-        uint32_t phys = 0;
-        int fr = find_phys(cached, len, &phys, err, errn);
-        munmap(cached, len);
-        if (fr != 0) {
-            close((int)d.fd);
-            continue;
-        }
-
-        int mem = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
-        if (mem < 0) {
-            close((int)d.fd);
-            snprintf(err, errn, "open /dev/mem: %s", strerror(errno));
-            return -1;
-        }
-        void *unc = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, mem, (off_t)phys);
-        if (unc == MAP_FAILED) {
-            close(mem);
-            close((int)d.fd);
-            snprintf(err, errn, "mmap arena at 0x%08x: %s", phys, strerror(errno));
-            return -1;
-        }
-        if (verify_phys(mem, unc, phys, len, err, errn) != 0) {
-            munmap(unc, len);
-            close(mem);
-            close((int)d.fd);
-            continue;                      /* try a smaller arena */
-        }
-        close(mem);
-
-        a->fd = (int)d.fd;
-        a->map = unc;
-        a->phys = phys;
-        a->bus = phys | 0xC0000000u;
-        a->bytes = len;
-        memset(a->map, 0, A_DATA_BASE);       /* header, code and uni areas */
-        a->npages = (uint32_t)((len - A_DATA_BASE) / ARENA_PAGE);
-        a->bits = calloc((a->npages + 31u) / 32u, sizeof(uint32_t));
-        if (!a->bits) {
-            munmap(unc, len);
-            close((int)d.fd);
-            a->fd = -1;
-            a->map = NULL;
-            snprintf(err, errn, "out of memory for a %u-page arena bitmap",
-                     a->npages);
-            return -1;
-        }
-        a->hint = 0;
-        a->used = 0;
-        return 0;
+        snprintf(last, sizeof(last), "%s", e2);
+        snprintf(err, errn, "%s", e2);
     }
     if (!*err)
         snprintf(err, errn, "no dma-buf of %zu MiB (CMA free?)", want >> 20);

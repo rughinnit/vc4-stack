@@ -63,6 +63,13 @@ struct prog {
     uint32_t code_off, uni_off;
     uint32_t nqpu_max, nuni, words;
     uint8_t  hash[32];
+    /* G3: the slot table is an LRU keyed by name (or by code hash for a
+     * client that sends no name).  Re-uploading a name reuses its slot; when
+     * the table is full the least recently used slot that is not executing is
+     * freed.  `busy` marks the one program in flight. */
+    char     name[VC4D_NAME_MAX];
+    uint64_t lru;
+    int      busy;
 };
 
 struct client {
@@ -71,8 +78,6 @@ struct client {
     uid_t    uid;
     pid_t    pid;
     struct region reg[MAX_REGIONS];
-    uint32_t prog[MAX_PROGS_CLI];
-    int      nprog;
     int      inflight;
     uint32_t launch_id;
     uint64_t denials;
@@ -105,9 +110,12 @@ static uint32_t next_launch = 1;
 static volatile sig_atomic_t stop_flag;
 
 static uint64_t st_launches, st_failed, st_bytes_up, st_wreg, st_rejects;
-static uint64_t st_reclaimed, st_recoveries;
+static uint64_t st_reclaimed, st_recoveries, st_evicted;
 static int st_clients, st_clients_max, st_progs;
 static int restart_needed;       /* recovery failed: exit after replying */
+static const char *restart_reason = "GPU context could not be reset";
+static uint64_t lru_clock;       /* monotonic use counter for the program LRU */
+static int busy_slot = -1;       /* the program slot that is executing */
 
 static void client_destroy(int idx);
 static void reap_dead_clients(int keep, const char *why);
@@ -298,6 +306,102 @@ static struct prog *find_prog(struct client *c, uint32_t handle)
     return p;
 }
 
+/* ----------------------------------------------------- program slot LRU (G3)
+ *
+ * The old table had 128 slots (one reserved for the probe) and no way to
+ * reclaim one: a session that touched more than 127 distinct kernels - the
+ * full YOLOv8 graph plus a few shapes - got E_NOMEM from UPLOAD for the rest
+ * of its life and every later launch failed until the daemon was restarted.
+ * That is a transient condition (more shapes than slots) turned permanent.
+ *
+ * A slot is now freed by LRU.  The key is the program *name* the client sends
+ * with UPLOAD (the code sha256 for a client that sends none), so re-uploading
+ * a kernel after an eviction costs the slot that kernel had, not a new one.
+ * The program in flight and the daemon's probe are never evicted.
+ */
+static void prog_touch(struct prog *p)
+{
+    p->lru = ++lru_clock;
+}
+
+static void prog_release(int slot)
+{
+    struct prog *p = &progs[slot];
+    if (!p->used)
+        return;
+    p->used = 0;
+    p->owner = -1;
+    p->name[0] = 0;
+    if (st_progs > 0)
+        st_progs--;
+}
+
+/* Return the slot to write this upload into, or -1.  found_out tells the
+ * caller that the slot is the same program (same name) and must keep its
+ * handle generation; evicted_out counts an LRU eviction. */
+static int prog_slot_for(struct client *c, const char *name,
+                         const uint8_t hash[32], uint32_t max_qpu,
+                         uint32_t nuni, int *same, uint64_t *evicted_out)
+{
+    if (same)
+        *same = 0;
+    if (evicted_out)
+        *evicted_out = 0;
+
+    /* 1. the same program, already resident: reuse it in place */
+    for (int i = 0; i < PROBE_SLOT; ++i) {
+        struct prog *p = &progs[i];
+        if (!p->used || p->owner != c->idx)
+            continue;
+        int match;
+        if (name && *name)
+            match = strcmp(p->name, name) == 0;
+        else
+            match = !p->name[0] && p->nqpu_max == max_qpu &&
+                    p->nuni == nuni && memcmp(p->hash, hash, 32) == 0;
+        if (!match)
+            continue;
+        if (p->busy)
+            return -1;              /* the copy that is executing; refuse */
+        if (same)
+            *same = 1;
+        return i;
+    }
+
+    /* 2. a free slot */
+    for (int i = 0; i < PROBE_SLOT; ++i)
+        if (!progs[i].used)
+            return i;
+
+    /* 3. evict the least recently used slot that is not executing: first from
+     * this client (its own handles go stale, which it can recover from by
+     * re-uploading), then from another client if this one owns nothing else. */
+    for (int pass = 0; pass < 2; ++pass) {
+        int best = -1;
+        for (int i = 0; i < PROBE_SLOT; ++i) {
+            struct prog *p = &progs[i];
+            if (!p->used || p->busy)
+                continue;
+            if (pass == 0 && p->owner != c->idx)
+                continue;
+            if (best < 0 || p->lru < progs[best].lru)
+                best = i;
+        }
+        if (best >= 0) {
+            logmsg("evict prog slot %d uid=%u name=%s (LRU, %llu slots in use)",
+                   best, (unsigned)c->uid,
+                   progs[best].name[0] ? progs[best].name : "(unnamed)",
+                   (unsigned long long)st_progs);
+            prog_release(best);
+            st_evicted++;
+            if (evicted_out)
+                *evicted_out = 1;
+            return best;
+        }
+    }
+    return -1;
+}
+
 static void release_client_resources(struct client *c)
 {
     for (int i = 0; i < MAX_REGIONS; ++i) {
@@ -308,12 +412,15 @@ static void release_client_resources(struct client *c)
     }
     for (int i = 0; i < MAX_PROGS_SLOTS; ++i) {
         if (progs[i].used && progs[i].owner == c->idx) {
+            if (progs[i].busy)
+                progs[i].busy = 0;
             progs[i].used = 0;
             progs[i].owner = -1;
-            st_progs--;
+            progs[i].name[0] = 0;
+            if (st_progs > 0)
+                st_progs--;
         }
     }
-    c->nprog = 0;
 }
 
 /* --------------------------------------------------------------- handlers */
@@ -343,7 +450,8 @@ static int handle_hello(struct client *c, const struct vc4d_hdr *h,
     r.max_uni = VC4D_MAX_UNI;
     r.max_prog = VC4D_MAX_PROG;
     r.flags = (opt.raw_srq ? VC4D_F_RAW_SRQ : 0) |
-              (opt.allowlist ? VC4D_F_ALLOWLIST : 0);
+              (opt.allowlist ? VC4D_F_ALLOWLIST : 0) |
+              VC4D_F_NAMED_PROGS | VC4D_F_UNI_MASK | VC4D_F_ARENA_RESTORE;
     r.ident0 = G.regs[R_IDENT0 / 4];
     r.ident1 = G.regs[R_IDENT1 / 4];
     return reply(c->fd, h, VC4D_OK, &r, sizeof(r), -1, 0, 0);
@@ -422,20 +530,48 @@ static int handle_upload(struct client *c, const struct vc4d_hdr *h,
     struct vc4d_upload_req q;
     memcpy(&q, pl, sizeof(q));
     const uint8_t *code = pl + sizeof(q);
-    size_t clen = plen - sizeof(q);
 
-    if (q.flags != 0 || q.bytes != clen) {
+    if (q.flags & ~VC4D_UPLOAD_NAMED) {
+        log_denial(c, "UPLOAD", "unknown upload flags");
+        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+    }
+    const int named = (q.flags & VC4D_UPLOAD_NAMED) != 0;
+    size_t avail = plen - sizeof(q);
+    if (q.bytes > avail)
+        return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
+    size_t extra = avail - q.bytes;
+    const uint8_t *namep = NULL;
+    size_t namelen = 0;
+    if (named) {
+        if (extra < 1 || extra >= VC4D_NAME_MAX) {
+            log_denial(c, "UPLOAD", "program name has a bad length");
+            return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+        }
+        namep = code + q.bytes;
+        namelen = extra;
+        for (size_t i = 0; i < namelen; ++i) {
+            if (namep[i] < 0x21 || namep[i] > 0x7e) {
+                log_denial(c, "UPLOAD", "program name has a non-printable byte");
+                return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+            }
+        }
+    } else if (extra != 0) {
         log_denial(c, "UPLOAD", "payload length disagrees with bytes");
         return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
     }
+    char name[VC4D_NAME_MAX];
+    name[0] = 0;
+    if (named) {
+        memcpy(name, namep, namelen);
+        name[namelen] = 0;
+    }
+    const size_t clen = q.bytes;
     if (q.bytes < 8 || (q.bytes & 7u) || q.bytes > VC4D_MAX_PROG ||
         q.max_qpu < 1 || q.max_qpu > VC4D_MAX_QPU ||
         q.nuni < 1 || q.nuni > VC4D_MAX_UNI) {
         log_denial(c, "UPLOAD", "bad size/alignment/max_qpu");
         return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
     }
-    if (c->nprog >= MAX_PROGS_CLI)
-        return reply(c->fd, h, VC4D_E_NOMEM, NULL, 0, -1, 0, 0);
 
     uint8_t hash[32];
     struct sha256 sh;
@@ -457,19 +593,19 @@ static int handle_upload(struct client *c, const struct vc4d_hdr *h,
         }
     }
 
-    int slot = -1;
-    /* PROBE_SLOT belongs to the daemon: it holds the known-good program that
-       gpu_recover() launches, so a client may never overwrite it. */
-    for (int i = 0; i < PROBE_SLOT; ++i)
-        if (!progs[i].used) { slot = i; break; }
-    if (slot < 0)
+    int same = 0;
+    uint64_t evicted = 0;
+    int slot = prog_slot_for(c, name, hash, q.max_qpu, q.nuni, &same, &evicted);
+    if (slot < 0) {
+        log_denial(c, "UPLOAD", "every program slot is executing or reserved");
         return reply(c->fd, h, VC4D_E_NOMEM, NULL, 0, -1, 0, 0);
+    }
 
     struct prog *p = &progs[slot];
-    uint32_t gen = (p->gen + 1u) & 0xFFFFFFu;
+    uint32_t gen = same ? p->gen : ((p->gen + 1u) & 0xFFFFFFu);
     if (!gen)
         gen = 1;
-    memset(p, 0, sizeof(*p));
+    int was_used = same;
     p->used = 1;
     p->owner = c->idx;
     p->gen = gen;
@@ -479,7 +615,11 @@ static int handle_upload(struct client *c, const struct vc4d_hdr *h,
     p->nuni = q.nuni;
     p->words = q.bytes / 8;
     memcpy(p->hash, hash, 32);
-    st_progs++;
+    snprintf(p->name, sizeof(p->name), "%s", name);
+    p->busy = 0;
+    prog_touch(p);
+    if (!was_used)
+        st_progs++;
 
     memcpy(A.map + p->code_off, code, clen);
     memset(A.map + p->code_off + clen, 0, A_CODE_SLOT - clen);
@@ -488,9 +628,14 @@ static int handle_upload(struct client *c, const struct vc4d_hdr *h,
     st_bytes_up += clen;
 
     uint32_t hnd = (gen << 8) | (uint32_t)(slot + 1);
-    c->prog[c->nprog++] = hnd;
     struct vc4d_upload_rsp r = { .prog = hnd, .code_off = p->code_off,
                                  .words = p->words };
+    if (opt.verbose)
+        logmsg("UPLOAD uid=%u pid=%d %s%s%s slot=%d prog=%u words=%u%s",
+               (unsigned)c->uid, (int)c->pid,
+               name[0] ? "name=" : "", name[0] ? name : "(unnamed)",
+               same ? " (resident)" : "", slot, hnd, p->words,
+               evicted ? " [LRU eviction]" : "");
     return reply(c->fd, h, VC4D_OK, &r, sizeof(r), -1, 0, 0);
 }
 
@@ -510,7 +655,12 @@ static int literal_forbidden(uint32_t v)
  * either a bus address inside this arena, or a literal outside every window a
  * device address could name.  Containment is per-arena here (the engine's
  * pointers are arena offsets, not buffer handles), which is the price of not
- * touching the op code. */
+ * touching the op code.
+ *
+ * This guess is only used for a client that sends no VC4D_LAUNCH_UNI_MASK: a
+ * value it cannot classify (every float <= -2.0f is >= 0xC0000000) is refused.
+ * With the mask the client says which words are addresses and the guess is
+ * not made at all. */
 static int arena_word_ok(uint32_t v)
 {
     if (v >= A.bus && (uint64_t)v < (uint64_t)A.bus + A.bytes)
@@ -518,9 +668,23 @@ static int arena_word_ok(uint32_t v)
     return !literal_forbidden(v);
 }
 
+/* UNI_MASK: this slot was declared an address, so it must land in this
+ * client's arena - that is the whole check, and it is exact. */
+static int arena_addr_ok(uint32_t v)
+{
+    return v >= A.bus && (uint64_t)v < (uint64_t)A.bus + A.bytes;
+}
+
 /* Poll an in-flight launch to completion, release the GPU lock and make the
  * GPU's results visible to unprivileged readers (L2 write-back + invalidate).
  * Fills lr and returns a VC4D_* status.  Shared by WAIT and LAUNCH_WAIT. */
+static void prog_unbusy(void)
+{
+    if (busy_slot >= 0 && busy_slot < MAX_PROGS_SLOTS)
+        progs[busy_slot].busy = 0;
+    busy_slot = -1;
+}
+
 static int await_launch(struct client *c, uint32_t id, struct launch_result *lr,
                         char *err, size_t errn)
 {
@@ -565,6 +729,7 @@ static int await_launch(struct client *c, uint32_t id, struct launch_result *lr,
             gpu_abort(&G);                          /* clears the queue word */
         }
         c->inflight = 0;
+        prog_unbusy();
         gpu_lock_drop();
         st_failed++;
         logmsg("TIMEOUT uid=%u pid=%d launch=%u (%s)", (unsigned)c->uid,
@@ -583,6 +748,7 @@ static int await_launch(struct client *c, uint32_t id, struct launch_result *lr,
         status = gpu_finish(&G, lr, err, errn);
     }
     c->inflight = 0;
+    prog_unbusy();
     gpu_lock_drop();
     G.regs[R_L2CACTL / 4] = 1u << 2;             /* result to DRAM */
 #if defined(__aarch64__)
@@ -606,14 +772,23 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
     memcpy(&q, pl, sizeof(q));
     const struct vc4d_uni *uni = (const struct vc4d_uni *)(pl + sizeof(q));
     const int in_arena = (q.flags & VC4D_LAUNCH_UNI_ARENA) != 0;
+    const int have_mask = (q.flags & VC4D_LAUNCH_UNI_MASK) != 0;
 
     if (q.flags & ~VC4D_LAUNCH_FLAGS_ALL) {
         log_denial(c, "LAUNCH", "unknown launch flags");
         return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
     }
+    if (have_mask && !in_arena) {
+        log_denial(c, "LAUNCH", "UNI_MASK without UNI_IN_ARENA");
+        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+    }
     if (q.nqpu < 1 || q.nqpu > VC4D_MAX_QPU || q.nuni < 1 ||
         q.nuni > VC4D_MAX_UNI) {
         log_denial(c, "LAUNCH", "nqpu/nuni out of range");
+        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+    }
+    if (have_mask && (q.uni_addr >> q.nuni) != 0) {
+        log_denial(c, "LAUNCH", "UNI_MASK sets a bit past the last uniform word");
         return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
     }
     if (in_arena) {
@@ -666,7 +841,16 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
                        q.prog, q.nqpu, q.uni_off, w[0], w[1], w[2], w[3],
                        w[4], w[5], w[6], w[7]);
             for (uint32_t u = 0; u < q.nuni; ++u) {
-                if (!arena_word_ok(w[u])) {
+                if (have_mask) {
+                    /* The client declared where its addresses are.  Validate
+                     * exactly those; a word with the bit clear is a value, so
+                     * a float whose bits look like a bus address is legal. */
+                    if (((q.uni_addr >> u) & 1u) && !arena_addr_ok(w[u])) {
+                        log_denial(c, "LAUNCH",
+                                   "declared address uniform is outside the arena");
+                        return reply(c->fd, h, VC4D_E_DENIED, NULL, 0, -1, 0, 0);
+                    }
+                } else if (!arena_word_ok(w[u])) {
                     log_denial(c, "LAUNCH",
                                "arena uniform word is outside the arena");
                     return reply(c->fd, h, VC4D_E_DENIED, NULL, 0, -1, 0, 0);
@@ -723,6 +907,8 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
     if (tmo > opt.max_timeout_ms)
         tmo = opt.max_timeout_ms;
 
+    prog_touch(p);          /* LRU: a launch is the strongest use */
+
     if (opt.gpu_lock && gpu_lock_fd >= 0) {
         int lr = gpu_lock_take(tmo < 30000u ? tmo : 30000u);
         if (lr != 0) {
@@ -742,6 +928,9 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
         st_failed++;
         return reply(c->fd, h, rc, NULL, 0, -1, 0, 0);
     }
+    /* This program must not be evicted while it is executing (G3). */
+    p->busy = 1;
+    busy_slot = (int)(p - progs);
     c->inflight = 1;
     c->launch_id = next_launch++;
     if (!next_launch)
@@ -871,6 +1060,9 @@ static int handle_stats(struct client *c, const struct vc4d_hdr *h,
     r.max_clients = MAX_CLIENTS;
     r.programs = (uint32_t)st_progs;
     r.dead = (uint32_t)G.dead;
+    r.evictions = st_evicted;
+    r.arena_want = (uint32_t)A.want;
+    r.arena_degraded = (uint32_t)A.degraded;
     return reply(c->fd, h, VC4D_OK, &r, sizeof(r), -1, 0, 0);
 }
 
@@ -941,6 +1133,7 @@ static void client_destroy(int idx)
             gpu_finish(&G, &lr, err, sizeof(err));
             gpu_lock_drop();
         }
+        prog_unbusy();
     }
     release_client_resources(c);
     close(c->fd);
@@ -1063,7 +1256,156 @@ static void accept_client(void)
         logmsg("connect uid=%u pid=%d", (unsigned)c->uid, (int)c->pid);
 }
 
+/* ------------------------------------------------------------ arena restore
+ *
+ * arena_open() may have had to settle for less than `want` (G2).  That must not
+ * last: once CMA has recovered and nothing is using the arena, exit and let
+ * systemd start a clean daemon, which will get the full block.  A restart is
+ * the only way to redo the allocation, because the daemon has dropped
+ * CAP_SYS_RAWIO and closed /dev/mem by the time it serves clients - it cannot
+ * open a bigger dma-buf itself, and keeping /dev/mem open in the unprivileged
+ * process would give up the property the daemon exists for.
+ *
+ * The exit is gated on CMA *being able* to satisfy the request.  The daemon's
+ * own arena counts towards that: exiting releases it.  That is the common
+ * upgrade case - the daemon holds 48 MiB, CMA has 72 MiB free, and 96 MiB only
+ * becomes available once the daemon lets go of its 48.
+ *
+ * A fragmented board can still fail the allocation after the restart, so each
+ * deliberate restart is spaced out (5 min, doubling to 6 h) by a stamp file in
+ * /run, which survives the restart but not a reboot.  A start that gets the
+ * full block removes the stamp, so a real recovery is immediate next time.
+ */
+/* Keyed by the requested size: two daemons with different --arena-mb (the
+ * installed one and a test one, say) must not reset each other's backoff.
+ * The directory is created (owned by the drop user) before vc4d gives up its
+ * privileges, because the stamp is written after it has dropped them; /run is
+ * the unit's ReadWritePaths entry and survives a restart but not a reboot,
+ * which is exactly the lifetime this state should have. */
+#define ARENA_STAMP_FMT "%s/arena-restore-%zu.state"
+static const char *state_dir = "/tmp";
+#define ARENA_BACKOFF_MIN_S 60
+#define ARENA_BACKOFF_MAX_S 21600
+
+static uint64_t arena_restore_next;
+static int arena_wait_logged;      /* "waiting for CMA" said once */
+static int arena_backoff_logged;   /* "a restore already failed" said once */
+
+static void arena_stamp_path(size_t want, char *out, size_t n)
+{
+    snprintf(out, n, ARENA_STAMP_FMT, state_dir, want >> 20);
+}
+
+static unsigned arena_backoff_attempts(size_t want)
+{
+    char path[128];
+    arena_stamp_path(want, path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    unsigned n = 0;
+    if (fscanf(f, "%u", &n) != 1)
+        n = 0;
+    fclose(f);
+    return n;
+}
+
+static time_t arena_stamp_mtime(size_t want)
+{
+    char path[128];
+    arena_stamp_path(want, path, sizeof(path));
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return 0;
+    return st.st_mtime;
+}
+
+static void arena_stamp_write(size_t want, unsigned attempts)
+{
+    char path[128];
+    arena_stamp_path(want, path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "%u\n", attempts);
+    fclose(f);
+}
+
+static void arena_stamp_clear(size_t want)
+{
+    char path[128];
+    arena_stamp_path(want, path, sizeof(path));
+    unlink(path);
+}
+
+static void arena_maybe_restore(void)
+{
+    if (!A.degraded || restart_needed)
+        return;
+    uint64_t now = now_ns();
+    if (now < arena_restore_next)
+        return;
+    arena_restore_next = now + 2000ull * 1000000ull;
+    if (A.used || st_clients || G.inflight)
+        return;                     /* wait for an idle arena, quietly */
+    if (A.want <= A.bytes)
+        return;
+    size_t total = 0, cfree = 0;
+    arena_cma_info(&total, &cfree);
+    /* our own block is released by the exit, so it counts as available */
+    uint64_t avail = (uint64_t)cfree + (uint64_t)A.bytes;
+    if (avail < (uint64_t)A.want + (8u << 20)) {
+        if (!arena_wait_logged)
+            logmsg("arena is %zu MiB of the %zu MiB requested; CMA has %zu MiB "
+                   "free, %zu MiB would be free after a restart: waiting for "
+                   "CMA before restoring it", A.bytes >> 20, A.want >> 20,
+                   cfree >> 20, avail >> 20);
+        arena_wait_logged = 1;
+        return;
+    }
+    unsigned n = arena_backoff_attempts(A.want);
+    unsigned backoff = ARENA_BACKOFF_MIN_S;
+    for (unsigned i = 1; i < n && backoff < ARENA_BACKOFF_MAX_S; ++i)
+        backoff *= 2;
+    if (backoff > ARENA_BACKOFF_MAX_S)
+        backoff = ARENA_BACKOFF_MAX_S;
+    time_t last = arena_stamp_mtime(A.want);
+    if (n && last && time(NULL) < last + (time_t)backoff) {
+        if (!arena_backoff_logged)
+            logmsg("arena restore: %u attempt(s) already failed; next try in "
+                   "%ld s (a fragmented CMA can refuse the full block even when "
+                   "enough is free in pieces).  Stop the other CMA user and "
+                   "restart vc4d to retry now.", n,
+                   (long)(last + (time_t)backoff - time(NULL)));
+        arena_backoff_logged = 1;
+        return;
+    }
+    logmsg("arena was %zu MiB of the %zu MiB requested; CMA now has %zu MiB "
+           "free (%zu MiB after this daemon releases its block) and the arena "
+           "is idle - exiting so a fresh daemon claims the full block "
+           "(no reboot needed)", A.bytes >> 20, A.want >> 20, cfree >> 20,
+           avail >> 20);
+    arena_stamp_write(A.want, n + 1);
+    restart_reason = "the arena was degraded and CMA has recovered";
+    restart_needed = 1;
+}
+
 /* ------------------------------------------------------------ main loop */
+/* A directory the unprivileged daemon can write its own state into (the
+ * arena-restore backoff).  Created while still root, chowned to the drop user;
+ * falls back to /tmp (which the unit also allows) if /run is not writable. */
+static void state_dir_init(uid_t uid, gid_t gid)
+{
+    if (mkdir("/run/vc4d", 0755) == 0 || errno == EEXIST) {
+        if (chown("/run/vc4d", uid, gid) == 0 ||
+            (access("/run/vc4d", W_OK) == 0)) {
+            state_dir = "/run/vc4d";
+            return;
+        }
+    }
+    state_dir = "/tmp";
+}
+
 static void drop_privileges(void)
 {
     struct passwd *pw = getpwnam(opt.drop_user);
@@ -1071,6 +1413,7 @@ static void drop_privileges(void)
     gid_t dgid = pw ? pw->pw_gid : 65534;
     if (!pw)
         logmsg("user '%s' not found, dropping to 65534", opt.drop_user);
+    state_dir_init(uid, dgid);
     if (setgroups(0, NULL) != 0) {
         logmsg("setgroups: %s", strerror(errno));
         exit(1);
@@ -1100,6 +1443,10 @@ static void drop_privileges(void)
 
 int main(int argc, char **argv)
 {
+    /* Journald and a redirected log must see each line as it happens: the
+     * arena retry/degrade/restore lines are timing information, and a
+     * block-buffered stderr makes them appear long after the fact. */
+    setvbuf(stderr, NULL, _IONBF, 0);
     memset(&opt, 0, sizeof(opt));
     opt.socket_path = DEFAULT_SOCKET;
     opt.drop_user = "nobody";
@@ -1167,8 +1514,11 @@ int main(int argc, char **argv)
         logmsg("arena: %s", err);
         return 1;
     }
-    logmsg("arena %zu MiB at phys 0x%08x bus 0x%08x",
-           A.bytes >> 20, A.phys, A.bus);
+    logmsg("arena %zu MiB%s at phys 0x%08x bus 0x%08x (requested %zu MiB)",
+           A.bytes >> 20, A.degraded ? " DEGRADED" : "", A.phys, A.bus,
+           A.want >> 20);
+    if (!A.degraded)
+        arena_stamp_clear(A.want);  /* a real restore resets the backoff */
 
     if (gpu_open(&G, err, sizeof(err)) != 0) {
         logmsg("gpu: %s", err);
@@ -1244,6 +1594,8 @@ int main(int argc, char **argv)
 
     if (opt.drop)
         drop_privileges();
+    else
+        state_dir_init(getuid(), getgid());
 
     /* close anything inherited that we do not need (0,1,2 are the journal) */
     for (int fd = 3; fd < 256; ++fd) {
@@ -1262,6 +1614,7 @@ int main(int argc, char **argv)
            not their socket is still open (see peer_alive()).  Once per poll
            iteration is enough: the timeout is 1 s at most. */
         reap_dead_clients(-1, "peer process is gone");
+        arena_maybe_restore();
         if (stop_flag || restart_needed)
             break;
         int n = 0;
@@ -1383,8 +1736,11 @@ int main(int argc, char **argv)
     unlink(opt.socket_path);
     gpu_close(&G);
     arena_close(&A);
-    logmsg("exit%s (reclaimed %llu client(s), %llu GPU reset(s))",
-           restart_needed ? ": GPU context could not be reset" : "",
-           (unsigned long long)st_reclaimed, (unsigned long long)st_recoveries);
+    logmsg("exit%s (reclaimed %llu client(s), %llu GPU reset(s), %llu slot eviction(s))",
+           restart_needed ? ": restarting" : "",
+           (unsigned long long)st_reclaimed, (unsigned long long)st_recoveries,
+           (unsigned long long)st_evicted);
+    if (restart_needed)
+        logmsg("restart reason: %s", restart_reason);
     return restart_needed ? 75 : 0;
 }

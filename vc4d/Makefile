@@ -11,8 +11,13 @@ SOLIB   = $(B)/libvc4client.so
 DEMO    = $(B)/demo_gemm
 HOSTILE = $(B)/test_hostile
 BENCH   = $(B)/bench_direct
+# G2/G3/G4 regression tests (G2's shell driver lives in infer/tests)
+LRU     = $(B)/test_prog_lru
+UNIMASK = $(B)/test_uni_mask
+CMAHOLD = $(B)/cmahold
+ARENASZ = $(B)/arena_size
 
-all: $(DAEMON) $(LIB) $(SOLIB) $(DEMO) $(HOSTILE)
+all: $(DAEMON) $(LIB) $(SOLIB) $(DEMO) $(HOSTILE) $(LRU) $(UNIMASK) $(CMAHOLD) $(ARENASZ)
 
 $(B):
 	mkdir -p $(B)
@@ -36,6 +41,18 @@ $(DEMO): demo/demo_gemm.c $(LIB) include/vc4client.h | $(B)
 
 $(HOSTILE): test/hostile.c proto/vc4d_proto.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+$(LRU): test/test_prog_lru.c $(LIB) include/vc4client.h | $(B)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
+
+$(UNIMASK): test/test_uni_mask.c $(LIB) include/vc4client.h | $(B)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
+
+$(ARENASZ): test/arena_size.c $(LIB) include/vc4client.h | $(B)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
+
+$(CMAHOLD): test/cmahold.c | $(B)
+	$(CC) $(CFLAGS) $< -o $@
 
 # the direct-root baseline links the engine's existing static library
 $(BENCH): bench/bench_direct.c | $(B)

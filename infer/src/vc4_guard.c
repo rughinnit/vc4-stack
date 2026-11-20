@@ -42,38 +42,19 @@ int vc4__unverified_allowed(void)
 }
 
 /*
- * Scalar parameters travel in the uniform block, and vc4d denies any uniform
- * word >= 0xC0000000 because such a word may name a GPU bus address (its
- * literal_forbidden()).  Every float <= -2.0f lands in that window: -2.0f is
- * 0xC0000000, -3.5f is 0xC0600000, -inf is 0xFF800000.  So Pow(x, -2), a Clip
- * limit of -3 or a LeakyRelu slope of -2 are legal in direct mode and
- * impossible through the daemon.
+ * Scalar parameters travel in the uniform block, and up to 1.2.6 this file
+ * refused any parameter whose fp32 bit pattern was >= 0xC0000000, because vc4d
+ * could not tell such a word from a GPU bus address (its literal_forbidden()).
+ * Every float <= -2.0f lands in that window (-2.0f is 0xC0000000, -3.5f is
+ * 0xC0600000), so Pow(x, -2), a Clip limit of -3 and a LeakyRelu slope of -2
+ * were refused in managed mode while working in direct mode (G4).
  *
- * The daemon cannot tell a value from an address in the materialised-uniform
- * (UNI_IN_ARENA) launch the engine uses - there is no per-word kind - so the
- * engine refuses with the real reason here, instead of letting the user read
- * "uniform is a bus/arena/MMIO address".  See docs/RELEASE.md for the
- * proposed protocol change (a per-word value flag); the engine has no
- * directory of "which uniform word is an address" to send today.
+ * That refusal is gone: protocol v2 gained VC4D_LAUNCH_UNI_MASK, a per-slot
+ * mask in which the launcher declares which uniform words are addresses.  The
+ * remote backend sends it on every launch (vc4_dev_remote.c: remote_uni_mask),
+ * so a value word is never compared with the bus window and the daemon still
+ * range-checks every real address.  See docs/VC4D.md and docs/BACKENDS.md.
  */
-vc4_status vc4__check_uniform_value(vc4_ctx *ctx, const char *what, float v)
-{
-    uint32_t b;
-    if (!ctx->remote)
-        return VC4_OK;                  /* direct /dev/mem has no such rule */
-    memcpy(&b, &v, 4);
-    if (b < 0xC0000000u)
-        return VC4_OK;
-    vc4__set_err(ctx,
-                 "%s: parameter %g has bit pattern 0x%08x, which vc4d refuses "
-                 "as a possible GPU bus address (every float <= -2.0 is in "
-                 "0xC0000000..0xFFFFFFFF).  The value cannot be carried in a "
-                 "uniform through the daemon; run with VC4INFER_DAEMON=0, or "
-                 "avoid parameters at or below -2.0 on this path.",
-                 what, (double)v, b);
-    return VC4_ERR_UNSUPPORTED;
-}
-
 vc4_status vc4__refuse_unverified(vc4_ctx *ctx, const char *what,
                                   const char *why)
 {

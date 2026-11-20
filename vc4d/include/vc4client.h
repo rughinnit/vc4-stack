@@ -51,6 +51,13 @@ int  vc4c_alloc(vc4c_conn *c, size_t bytes, unsigned flags, vc4c_buf *out);
 int  vc4c_free(vc4c_conn *c, vc4c_buf *b);
 int  vc4c_upload(vc4c_conn *c, const void *code, size_t bytes,
                  unsigned max_qpu, unsigned nuni, vc4c_prog *out);
+/* Named upload (G3): `name` is the program-slot LRU key, 1..63 printable
+ * bytes.  A daemon that predates it (no VC4D_F_NAMED_PROGS) gets a plain
+ * upload; the caller can check vc4c_info()->flags first if it cares whether
+ * eviction will key by name. */
+int  vc4c_upload_named(vc4c_conn *c, const char *name, const void *code,
+                       size_t bytes, unsigned max_qpu, unsigned nuni,
+                       vc4c_prog *out);
 int  vc4c_upload_file(vc4c_conn *c, const char *path, unsigned max_qpu,
                       unsigned nuni, vc4c_prog *out);
 
@@ -74,6 +81,20 @@ int  vc4c_launch_arena(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
 int  vc4c_launch_wait(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
                       const vc4c_buf *uniforms, unsigned uni_off,
                       unsigned timeout_ms, vc4c_result *out);
+
+/* Same two, with the per-slot address mask of G4: bit u says uniform word u
+ * holds a GPU bus address.  Words without the bit are values, so a float
+ * <= -2.0f (bit pattern >= 0xC0000000) is legal.  The address words are still
+ * range-checked against this client's arena.  Passed as a separate function so
+ * a caller that does not use it never sends the flag, and the plain forms keep
+ * the daemon's old heuristic. */
+int  vc4c_launch_arena_u(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
+                         const vc4c_buf *uniforms, unsigned uni_off,
+                         unsigned timeout_ms, uint32_t uni_addr);
+int  vc4c_launch_wait_u(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
+                        const vc4c_buf *uniforms, unsigned uni_off,
+                        unsigned timeout_ms, vc4c_result *out,
+                        uint32_t uni_addr);
 
 /* Like vc4c_sync(), but only asks the daemon to flush the GPU L2: the
  * dma-buf mapping is write-combining, so there is no CPU cache to maintain

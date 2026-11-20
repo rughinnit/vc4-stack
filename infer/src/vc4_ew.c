@@ -237,6 +237,12 @@ vc4_status vc4__ewb(vc4_ctx *ctx, const char *opname, int heavy,
 {
     if (!ctx || !a || !b || !out || !n || !opname)
         return VC4_ERR_INVAL;
+    if (heavy) {
+        vc4_status g = vc4__refuse_unverified(ctx, opname,
+            "the 4-vector-per-group store path writes no output");
+        if (g != VC4_OK)
+            return g;
+    }
     if (ctx->dead)
         return VC4_ERR_TIMEOUT;
     if (a->bytes < n * 4 || b->bytes < n * 4 || out->bytes < n * 4)

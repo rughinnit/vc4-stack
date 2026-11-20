@@ -16,6 +16,7 @@ LIB   = $(BUILD)/libvc4infer.a
 # same library: the op registry dispatches to them.
 SRC   = src/vc4_gen.c src/vc4_dev.c src/vc4_dev_remote.c src/vc4_kern.c src/vc4_gemm.c \
         src/vc4_ew.c src/vc4_conv.c src/vc4_nhwc.c src/vc4_api.c \
+        src/vc4_guard.c \
         ../training/src/vc4_convbwd.c ../training/src/vc4_train.c ../training/src/vc4_bwd.c
 OBJ   = $(addprefix $(BUILD)/,$(notdir $(SRC:.c=.o)))
 

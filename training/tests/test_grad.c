@@ -551,16 +551,28 @@ static int t_batchnorm(uint32_t N, uint32_t C, uint32_t HW)
     get(&c.bdx, dx, n);
     get(&c.bdgamma, dg, C);
     get(&c.bdbeta, db, C);
+    /* the saved batch stats as the backward saw them: the finite-difference
+     * loop below re-runs the forward, which overwrites them */
+    float mu_saved[64], is_saved[64];
+    get(&c.bmean, mu_saved, C);
+    get(&c.bvar, is_saved, C);
     const double h = 2e-2, tol = 1e-3;
     gc_t gx = {0}, gg = {0}, gb = {0};
     for (size_t i = 0; i < n; ++i) {
         double fd = fd_central(bn_loss_x, &c, (int)i, (float)h);
         gc_add(&gx, dx[i], fd, tol);
     }
+    for (int i = 0; i < (int)C; ++i) {   /* dgamma = sum dy*xhat exactly */
+        double sg = 0;
+        for (uint32_t nn = 0; nn < N; ++nn)
+            for (uint32_t k = 0; k < HW; ++k) {
+                size_t j = ((size_t)nn * C + i) * HW + k;
+                sg += (double)c.dy[j] * ((c.x[j] - mu_saved[i]) * is_saved[i]);
+            }
+        gc_add(&gg, dg[i], sg, tol);
+    }
     for (uint32_t i = 0; i < C; ++i) {
-        double fd = fd_central(bn_loss_g, &c, (int)i, (float)h);
-        gc_add(&gg, dg[i], fd, tol);
-        fd = fd_central(bn_loss_b, &c, (int)i, (float)h);
+        double fd = fd_central(bn_loss_b, &c, (int)i, (float)h);
         gc_add(&gb, db[i], fd, tol);
     }
     vc4_upload(G, &c.bx, c.x, n * 4);
@@ -672,14 +684,22 @@ static int t_layernorm(uint32_t rows, uint32_t cols)
     get(&bdx, dx, n);
     get(&bdg, dg, cols);
     get(&bdb, db, cols);
+    float mu_saved[64], is_saved[64];
+    get(&c.bmean, mu_saved, rows);
+    get(&c.bvar, is_saved, rows);
     const double h = 2e-2, tol = 1e-3;
     gc_t gx = {0}, gg = {0}, gb = {0};
     for (size_t i = 0; i < n; ++i)
         gc_add(&gx, dx[i], fd_central(ln_lx, &c, (int)i, (float)h), tol);
-    for (uint32_t i = 0; i < cols; ++i) {
-        gc_add(&gg, dg[i], fd_central(ln_lg, &c, (int)i, (float)h), tol);
-        gc_add(&gb, db[i], fd_central(ln_lb, &c, (int)i, (float)h), tol);
+    for (uint32_t j = 0; j < cols; ++j) {   /* dgamma = sum_rows dy*xhat */
+        double sg = 0;
+        for (uint32_t r = 0; r < rows; ++r)
+            sg += (double)c.dy[(size_t)r * cols + j] *
+                  ((c.x[(size_t)r * cols + j] - mu_saved[r]) * is_saved[r]);
+        gc_add(&gg, dg[j], sg, tol);
     }
+    for (uint32_t i = 0; i < cols; ++i)
+        gc_add(&gb, db[i], fd_central(ln_lb, &c, (int)i, (float)h), tol);
     vc4_upload(G, &c.bx, c.x, n * 4);
     vc4_upload(G, &c.bg, c.gam, cols * 4);
     vc4_upload(G, &c.bb, c.bet, cols * 4);
@@ -929,7 +949,7 @@ static void ref_cat(const float *x, double *y, const void *pv)
     }
 }
 
-static void bwd_cat(const float *dy, const float *x, float *g, const void *pv)
+static void bwd_cat(const float *x, const float *dy, float *g, const void *pv)
 {
     const cat_p *p = pv;
     int tot = 0;
@@ -1046,7 +1066,7 @@ static void ref_sum(const float *x, double *y, const void *pv)
         }
 }
 
-static void bwd_sum(const float *g, const float *x, float *out, const void *pv)
+static void bwd_sum(const float *x, const float *g, float *out, const void *pv)
 {
     const red_p *p = pv;
     int64_t n = 1, ng = 1;
@@ -1105,7 +1125,7 @@ static void ref_resize(const float *x, double *y, const void *pv)
         }
 }
 
-static void bwd_resize(const float *dy, const float *x, float *g, const void *pv)
+static void bwd_resize(const float *x, const float *dy, float *g, const void *pv)
 {
     const rs_p *p = pv;
     (void)x;
@@ -1143,7 +1163,7 @@ static void ref_pad(const float *x, double *y, const void *pv)
                           (size_t)yy * p->W + xx];
 }
 
-static void bwd_pad(const float *dy, const float *x, float *g, const void *pv)
+static void bwd_pad(const float *x, const float *dy, float *g, const void *pv)
 {
     const pad_p *p = pv;
     (void)x;
@@ -1170,7 +1190,7 @@ static void ref_tp(const float *x, double *y, const void *pv)
             y[(size_t)j * p->rows + i] = x[(size_t)i * p->cols + j];
 }
 
-static void bwd_tp(const float *dy, const float *x, float *g, const void *pv)
+static void bwd_tp(const float *x, const float *dy, float *g, const void *pv)
 {
     const tp_p *p = pv;
     (void)x;
@@ -1195,7 +1215,7 @@ static void ref_gather(const float *x, double *y, const void *pv)
         y[o] = x[p->idx[o]];
 }
 
-static void bwd_gather(const float *dy, const float *x, float *g, const void *pv)
+static void bwd_gather(const float *x, const float *dy, float *g, const void *pv)
 {
     const gath_p *p = pv;
     (void)x;
@@ -1219,7 +1239,7 @@ static void ref_scatter(const float *x, double *y, const void *pv)
         y[p->idx[i]] = x[i];
 }
 
-static void bwd_scatter(const float *dy, const float *x, float *g, const void *pv)
+static void bwd_scatter(const float *x, const float *dy, float *g, const void *pv)
 {
     const gath_p *p = pv;
     (void)x;
@@ -1321,12 +1341,52 @@ int main(int argc, char **argv)
 
         /* cat / split */
         {
+            /* cat backward is a permutation of dy: check it directly
+             * (a finite difference would only re-derive the same map) */
             cat_p cp = { 2, 3, 3, { 2, 4, 1, 0 } };
             size_t tot = 0;
             for (int i = 0; i < cp.nsrc; ++i) tot += cp.axisdim[i];
-            run_affine("cat bwd 3 parts", ref_cat, bwd_cat, &cp,
-                       (size_t)cp.outer * tot * cp.inner,
-                       (size_t)cp.outer * tot * cp.inner, 2e-2, 0);
+            const size_t nt = (size_t)cp.outer * tot * cp.inner;
+            float *dyv = malloc(nt * 4), *got = malloc(nt * 4);
+            for (size_t i = 0; i < nt; ++i) dyv[i] = frand();
+            vc4_buf bdy = mk(dyv, nt);
+            vc4_buf pr[4];
+            vc4_buf *pp[4];
+            for (int i = 0; i < cp.nsrc; ++i) {
+                pr[i] = mk(NULL, (size_t)cp.outer * cp.axisdim[i] * cp.inner);
+                pp[i] = &pr[i];
+            }
+            vc4_status st2 = vc4_cat_bwd(ctx, &bdy, pp, cp.axisdim, cp.nsrc,
+                                         cp.outer, cp.inner);
+            if (st2 != VC4_OK) {
+                printf("FAIL cat_bwd: %s\n", vc4_strerror(st2));
+                nfail++;
+            } else {
+                size_t off = 0, bad = 0;
+                double worst = 0;
+                for (int i = 0; i < cp.nsrc; ++i) {
+                    size_t np = (size_t)cp.outer * cp.axisdim[i] * cp.inner;
+                    get(&pr[i], got, np);
+                    for (int o = 0; o < cp.outer; ++o)
+                        for (int j = 0; j < cp.axisdim[i]; ++j)
+                            for (int k = 0; k < cp.inner; ++k) {
+                                size_t d = ((size_t)o * cp.axisdim[i] + j) *
+                                           cp.inner + k;
+                                double want = dyv[((size_t)o * tot + off + j) *
+                                                  cp.inner + k];
+                                if (fabs(got[d] - want) > worst)
+                                    worst = fabs(got[d] - want);
+                                if (got[d] != want) bad++;
+                            }
+                    off += cp.axisdim[i];
+                }
+                printf("%s %-26s n=%zu exact=%s worst=%.3g\n",
+                       bad == 0 ? "PASS" : "FAIL", "cat_bwd 3 parts", nt,
+                       bad == 0 ? "yes" : "no", worst);
+                if (bad) nfail++;
+            }
+            free(dyv);
+            free(got);
         }
 
         /* broadcasting binary ops */
@@ -1407,7 +1467,9 @@ int main(int argc, char **argv)
             gath_p sp;
             sp.n_in = 8;
             sp.n_out = 6;
-            int32_t w[6] = { 5, 0, 7, 3, 3, 1 };
+            /* distinct targets: a scatter that overwrites a cell twice has no
+             * derivative with respect to the overwritten value */
+            int32_t w[6] = { 5, 0, 7, 3, 2, 1 };
             memcpy(sp.idx, w, sizeof(w));
             run_affine("scatter_bwd", ref_scatter, bwd_scatter, &sp, sp.n_out,
                        sp.n_in, 2e-2, 0);

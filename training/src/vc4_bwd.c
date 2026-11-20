@@ -309,7 +309,7 @@ static vc4_status matvec_w(bw_ws *w, const float *W, uint32_t n_out,
                      VC4_MATVEC_MAX >> 20);
         return VC4_ERR_UNSUPPORTED;
     }
-    vc4_buf wb = ws_get(w, al64((size_t)n_out * n_in * 4));
+    vc4_buf wb = ws_get(w, al64((size_t)n_out * n_in * 4) + 64);
     if (!w->ok)
         return VC4_ERR_NOMEM;
     fbuf_write(w->ctx, &wb, W, (size_t)n_out * n_in);
@@ -537,17 +537,76 @@ vc4_status vc4_softmax_ce_bwd(vc4_ctx *ctx, const vc4_buf *logits,
                               vc4_buf *loss, vc4_buf *y_scratch, uint32_t rows,
                               uint32_t cols, float inv_batch)
 {
-    if (!ctx || !logits || !labels || !dlogits || !loss || !rows || !cols)
+    if (!ctx || !logits || !labels || !dlogits || !rows || !cols)
         return VC4_ERR_INVAL;
     if (ctx->dead)
         return VC4_ERR_TIMEOUT;
     const size_t n = (size_t)rows * cols;
     if ((uint64_t)logits->bytes < n * 4 || (uint64_t)dlogits->bytes < n * 4 ||
-        (uint64_t)labels->bytes < (uint64_t)rows * 4 || loss->bytes < 4)
+        (uint64_t)labels->bytes < (uint64_t)rows * 4)
+        return VC4_ERR_INVAL;
+    if (loss && loss->bytes < 4)
         return VC4_ERR_INVAL;
 
     bw_ws w;
     ws_on(&w, ctx);
+    vc4_status st = VC4_OK;
+
+    if (cols == 16 && rows % 8 == 0) {
+        /* The fused row kernel is the verified path: it gives dlogits and the
+         * per-QPU loss totals.  It wants 64 B of slack after a 16-wide row, so
+         * it runs on staged copies. */
+        const size_t groups = rows / 8;
+        vc4_buf lg = ws_get(&w, al64((size_t)rows * 64 + 64));
+        vc4_buf dl = ws_get(&w, al64((size_t)rows * 64 + 64));
+        vc4_buf part = ws_get(&w, al64(groups * 64));
+        vc4_buf ls = ws_get(&w, al64(64));
+        if (!w.ok)
+            st = VC4_ERR_NOMEM;
+        if (st == VC4_OK) {
+            vc4_invalidate_buf(ctx, logits);
+            memcpy(ctx->arena + lg.off, ctx->arena + logits->off,
+                   (size_t)rows * 64);
+            vc4__mark_dirty(ctx, lg.off, (size_t)rows * 64 + 64);
+        }
+        if (st == VC4_OK)
+            st = vc4_softmax_ce(ctx, &lg, labels, &dl, &part, rows, inv_batch);
+        if (st == VC4_OK) {
+            vc4__l2_flush(ctx);
+            vc4__invalidate_off(ctx, dlogits->off, (size_t)rows * 64);
+            memcpy(ctx->arena + dlogits->off, ctx->arena + dl.off,
+                   (size_t)rows * 64);
+            vc4__mark_dirty(ctx, dlogits->off, (size_t)rows * 64);
+        }
+        if (st == VC4_OK && loss) {
+            /* The fused kernel writes the *unscaled* -log p sum per group in
+             * lane 0 of its slot, so the total is a column sum and the batch
+             * normalisation is one more scale: loss is the mean CE. */
+            st = col_sum(ctx, &part, (uint32_t)groups, 16, &ls);
+            if (st == VC4_OK)
+                st = vc4_affine(ctx, &ls, &ls, 1, inv_batch, 0.0f);
+            if (st == VC4_OK) {
+                vc4__l2_flush(ctx);
+                vc4__invalidate_off(ctx, loss->off, 4);
+                memcpy(ctx->arena + loss->off, ctx->arena + ls.off, 4);
+                vc4__mark_dirty(ctx, loss->off, 4);
+            }
+        }
+        ws_off(&w);
+        return st;
+    }
+
+    /* Generic class count: dlogits = (p - onehot)*inv_batch.  The loss needs
+     * log(p[label]) and there is no usable log kernel (the body is 39248 B,
+     * the slot is 16384 B), so the caller is told to compute it from p. */
+    if (loss) {
+        vc4__set_err(ctx, "vc4_softmax_ce_bwd: the loss scalar is only "
+                     "computed for the 16-class fused path (cols == 16, "
+                     "rows %% 8 == 0); for %u classes pass loss = NULL and "
+                     "take -log(p[label]) from vc4_softmax()", cols);
+        ws_off(&w);
+        return VC4_ERR_UNSUPPORTED;
+    }
     vc4_buf p;
     if (y_scratch && y_scratch->bytes >= n * 4 && y_scratch->off)
         p = *y_scratch;
@@ -555,15 +614,15 @@ vc4_status vc4_softmax_ce_bwd(vc4_ctx *ctx, const vc4_buf *logits,
         p = ws_get(&w, al64(n * 4));
     vc4_buf oh = ws_get(&w, al64(n * 4));
     vc4_buf d = ws_get(&w, al64(n * 4));
-    vc4_buf pick = ws_get(&w, al64(n * 4));
-    vc4_buf lsum = ws_get(&w, al64(4));
-    vc4_status st = w.ok ? VC4_OK : VC4_ERR_NOMEM;
-
-    int32_t *lab = malloc((size_t)rows * 4);
+    if (!w.ok) {
+        ws_off(&w);
+        return VC4_ERR_NOMEM;
+    }
     float *ohv = calloc(n, 4);
-    if (!lab || !ohv)
+    int32_t *lab = malloc((size_t)rows * 4);
+    if (!ohv || !lab) {
         st = VC4_ERR_NOMEM;
-    if (st == VC4_OK) {
+    } else {
         vc4_invalidate_buf(ctx, labels);
         memcpy(lab, ctx->arena + labels->off, (size_t)rows * 4);
         for (uint32_t r = 0; r < rows; ++r) {
@@ -581,23 +640,12 @@ vc4_status vc4_softmax_ce_bwd(vc4_ctx *ctx, const vc4_buf *logits,
         st = vc4_softmax(ctx, logits, rows, cols, &p);
     if (st == VC4_OK) {
         fbuf_write(ctx, &oh, ohv, n);
-        st = ew(ctx, EW_MUL, &p, &oh, &pick, n);      /* rows*cols scratch */
-        if (st == VC4_OK)
-            st = row_sum(ctx, &pick, rows, cols, 0, &pick);
-        /* pick now holds p[label] in its first `rows` words */
-        if (st == VC4_OK)
-            st = u_log(ctx, &pick, &pick, rows);
-        if (st == VC4_OK)
-            st = row_sum(ctx, &pick, 1, rows, 0, &lsum);
-        if (st == VC4_OK)
-            st = vc4_affine(ctx, &lsum, loss, 1, -inv_batch, 0.0f);
+        st = ew(ctx, EW_SUB, &p, &oh, &d, n);
     }
     if (st == VC4_OK)
-        st = ew(ctx, EW_SUB, &p, &oh, &d, n);
-    if (st == VC4_OK)
         st = vc4_affine(ctx, &d, dlogits, n, inv_batch, 0.0f);
-    free(lab);
     free(ohv);
+    free(lab);
     ws_off(&w);
     return st;
 }
@@ -877,6 +925,7 @@ vc4_status vc4_layernorm_fwd(vc4_ctx *ctx, const vc4_buf *x,
     vc4_buf xhat = ws_get(&w, al64(n * 4));
     vc4_status st = w.ok ? VC4_OK : VC4_ERR_NOMEM;
     int sd[2] = { (int)rows, 1 }, od[2] = { (int)rows, (int)cols };
+    int sdcol[2] = { 1, (int)cols };   /* gamma/beta are per-column */
 
     if (st == VC4_OK)
         st = row_sum(ctx, x, rows, cols, 1, &mean);
@@ -901,11 +950,11 @@ vc4_status vc4_layernorm_fwd(vc4_ctx *ctx, const vc4_buf *x,
     if (st == VC4_OK)
         st = ew(ctx, EW_MUL, &d, &mb, &xhat, n);
     if (st == VC4_OK)
-        st = bcast_gen(ctx, gamma, sd, od, 2, &mb, n);
+        st = bcast_gen(ctx, gamma, sdcol, od, 2, &mb, n);
     if (st == VC4_OK)
         st = ew(ctx, EW_MUL, &xhat, &mb, &t, n);
     if (st == VC4_OK)
-        st = bcast_gen(ctx, beta, sd, od, 2, &mb, n);
+        st = bcast_gen(ctx, beta, sdcol, od, 2, &mb, n);
     if (st == VC4_OK)
         st = ew(ctx, EW_ADD, &t, &mb, y, n);
     ws_off(&w);
@@ -937,6 +986,7 @@ vc4_status vc4_layernorm_bwd(vc4_ctx *ctx, const vc4_buf *x,
     vc4_buf bb = ws_get(&w, al64(n * 4));
     vc4_status st = w.ok ? VC4_OK : VC4_ERR_NOMEM;
     int sd[2] = { (int)rows, 1 }, od[2] = { (int)rows, (int)cols };
+    int sdcol[2] = { 1, (int)cols };
 
     if (st == VC4_OK)
         st = bcast_gen(ctx, save_mean, sd, od, 2, &mb, n);
@@ -947,7 +997,7 @@ vc4_status vc4_layernorm_bwd(vc4_ctx *ctx, const vc4_buf *x,
     if (st == VC4_OK)
         st = ew(ctx, EW_MUL, &xhat, &mb, &xhat, n);
     if (st == VC4_OK)
-        st = bcast_gen(ctx, gamma, sd, od, 2, &mb, n);
+        st = bcast_gen(ctx, gamma, sdcol, od, 2, &mb, n);
     if (st == VC4_OK)
         st = ew(ctx, EW_MUL, dy, &mb, &gx, n);
     if (st == VC4_OK)
@@ -960,6 +1010,16 @@ vc4_status vc4_layernorm_bwd(vc4_ctx *ctx, const vc4_buf *x,
         st = bcast_gen(ctx, &a, sd, od, 2, &ab, n);
     if (st == VC4_OK)
         st = bcast_gen(ctx, &b, sd, od, 2, &bb, n);
+    /* dgamma = sum_rows dy*xhat: compute it BEFORE xhat is reused for the
+     * xhat*b term of dx (it is the same buffer). */
+    if (st == VC4_OK)
+        st = ew(ctx, EW_MUL, dy, &xhat, &t, n);
+    if (st == VC4_OK) {
+        int dims[2] = { (int)rows, (int)cols };
+        st = reduce_one(ctx, &t, dgamma, dims, 2, 0, 0);
+        if (st == VC4_OK)
+            st = reduce_one(ctx, dy, dbeta, dims, 2, 0, 0);
+    }
     if (st == VC4_OK)
         st = ew(ctx, EW_SUB, &gx, &ab, &t, n);
     if (st == VC4_OK)
@@ -970,15 +1030,6 @@ vc4_status vc4_layernorm_bwd(vc4_ctx *ctx, const vc4_buf *x,
         st = bcast_gen(ctx, save_invstd, sd, od, 2, &mb, n);
     if (st == VC4_OK)
         st = ew(ctx, EW_MUL, &t, &mb, dx, n);
-    /* dgamma = sum_rows dy*xhat, dbeta = sum_rows dy */
-    if (st == VC4_OK)
-        st = ew(ctx, EW_MUL, dy, &xhat, &t, n);
-    if (st == VC4_OK) {
-        int dims[2] = { (int)rows, (int)cols };
-        st = reduce_one(ctx, &t, dgamma, dims, 2, 0, 0);
-        if (st == VC4_OK)
-            st = reduce_one(ctx, dy, dbeta, dims, 2, 0, 0);
-    }
     ws_off(&w);
     return st;
 }
@@ -1026,13 +1077,18 @@ vc4_status vc4_avgpool_bwd(vc4_ctx *ctx, const vc4_buf *dy, vc4_buf *dx,
             for (int y = 0; y < H; ++y)
                 for (int x = 0; x < W; ++x) {
                     size_t i = ((size_t)c * H + y) * W + x;
-                    int wy = y / S, wx = x / S;
+                    int wy = (y + pad) / S, wx = (x + pad) / S;
                     for (int ky = 0; ky < K; ++ky)
                         for (int kx = 0; kx < K; ++kx) {
                             int oy = wy - ky, ox = wx - kx;
                             if (oy < 0 || oy >= Ho || ox < 0 || ox >= Wo)
                                 continue;
-                            if ((y - oy * S) >= N || (x - ox * S) >= N)
+                            /* the window starts at oy*S - pad, so the offset
+                             * of this position inside it is y+pad-oy*S */
+                            int kyoff = y + pad - oy * S;
+                            int kxoff = x + pad - ox * S;
+                            if (kyoff < 0 || kyoff >= N || kxoff < 0 ||
+                                kxoff >= N)
                                 continue;
                             /* the average pool divides by the window area */
                             int cnt = N * N;
@@ -1189,10 +1245,14 @@ vc4_status vc4_maxpooln_bwd(vc4_ctx *ctx, const vc4_buf *x,
                         for (int y = 0; y < H; ++y)
                             for (int x = 0; x < W; ++x) {
                                 size_t i = ((size_t)c * H + y) * W + x;
-                                int wy = y / S - ky, wx = x / S - kx;
+                                int wy = (y + pad) / S - ky;
+                                int wx = (x + pad) / S - kx;
                                 if (wy < 0 || wy >= Ho || wx < 0 || wx >= Wo)
                                     continue;
-                                if ((y - wy * S) >= N || (x - wx * S) >= N)
+                                int kyoff = y + pad - wy * S;
+                                int kxoff = x + pad - wx * S;
+                                if (kyoff < 0 || kyoff >= N || kxoff < 0 ||
+                                    kxoff >= N)
                                     continue;
                                 size_t op = ((size_t)c * drows + wy) * dpitch
                                             + wx;
@@ -1366,25 +1426,11 @@ vc4_status vc4_split_bwd(vc4_ctx *ctx, const vc4_buf *const *dy,
     bw_ws w;
     ws_on(&w, ctx);
     const size_t nt = (size_t)outer * (size_t)tot * inner;
-    float *W = calloc(nt * nt, 4);
     vc4_status st = VC4_OK;
-    if (!W)
-        st = VC4_ERR_NOMEM;
-    else {
+    {
         int off = 0;
-        for (int i = 0; i < nsrc; ++i) {
-            for (int o = 0; o < outer; ++o)
-                for (int j = 0; j < axisdim[i]; ++j)
-                    for (int k = 0; k < inner; ++k) {
-                        size_t d = ((size_t)o * axisdim[i] + j) * inner + k;
-                        size_t s = ((size_t)o * (size_t)tot + off + j) * inner
-                                   + k;
-                        W[s * nt + d] = 1.0f;
-                    }
-            off += axisdim[i];
-        }
-        /* one concatenated source vector: gather the parts into a workspace
-         * buffer, then a single matvec would need the parts concatenated */
+        /* each part is scattered into the concatenated buffer with its own
+         * [nt][np] 0/1 matrix, then the parts are added (they are disjoint) */
         vc4_buf cat = ws_get(&w, al64(nt * 4));
         if (!w.ok)
             st = VC4_ERR_NOMEM;
@@ -1393,7 +1439,7 @@ vc4_status vc4_split_bwd(vc4_ctx *ctx, const vc4_buf *const *dy,
             for (int i = 0; i < nsrc && st == VC4_OK; ++i) {
                 size_t np = (size_t)outer * axisdim[i] * inner;
                 /* scatter the part into `cat` at the right offsets */
-                float *P = calloc(np * np, 4);
+                float *P = calloc(np * nt, 4);
                 if (!P) {
                     st = VC4_ERR_NOMEM;
                     break;
@@ -1425,7 +1471,6 @@ vc4_status vc4_split_bwd(vc4_ctx *ctx, const vc4_buf *const *dy,
         }
         if (st == VC4_OK)
             st = copy_floats(ctx, &cat, dx, nt);
-        free(W);
     }
     ws_off(&w);
     return st;

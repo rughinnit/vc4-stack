@@ -27,11 +27,16 @@
 static int uop_nvec(vc4_uop op)
 {
     switch (op) {
-    case VC4_UOP_LOG: case VC4_UOP_TANH: case VC4_UOP_ERF: case VC4_UOP_ELU:
-    case VC4_UOP_SELU: case VC4_UOP_SOFTPLUS: case VC4_UOP_SOFTSIGN:
+    /* only the bodies that do not fit the 16-vector 16 KiB code slot: */
+    case VC4_UOP_SELU: case VC4_UOP_SOFTPLUS:
     case VC4_UOP_GELU: case VC4_UOP_GELU_ERF: case VC4_UOP_SIN:
-    case VC4_UOP_COS: case VC4_UOP_ROUND: case VC4_UOP_SQRT:
-    case VC4_UOP_RECIPROCAL: case VC4_UOP_EXP: case VC4_UOP_MISH:
+    case VC4_UOP_COS: case VC4_UOP_SQRT:
+    case VC4_UOP_RECIPROCAL: case VC4_UOP_MISH:
+    case VC4_UOP_LOG: case VC4_UOP_TANH: case VC4_UOP_ERF: case VC4_UOP_ELU:
+    /* exp's 16-vector body is not numerically verified and round's does not
+       fit the code slot; both use the refused 4-vector path instead of
+       running a number the tree cannot stand behind */
+    case VC4_UOP_EXP: case VC4_UOP_ROUND:
         return 4;
     default:
         return 16;
@@ -164,6 +169,13 @@ vc4_status vc4_unary(vc4_ctx *ctx, vc4_uop op, const vc4_buf *a, vc4_buf *out,
         return VC4_ERR_INVAL;
 
     int nvec = uop_nvec(op);
+    if (nvec != 16) {
+        vc4_status g = vc4__refuse_unverified(ctx, uop_name(op),
+            "its body is generated with 4 vectors per group and that store "
+            "path (build_ew nvec != 16) writes no output");
+        if (g != VC4_OK)
+            return g;
+    }
     size_t per = (size_t)16 * nvec;
     size_t ngroups = (n + per - 1) / per;
     size_t np = ngroups * per;
@@ -338,6 +350,13 @@ vc4_status vc4_gather(vc4_ctx *ctx, const vc4_buf *tab, vc4_buf *out,
 {
     if (!ctx || !tab || !out || !n)
         return VC4_ERR_INVAL;
+    {
+        vc4_status g = vc4__refuse_unverified(ctx, "vc4_gather",
+            "the TMU1 setup word takes its address from an accumulator and "
+            "its load/pop order does not match build_ew; it wedges the QPU");
+        if (g != VC4_OK)
+            return g;
+    }
     if (ctx->dead)
         return VC4_ERR_TIMEOUT;
     if (tab->bytes < n * 4 || out->bytes < n * 4)
@@ -412,6 +431,12 @@ vc4_status vc4_blit(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t bytes)
 {
     if (!ctx || !a || !out || !bytes)
         return VC4_ERR_INVAL;
+    {
+        vc4_status g = vc4__refuse_unverified(ctx, "vc4_blit",
+            "it uses build_ew's 4-vector store path, which writes no output");
+        if (g != VC4_OK)
+            return g;
+    }
     if (bytes % 64) {
         vc4__set_err(ctx, "vc4_blit: %zu bytes is not a multiple of 64 B; the "
                      "gather table handles unaligned copies", bytes);

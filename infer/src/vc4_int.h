@@ -113,6 +113,17 @@ vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
 vc4_status vc4__ew_run(vc4_ctx *ctx, vc4_op op, uint64_t n,
                        uint32_t a_bus, uint32_t b_bus, uint32_t o_bus);
 
+/* ---- vc4_guard.c: the unverified-kernel gate ---------------------------- */
+/*
+ * Kernels that no test exercises and that are confirmed to break the board
+ * (gather / reduce / blit / the nvec=4 store path) refuse to launch unless
+ * VC4_ALLOW_UNVERIFIED_KERNELS=1.  A refusal is VC4_ERR_UNSUPPORTED with the
+ * defect named in the error string.
+ */
+int        vc4__unverified_allowed(void);
+vc4_status vc4__refuse_unverified(vc4_ctx *ctx, const char *what,
+                                  const char *why);
+
 /* ---- vc4_ew.c: generic binary/backward elementwise ---------------------- */
 /* A kernel from kops' EWB family: out = f(a, b) with p0/p1 as attributes.
  * `heavy` selects the 4-vector group the long bodies are generated with. */

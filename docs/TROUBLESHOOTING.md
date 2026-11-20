@@ -21,6 +21,7 @@ layout from [TUTORIAL.md](TUTORIAL.md): `/home/raspi/work/vc4-stack`, user
 | `cma_heap_allocate` page-allocation failure, `vc4d` restart loop | 7 |
 | last bits differ from a CPU/float64 reference | 8 |
 | build or venv dies from RAM, `/tmp` fills | 9 |
+| `vc4_init` ok but the client arena is exactly 3 MiB (`VC4_DATA_BASE`) and `vc4_alloc` fails `have 0 B` | 14 |
 
 ## 1. `kernel jit failed ... status=2`
 
@@ -555,11 +556,14 @@ ordinary memory pressure, and the spread across 3 reps was small.
 fails with `out of arena memory` / `arena exhausted` even though nothing is
 running.  The backend retries for ~10 s and may still fail.
 
-**Cause.** On this `vc4d` build the arena region of a client that exits is not
-reclaimed promptly; the daemon still accounts for it when the next client
-asks.  This is separate from CMA exhaustion (section 7).
+**Cause.** On a `vc4d` older than 1.2.3 the arena region of a client that
+exits is not reclaimed promptly (G9/B10); the daemon still accounts for it when
+the next client asks.  This is separate from CMA exhaustion (section 7).
+Since 1.2.3 the region is released from the peer pid as soon as the process is
+gone, so the second client gets the full arena.
 
-**Fix.** Restart the daemon between long-lived GPU processes:
+**Fix.** On 1.2.3+ nothing; on an older daemon, restart it between long-lived
+GPU processes:
 
 ```sh
 sudo systemctl restart vc4d
@@ -636,7 +640,45 @@ silently spill to the CPU.
   `tests/test_ops.py` guard the known leak (a `DataPtr` deleter that never ran
   because its context was null); update if you are on an old build.
 
-## 14. Exit codes and where to look
+## 14. `vc4_init` succeeds but the client arena is 3 MiB and nothing allocates
+
+**Symptom.** A plain C client (the test binaries, a probe) prints:
+
+```
+init 0 (ok)
+arena_bytes=3145728 used=3145728
+alloc: st=-2 out of arena memory
+  last_error: arena exhausted: need 262144 B, have 0 B
+              (arena 3145728 B, 3145728 B in pool, 0 B in scratch)
+```
+
+`3145728` is `VC4_DATA_BASE`: the region the engine keeps for its code and
+uniform slots.  A client that reports *that* as its whole arena has no data
+space at all.  Python and the installed `.deb` are unaffected, which is the
+give-away.
+
+**Cause.** A **mixed build**.  `struct vc4_ctx` gained a field (the G11
+`lock_fd`), the Makefile had no header prerequisites, and `vc4_dev_remote.o`
+was left compiled against the old struct.  It wrote `arena_bytes`,
+`arena_top` and `scratch` 8 bytes below where the freshly compiled objects
+read them, so the client saw the old `arena_top` (3 MiB = `VC4_DATA_BASE`) as
+its arena size.  Nothing fails at link time: both objects define the same
+symbols with the same signatures.
+
+**Fix.** Rebuild from clean, in this order:
+
+```sh
+make -C vc4d
+make -C infer clean && make -C infer
+```
+
+Since `vc4infer 1.2.6` a mixed build is refused instead of silently producing a
+3 MiB arena: `vc4_init` checks the context it got and prints
+`vc4infer: vc4d context inconsistent after init: arena 3145728 B … stale .o
+files`, and the grant itself is validated against the daemon's HELLO reply.  If
+you see either message, run the two `make` commands above.
+
+## 15. Exit codes and where to look
 
 | exit | meaning | first thing to run |
 |---:|---|---|
@@ -652,3 +694,4 @@ not running`, start the daemon rather than running as root.  The client should
 never open `/dev/mem`; if it does, you are on the wrong backend
 (`VC4INFER_DAEMON=0` is the direct-root path used only by the low-level test
 suite).
+

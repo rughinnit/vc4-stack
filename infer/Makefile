@@ -22,6 +22,17 @@ SRC   = src/vc4_gen.c src/vc4_dev.c src/vc4_dev_remote.c src/vc4_kern.c src/vc4_
         ../training/src/vc4_convbwd.c ../training/src/vc4_train.c ../training/src/vc4_bwd.c
 OBJ   = $(addprefix $(BUILD)/,$(notdir $(SRC:.c=.o)))
 
+# Every header an object can include.  Without this the struct layout in
+# src/vc4_int.h could change without rebuilding the objects that were compiled
+# against the old one: the merge added `lock_fd` to struct vc4_ctx, a stale
+# vc4_dev_remote.o kept writing arena_bytes/arena_top at the old offsets, and
+# the result was a client that reported a 3 MiB arena (VC4_DATA_BASE) and
+# could not allocate a byte (B12 in docs/BUGS.md).  The archive/link steps
+# cannot see that, so the dependency has to be here.
+HDRS  = $(wildcard src/*.h) $(wildcard include/*.h) \
+        $(wildcard ../training/src/*.h) \
+        $(VC4D_DIR)/include/vc4client.h $(VC4D_DIR)/proto/vc4d_proto.h
+
 # every binary run_tests.sh runs is built by `make`: a release is built
 # from a clean tree, and a test the build forgot is a test that never ran.
 TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_onnxops $(BUILD)/test_nhwc $(BUILD)/test_copyops $(BUILD)/test_coherency $(BUILD)/test_gate $(BUILD)/test_daemon_recover $(BUILD)/test_daemon_arena $(BUILD)/test_daemon_reap $(BUILD)/test_direct_lock $(BUILD)/bench_matmul
@@ -32,10 +43,10 @@ all: $(LIB) $(BUILD)/libvc4infer.so $(TESTS) $(TRAIN_TESTS)
 $(BUILD):
 	mkdir -p $(BUILD) kcache
 
-$(BUILD)/%.o: src/%.c | $(BUILD)
+$(BUILD)/%.o: src/%.c $(HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DVC4_KGEN_DEFAULT='"$(KGEN_DEFAULT)"' -c $< -o $@
 
-$(BUILD)/%.o: ../training/src/%.c | $(BUILD)
+$(BUILD)/%.o: ../training/src/%.c $(HDRS) | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DVC4_KGEN_DEFAULT='"$(KGEN_DEFAULT)"' -c $< -o $@
 
 $(LIB): $(OBJ) $(VC4D_DIR)/build/libvc4client.a
@@ -44,7 +55,10 @@ $(LIB): $(OBJ) $(VC4D_DIR)/build/libvc4client.a
 $(BUILD)/libvc4infer.so: $(OBJ) $(VC4D_DIR)/build/libvc4client.a
 	$(CC) -shared -Wl,-soname,libvc4infer.so.1 -o $@ $^
 
-$(VC4D_DIR)/build/libvc4client.a:
+# Not just "if missing": a stale libvc4client.a is a wire-protocol mismatch,
+# which is exactly as expensive to debug as the struct one above.
+$(VC4D_DIR)/build/libvc4client.a: $(VC4D_DIR)/src/libvc4client.c \
+		$(VC4D_DIR)/include/vc4client.h $(VC4D_DIR)/proto/vc4d_proto.h
 	$(MAKE) -C $(VC4D_DIR) build/libvc4client.a
 
 $(BUILD)/test_%: tests/test_%.c $(LIB) tests/util.h | $(BUILD)

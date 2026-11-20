@@ -281,16 +281,56 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
 
     /* Fall back to smaller regions like the direct path does (CMA pressure,
      * another client already holding part of the arena). */
+    size_t got = 0;
     for (size_t len = want; len >= REMOTE_MIN_ARENA; len /= 2) {
         rc = vc4c_alloc(r->conn, len, 0, &r->region);
-        if (rc == 0)
+        if (rc == 0) {
+            got = len;
             break;
+        }
         if (rc != -VC4D_E_NOMEM && rc != -VC4D_E_TOOLARGE)
             break;
     }
-    if (!r->region.map) {
-        vc4__set_err(ctx, "vc4d ALLOC: %s (wanted %zu MiB)",
-                     vc4c_strerror(rc), want >> 20);
+    if (!r->region.map || rc != 0) {
+        vc4__set_err(ctx, "vc4d ALLOC: %s (wanted %zu MiB, daemon arena %u MiB, "
+                     "data base %u B)", vc4c_strerror(rc), want >> 20,
+                     info.arena_bytes >> 20, info.data_base);
+        vc4c_close(r->conn);
+        free(r);
+        free(ctx);
+        return VC4_ERR_NOMEM;
+    }
+
+    /* Never accept a grant that cannot hold data.
+     *
+     * The engine keeps its code and uniform slots in the first VC4_DATA_BASE
+     * bytes of its region and allocates upwards from there, so a region of
+     * exactly VC4_DATA_BASE is an arena with zero usable bytes - the client
+     * would report "ok" and then fail every vc4_alloc() (measured: B12, a
+     * struct-layout mismatch between two objects of the library, which made
+     * the client read the daemon's `off` as its `len`).  The reply is checked
+     * against what HELLO advertised, so a disagreement between client and
+     * daemon about the alloc reply fails here, with the numbers, instead of
+     * much later inside a graph. */
+    if (r->region.len <= VC4_DATA_BASE ||
+        r->region.off < info.data_base ||
+        (uint64_t)r->region.off + r->region.len > info.arena_bytes ||
+        r->region.len < got) {
+        vc4__set_err(ctx,
+                     "vc4d granted a %zu B region at off 0x%x but the daemon "
+                     "advertised %u B with a %u B data base: the region has "
+                     "%s data space (requested %zu MiB, granted %zu MiB). "
+                     "Client and daemon disagree about the allocation reply - "
+                     "rebuild both from the same tree (`make -C vc4d && make "
+                     "-C infer clean && make -C infer`) and check that "
+                     "struct vc4_ctx / struct vc4d_alloc_rsp are the same in "
+                     "every object of libvc4infer.a",
+                     (size_t)r->region.len, r->region.off, info.arena_bytes,
+                     info.data_base,
+                     r->region.len > VC4_DATA_BASE ? "some"
+                                                   : "no",
+                     want >> 20, (size_t)got >> 20);
+        vc4c_free(r->conn, &r->region);
         vc4c_close(r->conn);
         free(r);
         free(ctx);
@@ -305,7 +345,7 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
     ctx->gpu_bus = r->region.bus;      /* bus address of region.map[0] */
     /* ctx->v3d stays NULL: every register path is replaced by the daemon. */
     if (getenv("VC4INFER_DEBUG"))
-        fprintf(stderr, "[vc4] vc4d arena: off=0x%x len=0x%zx bus=0x%08x map=%p\n",
+        fprintf(stderr, "[vc4] vc4d arena: off=0x%x len=0x%x bus=0x%08x map=%p\n",
                 r->region.off, r->region.len, r->region.bus, r->region.map);
 
     if (cache_dir)

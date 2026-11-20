@@ -32,16 +32,36 @@ esac
 RUN="$SUDO env $DMENV VC4INFER_TMO_MS=20000"
 
 clocks() {
-    echo "--- clocks: $(vcgencmd measure_clock core) $(vcgencmd measure_clock v3d) $(vcgencmd get_throttled)"
+    echo "--- clocks: $(vcgencmd measure_clock core) $(vcgencmd measure_clock v3d) $(vcgencmd get_throttled) $(vcgencmd measure_temp)"
 }
 
 board() {
-    echo "--- board:"
+    echo "--- board: $(vcgencmd measure_temp)"
     sudo -n "$STATUS" | grep -E "STATE|SRQCS|V3D_ERRORS"
     sudo -n "$STATUS" | grep -q "STATE: LIVE" || {
         echo "!!! board is not LIVE - power-cycle it before running again"
         exit 1
     }
+}
+
+# --- thermal -----------------------------------------------------------------
+# The fan was removed on 2026-11-20: the board idles at ~56 C and a sustained
+# QPU load adds ~15 C in two minutes, after which the firmware cuts the clock
+# (docs/CLOCK-VARIANCE.md).  So every section starts from the same thermal
+# state, and each section prints the temperature it ran at.  TEMP_START_LIMIT
+# is the "cool enough to start" threshold; COOL_MAX_S bounds the wait.
+TEMP_START_LIMIT=${TEMP_START_LIMIT:-66}
+COOL_MAX_S=${COOL_MAX_S:-300}
+
+temp_c() { vcgencmd measure_temp 2>/dev/null | sed "s/^temp=//; s/.C$//"; }
+
+cool() {
+    _t=$(temp_c); _n=0
+    while [ -n "$_t" ] && [ "${_t%%.*}" -ge "$TEMP_START_LIMIT" ] && \
+          [ "$_n" -lt "$COOL_MAX_S" ]; do
+        sleep 2; _n=$((_n + 2)); _t=$(temp_c)
+    done
+    echo "--- cool: $(temp_c) C after ${_n}s (start limit ${TEMP_START_LIMIT} C)"
 }
 
 echo "=== backend: $BACKEND"
@@ -82,10 +102,12 @@ for i in $(seq 1 100); do [ -S "$TSOCK" ] && break; sleep 0.05; done
 ./build/test_daemon_arena "$TSOCK"
 ./build/test_daemon_reap "$TSOCK" 3
 board
+cool
 
 echo "=== test_direct_lock (G11: direct mode and vc4d share the GPU lock)"
 sudo -n ./build/test_direct_lock "$TSOCK"
 board
+cool
 sudo -n kill $TPID 2>/dev/null
 trap - EXIT
 sudo -n rm -f "$TSOCK"
@@ -148,6 +170,7 @@ done
 echo "=== test_nhwc (NHWC data plane: conv/depthwise/pool/concat/upsample)"
 timeout -k 5 900 $RUN ./build/test_nhwc "$REPS"
 board
+cool
 
 echo "=== test_onnxops (generic maxpool, forward softmax)"
 timeout -k 5 300 $RUN ./build/test_onnxops
@@ -157,26 +180,32 @@ timeout -k 5 300 $RUN ./build/test_onnxops
 echo "=== test_onnx_norm (17 ops through the runner)"
 PYTHONPATH=$PYTHONPATH:. timeout -k 5 600 python3 tests/test_onnx_norm.py
 board
+cool
 
 echo "=== test_onnx_gaps (variadic/conversion/gather family through the runner)"
 PYTHONPATH=$PYTHONPATH:. timeout -k 5 900 python3 tests/test_onnx_gaps.py
 board
+cool
 
 echo "=== test_copyops (layout copy kernels, byte-exact)"
 timeout -k 5 300 $RUN ./build/test_copyops
 board
+cool
 
 echo "=== test_coherency (cacheable arena mapping maintenance)"
 timeout -k 5 300 $RUN ./build/test_coherency
 board
+cool
 
 echo "=== test_train_ops (training primitives)"
 timeout -k 5 300 $RUN ./build/test_train_ops
 board
+cool
 
 echo "=== test_grad (finite differences)"
 timeout -k 5 600 $RUN ./build/test_grad 1
 board
+cool
 
 echo "=== test_bwd_one (each backward op in its own process: hang bisect)"
 for op in softmax_bwd softmax_ce_bwd batchnorm_bwd layernorm_bwd \
@@ -188,10 +217,13 @@ for op in softmax_bwd softmax_ce_bwd batchnorm_bwd layernorm_bwd \
         echo "FAIL: test_bwd_one $op"; exit 1; }
 done
 board
+cool
 
+cool
 echo "=== test_convgrad (conv dX/dW, pool; finite differences)"
 timeout -k 5 900 $RUN ./build/test_convgrad 1
 board
+cool
 
 for o in sgd adam; do
     echo "=== test_train --opt $o (300 steps)"

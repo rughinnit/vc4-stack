@@ -528,8 +528,35 @@ vc4_status vc4_init(vc4_ctx **out, const char *cache_dir, size_t arena_bytes)
     if (!out)
         return VC4_ERR_INVAL;
     *out = NULL;
-    if (daemon_mode())
-        return vc4__remote_init(out, cache_dir, arena_bytes);
+    if (daemon_mode()) {
+        vc4_status st = vc4__remote_init(out, cache_dir, arena_bytes);
+        if (st != VC4_OK)
+            return st;
+        /* Self-consistency of the context that came back, read through *this*
+           object's struct layout: a vc4_dev_remote.o built against an older
+           struct vc4_ctx would have written arena_bytes/arena_top/scratch into
+           the wrong slots, and the only symptom used to be a client that
+           believed it had a 3 MiB arena (B12).  Catch it at init, where the
+           message can say what is wrong. */
+        vc4_ctx *c = *out;
+        if (!c || vc4_arena_bytes(c) < (8u << 20) ||
+            vc4_arena_used(c) != VC4_DATA_BASE || !c->gpu_bus) {
+            /* Loud on purpose: this is a broken build, not a runtime
+               condition, and `out` is NULL afterwards, so there is nowhere
+               else for the detail to go. */
+            fprintf(stderr,
+                    "vc4infer: vc4d context inconsistent after init: arena "
+                    "%zu B, %zu B used, bus 0x%08x - libvc4infer.a mixes "
+                    "objects built against different headers (stale .o files); "
+                    "run `make -C vc4d && make -C infer clean && make -C infer`\n",
+                    vc4_arena_bytes(c), vc4_arena_used(c),
+                    c ? c->gpu_bus : 0);
+            vc4_shutdown(c);
+            *out = NULL;
+            return VC4_ERR_IO;
+        }
+        return VC4_OK;
+    }
     vc4_ctx *ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
         return VC4_ERR_NOMEM;

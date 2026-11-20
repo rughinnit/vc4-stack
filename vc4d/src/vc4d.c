@@ -384,6 +384,11 @@ static int handle_alloc(struct client *c, const struct vc4d_hdr *h,
 
     struct vc4d_alloc_rsp r = { .handle = (uint32_t)slot, .off = off,
                                  .len = len, .bus = arena_bus(&A, off) };
+    /* One line per grant: when a client later reports a nonsense arena, the
+       numbers it was given are the first thing to compare (B12). */
+    if (opt.verbose)
+        logmsg("ALLOC uid=%u pid=%d bytes=%u -> off=0x%x len=0x%x bus=0x%08x",
+               (unsigned)c->uid, (int)c->pid, q.bytes, off, len, r.bus);
     if (reply(c->fd, h, VC4D_OK, &r, sizeof(r), A.fd, 0, 0) != 0) {
         arena_free(&A, off, len);
         c->reg[slot].used = 0;

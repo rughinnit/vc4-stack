@@ -106,7 +106,15 @@ int main(int argc, char **argv)
     vc4_buf a, b, c;
     if (vc4_alloc(ctx, BYTES, &a) || vc4_alloc(ctx, BYTES, &b) ||
         vc4_alloc(ctx, BYTES, &c)) {
-        printf("FAIL: arena alloc\n");
+        /* Say what the client actually got: an arena with no data space is a
+         * client-side sizing/ABI problem, not a daemon one (B12). */
+        printf("FAIL: arena alloc of 3 x %d B: %s\n"
+               "      client arena %.2f MiB (%zu B used), %s\n",
+               BYTES, vc4_last_error(ctx),
+               vc4_arena_bytes(ctx) / 1048576.0, vc4_arena_used(ctx),
+               vc4_arena_bytes(ctx) <= (3u << 20)
+                   ? "the grant has no data space - rebuild client and daemon "
+                     "from the same tree" : "see the message above");
         return 1;
     }
     float *pa = calloc(M * M, 4), *pb = calloc(M * M, 4);
@@ -146,7 +154,8 @@ int main(int argc, char **argv)
         }
         if (vc4_alloc(ctx, BYTES, &a) || vc4_alloc(ctx, BYTES, &b) ||
             vc4_alloc(ctx, BYTES, &c)) {
-            CHECK(0, "the new client gets its arena");
+            CHECK(0, "the new client gets its arena: %s (arena %.2f MiB)",
+                  vc4_last_error(ctx), vc4_arena_bytes(ctx) / 1048576.0);
             break;
         }
         vc4_upload(ctx, &a, pa, BYTES);

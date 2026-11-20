@@ -158,7 +158,10 @@ def main():
                      np.float64)
         for i in range(cols):
             mem[A + 4 * i] = bits(a[i])
-        got, m, miss, nw = run(kind, opts, [A, O, 1, 0, 1], mem)
+        # u6 is the carry-seed address; the first chunk reads a zero word.
+        mem[A + 0x3000] = bits(0.0)
+        got, m, miss, nw = run(kind, opts, [A, O, 1, 0, 1, cols, A + 0x3000],
+                               mem)
         want = list(np.cumsum(a))
         total_bad += report("cumsum cols=%d" % cols, got, want, tol=2e-6)
         print("   TMU outside the mapped arena: %d, words %d" % (miss, nw))

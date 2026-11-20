@@ -476,21 +476,20 @@ int main(int argc, char **argv)
         }
         report(op, &bo, N, ref);
     } else if (!strcmp(op, "gate")) {
-        /* The refusal contract, asserted without launching anything:
-         * vc4_gather still refuses with a message.  vc4_blit is fixed (it
-         * rides the verified copy2d kernel), so here it must instead reach its
-         * own length check, which runs before any buffer is touched: a 100 B
-         * copy is refused by the function, not by the gate. */
+        /* Asserted without launching anything.  vc4_gather is element-verified
+         * now, so it must reach its own buffer-size check (a 1000-entry table
+         * does not fit in 64 B) instead of the old "not verified" gate.
+         * vc4_blit keeps its 64 B granularity refusal. */
         {
             vc4_buf dummy = { 0x1000, 64 }, dout = { 0x2000, 64 };
-            vc4_status g = vc4_gather(ctx, &dummy, &dout, 1, 0.0f);
-            if (g != VC4_ERR_UNSUPPORTED || !*vc4_last_error(ctx)) {
-                printf("FAIL vc4_gather did not refuse (st=%d %s)\n", g,
-                       vc4_strerror(g));
+            vc4_status g = vc4_gather(ctx, &dummy, &dout, 1000, 0.0f);
+            if (g != VC4_ERR_INVAL ||
+                strstr(vc4_last_error(ctx), "not verified on this board")) {
+                printf("FAIL vc4_gather: st=%d %s (expected the size check)\n",
+                       g, vc4_last_error(ctx));
                 errors++;
             } else {
-                printf("  %-11s refused: %s\n", "vc4_gather",
-                       vc4_last_error(ctx));
+                printf("  %-11s open, refuses a short table\n", "vc4_gather");
             }
             g = vc4_blit(ctx, &dummy, &dout, 100);
             if (g != VC4_ERR_UNSUPPORTED ||

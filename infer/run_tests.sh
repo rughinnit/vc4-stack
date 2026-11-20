@@ -185,7 +185,7 @@ if [ "$DAEMON" != 0 ]; then
     tail -2 /tmp/vc4-client-evidence.log | sed 's/^/  /'
 fi
 
-echo "=== test_gate (unverified kernels must refuse, not launch)"
+echo "=== test_gate (formerly gated entry points are open; argument checks fire)"
 $RUN ./build/test_gate
 
 for t in test_ew test_matmul test_conv; do

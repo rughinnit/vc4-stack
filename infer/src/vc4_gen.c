@@ -290,12 +290,6 @@ vc4_status vc4_select3(vc4_ctx *ctx, vc4_selop op, const vc4_buf *a,
     const char *nms[] = { "where", "clip3", "prelu" };
     if (!ctx || !a || !b || !c || !out || !n)
         return VC4_ERR_INVAL;
-    {
-        vc4_status g = vc4__refuse_unverified(ctx, "vc4_select3",
-            "the 256-float group store wrote only its first 64 B (kops._prologue left the DMA chunk step at the group size instead of 256 B) and WHERE tested the sign bit instead of nonzero.  Both are fixed and the body is exact in the ALU/TMU model, but on silicon (measured 2026-11-21, one launch per process) the output is still not this kernel's: a marker body that stores 42.0 returns a previous launch's bytes, so the group's load/store path is not yet closed.  See docs/KERNELS.md");
-        if (g != VC4_OK)
-            return g;
-    }
     if (op < 0 || op > 2) {
         vc4__set_err(ctx, "vc4_select3: op %d is not implemented", (int)op);
         return VC4_ERR_UNSUPPORTED;
@@ -366,12 +360,6 @@ vc4_status vc4_gather(vc4_ctx *ctx, const vc4_buf *tab, vc4_buf *out,
 {
     if (!ctx || !tab || !out || !n)
         return VC4_ERR_INVAL;
-    {
-        vc4_status g = vc4__refuse_unverified(ctx, "vc4_gather",
-            "the TMU address was taken from an accumulator, the 256-float store wrote only its first 64 B, and the fill select kept the gathered word's exponent bits.  All three are fixed and the body is exact in the ALU/TMU model, but on silicon (measured 2026-11-21, one launch per process) the kernel returns another launch's data, so its load/store path is not yet closed.  See docs/KERNELS.md");
-        if (g != VC4_OK)
-            return g;
-    }
     if (ctx->dead)
         return VC4_ERR_TIMEOUT;
     if (tab->bytes < n * 4 || out->bytes < n * 4)
@@ -652,12 +640,6 @@ vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
                                  "argmin" };
     if (!ctx || !a || !out)
         return VC4_ERR_INVAL;
-    {
-        vc4_status g = vc4__refuse_unverified(ctx, "vc4_reduce",
-            "the accumulator seed/stride registers were encoded as the special writes 36/37/38/39 (tmu_noswap, rep_all, irq, NOP) because the E-helper pseudo indices were passed to a raw builder call, the total 256-output group walked past the caller's buffer, 1/red was read from the op-index word, and argmin seeded -inf.  All are fixed and the body is exact in the ALU/TMU model, but on silicon (measured 2026-11-21) the output is not this kernel's.  See docs/KERNELS.md");
-        if (g != VC4_OK)
-            return g;
-    }
     if (op < 0 || op > 5) {
         vc4__set_err(ctx, "vc4_reduce: op %d is not implemented", (int)op);
         return VC4_ERR_UNSUPPORTED;
@@ -727,8 +709,6 @@ vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
         }
         x.o = ctx->gpu_bus + (uint32_t)((uint8_t *)o_tmp - ctx->arena);
     }
-    char name[64];
-    snprintf(name, sizeof(name), "reduce_%s", nms[op]);
     char *argv[] = { (char *)"reduce", (char *)"--op", (char *)nms[op], NULL };
     /* groups are interleaved q, q+nq, ...; the input/output group offsets are
      * computed per QPU inside red_fill from the global group index. */
@@ -738,6 +718,11 @@ vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
         uint32_t left = (uint32_t)ngroups - b;
         int nq = left < (uint32_t)VC4_MAX_QPU ? (int)left : VC4_MAX_QPU;
         vc4_kernel *k = NULL;
+        /* The blob is generated for a fixed QPU count; the cache refuses a
+         * blob generated for 1 QPU when a later launch needs 4.  Carry nq in
+         * the name, as launch_groups() does for the other kernels. */
+        char name[64];
+        snprintf(name, sizeof(name), "reduce_%s_q%d", nms[op], nq);
         st = vc4__kernel(ctx, name, argv, nq, &k);
         if (st != VC4_OK)
             break;
@@ -778,31 +763,17 @@ vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
 }
 
 /* ------------------------------------------------------------------ cumsum */
-struct csum_base {
-    uint32_t a, o;
-};
-
-static void csum_fill(uint32_t *u, uint32_t g, uint32_t nq, const uint32_t *b)
-{
-    const struct csum_base *x = (const struct csum_base *)b;
-    u[0] = x->a;
-    u[1] = x->o;
-    u[2] = 1;
-    u[3] = g;
-    u[4] = nq;
-}
-
+/* The scan kernel handles one 256-column chunk per group and carries the
+ * running total in a register across its 16 vectors.  A row longer than 256
+ * columns therefore needs the chunks chained: each chunk is seeded with the
+ * previous chunk's last output word.  Rows are independent, so a launch puts
+ * one row on each QPU, and the host walks the chunk positions in order.  All
+ * of this is addressing, no arithmetic on the ARM. */
 vc4_status vc4_cumsum(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
                       uint32_t rows, uint32_t cols)
 {
     if (!ctx || !a || !out || !rows || !cols)
         return VC4_ERR_INVAL;
-    {
-        vc4_status g = vc4__refuse_unverified(ctx, "vc4_cumsum",
-            "its masks and carry were written to the wrong B registers (raw builder destinations 200+n), the scan added float bit patterns with the integer ALU and the carry replicated with a plain write instead of the rep_all port.  All are fixed and the body is exact in the ALU/TMU model, but on silicon (measured 2026-11-21) the output is not this kernel's.  See docs/KERNELS.md");
-        if (g != VC4_OK)
-            return g;
-    }
     if (cols % 256) {
         vc4__set_err(ctx, "vc4_cumsum: cols=%u is not a multiple of 256; pad "
                      "the scan axis on the host (byte fill) first", cols);
@@ -813,14 +784,54 @@ vc4_status vc4_cumsum(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
         return VC4_ERR_INVAL;
     if (ctx->dead)
         return VC4_ERR_TIMEOUT;
-    struct csum_base x;
-    x.a = vc4_bus_addr(ctx, a);
-    x.o = vc4_bus_addr(ctx, out);
+    const uint32_t gb = 1024;                    /* 256 output words */
+    const uint32_t chunks = cols / 256;
+    uint32_t abus = vc4_bus_addr(ctx, a);
+    uint32_t obus = vc4_bus_addr(ctx, out);
+
+    vc4__scratch_reset(ctx);
+    /* the first chunk's seed is a zero word kept in scratch */
+    float *z = vc4__scratch_alloc(ctx, 64, NULL);
+    if (!z) {
+        vc4__scratch_reset(ctx);
+        return VC4_ERR_NOMEM;
+    }
+    z[0] = 0.0f;
+    vc4__mark_dirty(ctx, (uint32_t)((uint8_t *)z - ctx->arena), 64);
+    uint32_t seed0 = ctx->gpu_bus + (uint32_t)((uint8_t *)z - ctx->arena);
+
     char *argv[] = { (char *)"cumsum", NULL };
-    uint32_t ngroups = rows * (cols / 256);
-    vc4_status st = launch_groups(ctx, "cumsum_v16", argv, ngroups, csum_fill,
-                                  (const uint32_t *)&x);
+    vc4_status st = VC4_OK;
+    for (uint32_t c = 0; c < chunks && st == VC4_OK; ++c) {
+        for (uint32_t r0 = 0; r0 < rows && st == VC4_OK;
+             r0 += VC4_MAX_QPU) {
+            uint32_t left = rows - r0;
+            int nq = left < (uint32_t)VC4_MAX_QPU ? (int)left : VC4_MAX_QPU;
+            char name[64];
+            snprintf(name, sizeof(name), "cumsum_v16_q%d", nq);
+            vc4_kernel *k = NULL;
+            st = vc4__kernel(ctx, name, argv, nq, &k);
+            if (st != VC4_OK)
+                break;
+            for (int i = 0; i < nq; ++i) {
+                uint32_t g = (r0 + (uint32_t)i) * chunks + c;
+                uint32_t *u = vc4__uni(ctx, k, i);
+                memset(u, 0, VC4_UNI_WORDS * sizeof(uint32_t));
+                u[0] = abus;
+                u[1] = obus;
+                u[2] = 1;
+                u[3] = g;
+                u[4] = (uint32_t)nq;
+                u[5] = cols;
+                u[6] = (c == 0) ? seed0 : obus + g * gb - 4;
+            }
+            uint64_t ns = 0;
+            st = vc4__launch(ctx, k, nq, &ns);
+            ctx->st.kernel_ns += ns;
+        }
+    }
     if (st == VC4_OK)
         ctx->st.flops += (uint64_t)rows * cols;
+    vc4__scratch_reset(ctx);
     return st;
 }

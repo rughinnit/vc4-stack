@@ -230,9 +230,29 @@ static void t_reduce(void)
                     double want = red_ref_one(a + (size_t)o * red, red, op,
                                               &ai);
                     int is_arg = (op == VC4_RED_ARGMAX || op == VC4_RED_ARGMIN);
+                    /* red_ref_one returns the *value*; the arg ops store the
+                     * index, so the oracle compares against `ai` (comparing
+                     * the index with the value marked every arg result bad). */
+                    if (is_arg)
+                        want = (double)ai;
                     double got = is_arg ? (double)iout[o] : (double)out[o];
                     double tol = is_arg ? 0.0
                                         : 1e-5 + 1e-5 * (want < 0 ? -want : want);
+                    /* A sum is a chain of `red` QPU fadds and the FPU
+                     * truncates toward zero (docs/NUMERICS.md), so its error
+                     * is bounded by red ulps of the largest partial, not by
+                     * an IEEE-ordered sum.  Add that bound for Sum. */
+                    if (op == VC4_RED_SUM) {
+                        double scale = 0.0;
+                        for (uint32_t r = 0; r < red; ++r) {
+                            double v = a[(size_t)o * red + r];
+                            if (v < 0)
+                                v = -v;
+                            if (v > scale)
+                                scale = v;
+                        }
+                        tol += (double)red * scale * 2.4e-7;
+                    }
                     double e = got - want;
                     if (e < 0)
                         e = -e;
@@ -251,6 +271,8 @@ static void t_reduce(void)
                                                   &ai);
                         int is_arg = (op == VC4_RED_ARGMAX ||
                                       op == VC4_RED_ARGMIN);
+                        if (is_arg)
+                            want = (double)ai;
                         printf("   [%u] got %.7g want %.7g\n", o,
                                is_arg ? (double)iout[o] : (double)out[o], want);
                     }

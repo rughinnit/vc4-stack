@@ -97,6 +97,10 @@ for t in test_ew test_matmul test_conv; do
     board
 done
 
+echo "=== test_nhwc (NHWC data plane: conv/depthwise/pool/concat/upsample)"
+timeout -k 5 900 $RUN ./build/test_nhwc "$REPS"
+board
+
 echo "=== test_onnxops (generic maxpool, forward softmax)"
 timeout -k 5 300 $RUN ./build/test_onnxops
 board

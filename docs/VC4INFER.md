@@ -43,8 +43,7 @@ wheel is pure Python and uses the engine library the .deb installs:
 
 ```sh
 sudo apt install vc4infer
-pip install https://rughinnit.github.io/vc4-apt/pip/vc4infer-1.1.2-py3-none-any.whl
-# or: pip install --extra-index-url https://rughinnit.github.io/vc4-apt/pip/simple/ vc4infer
+pip install --extra-index-url https://rughinnit.github.io/vc4-apt/pip/simple/ vc4infer
 # (the older https://rughinnit.github.io/vc4top apt/pip location is deprecated)
 ```
 
@@ -227,7 +226,7 @@ stored CPU reference at `atol = rtol = 5e-4`:
 
 ```
 $ vc4infer selftest
-vc4infer 1.1.2 selftest
+vc4infer 1.2.10 selftest
   models:  /usr/share/vc4infer/models
   engine:  /usr/lib/aarch64-linux-gnu/libvc4infer.so.1
   backend: vc4d (/run/vc4d.sock, running)
@@ -474,14 +473,14 @@ then reused).  `VC4INFER_CACHE` overrides the directory.
 From a `vc4-stack` checkout on the board:
 
 ```sh
-make -C engine build/libvc4infer.so          # the engine
-packaging/vc4infer/build_deb.sh              # -> dist/vc4infer_<ver>_arm64.deb
-packaging/build_wheel.sh                     # -> dist/vc4infer-<ver>-py3-none-any.whl
-packaging/publish_apt.sh                     # signed gh-pages repo (vc4top key)
+make -C infer build/libvc4infer.so           # the engine
+infer/packaging/vc4infer/build_deb.sh        # -> dist/vc4infer_<ver>_arm64.deb
+infer/packaging/build_wheel.sh               # -> dist/vc4infer-<ver>-py3-none-any.whl
+packaging/publish_apt.sh                     # signed apt repo (vc4top archive key)
 ```
 
 `publish_apt.sh` adds `pool/main/v/vc4infer/` and `pip/` (the wheel plus a
-PEP 503 simple index) to the vc4top gh-pages branch, regenerates `Packages`,
+PEP 503 simple index) to the `main` branch of `rughinnit/vc4-apt`, regenerates `Packages`,
 `Release`, `Release.gpg` and `InRelease` with the existing archive key, and
 pushes.  The same keyring (`vc4top-archive-keyring.gpg`) verifies both
 packages.

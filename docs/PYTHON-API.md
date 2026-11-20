@@ -38,7 +38,7 @@ Two pieces, on purpose:
 | piece | contains | install |
 |---|---|---|
 | `vc4infer` .deb | `libvc4infer.so.1`, headers, CLI, kernel JIT, selftest models, the same Python package system-wide | `sudo apt install vc4infer` |
-| `vc4infer` wheel | the pure-Python package (engine API, CLI module, executor, ctypes binding, kernel generator, examples) — `py3-none-any` | `pip install vc4infer-1.1.2-py3-none-any.whl` |
+| `vc4infer` wheel | the pure-Python package (engine API, CLI module, executor, ctypes binding, kernel generator, examples) — `py3-none-any` | `pip install --extra-index-url https://rughinnit.github.io/vc4-apt/pip/simple/ vc4infer` |
 
 The wheel is pure Python, so it cannot carry the architecture-specific engine
 library; the .deb provides it.  In a venv:
@@ -46,9 +46,8 @@ library; the .deb provides it.  In a venv:
 ```sh
 sudo apt install vc4infer
 python3 -m venv ~/venvs/vc4 && . ~/venvs/vc4/bin/activate
-pip install https://rughinnit.github.io/vc4-apt/pip/vc4infer-1.1.2-py3-none-any.whl
-# or from the PEP 503 index (--index-url works too):
 pip install --extra-index-url https://rughinnit.github.io/vc4-apt/pip/simple/ vc4infer
+# the PEP 503 index also works as --index-url
 ```
 
 pip dependencies: `numpy`, `onnx>=1.14`, `pillow`.  `vc4d` must be running
@@ -61,7 +60,7 @@ client never opens `/dev/mem`.
 
 | name | meaning |
 |---|---|
-| `vc4infer.__version__` | `"1.1.2"` |
+| `vc4infer.__version__` | the installed package version |
 | `vc4infer.devices()` | `["vc4"]` |
 | `vc4infer.Device("vc4")` | the device object: `.name`, `.memory`, `.queue_depth`, `.ops`, `.supports(op)`, `.describe()` |
 | `vc4infer.Engine(model_path, device=None, *, mode="strict", host_policy="device", arena_mb=None, cache_dir=None)` | the engine |

@@ -15,9 +15,17 @@ measurements during this work and are now controlled:
    per-launch cost) differ by **7 % on a GEMM and 16 % on YOLO**. `docs/BACKENDS.md`.
 3. **Board load.** a concurrent build moves ARM numbers by 6–25 %. Every row
    below states the state it was taken in.
+4. **Temperature — since 2026-11-20 the board is fanless.** Idle ~56 C, and a
+   sustained QPU load reaches **73 C in under two minutes**; the soft limit is
+   80 C, after which the firmware cuts the clock. A long run therefore drifts
+   into a different regime mid-measurement, and *silently favours short runs*.
+   Long commands are wrapped in `tools/thermal-guard.sh --max 72`, and any row
+   taken after this date should carry its start/peak temperature. The ramp and
+   the rules are in `docs/CLOCK-VARIANCE.md`.
 
 Board: Raspberry Pi 3B, BCM2837, VideoCore IV (V3D), 12 QPUs, 6 TMUs,
-905 MiB RAM, `6.18.50+rpt-rpi-v8`, kernel CMA 256 MiB.
+905 MiB RAM, `6.18.50+rpt-rpi-v8`, kernel CMA 256 MiB. **Fanless since
+2026-11-20** (~56 C idle, 73 C after ~2 min of QPU load): see rule 4.
 
 ---
 

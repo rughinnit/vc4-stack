@@ -162,7 +162,26 @@ OPS = {
     "Pow": "QPU Log/Exp/Reciprocal chain (small integer exponents are exact "
            "multiply chains)",
     "Mod": "QPU Reciprocal/Floor/Sign + Mul/Sub (fmod and floor semantics)",
-    "DepthToSpace": "needs an element-level scatter (see the refusal)",
+    "DepthToSpace": "QPU element layout map (DCR/CRD), laned copies",
+    # the variadic / conversion / gather family (_dispatch_extra.py,
+    # docs/OPS-GAPS.md).  Each entry names the kernels the handler composes.
+    "Sum": "QPU elementwise Add chain (broadcast operands)",
+    "Mean": "QPU elementwise Add chain + QPU Affine 1/n",
+    "Max": "QPU exact bit select over the operands (NaN wins, +-inf copied)",
+    "Min": "QPU exact bit select over the operands (NaN wins, +-inf copied)",
+    "Div": "QPU Reciprocal + correctly-rounded MUL (constant divisor folds)",
+    "Cast": "view (fp32) / QPU Floor+Ceil truncation (int) + dtype boundary",
+    "LpNormalization": "QPU Abs/MUL + GEMM sum + QPU Sqrt/Reciprocal + MUL",
+    "Gather": "QPU copy2d row gather (activation data and host shape tensors)",
+    "GatherElements": "QPU copy2d laned word gather, axis moved innermost",
+    "GatherND": "QPU copy2d row gather over an integer index map",
+    "ScatterElements": "QPU copy2d word store + QPU Add/MUL for reductions",
+    "ScatterND": "QPU copy2d row store + QPU Add/MUL for reductions",
+    "NonZero": "QPU exact bit-compare mask + int64 coordinates on the ARM",
+    "TopK": "QPU exact-select scan per k + int32 index read-back",
+    "Unique": "QPU pairwise equality/order matrices + QPU row gather",
+    "ReverseSequence": "QPU copy2d laned gather over the time axis",
+    "CenterCropPad": "QPU fill2d + copy2d laned gather (crop/pad map)",
 }
 
 # Registered after the 2026-11-20 clean-window verification.  Set
@@ -489,13 +508,77 @@ def _check_cumsum(node, shapes, inits):
     return "supported", "prefix sum, axis in a constant"
 
 
-def _check_depthtospace(node, shapes, inits):
-    return "unsupported", (
-        "DepthToSpace needs an element-level scatter: an output row "
-        "[ow*blocksize + j] alternates between blocksize input channels, and a "
-        "copy2d destination vector is 16 contiguous words, so no lane stride "
-        "expresses it.  vc4_gather, which would, is refused on this board "
-        "(it wedges the QPU).  SpaceToDepth, its inverse, runs.")
+def _check_variadic(node, shapes, inits):
+    if not [i for i in node.input if i]:
+        return "unsupported", "no operands"
+    return "supported", "%d operands, numpy broadcast" % len(
+        [i for i in node.input if i])
+
+
+def _check_div(node, shapes, inits):
+    b = node.input[1] if len(node.input) > 1 else None
+    if b and b in inits and getattr(inits[b], "size", 0) == 1:
+        return "supported", "QPU Mul by the folded reciprocal"
+    return "supported", "QPU Reciprocal + MUL (finite, non-zero divisor)"
+
+
+def _check_cast(node, shapes, inits):
+    to = int(_attr(node, "to", TensorProto.FLOAT))
+    if to in (TensorProto.FLOAT, TensorProto.DOUBLE, TensorProto.INT32,
+              TensorProto.INT64, TensorProto.BOOL):
+        return "supported", "to %s" % TensorProto.DataType.Name(to)
+    return "unsupported", ("Cast to %s: the arena is fp32 activations and the "
+                           "integer outputs are host index tensors (FLOAT, "
+                           "DOUBLE, INT32, INT64, BOOL are wired)"
+                           % TensorProto.DataType.Name(to))
+
+
+def _check_lpnorm(node, shapes, inits):
+    p = int(_attr(node, "p", 2))
+    if p not in (1, 2):
+        return "unsupported", "p=%d (only p=1 and p=2)" % p
+    return "supported", "p=%d" % p
+
+
+def _check_gather(node, shapes, inits):
+    idx = node.input[1] if len(node.input) > 1 else None
+    if idx and idx not in inits and idx not in shapes:
+        return "unknown", "indices is a runtime tensor"
+    return "supported", "QPU copy2d rows"
+
+
+def _check_scatter(node, shapes, inits):
+    red = _attr(node, "reduction", "none") or "none"
+    if red not in ("none", "add", "mul"):
+        return "unsupported", ("reduction=%s (none, add, mul; max/min need a "
+                               "per-word comparison pass)" % red)
+    return "supported", "reduction %s" % red
+
+
+def _check_nonzero(node, shapes, inits):
+    return "supported", "QPU bit-compare mask + int64 coordinates"
+
+
+def _check_unique(node, shapes, inits):
+    return "supported", "pairwise equality/order matrices (bounded size)"
+
+
+def _check_topk(node, shapes, inits):
+    if len(node.input) > 1 and node.input[1] not in inits:
+        return "unsupported", "K is a runtime tensor"
+    return "supported", "k selection passes"
+
+
+def _check_reverseseq(node, shapes, inits):
+    if len(node.input) > 1 and node.input[1] not in inits:
+        return "unsupported", "sequence_lens is a runtime tensor"
+    return "supported", "laned gather over the time axis"
+
+
+def _check_centercrop(node, shapes, inits):
+    if len(node.input) > 1 and node.input[1] not in inits:
+        return "unsupported", "shape is a runtime tensor"
+    return "supported", "crop/pad index map"
 
 
 def _check_eargmax(node, shapes, inits):
@@ -518,7 +601,6 @@ _CHECKS = {
     "Pad": _check_pad,
     "Compress": _check_compress,
     "CumSum": _check_cumsum,
-    "DepthToSpace": _check_depthtospace,
     "ArgMax": _check_eargmax,
     "ArgMin": _check_eargmax,
     "Conv": _check_conv,
@@ -530,6 +612,23 @@ _CHECKS = {
     "MatMul": _check_matmul,
     "Concat": _check_concat,
     "Split": _check_split,
+    "Sum": _check_variadic,
+    "Mean": _check_variadic,
+    "Max": _check_variadic,
+    "Min": _check_variadic,
+    "Div": _check_div,
+    "Cast": _check_cast,
+    "LpNormalization": _check_lpnorm,
+    "Gather": _check_gather,
+    "GatherElements": _check_gather,
+    "GatherND": _check_gather,
+    "ScatterElements": _check_scatter,
+    "ScatterND": _check_scatter,
+    "NonZero": _check_nonzero,
+    "TopK": _check_topk,
+    "Unique": _check_unique,
+    "ReverseSequence": _check_reverseseq,
+    "CenterCropPad": _check_centercrop,
 }
 
 
@@ -619,6 +718,19 @@ def _tier(node, status, reason, dtypes, model):
 
     if op == "Cast":
         to = int(_attr(node, "to", TensorProto.FLOAT))
+        src = dtypes.get(node.input[0]) if node.input else None
+        if src is not None and _is_float(src):
+            if to in (TensorProto.FLOAT, TensorProto.DOUBLE,
+                      TensorProto.INT32, TensorProto.INT64, TensorProto.BOOL):
+                return ("vc4",
+                        "QPU conversion of an fp32 activation (Cast to %s)"
+                        % TensorProto.DataType.Name(to))
+            return ("host-unwritten",
+                    "Cast fp32 -> %s: no conversion kernel (the arena is fp32 "
+                    "activations and the integer outputs are host index "
+                    "tensors)%s"
+                    % (TensorProto.DataType.Name(to),
+                       "" if _defined(model, node) else ""))
         return ("host-meta",
                 "metadata/control type conversion (Cast to %s)"
                 % TensorProto.DataType.Name(to))
@@ -627,13 +739,6 @@ def _tier(node, status, reason, dtypes, model):
         return ("unsupported-graph",
                 "no ONNX definition for op %r in domain %r"
                 % (op, node.domain or "ai.onnx"))
-
-    if op == "Gather":
-        src = dtypes.get(node.input[0]) if node.input else None
-        if src is not None and _is_float(src):
-            return ("host-unwritten",
-                    "Gather on activation data (only int64 shape tensors are "
-                    "implemented)")
 
     if status == "supported":
         return "vc4", reason

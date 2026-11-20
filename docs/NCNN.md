@@ -16,6 +16,33 @@ post-processing**.
 | post-processing | **our** `decode_yolo` on both raw outputs — so the comparison isolates arithmetic and speed, not decode |
 | board | Pi 3B, ARM 1200 MHz, core pinned 400 MHz, `throttled=0x0`, quiet |
 
+### Conversion pipeline — PNNX, not `onnx2ncnn`
+
+The ncnn model was **not** converted from our ONNX file. Ultralytics'
+`export_ncnn()` calls `torch2ncnn()`, which runs **PNNX** (pinned
+`pnnx==20260526`; installed 20260526):
+
+```
+yolov8n.pt --(torch.jit.trace)--> torchscript --(pnnx)--> model.ncnn.param + model.ncnn.bin
+```
+
+The result is **154 layers**, of which **58 are `Swish`/`Sigmoid`**, against our
+ONNX graph of 263 nodes (206 dispatches after our own graph-level SiLU fusion).
+So ncnn also collapses the sigmoid×mul pair to a single `Swish` layer — it is
+not winning on epilogue fusion, but on having no per-layer handoff at all.
+
+**What this means for reading the comparison.** Both sides come from the same
+`yolov8n.pt` checkpoint, so the weights and the architecture are identical, but
+they travel through **two different conversion pipelines** (`torch.onnx` vs
+PNNX). Part of the 3.2e-4 difference could therefore be graph transformation
+rather than arithmetic. The strict arithmetic comparison is ONNX Runtime CPU vs
+VC4 on the **same ONNX file** (`docs/ACCURACY.md`) — and that gives the same
+3.2e-4 and the same identical detections, which is why the accuracy conclusion
+holds either way.
+
+So: this table compares **engines, including their graph optimisation**, not
+kernels in isolation. That is the comparison a user makes when choosing one.
+
 ## Speed (median of 7 after 3 warm-ups, ARM confirmed at 1199–1200 MHz)
 
 | backend | threads | ms | FPS | relative |

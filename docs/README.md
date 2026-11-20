@@ -16,6 +16,7 @@ and every path below is relative to the repository root unless it starts with
 | [`../infer/README.md`](../infer/README.md) | libvc4infer: API, build, kernel JIT, daemon backend, op coverage, limits |
 | [`../training/README.md`](../training/README.md) | backward kernels and the MLP/conv trainer, how to run them |
 | [`../vc4d/README.md`](../vc4d/README.md) | the privileged helper daemon: protocol, build, install |
+| `VC4CV.md` | Seneral/VC4CV (MIT): the QPU stencil programs, the 16-bit VDW stride confirmation, the ZeroCompat camera-buffer erratum, and why it cannot run on this stack |
 | `SOURCES-VERIFICATION.md` | link -> claim -> how we verified -> evidence -> status |
 | `FINDINGS.md` | consolidated catalogue of everything measured, with what remains unproven |
 | `REFERENCES.md` | every external source used, with URL, purpose, status; claims -> source table; Emma Anholt's work |

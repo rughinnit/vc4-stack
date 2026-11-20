@@ -59,13 +59,19 @@ echo "=== test_dispatch (no GPU)"
 # an arena mapping, has no /dev/mem and no capabilities.
 if [ "$DAEMON" != 0 ]; then
     echo "=== unprivileged client evidence"
-    ./build/test_matmul 1 >/tmp/vc4-client-evidence.log 2>&1 &
+    # Long enough to still be running when inspected: one 256^3 matmul is
+    # ~4 ms, so a short run exits before the evidence can be read (that made
+    # the suite report a failure whenever the kernel cache was warm).
+    ./build/test_matmul 300 >/tmp/vc4-client-evidence.log 2>&1 &
     pid=$!
     alive=0
-    for i in $(seq 1 100); do
-        if [ -e /proc/$pid/status ]; then alive=1; break; fi
+    # Wait for the client to open its daemon socket, not for a fixed time.
+    for i in $(seq 1 200); do
+        if [ ! -e /proc/$pid/status ]; then break; fi
+        alive=1
+        if ls -l /proc/$pid/fd 2>/dev/null | grep -q 'socket:'; then break; fi
+        sleep 0.02
     done
-    sleep 0.5
     if [ "$alive" = 1 ] && [ -e /proc/$pid/status ]; then
         echo "  client pid=$pid"
         grep -E '^(Uid|Gid|CapEff|NoNewPrivs):' /proc/$pid/status | sed 's/^/  /'

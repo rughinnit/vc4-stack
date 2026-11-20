@@ -361,7 +361,7 @@ grep Cma /proc/meminfo        CmaTotal: 262144 kB
 
 | item | why |
 |---|---|
-| TensorFlow 2.21 import/runtime on this board | the install unpacks 1.3 GB onto an SD card while three concurrent builds compile/run; pip was still writing after ~20 min at 235 MB. Aborted to keep the board alive. The **wheel, its aarch64/cp313 tag and its PluggableDevice/PJRT headers are verified**; the import is not. |
+| TensorFlow 2.21 import/runtime on this board | the install unpacks 1.3 GB onto an SD card while three concurrent builds compile and run; pip was still writing after ~20 min at 235 MB. Aborted to keep the board alive. The **wheel, its aarch64/cp313 tag and its PluggableDevice/PJRT headers are verified**; the import is not. |
 | ggml backend on the board | no aarch64 llama.cpp build was attempted; API verified from the vendored sdist. Building llama.cpp on this 905 MiB board is a separate (large) job. |
 | ORT EP end-to-end | the wheel ships no headers and `raw.githubusercontent.com` / `api.github.com` returned 404 for this repo from this host, so the EP ABI could not be compiled here; verified from the shipped `.so` strings and Python API instead. |
 | OpenVINO plugin build | the plugin ABI header (`openvino/runtime/iplugin.hpp`) is not in the wheel; the OpenVINO source tree is not obtainable on the board (GitHub unreachable, no sdist). |

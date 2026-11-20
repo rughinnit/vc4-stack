@@ -1,0 +1,17 @@
+# Defaults for vc4d, read by /lib/systemd/system/vc4d.service.
+#
+# The daemon mmaps /dev/mem once, allocates the client arena (one dmabuf) and
+# then drops to `nobody` with an empty capability set before serving clients.
+# Unprivileged callers reach it through /run/vc4d.sock (mode 0660, group vc4).
+#
+# --arena-mb 96      the shared client arena.  The 160x160 YOLOv8n selftest
+#                    fits in ~64 MiB; 96 leaves headroom for the 320x320
+#                    recipe without eating the whole 256 MiB CMA region.
+# --max-timeout-ms   how long the daemon waits for one launch before declaring
+#                    the GPU wedged.  The first run of a large graph JITs its
+#                    kernels; 10 s is generous for that on stock clocks.
+#
+# vc4-toolkit-fast overrides this file with
+# /etc/systemd/system/vc4d.service.d/10-fast.conf (arena 150 MiB).  Toggle it
+# with `vc4fast on|off|status`.  No setting here changes any clock.
+VC4D_ARGS="--socket /run/vc4d.sock --arena-mb 96 --group vc4 --drop-user nobody --max-timeout-ms 10000"

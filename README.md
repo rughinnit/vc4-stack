@@ -27,7 +27,7 @@ your user is in the `vc4` group, then
 
 | path | what it is | start here | status |
 |---|---|---|---|
-| `infer/` | **libvc4infer + vc4infer** — the engine (dma-buf arena, kernel JIT/cache, strict op registry, matmul/conv/elementwise), the ONNX executor, the Python API, the CLI, and the `.deb`/wheel builders | [`infer/README.md`](infer/README.md), [`docs/VC4INFER.md`](docs/VC4INFER.md) | active — vc4infer **1.2.1**; YOLOv8n 160x160 runs end to end on the QPUs at **2.09 FPS** (stock clocks, quiet board) |
+| `infer/` | **libvc4infer + vc4infer** — the engine (dma-buf arena, kernel JIT/cache, strict op registry, matmul/conv/elementwise), the ONNX executor, the Python API, the CLI, and the `.deb`/wheel builders | [`infer/README.md`](infer/README.md), [`docs/VC4INFER.md`](docs/VC4INFER.md) | active — vc4infer **1.2.2**; YOLOv8n 160x160 runs end to end on the QPUs at **2.09 FPS** (stock clocks, quiet board) |
 | `kernels/` | hand-written QPU kernels: `wider-tile/asm6..asm10`, each with its NOTES/RESULTS and generator, plus the `attempt-asm10` history | [`kernels/wider-tile/`](kernels/wider-tile) | verified, frozen (results in `kernels/wider-tile/RESULTS*.md`) |
 | `training/` | backward kernels (`vc4_train.c`, `vc4_convbwd.c`) and the MLP/conv trainer with finite-difference checks | [`training/README.md`](training/README.md) | toy scale; gradients verified |
 | `tools/` | `build-fast.sh` (memory-aware `-j` + ccache), `qpu_disasm.py`, `xcheck/` (four independent encoders), `gput.sh` (locked GPU run + board check) | script headers | in use |
@@ -39,6 +39,36 @@ your user is in the `vc4` group, then
 entry point, and `tests/`, `examples/`, `packaging/` and `pyproject.toml` belong
 to the same product.  The backward kernels are compiled into the same library
 from `training/src/`.
+
+## Install
+
+The stack installs from a signed apt repository, the way CUDA or TensorRT do:
+
+```sh
+curl -fsSL https://rughinnit.github.io/vc4-apt/key.asc \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/vc4-apt.gpg
+echo "deb [signed-by=/etc/apt/keyrings/vc4-apt.gpg] https://rughinnit.github.io/vc4-apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/vc4-apt.list
+sudo apt update
+sudo apt install vc4-toolkit
+```
+
+`vc4-toolkit` is the single install command: `vc4d` (daemon), `vc4infer`
+(engine, Python API, CLI), `vc4infer-dev` (header + pkg-config + CMake),
+`vc4-query` (the `deviceQuery` analogue), `vc4-smi` (the `nvidia-smi`
+analogue), `vc4train` (training demo) and `vc4top`/`vc4top-dkms`.
+
+```sh
+vc4-query             # what did I just install?
+vc4-smi               # is the GPU healthy?
+vc4infer selftest     # 4/4 bundled models
+```
+
+For the speed-tuned rebuild of the same stack (`-O3 -march=native`, a
+prewarmed read-only kernel cache and a tuned daemon), install
+`vc4-toolkit-fast` instead.  Both paths, the pip index (`vc4infer`,
+`torch-vc4`) and the framework support table are in
+[docs/INSTALL.md](docs/INSTALL.md).
 
 ## Build and run
 

@@ -1,0 +1,34 @@
+.TH VC4-SMI 1 "2026-11-20" "vc4-stack" "User Commands"
+.SH NAME
+vc4-smi \- one-shot VideoCore IV status summary
+.SH SYNOPSIS
+.B vc4-smi
+[\fB\-\-json\fR]
+.SH DESCRIPTION
+.B vc4-smi
+prints state, QPU utilisation, the stock core/V3D clocks, temperature, throttle
+bits, CMA memory, QPU state and the processes attached to
+.IR /run/vc4d.sock .
+It is a thin wrapper over
+.BR "vc4top \-\-once"
+with
+.BR NO_COLOR=1 ,
+plus the read-only
+.I /sys/kernel/vc4mon
+register window.
+.PP
+It never opens
+.I /dev/mem
+and never writes a register.  It changes no clock, governor or voltage.
+.SH OPTIONS
+.TP
+.B \-\-json
+Print one JSON object instead of the table.
+.SH EXIT STATUS
+0 when the GPU is healthy; 1 when a current throttle bit is set, the firmware
+reports undervoltage, the scheduler queue reports an error, or ERRSTAT has
+bits other than VCD-idle; 2 on a usage error or when vc4top is missing.
+.SH SEE ALSO
+.BR vc4-query (1),
+.BR vc4top (1),
+.BR vc4infer (1)

@@ -1,0 +1,41 @@
+[Unit]
+Description=vc4d - VideoCore IV QPU helper daemon
+Documentation=file:/usr/share/doc/vc4d/README.md man:vc4d(8)
+After=local-fs.target
+# the daemon needs /dev/mem for the V3D window and the dma-buf arena
+ConditionPathExists=/dev/mem
+# a crash loop is a packaging problem, not a reason to give up silently
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Order matters: Environment= is the fallback, /etc/default/vc4d (when present)
+# overrides it, and the vc4-toolkit-fast drop-in replaces the whole file list.
+Environment=VC4D_ARGS=--socket /run/vc4d.sock --arena-mb 96 --group vc4 --drop-user nobody --max-timeout-ms 10000
+EnvironmentFile=-/etc/default/vc4d
+Environment=VC4D_GPU_LOCK=1
+ExecStart=/usr/sbin/vc4d $VC4D_ARGS
+Restart=always
+RestartSec=2
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=yes
+PrivateNetwork=yes
+ProtectSystem=strict
+ReadWritePaths=/run /tmp
+ProtectHome=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+LimitNOFILE=256
+DevicePolicy=closed
+DeviceAllow=/dev/null rw
+DeviceAllow=/dev/urandom r
+DeviceAllow=/dev/mem rw
+DeviceAllow=/dev/dma_heap/linux,cma rw
+DeviceAllow=/dev/vcio rw
+CapabilityBoundingSet=CAP_SYS_RAWIO CAP_CHOWN CAP_SETGID CAP_SETUID
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

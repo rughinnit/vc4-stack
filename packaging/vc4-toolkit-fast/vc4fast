@@ -1,0 +1,68 @@
+#!/bin/sh
+# vc4fast - switch vc4d between the safe defaults and the speed-tuned drop-in.
+#
+#   vc4fast on      arena 150 MiB, launch timeout 60 s   (the fast recipe)
+#   vc4fast off     the vc4d package defaults (/etc/default/vc4d, arena 96 MiB)
+#   vc4fast status  which one is active, and the daemon's current argv
+#
+# It changes no clock, no governor and no voltage: the board stays at stock
+# core 400 MHz / V3D 300 MHz.  The only things that change are how much CMA
+# the arena may use and how long one launch may run before vc4d calls the GPU
+# wedged.
+set -eu
+
+DRIVER_DIR=/etc/systemd/system/vc4d.service.d
+DROPIN=$DRIVER_DIR/10-fast.conf
+SHIPPED=/usr/share/vc4-toolkit-fast/10-fast.conf
+MARK=/etc/vc4/.vc4fast-off
+
+need_root() {
+	[ "$(id -u)" = 0 ] || {
+		echo "vc4fast: must be root (sudo vc4fast $1)" >&2
+		exit 1
+	}
+}
+
+restart_daemon() {
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload
+		systemctl try-restart vc4d.service || systemctl restart vc4d.service || true
+	fi
+}
+
+case "${1:-status}" in
+on)
+	need_root on
+	install -d -m 0755 "$DRIVER_DIR" /etc/vc4
+	install -m 0644 "$SHIPPED" "$DROPIN"
+	rm -f "$MARK"
+	restart_daemon
+	echo "vc4fast: on  (arena 150 MiB, max-timeout 60000 ms)"
+	echo "         clocks unchanged: core 400 MHz / V3D 300 MHz"
+	;;
+off)
+	need_root off
+	rm -f "$DROPIN"
+	install -d -m 0755 /etc/vc4
+	: > "$MARK"
+	restart_daemon
+	echo "vc4fast: off (vc4d defaults from /etc/default/vc4d)"
+	echo "         clocks unchanged: core 400 MHz / V3D 300 MHz"
+	;;
+status)
+	if [ -f "$DROPIN" ]; then
+		echo "vc4fast: on"
+	else
+		echo "vc4fast: off"
+	fi
+	if [ -r /proc/$(systemctl show -p MainPID --value vc4d 2>/dev/null)/cmdline ] 2>/dev/null; then
+		printf 'vc4d argv: '
+		tr '\0' ' ' < "/proc/$(systemctl show -p MainPID --value vc4d)/cmdline"
+		echo
+	fi
+	;;
+*)
+	echo "usage: vc4fast on|off|status" >&2
+	exit 2
+	;;
+esac

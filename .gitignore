@@ -28,3 +28,6 @@ infer/tools/onnx/models/
 /logs/
 *.log
 !docs/logs/*.log
+
+# daemon build output
+vc4d/build/

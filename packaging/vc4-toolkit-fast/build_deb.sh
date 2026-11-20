@@ -92,7 +92,8 @@ install -d "$stage/DEBIAN" \
 	"$stage/usr/share/doc/vc4infer" \
 	"$stage/usr/share/man/man1" \
 	"$pkg/vc4infer/kgen" \
-	"$pkg/vc4infer/contrib"
+	"$pkg/vc4infer/contrib" \
+	"$pkg/vc4infer/ort"
 
 install -m 0755 "$build/libvc4infer.so.fast" "$stage/usr/lib/$triplet/libvc4infer.so.1"
 strip --strip-unneeded "$stage/usr/lib/$triplet/libvc4infer.so.1"
@@ -106,6 +107,8 @@ chmod 0755 "$stage/usr/bin/vc4infer"
 install -m 0644 "$root/infer/python/vc4infer"/*.py "$pkg/vc4infer/"
 install -m 0644 "$root/infer/python/vc4infer/kgen"/*.py "$pkg/vc4infer/kgen/"
 install -m 0644 "$root/infer/python/vc4infer/contrib"/*.py "$pkg/vc4infer/contrib/"
+# the ONNX Runtime shim is a subpackage, not a module
+install -m 0644 "$root/infer/python/vc4infer/ort"/*.py "$pkg/vc4infer/ort/" 2>/dev/null || true
 for f in kgen.py kops.py qenc.py gen.py vpmwords.py; do
 	install -m 0644 "$root/infer/tools/$f" "$stage/usr/lib/vc4infer/kgen/$f"
 done

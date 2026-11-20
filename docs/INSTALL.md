@@ -185,6 +185,14 @@ shared with other build jobs (load average 2.5-5.6) and the YOLO mean varied
 949 ms), so \*the 8.5% is inside the run-to-run spread.  The short version:
 **the two builds are within noise of each other.**
 
+`vc4-query` shows the arena the daemon actually got.  `vc4d` halves the
+request when CMA cannot supply a contiguous block (the display and the
+firmware share the same 256 MiB CMA region), so on a board that has been
+allocating for a while a 150 MiB request can land lower; a fresh boot gives
+the full size.  That is a property of CMA on a 1 GB board, not of the
+package.  If `vc4-smi` or `vc4infer selftest` reports a small arena, reboot
+or lower `--arena-mb` and check `vc4-query` again.
+
 `vc4fast` is deliberately not a clock switch.  We do not touch `cpufreq`: on
 this board the ARM governor is `ondemand`, and pinning it to `performance`
 would raise the ARM clock under load.  Every number above was taken at the

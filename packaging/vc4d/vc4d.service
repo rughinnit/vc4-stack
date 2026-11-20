@@ -12,7 +12,11 @@ StartLimitBurst=10
 Type=simple
 # Order matters: Environment= is the fallback, /etc/default/vc4d (when present)
 # overrides it, and the vc4-toolkit-fast drop-in replaces the whole file list.
-Environment=VC4D_ARGS=--socket /run/vc4d.sock --arena-mb 96 --group vc4 --drop-user nobody --max-timeout-ms 10000
+#
+# The value MUST be quoted.  An unquoted Environment= is split on whitespace,
+# so systemd reads "--arena-mb", "96", ... as separate (invalid) assignments
+# and drops them: the daemon then starts without its socket/arena arguments.
+Environment="VC4D_ARGS=--socket /run/vc4d.sock --arena-mb 96 --group vc4 --drop-user nobody --max-timeout-ms 10000"
 EnvironmentFile=-/etc/default/vc4d
 Environment=VC4D_GPU_LOCK=1
 ExecStart=/usr/sbin/vc4d $VC4D_ARGS

@@ -20,6 +20,14 @@ if [ "$1" = purge ]; then
 	find /usr/lib/python3/dist-packages/vc4infer -type d -name '__pycache__' \
 		-prune -exec rm -rf {} + 2>/dev/null || true
 	rm -rf /usr/lib/vc4infer/kgen/__pycache__
+
+# dpkg could not rmdir these while the unowned __pycache__ was present; now
+# that it is gone, remove the empty directories too.
+rmdir /usr/lib/vc4infer/kgen \
+      /usr/lib/python3/dist-packages/vc4infer/kgen \
+      /usr/lib/python3/dist-packages/vc4infer/contrib \
+      /usr/lib/python3/dist-packages/vc4infer/ort 2>/dev/null || true
+rmdir /usr/lib/vc4infer 2>/dev/null || true
 fi
 
 # the per-user caches seeded from /usr/lib/vc4infer/kcache are the user's own

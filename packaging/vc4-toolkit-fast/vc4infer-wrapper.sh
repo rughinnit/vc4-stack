@@ -16,7 +16,10 @@ sys=/usr/lib/vc4infer/kcache
 if [ -z "${VC4INFER_CACHE:-}" ] && [ -d "$sys" ]; then
 	base=${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}
 	usr=$base/vc4infer/kcache
-	marker=$usr/.seeded-@VERSION@
+	# the marker carries the system cache's identity, not just the package
+	# version: a reinstall of the same version can ship a different blob set
+	stamp=$(stat -c '%Y-%s' "$sys/MANIFEST" 2>/dev/null || echo none)
+	marker=$usr/.seeded-@VERSION@-$stamp
 	if [ ! -e "$marker" ]; then
 		if mkdir -p "$usr" 2>/dev/null; then
 			cp -a "$sys"/. "$usr"/ 2>/dev/null || true

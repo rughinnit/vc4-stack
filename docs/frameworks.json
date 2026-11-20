@@ -6,7 +6,7 @@
     "wheel_ok": true,
     "runs_here": true,
     "extension_point": "none needed: native executor over the strict engine op table (infer/python/vc4infer/_onnxrun.py)",
-    "effort": "available now",
+    "effort": "available now — shipped executor with a 263-node YOLOv8n run end to end",
     "status": "implemented",
     "testable_here": "yes: onnx 1.23.2 installs and imports on cp313/aarch64",
     "user_entry": [
@@ -34,7 +34,7 @@
     "wheel_ok": true,
     "runs_here": true,
     "extension_point": "PrivateUse1 + PrivateUse1HooksInterface + AutogradPrivateUse1 (TORCH_LIBRARY_IMPL(aten, PrivateUse1, m), C10_REGISTER_GUARD_IMPL)",
-    "effort": "available now (subset op table; everything else raises)",
+    "effort": "available now — built PrivateUse1 backend, 46 gradient checks, subset op table (everything else raises)",
     "status": "implemented",
     "testable_here": "yes: torch 2.15.0+cpu installed; torch_vc4 extension built for cp313; the PyPI aarch64 torch wheel is the CUDA build and does not import (libcudart.so.13)",
     "user_entry": [
@@ -302,7 +302,9 @@
       "memory": "n/a"
     },
     "notes": "PyPI file list for 3.3.1 has macOS arm64 wheels but no manylinux aarch64 wheel.",
-    "evidence": ["https://pypi.org/pypi/paddlepaddle/json"]
+    "evidence": [
+      "https://pypi.org/pypi/paddlepaddle/json"
+    ]
   },
   {
     "rank": null,
@@ -324,7 +326,9 @@
       "memory": "n/a"
     },
     "notes": "PyPI file list for 2.11.0 has no manylinux aarch64 wheel.",
-    "evidence": ["https://pypi.org/pypi/mindspore/json"]
+    "evidence": [
+      "https://pypi.org/pypi/mindspore/json"
+    ]
   },
   {
     "rank": null,
@@ -346,7 +350,9 @@
       "memory": "n/a"
     },
     "notes": "Use ai-edge-litert 2.3.0 instead; it has cp313 aarch64 wheels.",
-    "evidence": ["https://pypi.org/pypi/tflite-runtime/json"]
+    "evidence": [
+      "https://pypi.org/pypi/tflite-runtime/json"
+    ]
   },
   {
     "rank": null,
@@ -368,6 +374,8 @@
       "memory": "n/a"
     },
     "notes": "This is why the ONNX row is inference-only: the training runtime for ONNX does not exist for aarch64/cp313.",
-    "evidence": ["https://pypi.org/pypi/onnxruntime-training/json"]
+    "evidence": [
+      "https://pypi.org/pypi/onnxruntime-training/json"
+    ]
   }
 ]

@@ -67,26 +67,24 @@ int main(void)
     expect_refusal(ctx, "vc4_select3",
                    vc4_select3(ctx, VC4_SEL_WHERE, &a, &b, &c, &o, 16));
 
-    /* The uniform rule has a second corner: vc4d refuses any uniform word
-     * >= 0xC0000000 as a possible bus address, and every float <= -2.0 is one
-     * (-2.0f == 0xC0000000).  In daemon mode the engine must refuse such a
-     * parameter itself, naming the value, instead of letting the daemon report
-     * "uniform is a bus/arena/MMIO address".  In direct mode the value is legal
-     * and this check does not exist. */
-    if (getenv("VC4INFER_DAEMON") && *getenv("VC4INFER_DAEMON") &&
-        strcmp(getenv("VC4INFER_DAEMON"), "0") != 0) {
+    /* The uniform rule has a second corner, fixed in 1.2.7 (G4): vc4d used to
+     * refuse any uniform word >= 0xC0000000 as a possible bus address, and
+     * every float <= -2.0 is one (-2.0f == 0xC0000000).  The engine refused
+     * such a parameter itself in daemon mode.  LAUNCH now carries a per-slot
+     * address mask, so the value must be *accepted* and computed, in both
+     * modes, with the same result. */
+    {
         vc4_status st = vc4_unary(ctx, VC4_UOP_AFFINE, &a, &o, 16, -2.0f,
                                   0.0f, 0.0f);
         const char *msg = vc4_last_error(ctx);
-        if (st != VC4_ERR_UNSUPPORTED || !msg || !strstr(msg, "0x")) {
-            printf("FAIL uniform value: st=%d (%s), expected a refusal naming "
-                   "the bit pattern\n", (int)st, msg ? msg : "(no message)");
+        if (st != VC4_OK) {
+            printf("FAIL uniform value -2.0: st=%d (%s), expected the launch to "
+                   "run (G4)\n", (int)st, msg ? msg : "(no message)");
             ++errors;
         } else {
-            printf("  %-12s refused: %s\n", "uniform/-2.0", msg);
+            printf("  %-12s launched: a parameter of -2.0 is legal\n",
+                   "uniform/-2.0");
         }
-    } else {
-        printf("  uniform/-2.0  skipped (direct mode: the value is legal)\n");
     }
 
     vc4_shutdown(ctx);

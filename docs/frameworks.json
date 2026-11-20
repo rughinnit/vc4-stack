@@ -1,0 +1,373 @@
+[
+  {
+    "rank": 1,
+    "name": "ONNX",
+    "version_tested": "onnx 1.23.2 (cp312-abi3 wheel on CPython 3.13); models exported at opset 13",
+    "wheel_ok": true,
+    "runs_here": true,
+    "extension_point": "none needed: native executor over the strict engine op table (infer/python/vc4infer/_onnxrun.py)",
+    "effort": "available now",
+    "status": "implemented",
+    "testable_here": "yes: onnx 1.23.2 installs and imports on cp313/aarch64",
+    "user_entry": [
+      "vc4infer run model.onnx --input x.npy",
+      "Engine(\"model.onnx\").run({\"x\": a})"
+    ],
+    "buys": "the widest model zoo with no framework installed; the export target every other framework can reach",
+    "training": {
+      "autodiff": "none (the format carries no gradients)",
+      "requires": "an external trainer (PyTorch/JAX/TF) that exports a new graph; this executor is inference-only",
+      "feasibility": "inference only (no autodiff to plug into)",
+      "memory": "as inference: 26.6 MiB pool peak for YOLOv8n-160"
+    },
+    "notes": "263-node YOLOv8n-160 runs with 233 vc4 + 30 plan-time folded nodes, host_compute_nodes=0, host bytes=0, arithmetic_on_vc4=100% (273,249,600 MACs), 543.5 ms/image = 1.84 FPS, qpu_duty 58.9%; 320x320 needs --arena-mb 150 and gives 1323.1 ms = 0.76 FPS. Unsupported nodes raise UnsupportedNode/HostNotAllowed/NeedsDeviceDispatch; If/Loop/Scan are refused under host_policy=device.",
+    "evidence": [
+      "infer/src/vc4_api.c op table; infer/README.md coverage (22 of 34 entries)",
+      "docs/ONNX.md sections 7 and 10.3-10.4.4",
+      "docs/results/ and infer/tools/onnx/yolo160_bench.json"
+    ]
+  },
+  {
+    "rank": 2,
+    "name": "PyTorch",
+    "version_tested": "torch 2.15.0+cpu; torch_vc4 @ 6496a83 (csrc/torch_vc4.cpp, torch_vc4/ops.py, torch_vc4/autograd.py)",
+    "wheel_ok": true,
+    "runs_here": true,
+    "extension_point": "PrivateUse1 + PrivateUse1HooksInterface + AutogradPrivateUse1 (TORCH_LIBRARY_IMPL(aten, PrivateUse1, m), C10_REGISTER_GUARD_IMPL)",
+    "effort": "available now (subset op table; everything else raises)",
+    "status": "implemented",
+    "testable_here": "yes: torch 2.15.0+cpu installed; torch_vc4 extension built for cp313; the PyPI aarch64 torch wheel is the CUDA build and does not import (libcudart.so.13)",
+    "user_entry": [
+      "import torch_vc4; d = torch_vc4.device()",
+      "model.to(d); y = model(x.to(d))",
+      "y.sum().backward()"
+    ],
+    "buys": "the only path where the framework's own autograd drives QPU backward kernels; users keep torch code and train on the device",
+    "training": {
+      "autodiff": "host tape: AutogradPrivateUse1 Functions registered per aten op",
+      "requires": "backward kernels (shipped: matmul_bt, conv dX/dW, relu_bwd, maxpool_bwd, softmax_ce_bwd) plus device optimizer updates (hand-written SGD/Adam)",
+      "feasibility": "training available now for the op table",
+      "memory": "~0.25-1 M params at 32x32/batch 8 with Adam in the 64 MiB client; 16 B/param of state"
+    },
+    "notes": "46 gradient checks within 5.4e-6 norm-relative; tiny CNN (1->16 conv, pool, 16->16 conv, linear) trains at 39 ms/step with 77 launches/step. Missing ops raise: no sin/exp/log, no broadcasting, no bmm, batch 1 in this backend, softmax last-dim <=16 classes, no torch.optim (hand-written update). The device string must be torch_vc4.device(): torch.device('vc4') is rejected by torch's parser.",
+    "evidence": [
+      "~/work/torch-vc4/README.md, RESULTS.md, commit 6496a83, torch_vc4/_C.cpython-313-aarch64-linux-gnu.so",
+      "torch/utils/backend_registration.py:76 rename_privateuse1_backend (installed torch 2.15.0+cpu)"
+    ]
+  },
+  {
+    "rank": 3,
+    "name": "ONNX Runtime",
+    "version_tested": "onnxruntime 1.32.0 (cp313 manylinux_2_28 aarch64)",
+    "wheel_ok": true,
+    "runs_here": true,
+    "extension_point": "EP C API: OrtEpFactory / OrtEp / OrtNodeComputeInfo / OrtDataTransferImpl, entry points CreateEpFactories and ReleaseEpFactory; Python register_execution_provider_library",
+    "effort": "medium (weeks) for a real in-process EP; the Python graph-partitioning provider was small (days) and is done",
+    "status": "in progress: vc4infer.ort Python provider + infer/onnxruntime_ep tests; no in-process EP",
+    "testable_here": "ORT installs and runs (providers ['AzureExecutionProvider','CPUExecutionProvider']); no VC4 EP can be built from the wheel because it ships no headers",
+    "user_entry": [
+      "import vc4infer.ort",
+      "s = vc4infer.ort.InferenceSession(m, providers=[\"vc4\"]); s.run(None, {\"x\": a})",
+      "EP (when written): ort.register_execution_provider_library(\"vc4\", \"libvc4_ep.so\")"
+    ],
+    "buys": "the widest inference ecosystem: any ORT consumer (Python/C/C++/Java/JS) and ORT's quantisation/tooling, with VC4 behind one EP",
+    "training": {
+      "autodiff": "ORT Training (separate runtime/package), not the inference EP",
+      "requires": "a training EP plus ORT's optimizer/checkpoint machinery",
+      "feasibility": "not testable here: onnxruntime-training 1.19.2 has no aarch64/cp313 wheel (x86_64, cp38-cp311); inference-only even with an EP",
+      "memory": "n/a on this board"
+    },
+    "notes": "The wheel's capi/ has shared objects only (no .h); raw.githubusercontent.com and api.github.com returned 404 for onnxruntime from this host, so the version-locked EP ABI header could not be obtained. Evidence for the ABI is the shipped binary's strings: CreateEpFactories, ReleaseEpFactory, OrtEpFactory, OrtEpDevice, OrtNodeComputeInfo::CreateState, OrtEp::GetCapability, OrtDataTransferImpl. vc4infer.ort partitions an ONNX graph and runs VC4-claimed nodes through libvc4infer, with an explicit ort-cpu remainder in its report.",
+    "evidence": [
+      "strings onnxruntime/capi/libonnxruntime.so.1.32.0 | grep -E 'CreateEpFactories|ReleaseEpFactory|OrtEpDevice|OrtNodeComputeInfo'",
+      "onnxruntime/__init__.py:63 register_execution_provider_library; onnxruntime_inference_collection.py get_input_epdevices/OrtEpDevice",
+      "infer/python/vc4infer/ort/{__init__,_session,_partition,_report}.py; infer/onnxruntime_ep/tests/test_vc4_ep.py"
+    ]
+  },
+  {
+    "rank": 4,
+    "name": "ggml / gguf",
+    "version_tested": "llama.cpp vendored in llama-cpp-python 0.3.37 sdist (ggml-backend.h, ggml-backend-impl.h, ggml-opt.h); gguf 0.19.0 is a pure-Python file-format reader only",
+    "wheel_ok": false,
+    "runs_here": false,
+    "extension_point": "ggml_backend_i + ggml_backend_reg_i + ggml_backend_device_i + ggml_backend_buffer_type_i; dynamic plugin via GGML_BACKEND_DL_IMPL/ggml_backend_score, loaded by ggml_backend_load_all",
+    "effort": "medium (weeks): implement the backend vtable and map ggml ops to the engine; no compiler",
+    "status": "not started",
+    "testable_here": "no aarch64 llama.cpp build attempted (building it on a 905 MiB board is a separate large job); API read from the sdist, not from memory",
+    "user_entry": [
+      "drop libggml-vc4.so (exports ggml_backend_score) in the backend search path",
+      "ggml_backend_load_all()",
+      "llama.cpp then lists the VC4 device"
+    ],
+    "buys": "LLM/transformer graphs with the smallest plugin ABI (no compiler), plus ggml-opt training",
+    "training": {
+      "autodiff": "device/graph: ggml-opt builds the forward+backward graph itself",
+      "requires": "the backend must execute the backward graph (ggml_opt_epoch) and hold gradients plus optimizer tensors in backend buffers",
+      "feasibility": "training after N backward ops (ggml-opt is already the trainer)",
+      "memory": "16 B/param (Adam) in the arena; same 64/150 MiB ceilings"
+    },
+    "notes": "ggml_backend_reg_i has get_proc_address; GGML_BACKEND_DL_IMPL(reg_fn) exports ggml_backend_score and a reg getter. Ops are elementwise/matmul/rope/attention-shaped, so the mapping to the engine is direct but the LLM working set will not fit at useful sizes: a 1B-param fp32 model is 4 GB. int8/quantised ggml types reduce footprint only (int8 MAC/s == fp32 on this ISA).",
+    "evidence": [
+      "llama_cpp_python-0.3.37/vendor/llama.cpp/ggml/include/ggml-backend.h:248,272,276",
+      "ggml/src/ggml-backend-impl.h:130,185,239,263,267",
+      "ggml/include/ggml-opt.h:39,138,219"
+    ]
+  },
+  {
+    "rank": 5,
+    "name": "TFLite / LiteRT",
+    "version_tested": "ai-edge-litert 2.3.0 (cp313 manylinux_2_27 aarch64)",
+    "wheel_ok": true,
+    "runs_here": true,
+    "extension_point": "external delegate shared library: tflite_plugin_create_delegate / tflite_plugin_destroy_delegate (external_delegate_interface.h); internal TfLiteDelegate Prepare/CopyFromBufferHandle hooks; LiteRT dispatch via LiteRtSetDelegateFunction and LiteRtDispatchDelegateGetHooks",
+    "effort": "medium (weeks): delegate .so with a partition pass plus kernels for the claimed subgraphs",
+    "status": "not started",
+    "testable_here": "yes: ai-edge-litert 2.3.0 imports; Interpreter and load_delegate are present",
+    "user_entry": [
+      "i = Interpreter(\"m.tflite\")",
+      "i.load_delegate(\"libvc4_delegate.so\")",
+      "i.allocate_tensors(); i.invoke()"
+    ],
+    "buys": "the edge/Android model zoo and int8-quantised footprints (not int8 speed)",
+    "training": {
+      "autodiff": "none",
+      "requires": "nothing to plug into; a delegate only executes subgraphs",
+      "feasibility": "inference only (no autodiff to plug into)",
+      "memory": "int8 shrinks footprint only; the arena limits are unchanged"
+    },
+    "notes": "interpreter.py implements load_delegate with tflite_plugin_create_delegate/destroy and points at tensorflow/lite/delegates/external/external_delegate_interface.h; libLiteRt.so also exports LiteRtWrapDelegate/LiteRtUnwrapDelegate and the dispatch hooks. TFLite graphs are static; dynamic shapes and control flow are not part of the delegate contract. tflite-runtime is superseded and stops at cp311.",
+    "evidence": [
+      "ai_edge_litert/interpreter.py:60-123",
+      "nm -D libLiteRt.so | grep -i delegate; strings | grep LiteRtDispatchDelegate",
+      "PyPI: ai-edge-litert 2.3.0 cp313 aarch64 wheel"
+    ]
+  },
+  {
+    "rank": 6,
+    "name": "Apache TVM",
+    "version_tested": "apache-tvm 0.27.0.post1 (py3-none manylinux_2_27/2_28 aarch64)",
+    "wheel_ok": true,
+    "runs_here": true,
+    "extension_point": "Relax BYOC: pattern table + FuseOpsByPattern + relax.ext.<name> codegen + JSON runtime; relay.ext is absent because Relay is not shipped in 0.27",
+    "effort": "large (months): a BYOC codegen is a compiler backend (it must emit QPU kernels and a runtime module for every pattern it claims)",
+    "status": "not started",
+    "testable_here": "yes: TVM imports; tvm.relax present, tvm.relay absent; the example_npu BYOC template is documentation only (relax.ext.example_npu is not registered)",
+    "user_entry": [
+      "nothing today (no codegen)",
+      "when done: register relax.ext.vc4 and build with the BYOC PassContext"
+    ],
+    "buys": "one codegen for TF/Keras/MXNet/PyTorch frontends via Relax importers; Relax training passes",
+    "training": {
+      "autodiff": "compiler: relax.transform.Gradient plus tvm.relax.training.Trainer (SGD/Adam in relax/training/optimizer.py)",
+      "requires": "the relax.ext.vc4 codegen must lower the gradient ops as well as the forward ones",
+      "feasibility": "training after N backward ops (and after the codegen exists)",
+      "memory": "16 B/param in the arena; same ceilings"
+    },
+    "notes": "The 0.27 wheel has no tvm/relay directory, so relay.ext and the Relay BYOC examples do not apply; the Relax example (tvm/relax/backend/contrib/example_npu/README.md) describes FuseOpsByPattern -> composite functions -> relax.ext.example_npu -> runtime.ExampleNPUJSONRuntimeCreate. TVM would need its own CPU fallback disabled to honour this project's no-host-compute invariant.",
+    "evidence": [
+      "tvm/relax/backend/contrib/example_npu/README.md:124,183,215",
+      "tvm/relax/training/{trainer,optimizer,loss,setup_trainer}.py",
+      "tvm/relax/transform/__init__.py:50 Gradient; directory listing shows no tvm/relay"
+    ]
+  },
+  {
+    "rank": 7,
+    "name": "JAX",
+    "version_tested": "jax 0.12.1 + jaxlib 0.12.1 (cp313 manylinux_2_27 aarch64)",
+    "wheel_ok": true,
+    "runs_here": true,
+    "extension_point": "PJRT C API: PJRT_Client_Create, PJRT_Api function table, PJRT_LoadedExecutable_Execute, PJRT_Buffer_ToHostBuffer, PJRT_Device_GetDescription; plugin discovery via the jax_plugins namespace/entry point and register_plugin(name, priority=, library_path=, options=)",
+    "effort": "large (months): PJRT is a compiler backend in disguise; the device must execute StableHLO",
+    "status": "not started",
+    "testable_here": "yes: jax and jaxlib import; jax.jit(x*2)(3.0)=6.0 and jax.grad(x*x)(3.0)=6.0 on the CPU backend",
+    "user_entry": [
+      "JAX_PLATFORMS=vc4",
+      "a jax_plugins.vc4 package calls register_plugin(\"vc4\", library_path=\"libpjrt_vc4.so\")",
+      "then jax.devices() includes vc4"
+    ],
+    "buys": "the only real JAX path; grad/vmap/jit come free once the emitted primitives execute",
+    "training": {
+      "autodiff": "host trace: jax.grad emits StableHLO for the backward pass",
+      "requires": "a PJRT device that executes the primitives jax.grad emits; no gradient maths in the plugin",
+      "feasibility": "training after the PJRT executor (then training is free)",
+      "memory": "16 B/param in the arena; same ceilings"
+    },
+    "notes": "jaxlib ships only xla/ffi headers, not pjrt_c_api.h; the PJRT struct/function names above were read from the same XLA header shipped by the TensorFlow 2.21 wheel. A PJRT plugin must provide PJRT_Client/PJRT_Device/PJRT_Buffer/PJRT_LoadedExecutable implementations plus a StableHLO executor; wrapping the existing op table is not enough because JAX emits fused/unnormalised HLO.",
+    "evidence": [
+      "jax/_src/xla_bridge.py:459-525 discover_pjrt_plugins/register_plugin",
+      "tensorflow/include/tensorflow/compiler/xla/pjrt/c/pjrt_c_api.h:486,1344,1917,2266,2779",
+      "board run: jax.jit/jax.grad outputs 6.0"
+    ]
+  },
+  {
+    "rank": 8,
+    "name": "TensorFlow",
+    "version_tested": "tensorflow 2.21.0 (cp313 manylinux_2_27 aarch64, 282,213,003 B)",
+    "wheel_ok": true,
+    "runs_here": "unverified",
+    "extension_point": "PluggableDevice via StreamExecutor C API: SE_InitPlugin, SE_PlatformRegistrationParams, SE_CreateStreamExecutorParams, device/stream/allocator/event function tables, plus kernel registration",
+    "effort": "large (months): a platform plus a kernel for every TF op the model uses",
+    "status": "not started",
+    "testable_here": "wheel exists and ships stream_executor.h and pjrt_c_api.h; import on this board is unverified (install aborted, see notes)",
+    "user_entry": [
+      "tf.load_pluggable_device_library(\"libvc4_plugin.so\")",
+      "with tf.device(\"/device:VC4:0\"): ..."
+    ],
+    "buys": "the Keras/TF ecosystem and its host autodiff; the only in-graph TF path",
+    "training": {
+      "autodiff": "host: GradientTape builds graph functions for the backward pass",
+      "requires": "PluggableDevice plus registered kernels for every op the gradient functions use",
+      "feasibility": "training after the PluggableDevice + N kernels",
+      "memory": "16 B/param in the arena; same ceilings"
+    },
+    "notes": "The 1.3 GB unpack did not finish on the shared 905 MiB board (three concurrent builds compiling/running); pip was at 235 MB after ~20 min and was stopped to protect the board. Static evidence is complete: PyPI cp313/aarch64 wheel, SE_InitPlugin at stream_executor.h:530, load_pluggable_device_library at tensorflow/python/framework/load_library.py:160. StreamExecutor requires allocator, stream, event, timer and blit implementations before a single TF op can run.",
+    "evidence": [
+      "tensorflow/include/tensorflow/c/experimental/stream_executor/stream_executor.h:187,225,420,509,530",
+      "tensorflow/python/framework/load_library.py:160",
+      "PyPI wheel tag cp313-manylinux_2_27_aarch64"
+    ]
+  },
+  {
+    "rank": 9,
+    "name": "OpenVINO",
+    "version_tested": "openvino 2026.4.1 (cp313 manylinux_2_35 aarch64)",
+    "wheel_ok": true,
+    "runs_here": true,
+    "extension_point": "device plugin registered with Core::register_plugin(path, device_name); remote tensors via RemoteContext::create_tensor / RemoteTensor; the plugin ABI header (IPlugin) is not shipped in the wheel",
+    "effort": "large (months): the plugin ABI requires the OpenVINO source tree, not the wheel",
+    "status": "not started",
+    "testable_here": "yes as a framework: imports and Core().available_devices == ['CPU']; no VC4 plugin can be built from the wheel",
+    "user_entry": [
+      "core.register_plugin(\"libvc4_plugin.so\", \"VC4\")",
+      "core.compile_model(model, \"VC4\")"
+    ],
+    "buys": "model-server ecosystem and its ONNX/Paddle/TF/JAX/GGUF frontends (all shipped in the wheel); long path to a device plugin",
+    "training": {
+      "autodiff": "none (OTX trains in PyTorch and converts)",
+      "requires": "nothing to plug into",
+      "feasibility": "inference only (no autodiff to plug into)",
+      "memory": "n/a"
+    },
+    "notes": "The wheel's include tree has core.hpp/remote_tensor.hpp but no openvino/runtime/iplugin.hpp (grep for IPlugin returns nothing); GitHub is unreachable from this host, so the ABI cannot be obtained. Graph is static; remote tensors would let the plugin share the dma-buf arena, but only after the plugin exists.",
+    "evidence": [
+      "openvino/include/openvino/runtime/core.hpp:860,883",
+      "openvino/include/openvino/runtime/remote_context.hpp:149; remote_tensor.hpp:23",
+      "board run: Core().available_devices == ['CPU']"
+    ]
+  },
+  {
+    "rank": 10,
+    "name": "MXNet",
+    "version_tested": "mxnet 1.9.1 (py3-none manylinux2014 aarch64)",
+    "wheel_ok": true,
+    "runs_here": false,
+    "extension_point": "MXCustomOpRegister / mxnet::ext::CustomOp (operator customisation only); Storage has no registration API and DeviceType is a closed enum (kCPU/kGPU/kCPUPinned/kCPUShared)",
+    "effort": "not viable: a new device would require an MXNet fork",
+    "status": "not started",
+    "testable_here": "no: the wheel installs but import fails with OSError: libarmpl_lp64_mp.so: cannot open shared object file",
+    "user_entry": [
+      "MXCustomOpRegister(\"MyOp\", creator) for ops only",
+      "no new device entry point exists"
+    ],
+    "buys": "legacy only; everything it reaches is already reachable via ONNX or TVM",
+    "training": {
+      "autodiff": "host mx.autograd",
+      "requires": "a working device first; the wheel does not import",
+      "feasibility": "not feasible on this board",
+      "memory": "n/a"
+    },
+    "notes": "The aarch64 wheel links ARM Performance Libraries (libarmpl_lp64_mp.so) which are not packaged for Debian 13; even with ARMPL, mxnet::Context::DeviceType has no third-device slot and Storage::Get() is the only storage entry point, so a VC4 backend is a fork rather than a plugin.",
+    "evidence": [
+      "board: import mxnet -> OSError libarmpl_lp64_mp.so",
+      "mxnet/include/mxnet/c_api.h:3236; lib_api.h:750; storage.h:35; base.h:103"
+    ]
+  },
+  {
+    "rank": null,
+    "excluded": true,
+    "name": "PaddlePaddle",
+    "version_tested": "paddlepaddle 3.3.1",
+    "wheel_ok": false,
+    "runs_here": false,
+    "extension_point": "none available (no Linux aarch64 wheel)",
+    "effort": "not viable",
+    "status": "not started",
+    "testable_here": "no Linux aarch64 wheel (macOS arm64 only)",
+    "user_entry": [],
+    "buys": "nothing that ONNX does not already cover",
+    "training": {
+      "autodiff": "host (dygraph)",
+      "requires": "a Paddle device plugin, which needs a Paddle build for aarch64 first",
+      "feasibility": "not feasible on this board",
+      "memory": "n/a"
+    },
+    "notes": "PyPI file list for 3.3.1 has macOS arm64 wheels but no manylinux aarch64 wheel.",
+    "evidence": ["https://pypi.org/pypi/paddlepaddle/json"]
+  },
+  {
+    "rank": null,
+    "excluded": true,
+    "name": "MindSpore",
+    "version_tested": "mindspore 2.11.0",
+    "wheel_ok": false,
+    "runs_here": false,
+    "extension_point": "none available (no aarch64 wheel)",
+    "effort": "not viable",
+    "status": "not started",
+    "testable_here": "no aarch64 wheel at all (macOS arm64 only for some cp versions)",
+    "user_entry": [],
+    "buys": "nothing that ONNX does not already cover",
+    "training": {
+      "autodiff": "host/device graph (MindSpore autodiff)",
+      "requires": "a MindSpore device backend, which needs a MindSpore aarch64 build first",
+      "feasibility": "not feasible on this board",
+      "memory": "n/a"
+    },
+    "notes": "PyPI file list for 2.11.0 has no manylinux aarch64 wheel.",
+    "evidence": ["https://pypi.org/pypi/mindspore/json"]
+  },
+  {
+    "rank": null,
+    "excluded": true,
+    "name": "tflite-runtime",
+    "version_tested": "tflite-runtime 2.14.0",
+    "wheel_ok": false,
+    "runs_here": false,
+    "extension_point": "same TfLiteDelegate/plugin ABI as LiteRT, but no cp313 build",
+    "effort": "not viable (superseded)",
+    "status": "not started",
+    "testable_here": "no cp313 wheel; newest is cp311",
+    "user_entry": [],
+    "buys": "nothing; ai-edge-litert is the supported replacement",
+    "training": {
+      "autodiff": "none",
+      "requires": "nothing to plug into",
+      "feasibility": "inference only (no autodiff to plug into)",
+      "memory": "n/a"
+    },
+    "notes": "Use ai-edge-litert 2.3.0 instead; it has cp313 aarch64 wheels.",
+    "evidence": ["https://pypi.org/pypi/tflite-runtime/json"]
+  },
+  {
+    "rank": null,
+    "excluded": true,
+    "name": "onnxruntime-training",
+    "version_tested": "onnxruntime-training 1.19.2",
+    "wheel_ok": false,
+    "runs_here": false,
+    "extension_point": "ORT training EP plus ORT's optimizer/checkpoint runtime",
+    "effort": "not viable on this board",
+    "status": "not started",
+    "testable_here": "no aarch64/cp313 wheel (x86_64 only, cp38-cp311)",
+    "user_entry": [],
+    "buys": "nothing here: ORT Training is the only way to train ONNX graphs, and it is not packaged for this board",
+    "training": {
+      "autodiff": "ORT Training's own training graph/optimizer",
+      "requires": "a training EP plus optimizer/checkpoint machinery",
+      "feasibility": "not feasible on this board (no wheel)",
+      "memory": "n/a"
+    },
+    "notes": "This is why the ONNX row is inference-only: the training runtime for ONNX does not exist for aarch64/cp313.",
+    "evidence": ["https://pypi.org/pypi/onnxruntime-training/json"]
+  }
+]

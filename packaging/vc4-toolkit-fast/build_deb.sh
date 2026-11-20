@@ -124,6 +124,9 @@ install -m 0644 "$modeldir"/* "$stage/usr/share/vc4infer/models/"
 if [ -n "${VC4FAST_SEED_CACHE:-}" ] && [ -d "$VC4FAST_SEED_CACHE" ]; then
 	echo "== seeding the kernel cache from $VC4FAST_SEED_CACHE"
 	cp -a "$VC4FAST_SEED_CACHE"/. "$stage/usr/lib/vc4infer/kcache"/ 2>/dev/null || true
+	# a cache shipped in a package is read-only; the manifest rewrite below
+	# and any JIT fallback during prewarming need it writable
+	chmod -R u+w "$stage/usr/lib/vc4infer/kcache" 2>/dev/null || true
 fi
 
 echo "== prewarming the kernel cache (bundled models)"

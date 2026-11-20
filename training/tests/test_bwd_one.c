@@ -476,22 +476,31 @@ int main(int argc, char **argv)
         }
         report(op, &bo, N, ref);
     } else if (!strcmp(op, "gate")) {
-        /* The refusal contract, asserted without launching anything: these two
-         * kernels must refuse with a message.  vc4_reduce and the nvec=4 uop
-         * bodies are repaired on another change; calling them here would
-         * *launch* them (one wedged the QPU while this test was written), so
-         * they are deliberately not touched.  Nothing below reaches the QPU. */
-        static const char *nm2[] = { "vc4_gather", "vc4_blit" };
-        for (int i = 0; i < 2; ++i) {
+        /* The refusal contract, asserted without launching anything:
+         * vc4_gather still refuses with a message.  vc4_blit is fixed (it
+         * rides the verified copy2d kernel), so here it must instead reach its
+         * own length check, which runs before any buffer is touched: a 100 B
+         * copy is refused by the function, not by the gate. */
+        {
             vc4_buf dummy = { 0x1000, 64 }, dout = { 0x2000, 64 };
-            vc4_status g = i ? vc4_blit(ctx, &dummy, &dout, 64)
-                             : vc4_gather(ctx, &dummy, &dout, 1, 0.0f);
+            vc4_status g = vc4_gather(ctx, &dummy, &dout, 1, 0.0f);
             if (g != VC4_ERR_UNSUPPORTED || !*vc4_last_error(ctx)) {
-                printf("FAIL %s did not refuse (st=%d %s)\n", nm2[i], g,
+                printf("FAIL vc4_gather did not refuse (st=%d %s)\n", g,
                        vc4_strerror(g));
                 errors++;
             } else {
-                printf("  %-11s refused: %s\n", nm2[i], vc4_last_error(ctx));
+                printf("  %-11s refused: %s\n", "vc4_gather",
+                       vc4_last_error(ctx));
+            }
+            g = vc4_blit(ctx, &dummy, &dout, 100);
+            if (g != VC4_ERR_UNSUPPORTED ||
+                !strstr(vc4_last_error(ctx), "multiple of 64") ||
+                strstr(vc4_last_error(ctx), "not verified on this board")) {
+                printf("FAIL vc4_blit 100 B: st=%d %s (expected the 64 B "
+                       "granularity refusal)\n", g, vc4_last_error(ctx));
+                errors++;
+            } else {
+                printf("  %-11s open, refuses 100 B\n", "vc4_blit");
             }
         }
     } else {

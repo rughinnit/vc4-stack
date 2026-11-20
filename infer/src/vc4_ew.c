@@ -232,21 +232,25 @@ typedef struct {
     int         heavy;      /* generated with 4 vectors per group */
 } ewb_desc;
 
+/* `name` is the kops.EWB key; `heavy` must match kops.EWB_HEAVY exactly (the
+ * host's group size and the generated nvec are the same decision).  Only
+ * gelu_erf_bwd is heavy: its body embeds the erf and exp cores, 1979 words at
+ * 4 vectors per group. */
 static const ewb_desc EWB_DESC[VC4_BW_COUNT] = {
-    [VC4_BW_SIGMOID]     = { "sigmoid_bwd", 1 },
-    [VC4_BW_SILU]        = { "silu_bwd", 1 },
-    [VC4_BW_TANH]        = { "tanh_bwd", 1 },
-    [VC4_BW_EXP]         = { "exp_bwd", 1 },
-    [VC4_BW_LOG]         = { "log_bwd", 1 },
-    [VC4_BW_SQRT]        = { "sqrt_bwd", 1 },
+    [VC4_BW_SIGMOID]     = { "sigmoid_bwd", 0 },
+    [VC4_BW_SILU]        = { "silu_bwd", 0 },
+    [VC4_BW_TANH]        = { "tanh_bwd", 0 },
+    [VC4_BW_EXP]         = { "exp_bwd", 0 },
+    [VC4_BW_LOG]         = { "log_bwd", 0 },
+    [VC4_BW_SQRT]        = { "sqrt_bwd", 0 },
     [VC4_BW_ABS]         = { "abs_bwd", 0 },
     [VC4_BW_CLIP]        = { "clip_bwd", 0 },
     [VC4_BW_LEAKYRELU]   = { "leakyrelu_bwd", 0 },
     [VC4_BW_HARDSWISH]   = { "hardswish_bwd", 0 },
     [VC4_BW_HARDSIGMOID] = { "hardsigmoid_bwd", 0 },
-    [VC4_BW_GELU]        = { "gelu_bwd", 1 },
-    [VC4_BW_GELU_ERF]    = { NULL, 0 },      /* composed, see below */
-    [VC4_BW_ERF]         = { "erf_bwd", 1 },
+    [VC4_BW_GELU]        = { "gelu_bwd", 0 },
+    [VC4_BW_GELU_ERF]    = { "gelu_erf_bwd", 1 },
+    [VC4_BW_ERF]         = { "erf_bwd", 0 },
 };
 
 vc4_status vc4__ewb(vc4_ctx *ctx, const char *opname, int heavy,
@@ -255,12 +259,6 @@ vc4_status vc4__ewb(vc4_ctx *ctx, const char *opname, int heavy,
 {
     if (!ctx || !a || !b || !out || !n || !opname)
         return VC4_ERR_INVAL;
-    if (heavy) {
-        vc4_status g = vc4__refuse_unverified(ctx, opname,
-            "the 4-vector-per-group store path writes no output");
-        if (g != VC4_OK)
-            return g;
-    }
     if (ctx->dead)
         return VC4_ERR_TIMEOUT;
     if (a->bytes < n * 4 || b->bytes < n * 4 || out->bytes < n * 4)
@@ -345,13 +343,14 @@ vc4_status vc4__ewb(vc4_ctx *ctx, const char *opname, int heavy,
 }
 
 /*
- * The derivative of each op, as a short composition of the atoms that are
- * verified on this board (ew add/mul/sigmoid/rsqrt, ewb sub/div/exp/abs/...).
- * The "heavy" kops bodies (a full exp2 polynomial per op at 16 vectors) do not
- * fit the 2048-instruction code slot, and their 4-vector form writes nothing
- * on this board, so the compositions below are the supported path.  Each one
- * recomputes the forward value with the *same* primitives the forward op
- * uses, so the gradient is consistent with it.
+ * The derivative of each op.  Most are short compositions of the atoms that
+ * are verified on this board (ew add/mul/sigmoid/rsqrt, ewb sub/div/exp/abs),
+ * because the whole-body kops form of those ops at 16 vectors does not fit the
+ * 2048-instruction code slot.  The exact erf-form GELU derivative is special:
+ * it has no short composition, so it runs as one fused kernel generated at
+ * 4 vectors per group (kops.EWB_HEAVY; 1979 words, so it fits).  Each
+ * composition recomputes the forward value with the *same* primitives the
+ * forward op uses, so the gradient is consistent with it.
  */
 static vc4_status bw_sigmoid(vc4_ctx *c, const vc4_buf *x, const vc4_buf *g,
                              vc4_buf *o, size_t n)
@@ -555,6 +554,19 @@ static vc4_status bw_gelu(vc4_ctx *c, const vc4_buf *x, const vc4_buf *g,
         st = vc4_elementwise(c, VC4_OP_MUL, g, &d, o, n);
     vc4__ws_end(c, top);
     return st;
+}
+
+/* Exact erf-form GELU derivative, one fused kernel:
+ *   g * ( 0.5*(1 + erf(x/sqrt 2)) + x*exp(-x^2/2)/sqrt(2 pi) )
+ * The body is written from the same erf/exp primitives the forward
+ * VC4_UOP_GELU_ERF uses, so the gradient is the derivative of the kernel that
+ * ran.  It is generated at 4 vectors per group (kops.EWB_HEAVY) because the
+ * 16-vector body is 4222 words against a 2048-instruction slot; the host's
+ * group size here must be 64 floats to match. */
+static vc4_status bw_gelu_erf(vc4_ctx *c, const vc4_buf *x, const vc4_buf *g,
+                              vc4_buf *o, size_t n)
+{
+    return vc4__ewb(c, "gelu_erf_bwd", 1, x, g, o, n, 0.0f, 0.0f);
 }
 
 /* ---- helpers for the relu_bwd-based masks --------------------------------
@@ -809,11 +821,7 @@ vc4_status vc4_bwop_run(vc4_ctx *ctx, vc4_bwop op, const vc4_buf *x,
     case VC4_BW_SQRT:        return bw_sqrt(ctx, x, g, out, n);
     case VC4_BW_ERF:         return bw_erf(ctx, x, g, out, n);
     case VC4_BW_GELU:        return bw_gelu(ctx, x, g, out, n);
-    case VC4_BW_GELU_ERF:
-        vc4__set_err(ctx, "vc4_bwop: the erf-form GELU derivative needs an erf "
-                     "kernel and the erf body does not fit the code slot at "
-                     "16 vectors; use the tanh form (VC4_BW_GELU)");
-        return VC4_ERR_UNSUPPORTED;
+    case VC4_BW_GELU_ERF:    return bw_gelu_erf(ctx, x, g, out, n);
     case VC4_BW_ABS:         return bw_abs(ctx, x, g, out, n);
     case VC4_BW_CLIP:        return bw_clip(ctx, x, g, out, n, p0, p1);
     case VC4_BW_LEAKYRELU:   return bw_leaky(ctx, x, g, out, n, p0);

@@ -347,6 +347,13 @@ static double d_gelu(double x, double p0, double p1)
     double t = tanh(gs * (x + c * x * x * x));
     return 0.5 * (1 + t) + 0.5 * x * (1 - t * t) * gs * (1 + 3 * c * x * x);
 }
+/* d/dx [0.5 x (1 + erf(x/sqrt 2))] = 0.5(1+erf) + x exp(-x^2/2)/sqrt(2 pi) */
+static double d_gelu_erf(double x, double p0, double p1)
+{
+    (void)p0; (void)p1;
+    return 0.5 * (1.0 + erf(x / sqrt(2.0))) +
+           x * exp(-0.5 * x * x) / sqrt(2.0 * M_PI);
+}
 static double d_erf(double x, double p0, double p1)
 { (void)p0; (void)p1; return 2.0 / sqrt(M_PI) * exp(-x * x); }
 
@@ -394,6 +401,7 @@ static int t_ew_family(void)
         { "hardswish_bwd", d_hardswish, VC4_BW_HARDSWISH,
           1.0f / 6.0f, 0.5f, 0, 1e-3 },
         { "gelu_bwd",     d_gelu,     VC4_BW_GELU,     0, 0, 0, 1e-3 },
+        { "gelu_erf_bwd", d_gelu_erf, VC4_BW_GELU_ERF, 0, 0, 0, 1e-3 },
         { "erf_bwd",      d_erf,      VC4_BW_ERF,      0, 0, 0, 1e-3 },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)

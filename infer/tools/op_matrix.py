@@ -1897,6 +1897,11 @@ def write_markdown(path, payload):
     add("|---|---|")
     add("| Generated | %s |" % payload["generated"])
     add("| Engine | vc4infer %s |" % payload["versions"]["vc4infer"])
+    pg = payload["versions"].get("vc4infer_file")
+    if pg:
+        add("| Python package | `%s` |" % pg)
+    add("| Engine library | `%s` |"
+        % (os.environ.get("VC4INFER_LIB") or "(installed default)"))
     add("| Runner | `mode=%s`, `host_policy=%s` |" %
         (payload["runner"]["mode"], payload["runner"]["host_policy"]))
     add("| ONNX / opset | onnx %s, default domain opset **%s** |" %

@@ -188,10 +188,11 @@ class Engine:
             self._runner = _runtime.Runner(self.model_path, self._eng,
                                            mode=mode,
                                            host_policy=host_policy)
-            if not self._runner.float_inputs:
-                raise UnsupportedNode("", "Input",
-                                      "graph has no fp32 input; vc4infer runs "
-                                      "fp32 graphs only")
+            # A graph with no fp32 input is legal: a generator such as
+            # RandomUniform/RandomNormal, or a constant-folded graph.  It runs
+            # with an empty feed (or an integer feed such as a shape).  The old
+            # check rejected exactly the operators whose output does not depend
+            # on an input tensor, which is every device-RNG operator.
         except BaseException:
             self._eng.close()
             raise

@@ -78,6 +78,7 @@ static const char *uop_name(vc4_uop op)
     case VC4_UOP_COS: return "cos";
     case VC4_UOP_AFFINE: return "affine";
     case VC4_UOP_MISH: return "mish";
+    case VC4_UOP_RNG: return "rng";
     case VC4_UOP_ACOS: return "acos";
     case VC4_UOP_ACOSH: return "acosh";
     case VC4_UOP_ASIN: return "asin";

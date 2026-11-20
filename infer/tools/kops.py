@@ -1186,6 +1186,15 @@ STD = {
     'TWO_OVER_SQRTPI': (_fb(2.0 / 1.77245385090551602729), 0),
     'INV_SQRT2PI': (_fb(0.39894228040143267794), 0),
     'NEGINF': (0xFF800000, 0), 'POSINF': (0x7F800000, 0),
+    # the counter-based RNG body: 16-bit halves of the two "lowbias32"
+    # multipliers and of the two seed-mix multipliers, the low-half mask, and
+    # the 2^-24 that turns a 24-bit integer into [0,1)
+    'M16': (0x0000FFFF, 1),
+    'K1L': (0x352D, 1), 'K1H': (0x7FEB, 1),
+    'K2L': (0xA68B, 1), 'K2H': (0x846C, 1),
+    'G1L': (0x79B1, 1), 'G1H': (0x9E37, 1),
+    'G2L': (0xCA77, 1), 'G2H': (0x85EB, 1),
+    'RSCALE': (0x33800000, 0),
     'NAN': (0x7FC00000, 0), 'INFI': (0x7F800000, 1),
     # inverse / hyperbolic (2026-11-20): minimax coefficients, fitted in
     # float64 and rounded to fp32 (docs/OPS-UNARY.md has the fit errors)
@@ -1235,6 +1244,86 @@ E_CORE_ERF = tuple(c for c in E_CORE[1:] if c != 'ONE_I')
 ERF_C = ('ABSM', 'SIX', 'ERFC1', 'ERF1', 'ERF2', 'ERF3', 'ERF4',
          'ERF5', 'NLOG2E', 'ONE', 'SIGNB') + E_CORE_ERF + RCP_C
 
+
+# ================================================================ rng (uop)
+# A counter-based device RNG.  ``docs/OPS-RNN.md`` sec. 5 has the record; the
+# algorithm is documented here because this body *is* the definition.
+#
+#   s = mul32(FTOI(seed), 0x9E3779B1) + mul32(FTOI(call), 0x85EBCA77)
+#   z = counter_bits ^ s                       (counter = the element index)
+#   z ^= z >> 16;  z = mul32(z, 0x7FEB352D)
+#   z ^= z >> 15;  z = mul32(z, 0x846CA68B)
+#   z ^= z >> 16
+#   u = ITOF(z >> 8) * 2^-24                   in [0, 1)
+#
+# The two multiplies are Pelle Evensen's "lowbias32" finaliser, which is a
+# bijection on 32 bits with measured avalanche ~16 bits/bit; xoring the seed
+# mixture into the counter first makes the value a function of (seed, call,
+# element index) only -- there is no state to advance, so the same three
+# numbers always give the same draw and a second launch of the same node is
+# de-correlated by the call counter.  Not cryptographic: an observer who knows
+# the seed can reproduce the stream, and the 3-round finaliser is not a
+# cipher.  Statistical evidence (1e6 draws) is in docs/OPS-RNN.md sec. 5.
+def _mul32(e, out, x, klo, khi):
+    """out = x * (khi << 16 | klo) mod 2^32, x a 32-bit word.
+
+    The QPU has only mul24 (24x24 -> low 32 bits), so a 32-bit multiply by a
+    constant is three 16x16 products: the two low-half terms add in the low
+    half, the cross terms shift into the high half (anything above 2^32
+    vanishes), which is exact.
+    """
+    k = e.k
+    C = e.ctx
+    al, ah = C.ta(), C.ta()
+    p0, p1 = C.ta(), C.ta()
+    e.op(k.ADD_AND, al, x, C.k('M16'))
+    e.opi(k.ADD_SHR, ah, x, 16)
+    e.mul24(ACC0, al, C.k(klo))
+    e.op(k.ADD_OR, p0, ACC0, ACC0)
+    e.mul24(ACC1, ah, C.k(klo))
+    e.op(k.ADD_OR, p1, ACC1, ACC1)
+    e.mul24(ACC2, al, C.k(khi))
+    e.op(k.ADD_ADD, p1, p1, ACC2)          # mul -> add is exact at 0 nops
+    e.opi(k.ADD_SHL, p1, p1, 16)
+    e.op(k.ADD_ADD, out, p0, p1)
+    C.rel(al, ah, p0, p1)
+
+
+def b_rng(e, IN, OUT):
+    """out = uniform in [0,1) from the counter word IN.
+
+    The two parameters are the 16-bit halves of a 32-bit stream key that the
+    ARM derives once per launch from the operator's seed and its launch
+    counter.  That is a *key schedule*, not a draw: it produces one integer
+    per launch and no per-element randomness.  Every element value is the
+    QPU hash below.
+    """
+    k = e.k
+    C = e.ctx
+    lo, hi = C.ta(), C.ta()
+    t = C.ta()
+    z = C.ta()
+    e.op(k.ADD_FTOI, lo, C.k('KEYLO'), C.k('KEYLO'))
+    e.op(k.ADD_FTOI, hi, C.k('KEYHI'), C.k('KEYHI'))
+    e.opi(k.ADD_SHL, hi, hi, 16)
+    e.op(k.ADD_OR, t, lo, hi)
+    e.op(k.ADD_XOR, z, IN, t)
+    C.rel(lo, hi)
+    e.opi(k.ADD_SHR, t, z, 16)
+    e.op(k.ADD_XOR, z, z, t)
+    _mul32(e, z, z, 'K1L', 'K1H')
+    e.opi(k.ADD_SHR, t, z, 15)
+    e.op(k.ADD_XOR, z, z, t)
+    _mul32(e, z, z, 'K2L', 'K2H')
+    e.opi(k.ADD_SHR, t, z, 16)
+    e.op(k.ADD_XOR, z, z, t)
+    e.opi(k.ADD_SHR, z, z, 8)
+    e.op(k.ADD_ITOF, OUT, z, z)
+    e.mul(OUT, OUT, C.k('RSCALE'))
+    C.rel(t, z)
+
+
+
 UOPS = {
     'abs':        (('ABSM',), b_abs, ()),
     'neg':        (('SIGNB',), b_neg, ()),
@@ -1268,6 +1357,9 @@ UOPS = {
     'mish':       (('ABSM', 'NLOG2E', 'ONE', 'ZERO') + LOGP_C + RCP_C
                    + ('T44', 'NLOG2E2', 'SIGNB') + E_CORE_ERF, b_mish, ()),
     'affine':     ((), b_affine, ('P0', 'P1')),
+    # rng: nine constants plus the two parameters (seed, call counter)
+    'rng':        (('M16', 'K1L', 'K1H', 'K2L', 'K2H', 'RSCALE'),
+                   b_rng, ('KEYLO', 'KEYHI')),
     'sin':        (SIN_C, b_sin, ()),
     'cos':        (SIN_C, b_cos, ()),
     'acos':       (ASIN_C, b_acos, ()),
@@ -1398,7 +1490,7 @@ UOP_ORDER = ['abs', 'neg', 'identity', 'clip', 'leakyrelu', 'floor', 'ceil',
              'erf', 'elu', 'selu', 'softplus', 'softsign', 'gelu', 'gelu_erf',
              'hardsigmoid', 'hardswish', 'sin', 'cos', 'affine', 'mish',
              'acos', 'acosh', 'asin', 'asinh', 'atan', 'atanh', 'tan', 'sinh',
-             'cosh']
+             'cosh', 'rng']
 
 # The unary ops ride on kgen.build_ew's *verified* harness (TMU priming, the
 # 16-vector group, the VPM->DMA store, the counter branch).  Only the body is

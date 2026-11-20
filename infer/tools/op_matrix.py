@@ -21,8 +21,15 @@ Each operator is classified from what actually happened:
   refused        even the general case was refused (UnsupportedNode /
                  HostNotAllowed / NeedsDeviceDispatch), with the engine's text
   mismatch       the engine ran and disagreed with the oracle -- a BUG
+  hang           the device did not return, or was lost; never scored as vc4
   invalid-model  our synthesis was wrong (reported, never scored)
-  untested       no valid synthesis / no oracle; counted against completeness
+  unmeasured     graph built and validated, but no vc4 result in this revision
+  untested       no synthesised graph at all; counted against completeness
+
+``--skip-gpu`` produces the graph-validity pass (``onnx.checker`` plus
+``onnx.reference``), which needs no vc4 package and no device.  In that mode
+every scoreable row is ``unmeasured`` and no percentage is reported: an
+unmeasured row is never counted as supported.
 
 The denominator is deliberately adversarial.  Two numbers are reported and
 never conflated:
@@ -34,7 +41,8 @@ never conflated:
 Usage
 -----
     TMPDIR=$HOME/scratch/tmp python3 infer/tools/op_matrix.py
-    python3 infer/tools/op_matrix.py --only Conv,Resize --stage synth
+    python3 infer/tools/op_matrix.py --skip-gpu          # no device needed
+    python3 infer/tools/op_matrix.py --only Conv,Resize --skip-gpu
     python3 infer/tools/op_matrix.py --opset 17 --out-dir /tmp/out
 
 The tool never calls the GPU for an operator the policy refuses: ``check_policy``
@@ -45,7 +53,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import hashlib
 import json
 import os
 import pickle

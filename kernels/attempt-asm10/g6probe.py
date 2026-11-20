@@ -2,7 +2,7 @@ import sys
 sys.path.insert(0, '/opt/vc4-asm/tools'); sys.path.insert(0, '/opt/vc4-asm/asm3')
 import kgen
 import importlib.util
-spec = importlib.util.spec_from_file_location("gemm6", "/opt/vc4-asm/asm9_gemm6.py")
+spec = importlib.util.spec_from_file_location("gemm6", os.path.join(BASE, "asm9_gemm6.py"))
 g6 = importlib.util.module_from_spec(spec); spec.loader.exec_module(g6)
 N = 64
 a = g6.build(N)

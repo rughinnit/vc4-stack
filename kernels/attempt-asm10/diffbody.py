@@ -1,11 +1,19 @@
-import sys, os, struct
-sys.path.insert(0, '/opt/vc4-asm/tools')
-sys.path.insert(0, '/opt/vc4-asm/asm3')
-sys.path.insert(0, '/opt/vc4-asm/asm9')
+import os
+import sys
+import struct
+
+# These comparison scripts were written against the asm9/asm3 generator trees,
+# which are not part of this repository.  Point VC4_ASM_DIR at a checkout that
+# has them (tools/, asm3/, asm9/, asm9_gemm6.py) to run the comparison.
+BASE = os.environ.get("VC4_ASM_DIR")
+if not BASE:
+    sys.exit("set VC4_ASM_DIR to the asm tree this script compares against")
+for _sub in ("", "tools", "asm3", "asm9"):
+    sys.path.insert(0, os.path.join(BASE, _sub) if _sub else BASE)
 import kgen
 mine = kgen.build_gemm10(64, 64, 64, 1)
 import importlib.util
-spec = importlib.util.spec_from_file_location("gemm6", "/opt/vc4-asm/asm9_gemm6.py")
+spec = importlib.util.spec_from_file_location("gemm6", os.path.join(BASE, "asm9_gemm6.py"))
 g6 = importlib.util.module_from_spec(spec); spec.loader.exec_module(g6)
 ref = g6.build(64)
 mw = mine.words(); rw = ref.words()

@@ -70,7 +70,9 @@ VC4INFER_DAEMON=1 python infer/tools/onnx/yolo_report.py infer/tools/onnx/models
 
 The runner takes the GPU lock through vc4d; do **not** hold
 `/tmp/vc4-gpu.lock` in the calling shell in daemon mode (vc4d takes it per
-launch, and a second holder makes every launch time out).
+launch, and a second holder makes every launch time out).  The same applies to
+direct mode since vc4infer 1.2.5: the engine takes the lock itself, per launch,
+in both modes (G11).
 
 `VC4INFER_CACHE` matters: the C library's built-in cache path is the installed
 `/usr/lib/vc4infer/kcache`, which is root-owned once the `.deb` is installed, so
@@ -557,7 +559,10 @@ Measured on the `bilinear` graph (Conv 8->16 3x3 then a 2x linear resize of a
 12x12 map): **5 runs, 0/9216 mismatches, max abs 5.25e-6**, 16.2 ms mean
 wall, 1.9 ms GPU, 23 launches.  The working set is about 6x the output (four
 taps + four weights + temporaries), so a large resize can exhaust the graph
-pool; `Pool.alloc` raises `graph pool exhausted` with the exact byte count.
+pool; since `vc4infer` 1.2.5 the pool is sized from the graph's own peak, a
+short estimate grows by another arena segment, and a model that cannot fit is
+refused at plan time with the bytes needed, the scratch reserve and the arena
+size instead of a mid-run `graph pool exhausted ... of N B`.
 A dedicated bilinear kernel would cut both the launches and the memory; it is
 the obvious next step.
 

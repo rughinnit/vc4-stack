@@ -167,17 +167,42 @@ else
 fi
 sed 's/^/  /' /tmp/vc4d-strict.log | tail -10
 
+say "recovery (G1) and arena reclaim (G9) on a private socket"
+# A daemon these can provoke without disturbing the acceptance daemon: the
+# recovery test times a launch out on purpose and the arena test orphans a
+# connection.  --gpu-lock keeps the two daemons taking turns.
+TSOCK=/run/vc4d-test-$$.sock
+sudo -n rm -f "$TSOCK"
+sudo -n setsid ./build/vc4d --socket "$TSOCK" --arena-mb 16 --group vc4 \
+    --drop-user nobody --gpu-lock --max-timeout-ms 5000 \
+    > /tmp/vc4d-test.log 2>&1 &
+for _ in $(seq 1 100); do [ -S "$TSOCK" ] && break; sleep 0.1; done
+TPID=$(pgrep -f -- "--socket $TSOCK" | head -1)
+RECOVER_RC=1
+ARENA_RC=1
+if [ -S "$TSOCK" ] && [ -x ../infer/build/test_daemon_recover ]; then
+    ../infer/build/test_daemon_recover "$TSOCK"; RECOVER_RC=$?
+    ../infer/build/test_daemon_arena "$TSOCK"; ARENA_RC=$?
+    echo "  recovery/log:"; grep -E "TIMEOUT|reset|reclaim" /tmp/vc4d-test.log | tail -6 | sed 's/^/    /'
+else
+    echo "  SKIP: build ../infer (test_daemon_recover) first"
+fi
+[ -n "$TPID" ] && sudo -n kill "$TPID" 2>/dev/null
+sudo -n rm -f "$TSOCK"
+echo "test_daemon_recover=$RECOVER_RC test_daemon_arena=$ARENA_RC"
+
 say "stop daemon"
 stop_daemon
 [ -S "$SOCK" ] && echo "  WARN: $SOCK still present" || echo "  OK: socket removed"
 
 say "summary"
-echo "demo_gemm=$DEMO_RC bench=$BENCH_RC hostile=$HOSTILE_RC strict=$STRICT_RC"
+echo "demo_gemm=$DEMO_RC bench=$BENCH_RC hostile=$HOSTILE_RC strict=$STRICT_RC recover=$RECOVER_RC arena=$ARENA_RC"
 echo "daemon_rawmem=$DAEMON_RAWMEM client_rawmem=$CLIENT_RAWMEM client_caps=$CLIENT_CAPS daemon_alive=$DAEMON_ALIVE fdleak=$FDLEAK"
 clock
 if [ "$DEMO_RC" = 0 ] && [ "$HOSTILE_RC" = 0 ] && [ "$STRICT_RC" = 0 ] &&
    [ "$BENCH_RC" = 0 ] && [ "$DAEMON_RAWMEM" = 0 ] && [ "$CLIENT_RAWMEM" = 0 ] &&
-   [ "$CLIENT_CAPS" = 0 ] && [ "$DAEMON_ALIVE" = 0 ] && [ "$FDLEAK" = 0 ]; then
+   [ "$CLIENT_CAPS" = 0 ] && [ "$DAEMON_ALIVE" = 0 ] && [ "$FDLEAK" = 0 ] &&
+   [ "$RECOVER_RC" = 0 ] && [ "$ARENA_RC" = 0 ]; then
     echo "ACCEPTANCE PASSED"
     exit 0
 fi

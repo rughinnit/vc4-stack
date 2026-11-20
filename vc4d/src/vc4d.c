@@ -105,7 +105,12 @@ static uint32_t next_launch = 1;
 static volatile sig_atomic_t stop_flag;
 
 static uint64_t st_launches, st_failed, st_bytes_up, st_wreg, st_rejects;
+static uint64_t st_reclaimed, st_recoveries;
 static int st_clients, st_clients_max, st_progs;
+static int restart_needed;       /* recovery failed: exit after replying */
+
+static void client_destroy(int idx);
+static void reap_dead_clients(int keep, const char *why);
 
 static void logmsg(const char *fmt, ...)
 {
@@ -123,6 +128,19 @@ static uint64_t now_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
+
+/* The daemon's known-good program: `thrend` (sig 3) followed by the three
+ * branch-delay slots every generated kernel ends with, i.e. exactly the tail
+ * of kgen's output.  One QPU, no operands, no memory access: ~1 us, 12 cycles,
+ * zero error bits (measured on this board).  It lives in the reserved last
+ * code slot and is the only thing gpu_recover() trusts as proof that the
+ * context works again. */
+static const uint32_t probe_words[8] = {
+    0x9e70009eu, 0x30000000u,   /* thrend  */
+    0x9e70009eu, 0x10000000u,   /* nop (delay 1) */
+    0x9e70009eu, 0x10000000u,   /* nop (delay 2) */
+    0x9e70009eu, 0x10000000u,   /* nop (delay 3) */
+};
 
 /* Bounded wait for the board-wide GPU lock.  Non-blocking + sleep rather than
  * a blocking flock() so a client request can never stall forever. */
@@ -144,6 +162,47 @@ static void gpu_lock_drop(void)
 {
     if (opt.gpu_lock && gpu_lock_fd >= 0)
         flock(gpu_lock_fd, LOCK_UN);
+}
+
+/* A launch timed out.  The old behaviour was to set G.dead and keep it set:
+ * the daemon stayed up but every later client failed with
+ *   daemon is dead (GPU timeout earlier)
+ * until someone ran `systemctl restart vc4d` (G1 in docs/BUGS.md).
+ *
+ * Now the context is reset and verified with the probe program, under the same
+ * board-wide GPU lock a launch takes, and only then are launches accepted
+ * again.  If the reset cannot be verified (the QPU is genuinely stuck, the V3D
+ * is powered down, the queue will not drain) the daemon leaves instead of
+ * becoming a zombie: systemd's Restart=always brings up a clean one in ~2 s.
+ * Exiting after a reply keeps the client's error meaningful (E_TIMEOUT /
+ * E_GPU) rather than turning it into a socket EOF. */
+static void try_recover(const char *why)
+{
+    char err[256] = "";
+    uint64_t t0 = now_ns();
+    int locked = 1;
+    if (opt.gpu_lock && gpu_lock_fd >= 0) {
+        int lr = gpu_lock_take(2000);
+        if (lr != 0) {
+            locked = 0;
+            snprintf(err, sizeof(err), "GPU lock %s",
+                     lr == -2 ? "wait timed out" : "failed");
+        }
+    }
+    int rc = -1;
+    if (locked)
+        rc = gpu_recover(&G, err, sizeof(err));
+    gpu_lock_drop();
+    if (rc == 0) {
+        st_recoveries++;
+        logmsg("%s: GPU context reset and verified with a probe launch "
+               "(%.1f ms); accepting launches again", why,
+               (double)(now_ns() - t0) / 1e6);
+        return;
+    }
+    logmsg("%s: GPU context reset FAILED: %s", why, err);
+    logmsg("leaving so systemd (Restart=always) starts a clean daemon");
+    restart_needed = 1;
 }
 
 static void on_signal(int sig) { (void)sig; stop_flag = 1; }
@@ -269,6 +328,10 @@ static int handle_hello(struct client *c, const struct vc4d_hdr *h,
         log_denial(c, "HELLO", "version mismatch");
         return reply(c->fd, h, VC4D_E_VERSION, NULL, 0, -1, VC4D_VERSION, 0);
     }
+    /* A client arriving is the natural moment to sweep: anything left over
+       from a process that has already exited is released before this client
+       asks for arena of its own. */
+    reap_dead_clients(c->idx, "gone before a new client's HELLO");
     struct vc4d_hello_rsp r;
     memset(&r, 0, sizeof(r));
     r.version = VC4D_VERSION;
@@ -390,7 +453,9 @@ static int handle_upload(struct client *c, const struct vc4d_hdr *h,
     }
 
     int slot = -1;
-    for (int i = 0; i < MAX_PROGS_SLOTS; ++i)
+    /* PROBE_SLOT belongs to the daemon: it holds the known-good program that
+       gpu_recover() launches, so a client may never overwrite it. */
+    for (int i = 0; i < PROBE_SLOT; ++i)
         if (!progs[i].used) { slot = i; break; }
     if (slot < 0)
         return reply(c->fd, h, VC4D_E_NOMEM, NULL, 0, -1, 0, 0);
@@ -467,12 +532,41 @@ static int await_launch(struct client *c, uint32_t id, struct launch_result *lr,
     }
     memset(lr, 0, sizeof(*lr));
     if (rc == -2) {
-        gpu_abort(&G);
+        /* The deadline passed, but the launch may simply be slower than the
+         * client asked for.  Give it a bounded grace to drain by itself: the
+         * context reset below must never land under a kernel that is still
+         * executing, or the completion counter it relies on is meaningless
+         * (measured: the probe then never reports done).  1000 ms covers any
+         * legitimate overrun of a timeout that is measured in milliseconds;
+         * a genuinely stuck QPU does not finish in it, and is handled by the
+         * abort + reset + probe path. */
+        uint64_t grace = now_ns() + 1000ull * 1000000ull;
+        int drained = 0;
+        while (now_ns() < grace) {
+            int pr = gpu_poll(&G);
+            if (pr == 1) {
+                drained = 1;
+                break;
+            }
+            if (pr < 0)
+                break;
+            usleep(100);
+        }
+        if (drained) {
+            struct launch_result tmp;
+            char e2[128];
+            gpu_finish(&G, &tmp, e2, sizeof(e2));   /* clears inflight */
+        } else {
+            gpu_abort(&G);                          /* clears the queue word */
+        }
         c->inflight = 0;
         gpu_lock_drop();
         st_failed++;
-        logmsg("TIMEOUT uid=%u pid=%d launch=%u; daemon marked dead",
-               (unsigned)c->uid, (int)c->pid, id);
+        logmsg("TIMEOUT uid=%u pid=%d launch=%u (%s)", (unsigned)c->uid,
+               (int)c->pid, id,
+               drained ? "the kernel finished after its deadline"
+                       : "the kernel did not finish; aborting the queue");
+        try_recover("after a launch timeout");
         return VC4D_E_TIMEOUT;
     }
     int status;
@@ -833,19 +927,90 @@ static void client_destroy(int idx)
             usleep(50);
         if (rc <= 0) {
             gpu_abort(&G);
-            logmsg("launch %u aborted; daemon marked dead", c->launch_id);
+            logmsg("launch %u aborted", c->launch_id);
+            gpu_lock_drop();
+            try_recover("after a client left a launch in flight");
         } else {
             struct launch_result lr;
             char err[128];
             gpu_finish(&G, &lr, err, sizeof(err));
+            gpu_lock_drop();
         }
-        gpu_lock_drop();
     }
     release_client_resources(c);
     close(c->fd);
     free(c);
     clients[idx] = NULL;
     st_clients--;
+}
+
+/* ------------------------------------------------------- client liveness --
+ *
+ * A region belongs to the socket that allocated it, and until now it was
+ * released only when the daemon saw that socket close (POLLHUP / a 0-byte
+ * read).  A client whose socket outlives the process that allocated -- a
+ * fork, an inherited or leaked descriptor -- therefore pinned its arena
+ * forever: measured on this board, one 8 MiB region survived its allocating
+ * process and the next client was denied with `op=ALLOC: arena exhausted`
+ * while nothing was running (G9 in docs/BUGS.md).
+ *
+ * Liveness is anchored on the peer pid recorded at accept time (SO_PEERCRED),
+ * not on the socket.  kill(pid, 0) answers "gone" with ESRCH; EPERM means the
+ * process exists but belongs to another user, which is the normal case for a
+ * daemon that dropped to `nobody`.  In addition the socket itself is peeked:
+ * a peer that has shut its end down reads as EOF even if its pid is alive, so
+ * reclaiming never depends on the poll loop having seen the HUP.  The check is
+ * two syscalls, cheap enough to run on every poll iteration, on HELLO and
+ * before refusing a connection for lack of a slot.
+ *
+ * Trade-off, documented in vc4d/README.md: a client that forks and keeps
+ * *using* the inherited connection after the parent exits is reaped.  It must
+ * reconnect instead; the engine never does this.
+ */
+static int peer_alive(const struct client *c)
+{
+    if (c->pid > 0) {
+        if (kill(c->pid, 0) != 0 && errno != EPERM)
+            return 0;                   /* ESRCH: the peer process is gone */
+    }
+    /* Independent of poll's POLLHUP: a peer that has shut down its end of the
+       socket reads as EOF.  A half-closed connection whose pid is still alive
+       (a client that leaked the fd, a fork, a process that closed the socket
+       but not its pid) would otherwise pin its regions until the pid exits;
+       the sweep must not depend on the poll loop having seen the HUP.  MSG_PEEK
+       does not consume a pending datagram, and -1/EAGAIN means "no data". */
+    char b;
+    ssize_t n = recv(c->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0)
+        return 0;                       /* EOF: the peer has gone away */
+    return 1;
+}
+
+static int client_nregions(const struct client *c)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_REGIONS; ++i)
+        if (c->reg[i].used)
+            n++;
+    return n;
+}
+
+/* Reap every client whose peer process has exited.  `keep` is a client index
+ * to skip (the one currently being served): its pid can only be gone between
+ * accept and HELLO, and destroying it under dispatch would use freed memory. */
+static void reap_dead_clients(int keep, const char *why)
+{
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        struct client *c = clients[i];
+        if (!c || i == keep || peer_alive(c))
+            continue;
+        int nr = client_nregions(c);
+        logmsg("reclaim pid=%d uid=%u (%s): releasing %d region(s)%s",
+               (int)c->pid, (unsigned)c->uid, why, nr,
+               c->inflight ? " and a launch in flight" : "");
+        client_destroy(i);
+        st_reclaimed++;
+    }
 }
 
 static void accept_client(void)
@@ -858,6 +1023,13 @@ static void accept_client(void)
     int slot = -1;
     for (int i = 0; i < MAX_CLIENTS; ++i)
         if (!clients[i]) { slot = i; break; }
+    if (slot < 0) {
+        /* a slot held by a process that has already exited is not a full
+           table: reclaim it instead of turning the new client away */
+        reap_dead_clients(-1, "a departed peer held the last slot");
+        for (int i = 0; i < MAX_CLIENTS; ++i)
+            if (!clients[i]) { slot = i; break; }
+    }
     if (slot < 0) {
         logmsg("DENY connection: too many clients");
         close(fd);
@@ -1001,6 +1173,23 @@ int main(int argc, char **argv)
     logmsg("V3D IDENT0=0x%08x IDENT1=0x%08x errstat=0x%08x",
            G.regs[R_IDENT0 / 4], G.regs[R_IDENT1 / 4], G.errstat_base);
 
+    /* Load the known-good probe program into the reserved last slot and point
+       the recovery path at it.  It is uploaded exactly like a client program
+       (bytes in the code slot, a zeroed 64-byte uniform block) so the probe
+       exercises the same access path a kernel does. */
+    {
+        uint32_t pcode = A_CODE_BASE + PROBE_SLOT * A_CODE_SLOT;
+        uint32_t puni = A_UNI_BASE + PROBE_SLOT * A_UNI_SLOT;
+        memcpy(A.map + pcode, probe_words, sizeof(probe_words));
+        memset(A.map + pcode + sizeof(probe_words), 0,
+               A_CODE_SLOT - sizeof(probe_words));
+        memset(A.map + puni, 0, A_UNI_SLOT);
+        __sync_synchronize();
+        gpu_use_probe(&G, arena_bus(&A, pcode), arena_bus(&A, puni));
+        logmsg("probe program in slot %d: code bus 0x%08x uni bus 0x%08x",
+               (int)PROBE_SLOT, arena_bus(&A, pcode), arena_bus(&A, puni));
+    }
+
     struct group *gr = getgrnam(opt.group);
     if (!gr) {
         logmsg("group '%s' does not exist (create it and add clients)", opt.group);
@@ -1058,20 +1247,30 @@ int main(int argc, char **argv)
     }
 
     struct pollfd pfds[MAX_CLIENTS + 1];
-    struct client *who[MAX_CLIENTS + 1];
+    /* Who is at each poll slot, by *index*, not by pointer: serving one
+       client can reap another (HELLO sweeps dead peers, accept_client may
+       reclaim a departed slot), and a pointer cached before the sweep would
+       then dangle.  -1 is the listening socket. */
+    int who[MAX_CLIENTS + 1];
     while (!stop_flag) {
+        /* Release arena held by clients whose process has exited, whether or
+           not their socket is still open (see peer_alive()).  Once per poll
+           iteration is enough: the timeout is 1 s at most. */
+        reap_dead_clients(-1, "peer process is gone");
+        if (stop_flag || restart_needed)
+            break;
         int n = 0;
         pfds[n].fd = listen_fd;
         pfds[n].events = POLLIN;
         pfds[n].revents = 0;
-        who[n] = NULL;
+        who[n] = -1;
         n++;
         for (int i = 0; i < MAX_CLIENTS; ++i) {
             if (clients[i]) {
                 pfds[n].fd = clients[i]->fd;
                 pfds[n].events = POLLIN;
                 pfds[n].revents = 0;
-                who[n] = clients[i];
+                who[n] = i;
                 n++;
             }
         }
@@ -1085,12 +1284,12 @@ int main(int argc, char **argv)
         for (int pi = 0; pi < n; ++pi) {
             if (!pfds[pi].revents)
                 continue;
-            if (!who[pi]) {
+            if (who[pi] < 0 || !clients[who[pi]]) {
                 if (pfds[pi].revents & POLLIN)
                     accept_client();
                 continue;
             }
-            struct client *c = who[pi];
+            struct client *c = clients[who[pi]];
             if (!(pfds[pi].revents & (POLLIN | POLLHUP | POLLERR)))
                 continue;
 
@@ -1179,6 +1378,8 @@ int main(int argc, char **argv)
     unlink(opt.socket_path);
     gpu_close(&G);
     arena_close(&A);
-    logmsg("exit");
-    return 0;
+    logmsg("exit%s (reclaimed %llu client(s), %llu GPU reset(s))",
+           restart_needed ? ": GPU context could not be reset" : "",
+           (unsigned long long)st_reclaimed, (unsigned long long)st_recoveries);
+    return restart_needed ? 75 : 0;
 }

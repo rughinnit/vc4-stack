@@ -23,9 +23,9 @@ cycle count** (6 773 184) as the direct root path.
 | file | lines | purpose |
 |---|---:|---|
 | `proto/vc4d_proto.h` | 144 | wire protocol: header, opcodes, payload structs, limits |
-| `src/vc4d.c` | 1101 | socket, framing, policy, dispatch, privilege drop, logging |
-| `src/vc4d_arena.c` | 319 | dma-buf, physical-base discovery + verification, free-list allocator |
-| `src/vc4d_gpu.c` | 230 | V3D mapping, register allowlist, launch/wait sequence |
+| `src/vc4d.c` | 1230 | socket, framing, policy, dispatch, liveness reaping, privilege drop, logging |
+| `src/vc4d_arena.c` | 350 | dma-buf, physical-base discovery + verification, page-bitmap allocator |
+| `src/vc4d_gpu.c` | 420 | V3D mapping, register allowlist, launch/wait, context reset + probe |
 | `src/vc4d_sha256.c` | 125 | SHA-256 for the strict-mode program allowlist |
 | `src/vc4d.h` | 111 | internal definitions |
 | `include/vc4client.h` | 70 | client API |
@@ -189,7 +189,8 @@ listener is the unix socket.
 | literal uniforms may not be bus/arena/MMIO addresses | `literal_forbidden` |
 | `nqpu ≤ declared max_qpu`, `nuni == declared nuni` | `handle_launch` |
 | one launch in flight; `WAIT` only by the owner | `handle_launch`/`wait` |
-| timeout bounded by `--max-timeout-ms`, then *dead* (no more launches) | `handle_wait` |
+| timeout bounded by `--max-timeout-ms`; then a context reset that must pass a probe launch, or the daemon exits 75 | `try_recover`, `gpu_recover` |
+| a client's regions are released when its **peer pid** is gone, not only when its socket closes | `peer_alive`, `reap_dead_clients` |
 | register writes only to the allowlist | `gpu_wreg` |
 | program SHA-256 allowlist in `--strict` | `handle_upload` |
 | arena physical base verified against `/dev/mem` before first use | `verify_phys` |
@@ -229,9 +230,11 @@ Other honest limitations:
   checked, but memory isolation between clients would need one dma-buf per
   client (easy to add; not done because CMA is the scarce resource).
 * **A bad kernel can still hang the GPU** (and historically the whole board).
-  The daemon bounds it with a timeout, resets the queue word, marks itself
-  dead and refuses further launches — but a really wild kernel can still
-  reboot the Pi.  One GPU user at a time remains the operational rule.
+  The daemon bounds it with a timeout and then resets the V3D context and
+  verifies it with a launch of its own 4-instruction probe program (see
+  §4.3); if the reset cannot be verified it exits so systemd starts a clean
+  one.  A really wild kernel can still reboot the Pi.  One GPU user at a time
+  remains the operational rule.
 * `WAIT` polls the queue inside the single-threaded loop, so one slow launch
   delays other clients by at most the timeout.
 * The physical-base scan reads 1008 × 4 KiB from `/dev/mem` (~5 ms measured);
@@ -358,6 +361,44 @@ The earlier development crash (a uniform *address* vs *value* mix-up in
 `SRQUA`) is what motivated: the arena physical-base verification, the
 `nuni`-declared-at-UPLOAD rule, and the `--strict` allowlist.
 
+### 6.1 Recovery and reclaim (the two regressions that turned a failure permanent)
+
+**A launch timeout no longer kills the daemon (was G1).**  `gpu_abort()` still
+clears the queue word and sets `dead`, but `try_recover()` then resets the
+context under the board GPU lock and *proves* it:
+
+1. wait up to 1 s for `SRQCS` to read idle (a launch that missed its deadline
+   can still be draining);
+2. write back + invalidate L2, invalidate the slice caches, W1C `ERRSTAT`,
+   `VPMBASE=16`, re-arm the counters, `SRQ` reset, and require an idle queue;
+3. launch the daemon's own probe program - four instructions,
+   `thrend` + the three delay slots every kernel ends with - from the reserved
+   last code slot (`PROBE_SLOT = 127`), with a zeroed 64-byte uniform block,
+   and require completion with no new `ERRSTAT` bits.
+
+Measured on this board: 12 cycles, ~1 us per probe, sub-millisecond for the
+whole reset.  If any step fails (queue will not drain, V3D powered down, probe
+incomplete) the daemon logs `GPU context reset FAILED: …` and **exits 75**;
+`Restart=always` starts a clean one in ~2 s.  Either way no zombie.
+
+The register *mapping* is not re-created, and cannot be: it is a `MAP_SHARED`
+`/dev/mem` mapping of the V3D window that stays valid for the process's life,
+and re-mmap would need `CAP_SYS_RAWIO` + `/dev/mem`, both given up before
+serving clients.  What is re-initialised is the register *state*, and the probe
+is what makes that checkable instead of assumed.
+
+**A departed client's arena comes back (was G9).**  Reclamation used to be
+tied to the socket: if a client forked (or leaked its descriptor) and the
+allocating process exited, its region stayed pinned until the *socket* closed -
+measured: one 8 MiB region outlived its owner and the next client was denied
+`op=ALLOC: arena exhausted` while nothing was running.  Liveness is now
+anchored on the peer pid from `SO_PEERCRED` (`kill(pid, 0)`: `ESRCH` = gone,
+`EPERM` = alive), checked every poll iteration, on `HELLO`, and before
+refusing a connection for lack of a slot.  The heap is a page bitmap instead of
+a capped free list, so a freed page cannot be lost either.  Trade-off: a client
+that forks and keeps *using* the inherited connection after the parent exits is
+reaped - it must reconnect.
+
 ---
 
 ## 7. The engine on vc4d (`VC4INFER_DAEMON=1`)
@@ -415,6 +456,11 @@ otherwise the two `flock`s deadlock.  If another user already holds the lock,
 `LAUNCH` returns `E_BUSY` without kicking anything; the engine retries for up
 to a minute so a concurrent direct-root run is survived.  `ReadWritePaths`
 in the unit now includes `/tmp` so the daemon can create the lock at boot.
+Since the G11 fix the *engine* also takes this lock per launch in direct mode,
+so a direct run and a live daemon take turns instead of overwriting each
+other's queue; a wrapper must therefore not take the lock itself (the engine
+detects the resulting wait and fails with a message naming the lock after
+`VC4INFER_GPU_LOCK_MS`, default 30 s).
 
 **Sizing.**  The unit starts with `--arena-mb 72` (CMA is 256 MiB on this
 board).  The engine's default client arena is 64 MiB and the daemon's data

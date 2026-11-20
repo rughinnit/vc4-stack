@@ -12,9 +12,14 @@ Type=simple
 ExecStart=/usr/local/sbin/vc4d --socket /run/vc4d.sock --arena-mb 72 \
           --group vc4 --drop-user nobody --max-timeout-ms 10000
 Environment=VC4D_GPU_LOCK=1
-Restart=on-failure
+# Restart on ANY exit, not just a failure: after a GPU timeout vc4d resets the
+# V3D context and verifies it with a probe launch (see README §6.1); when that
+# cannot be done it exits 75 on purpose so this brings up a clean daemon,
+# instead of leaving a zombie that refuses every launch.
+Restart=always
 RestartSec=2
-StartLimitBurst=5
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 # --- hardening -------------------------------------------------------------
 NoNewPrivileges=yes

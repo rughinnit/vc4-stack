@@ -253,7 +253,7 @@ Ultralytics' own letterbox, `non_max_suppression` and `Results` stay in charge.
 |---|---|
 | `VC4INFER_DAEMON` | `1` (default in the packages) uses `vc4d`; `0` is the direct-root `/dev/mem` path used only by the low-level test suite. |
 | `VC4INFER_ARENA_MB` | client arena size to request (default 64).  Must be <= what `vc4d` serves. |
-| `VC4_POOL_RESERVE_MB` | graph-pool reserve (default 24 MiB); the 320 recipe uses 32. |
+| `VC4_POOL_RESERVE_MB` | overrides the arena bytes kept free for the engine's per-op scratch.  The graph pool itself is sized from the model (weights + live activations + conv panels) since 1.2.5; set this only when a model needs more conv scratch than the estimate (the 320 recipe uses 32). |
 | `VC4INFER_CACHE` | kernel blob cache directory (default `~/.cache/vc4infer/kcache`). |
 | `VC4INFER_KGEN` | explicit path to `kgen.py`; overrides the baked/installed resolution. |
 | `VC4INFER_TMO_MS` | launch timeout in ms (default 20000 in the test harness). |

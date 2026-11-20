@@ -2,8 +2,10 @@ CC      ?= gcc
 AR      ?= ar
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=gnu11 -fPIC
 # vc4d ships libvc4client.a and the wire headers; VC4INFER_DAEMON=1 links it.
-VC4D_DIR ?= /home/raspi/work/vc4d
-CPPFLAGS = -Iinclude -Isrc -Itests -I../training/src -I$(VC4D_DIR)/include
+# Default to the daemon in *this* checkout (it used to point at a hand-copied
+# /home/raspi/work/vc4d, which silently built against stale headers).
+VC4D_DIR ?= ../vc4d
+CPPFLAGS = -Iinclude -Isrc -Itests -I../training/src -I$(VC4D_DIR)/include -I$(VC4D_DIR)/proto
 LDLIBS  = -lm $(VC4D_DIR)/build/libvc4client.a
 
 # Path baked into the library for the kernel generator.  A source-tree build
@@ -22,7 +24,7 @@ OBJ   = $(addprefix $(BUILD)/,$(notdir $(SRC:.c=.o)))
 
 # every binary run_tests.sh runs is built by `make`: a release is built
 # from a clean tree, and a test the build forgot is a test that never ran.
-TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_onnxops $(BUILD)/test_nhwc $(BUILD)/test_copyops $(BUILD)/test_coherency $(BUILD)/test_gate $(BUILD)/bench_matmul
+TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_onnxops $(BUILD)/test_nhwc $(BUILD)/test_copyops $(BUILD)/test_coherency $(BUILD)/test_gate $(BUILD)/test_daemon_recover $(BUILD)/test_daemon_arena $(BUILD)/test_daemon_reap $(BUILD)/test_direct_lock $(BUILD)/bench_matmul
 TRAIN_TESTS = $(BUILD)/test_train_ops $(BUILD)/test_grad $(BUILD)/test_train $(BUILD)/test_convgrad $(BUILD)/test_convnet $(BUILD)/test_bwd_one
 
 all: $(LIB) $(BUILD)/libvc4infer.so $(TESTS) $(TRAIN_TESTS)
@@ -52,6 +54,11 @@ $(BUILD)/test_%: ../training/tests/test_%.c $(LIB) tests/util.h | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@ $(LDLIBS)
 
 $(BUILD)/bench_matmul: tests/bench_matmul.c $(LIB) tests/util.h | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@ $(LDLIBS)
+
+# G11 lives beside the daemon (it is about the daemon/direct interop) but needs
+# the engine to launch from the direct path.
+$(BUILD)/test_direct_lock: $(VC4D_DIR)/test/test_direct_lock.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@ $(LDLIBS)
 
 # GPU-free verification of the formulas the kernels implement

@@ -373,11 +373,15 @@ class Engine:
         """Arena, graph pool and peak usage in bytes and MiB."""
         arena = int(self._eng.arena_bytes)
         pool = int(self._runner.pool.size)
-        peak = int(self._runner.pool.used_bytes)
+        peak = int(self._runner.pool.high)          # high-water this run
+        plan = getattr(self._runner, "pool_plan", {}) or {}
         return {
             "arena_bytes": arena, "arena_mb": arena / 2 ** 20,
             "pool_bytes": pool, "pool_mb": pool / 2 ** 20,
+            "pool_segments": int(getattr(self._runner.pool, "segments", 1)),
             "peak_bytes": peak, "peak_mb": peak / 2 ** 20,
+            "estimate_bytes": int(plan.get("pool_bytes", 0)),
+            "scratch_bytes": int(plan.get("scratch_bytes", 0)),
             "device": self.device.name,
         }
 

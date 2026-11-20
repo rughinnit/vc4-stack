@@ -167,6 +167,16 @@ vc4_status vc4_unary(vc4_ctx *ctx, vc4_uop op, const vc4_buf *a, vc4_buf *out,
         return VC4_ERR_TIMEOUT;
     if (a->bytes < n * 4 || out->bytes < n * 4)
         return VC4_ERR_INVAL;
+    {
+        char what[48];
+        const float pv[3] = { p0, p1, p2 };
+        snprintf(what, sizeof(what), "vc4_unary %s", uop_name(op));
+        for (int i = 0; i < 3; ++i) {
+            vc4_status g = vc4__check_uniform_value(ctx, what, pv[i]);
+            if (g != VC4_OK)
+                return g;
+        }
+    }
 
     /* The non-16 group path was element-verified on 2026-11-20: 0
      * mismatches over 105,264 elements for the whole unary family, five
@@ -276,6 +286,14 @@ vc4_status vc4_select3(vc4_ctx *ctx, vc4_selop op, const vc4_buf *a,
     const char *nms[] = { "where", "clip3", "prelu" };
     if (!ctx || !a || !b || !c || !out || !n)
         return VC4_ERR_INVAL;
+    {
+        vc4_status g = vc4__refuse_unverified(ctx, "vc4_select3",
+            "it shares the pad_stream/TMU lane pattern of vc4_reduce: WHERE "
+            "returns VC4_OK with every element wrong (measured on 2026-11-20, "
+            "one launch per process)");
+        if (g != VC4_OK)
+            return g;
+    }
     if (op < 0 || op > 2) {
         vc4__set_err(ctx, "vc4_select3: op %d is not implemented", (int)op);
         return VC4_ERR_UNSUPPORTED;
@@ -650,6 +668,14 @@ vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
                                  "argmin" };
     if (!ctx || !a || !out)
         return VC4_ERR_INVAL;
+    {
+        vc4_status g = vc4__refuse_unverified(ctx, "vc4_reduce",
+            "it walks a fixed 256-output group (reading past the caller's "
+            "buffer into unmapped memory) and seeds r4 instead of r0; every "
+            "shape, including outer=256 red=16, kills the QPU context");
+        if (g != VC4_OK)
+            return g;
+    }
     if (op < 0 || op > 5) {
         vc4__set_err(ctx, "vc4_reduce: op %d is not implemented", (int)op);
         return VC4_ERR_UNSUPPORTED;
@@ -782,6 +808,13 @@ vc4_status vc4_cumsum(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
 {
     if (!ctx || !a || !out || !rows || !cols)
         return VC4_ERR_INVAL;
+    {
+        vc4_status g = vc4__refuse_unverified(ctx, "vc4_cumsum",
+            "it uses the TMU setup that wedges vc4_gather; every shape kills "
+            "the QPU context (measured on 2026-11-20, one launch per process)");
+        if (g != VC4_OK)
+            return g;
+    }
     if (cols % 256) {
         vc4__set_err(ctx, "vc4_cumsum: cols=%u is not a multiple of 256; pad "
                      "the scan axis on the host (byte fill) first", cols);

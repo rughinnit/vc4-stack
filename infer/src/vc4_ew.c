@@ -265,6 +265,15 @@ vc4_status vc4__ewb(vc4_ctx *ctx, const char *opname, int heavy,
         return VC4_ERR_TIMEOUT;
     if (a->bytes < n * 4 || b->bytes < n * 4 || out->bytes < n * 4)
         return VC4_ERR_INVAL;
+    {
+        char what[48];
+        snprintf(what, sizeof(what), "vc4_%s", opname);
+        vc4_status g = vc4__check_uniform_value(ctx, what, p0);
+        if (g == VC4_OK)
+            g = vc4__check_uniform_value(ctx, what, p1);
+        if (g != VC4_OK)
+            return g;
+    }
 
     const size_t group = heavy ? 64u : 256u;
     const size_t np = ((n + group - 1) / group) * group;

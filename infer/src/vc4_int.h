@@ -123,6 +123,8 @@ vc4_status vc4__ew_run(vc4_ctx *ctx, vc4_op op, uint64_t n,
 int        vc4__unverified_allowed(void);
 vc4_status vc4__refuse_unverified(vc4_ctx *ctx, const char *what,
                                   const char *why);
+vc4_status vc4__check_uniform_value(vc4_ctx *ctx, const char *what,
+                                     float v);
 
 /* ---- vc4_ew.c: generic binary/backward elementwise ---------------------- */
 /* A kernel from kops' EWB family: out = f(a, b) with p0/p1 as attributes.

@@ -91,6 +91,9 @@ if [ "$DAEMON" != 0 ]; then
     tail -2 /tmp/vc4-client-evidence.log | sed 's/^/  /'
 fi
 
+echo "=== test_gate (unverified kernels must refuse, not launch)"
+$RUN ./build/test_gate
+
 for t in test_ew test_matmul test_conv; do
     echo "=== $t  (reps=$REPS)"
     timeout -k 5 900 $RUN ./build/$t "$REPS"

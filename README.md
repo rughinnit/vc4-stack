@@ -41,7 +41,9 @@ clocks, completeness — is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), and
 every bug with its cause, fix and verification is in
 [`docs/BUGS.md`](docs/BUGS.md) (the open ones are listed there too).
 Accuracy — including VC4 vs the CPU on the same image, where the detections are
-identical to 0.00 px — is in [`docs/ACCURACY.md`](docs/ACCURACY.md).
+identical to 0.00 px — is in [`docs/ACCURACY.md`](docs/ACCURACY.md), and the
+head-to-head against **ncnn** (6.4× faster than our GPU path at 160×160, with
+identical detections) is in [`docs/NCNN.md`](docs/NCNN.md).
 
 Full table, the two execution paths and a "which repo do I open" guide:
 [`docs/ECOSYSTEM.md`](docs/ECOSYSTEM.md).

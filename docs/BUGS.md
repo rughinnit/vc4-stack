@@ -110,4 +110,7 @@ loud · **S4** build/package/test defect · **S5** measurement artifact.
 | G5 | nv8 store path unexplained (`2^92` scale) | `Exp/Log/Round` limited to the nv4 path | works on nv4 | `docs/ONNX.md` §12 |
 | G6 | `Gelu`-erf **backward** impossible | 4,222 words against a 2,048-instruction slot | forward only | `docs/TRAINING.md` |
 | G7 | 5 kernels gated (B4, B5) | `DepthToSpace` refused; some ops use expensive compositions | refuse loudly | above |
+| G9 | **the daemon does not reclaim a departed client's arena region** | after enough clients it logs `vc4d: DENY op=ALLOC: arena exhausted` with nothing running, and every new client fails | `systemctl restart vc4d` | found 2026-11-20 while running the ncnn comparison |
+| G10 | **the runner's arena pool silently floors at 8 MiB** (`max(arena - VC4_POOL_RESERVE_MB, 8 MiB)`) | with a small client arena, YOLO fails with `graph pool exhausted ... of 8388608 B`, which reads like a model-size problem | set `VC4_POOL_RESERVE_MB=0`; the correct fix is to size the pool from the model's peak and report the shortfall | `_onnxrun.py` |
+| G11 | **`direct` backend and a running `vc4d` cannot both drive the QPUs** | a direct launch while the daemon is active timed out (`conv_nhwc_dil: GPU timeout`), though the daemon stayed healthy | `systemctl stop vc4d` before direct benchmarks | `docs/NCNN.md` |
 | G8 | ~74 of 152 expressible ONNX ops still refused | models using them fail by name | `vc4infer nodes` before running | `docs/COMPLETENESS.md` |

@@ -207,7 +207,7 @@ of `0x1000 VCD-idle`), and launches may keep timing out.
   both did it);
 * a legitimate launch that simply outran its timeout.
 
-**What the daemon does now.**  Since `vc4d 1.2.2` (B9) a launch timeout no
+**What the daemon does now.**  Since `vc4d 1.2.4` (B9) a launch timeout no
 longer kills the daemon.  It resets the V3D context - queue, VPM base, L2/SLC,
 error latch, counters - under the board GPU lock and then **proves** the reset
 with a launch of its own 4-instruction probe program (the last code slot is
@@ -273,7 +273,7 @@ that allocated it.  A client that forked (or leaked its descriptor) kept the
 connection open after the allocating process exited, and the region was pinned
 until the socket closed - forever, if the holder lived on.  This was G9.
 
-**Fix.** `vc4d 1.2.2` anchors liveness on the peer pid from `SO_PEERCRED` and
+**Fix.** `vc4d 1.2.4` anchors liveness on the peer pid from `SO_PEERCRED` and
 reclaims a region when that process is gone, even if the socket is still open;
 it sweeps every poll iteration, on `HELLO`, and before refusing a connection
 for lack of a slot.  It logs what it reclaimed:
@@ -293,7 +293,7 @@ after the parent exits is reaped by design: reconnect in the child instead.
 something other than `vc4d` holds `/tmp/vc4-gpu.lock`.
 
 **Cause.** `vc4d` takes `flock(LOCK_EX)` on `/tmp/vc4-gpu.lock` **per launch**,
-to serialise all clients.  Since `vc4d 1.2.2` / `vc4infer 1.2.5` the engine
+to serialise all clients.  Since `vc4d 1.2.4` / `vc4infer 1.2.5` the engine
 takes the same lock for the same window in **both** modes (that is what makes
 G11 fixed: a `--backend direct` run and a live daemon now take turns instead of
 overwriting each other's queue).  If the client also holds that lock (a test

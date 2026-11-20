@@ -109,8 +109,13 @@ static int srq_reset(struct gpu *g)
 
 static int queue_idle(struct gpu *g)
 {
+    /* The completed counter (bits 16-23) is cumulative since the last SRQ
+       reset - 12 after a 12-QPU launch - so it says nothing about whether a
+       kernel is running.  Idle is "nothing queued and no queue error"; the
+       "is a kernel still executing" question is answered by gpu_poll(), which
+       is why a reset waits for the aborted launch to drain first. */
     uint32_t s = g->regs[R_SRQCS / 4];
-    return (s & 0x3F) == 0 && ((s >> 16) & 0xFF) == 0 && !(s & (1u << 7));
+    return (s & 0x3F) == 0 && !(s & (1u << 7));
 }
 
 /* Counter setup shared by a client launch and the recovery probe. */

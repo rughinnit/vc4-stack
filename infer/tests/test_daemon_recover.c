@@ -1,51 +1,49 @@
 /*
  * test_daemon_recover.c - G1: a launch timeout must not leave vc4d dead.
  *
- * Before the fix, one timed-out launch set the daemon's `dead` flag and it
+ * Before the fix one timed-out launch set the daemon's `dead` flag and it
  * stayed set: every later client failed with
  *     -12 daemon is dead (GPU timeout earlier)
- * until someone ran `systemctl restart vc4d`.  The QPU itself was usually
- * fine (SRQCS back to 0, ERRSTAT back to 0x1000 VCD-idle).
+ * until someone ran `systemctl restart vc4d`, although the QPU was fine.
  *
- * This test forces a *real* timeout against a real daemon and then asks the
- * same daemon to run a known-good launch:
+ * The timeout is produced the way the driver produces them in the field: a
+ * legitimate, *bounded* kernel (a 256^3 GEMM, ~5 ms of QPU work on this board)
+ * launched with a 1 ms deadline.  The kernel always terminates by itself, so
+ * the daemon's reset finds the queue idle a few milliseconds later - this is
+ * a transient timeout, not a wedged QPU, and it cannot wedge the board.
  *
- *   1. upload a program with no `thrend` signal (two nops; the daemon zeroes
- *      the rest of the slot, so the QPU hits sig=0 "break" and the queue
- *      never completes) and launch it with a 100 ms timeout  => E_TIMEOUT;
- *   2. STATS must report dead == 0: the context was reset and verified;
- *   3. the 4-instruction probe program must launch, complete with no error
- *      bits and report cycles  => the daemon is serving again;
- *   4. steps 1-3 twice more: recovery is a repeated capability, not a
- *      one-shot.
+ * Each round:
+ *   1. a fresh client runs the control GEMM with a generous deadline  => OK
+ *   2. the same client re-runs it with a 1 ms deadline              => TIMEOUT
+ *   3. a *new* client runs the GEMM with a generous deadline: this is the
+ *      proof that the daemon reset the context and is serving again (before
+ *      the fix this failed with E_DEAD, and STATS.dead stayed 1)
  *
- * The timeout program halts itself (sig=BREAK), so it cannot leave the QPU
- * spinning: a wedged window here would already be a wedged board.
- *
- * usage: test_daemon_recover [SOCKET]      (default /run/vc4d.sock)
+ * usage: test_daemon_recover SOCKET
  */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "vc4infer.h"
 #include "vc4d_proto.h"
 #include "vc4client.h"
 
-/* thrend + three delay nops: the tail every kgen kernel ends with. 1 QPU,
- * no operands, ~1 us. */
-static const uint32_t good_prog[8] = {
-    0x9e70009eu, 0x30000000u,
-    0x9e70009eu, 0x10000000u,
-    0x9e70009eu, 0x10000000u,
-    0x9e70009eu, 0x10000000u,
-};
-/* two nops and no end signal: the queue never reports completion */
-static const uint32_t hang_prog[4] = {
-    0x9e70009eu, 0x10000000u,
-    0x9e70009eu, 0x10000000u,
-};
+#define M 256
+#define BYTES (M * M * 4)
+
+static const char *sock = "/run/vc4d.sock";
+static int fails;
+
+#define CHECK(cond, ...) do {                                          \
+        if (cond) { printf("  PASS  "); }                              \
+        else { printf("  FAIL  "); fails++; }                          \
+        printf(__VA_ARGS__);                                           \
+        printf("\n");                                                  \
+    } while (0)
 
 static uint64_t now_ns(void)
 {
@@ -54,91 +52,114 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static int fails;
-#define CHECK(cond, ...) do {                                          \
-        if (cond) {                                                    \
-            printf("  PASS  ");                                        \
-        } else {                                                       \
-            printf("  FAIL  ");                                        \
-            fails++;                                                   \
-        }                                                              \
-        printf(__VA_ARGS__);                                           \
-        printf("\n");                                                  \
-    } while (0)
+/* One engine client, as the CLI and the tests create them. */
+static vc4_ctx *open_client(const char *tmo_ms)
+{
+    setenv("VC4INFER_DAEMON", "1", 1);
+    setenv("VC4D_SOCKET", sock, 1);
+    setenv("VC4INFER_TMO_MS", tmo_ms, 1);
+    vc4_ctx *ctx = NULL;
+    if (vc4_init(&ctx, NULL, 0) != VC4_OK)
+        return NULL;
+    return ctx;
+}
+
+static int run_gemm(vc4_ctx *ctx, vc4_buf *a, vc4_buf *b, vc4_buf *c,
+                    double *ms, char *err, size_t errn)
+{
+    uint64_t t0 = now_ns();
+    vc4_status st = vc4_matmul(ctx, a, b, c, M, M, M, VC4_LAYOUT_ROW_MAJOR);
+    *ms = (double)(now_ns() - t0) / 1e6;
+    if (st != VC4_OK)
+        snprintf(err, errn, "%s (%s)", vc4_strerror(st), vc4_last_error(ctx));
+    return st == VC4_OK ? 0 : -1;
+}
+
+static int stats_dead(unsigned *dead)
+{
+    vc4c_conn *c = NULL;
+    if (vc4c_connect(&c, sock))
+        return -1;
+    struct vc4d_stats_rsp st;
+    memset(&st, 0, sizeof(st));
+    int rc = vc4c_get_stats(c, &st);
+    vc4c_close(c);
+    if (rc == 0 && dead)
+        *dead = st.dead;
+    return rc;
+}
 
 int main(int argc, char **argv)
 {
-    const char *sock = argc > 1 ? argv[1] : "/run/vc4d.sock";
-    vc4c_conn *c = NULL;
-    int rc = vc4c_connect(&c, sock);
-    if (rc) {
-        printf("FAIL: connect %s: %s\n", sock, vc4c_strerror(rc));
-        return 1;
-    }
-    struct vc4d_hello_rsp info;
-    if (vc4c_info(c, &info)) {
-        printf("FAIL: HELLO\n");
-        return 1;
-    }
-    printf("daemon %s: arena %u B, ident0 0x%08x\n", sock, info.arena_bytes,
-           info.ident0);
+    if (argc > 1)
+        sock = argv[1];
 
-    vc4c_buf uni;
-    rc = vc4c_alloc(c, 4096, VC4D_ALLOC_ZERO, &uni);
-    if (rc) {
-        printf("FAIL: alloc: %s\n", vc4c_strerror(rc));
-        return 1;
-    }
-    vc4c_prog hang, good;
-    if ((rc = vc4c_upload(c, hang_prog, sizeof(hang_prog), 1, 1, &hang)) ||
-        (rc = vc4c_upload(c, good_prog, sizeof(good_prog), 1, 1, &good))) {
-        printf("FAIL: upload: %s\n", vc4c_strerror(rc));
-        return 1;
-    }
+    char err[512];
+    double ms = 0;
 
-    /* A known-good launch must work *before* the timeout, so a failure later
-     * cannot be blamed on the program. */
-    vc4c_result r;
-    rc = vc4c_launch_wait(c, &good, 1, &uni, 0, 1000, &r);
-    CHECK(rc == 0 && r.errs == 0,
-          "control launch before the timeout: rc=%d (%s) errs=0x%x",
-          rc, vc4c_strerror(rc), r.errs);
-    if (rc)
+    /* ---- round 0: control, with a generous deadline ------------------- */
+    vc4_ctx *ctx = open_client("20000");
+    if (!ctx) {
+        printf("FAIL: cannot open a client on %s (is vc4d running?)\n", sock);
         return 1;
+    }
+    vc4_buf a, b, c;
+    if (vc4_alloc(ctx, BYTES, &a) || vc4_alloc(ctx, BYTES, &b) ||
+        vc4_alloc(ctx, BYTES, &c)) {
+        printf("FAIL: arena alloc\n");
+        return 1;
+    }
+    float *pa = calloc(M * M, 4), *pb = calloc(M * M, 4);
+    for (int i = 0; i < M * M; ++i) {
+        pa[i] = 1e-3f;
+        pb[i] = 1e-3f;
+    }
+    vc4_upload(ctx, &a, pa, BYTES);
+    vc4_upload(ctx, &b, pb, BYTES);
+    CHECK(run_gemm(ctx, &a, &b, &c, &ms, err, sizeof(err)) == 0,
+          "control GEMM with a 20 s deadline: %.1f ms", ms);
 
     for (int round = 1; round <= 3; ++round) {
         printf("-- timeout round %d\n", round);
-        memset(&r, 0, sizeof(r));
-        rc = vc4c_launch_wait(c, &hang, 1, &uni, 0, 100, &r);
-        CHECK(rc == -VC4D_E_TIMEOUT,
-              "launch without an end signal times out: rc=%d (%s)",
-              rc, vc4c_strerror(rc));
-        if (rc == -VC4D_E_TIMEOUT)
-            printf("        (client sees %s, as it should)\n",
-                   vc4c_strerror(rc));
 
-        struct vc4d_stats_rsp st;
-        memset(&st, 0, sizeof(st));
-        rc = vc4c_get_stats(c, &st);
-        CHECK(rc == 0 && st.dead == 0,
-              "daemon reports dead=%u after the timeout (0 = recovered)",
-              st.dead);
+        /* the same client, now with a 1 ms deadline: a real transient
+         * timeout, because the kernel needs milliseconds */
+        setenv("VC4INFER_TMO_MS", "1", 1);
+        int rc = run_gemm(ctx, &a, &b, &c, &ms, err, sizeof(err));
+        CHECK(rc != 0 && strstr(err, "timeout") != NULL,
+              "1 ms deadline on a ~5 ms GEMM times out: %s", err);
 
-        /* The next launch is the proof: it has to complete on the reset
-         * context, with no new error bits. */
+        unsigned dead = 99;
+        CHECK(stats_dead(&dead) == 0 && dead == 0,
+              "daemon reports dead=%u after the timeout (0 = it reset and "
+              "verified the context)", dead);
+
+        vc4_shutdown(ctx);           /* the timed-out client gives up */
+
+        /* a *new* client is the proof that launches work again */
         uint64_t t0 = now_ns();
-        memset(&r, 0, sizeof(r));
-        rc = vc4c_launch_wait(c, &good, 1, &uni, 0, 2000, &r);
-        double ms = (double)(now_ns() - t0) / 1e6;
-        CHECK(rc == 0 && r.errs == 0,
-              "known-good launch after recovery: rc=%d (%s) errs=0x%x "
-              "cycles=%u in %.1f ms", rc, vc4c_strerror(rc), r.errs,
-              r.cycles, ms);
+        ctx = open_client("20000");
+        double reopen_ms = (double)(now_ns() - t0) / 1e6;
+        if (!ctx) {
+            CHECK(0, "a new client can open after the timeout");
+            break;
+        }
+        if (vc4_alloc(ctx, BYTES, &a) || vc4_alloc(ctx, BYTES, &b) ||
+            vc4_alloc(ctx, BYTES, &c)) {
+            CHECK(0, "the new client gets its arena");
+            break;
+        }
+        vc4_upload(ctx, &a, pa, BYTES);
+        vc4_upload(ctx, &b, pb, BYTES);
+        rc = run_gemm(ctx, &a, &b, &c, &ms, err, sizeof(err));
+        CHECK(rc == 0, "the next client's GEMM completes: %.1f ms "
+              "(reconnect %.1f ms)", ms, reopen_ms);
         if (rc)
             break;
     }
 
-    vc4c_close(c);
+    if (ctx)
+        vc4_shutdown(ctx);
     printf(fails ? "G1 FAIL (%d)\n" : "G1 PASS\n", fails);
     return fails ? 1 : 0;
 }

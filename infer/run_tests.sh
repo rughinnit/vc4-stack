@@ -80,6 +80,7 @@ for i in $(seq 1 100); do [ -S "$TSOCK" ] && break; sleep 0.05; done
 [ -S "$TSOCK" ] || { echo "FAIL: private vc4d did not start"; tail -5 "$TMPD/vc4d-test-$$.log"; exit 1; }
 ./build/test_daemon_recover "$TSOCK"
 ./build/test_daemon_arena "$TSOCK"
+./build/test_daemon_reap "$TSOCK" 3
 board
 
 echo "=== test_direct_lock (G11: direct mode and vc4d share the GPU lock)"

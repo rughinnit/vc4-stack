@@ -532,12 +532,40 @@ static int await_launch(struct client *c, uint32_t id, struct launch_result *lr,
     }
     memset(lr, 0, sizeof(*lr));
     if (rc == -2) {
-        gpu_abort(&G);
+        /* The deadline passed, but the launch may simply be slower than the
+         * client asked for.  Give it a bounded grace to drain by itself: the
+         * context reset below must never land under a kernel that is still
+         * executing, or the completion counter it relies on is meaningless
+         * (measured: the probe then never reports done).  1000 ms covers any
+         * legitimate overrun of a timeout that is measured in milliseconds;
+         * a genuinely stuck QPU does not finish in it, and is handled by the
+         * abort + reset + probe path. */
+        uint64_t grace = now_ns() + 1000ull * 1000000ull;
+        int drained = 0;
+        while (now_ns() < grace) {
+            int pr = gpu_poll(&G);
+            if (pr == 1) {
+                drained = 1;
+                break;
+            }
+            if (pr < 0)
+                break;
+            usleep(100);
+        }
+        if (drained) {
+            struct launch_result tmp;
+            char e2[128];
+            gpu_finish(&G, &tmp, e2, sizeof(e2));   /* clears inflight */
+        } else {
+            gpu_abort(&G);                          /* clears the queue word */
+        }
         c->inflight = 0;
         gpu_lock_drop();
         st_failed++;
-        logmsg("TIMEOUT uid=%u pid=%d launch=%u", (unsigned)c->uid,
-               (int)c->pid, id);
+        logmsg("TIMEOUT uid=%u pid=%d launch=%u (%s)", (unsigned)c->uid,
+               (int)c->pid, id,
+               drained ? "the kernel finished after its deadline"
+                       : "the kernel did not finish; aborting the queue");
         try_recover("after a launch timeout");
         return VC4D_E_TIMEOUT;
     }
@@ -929,9 +957,11 @@ static void client_destroy(int idx)
  * Liveness is anchored on the peer pid recorded at accept time (SO_PEERCRED),
  * not on the socket.  kill(pid, 0) answers "gone" with ESRCH; EPERM means the
  * process exists but belongs to another user, which is the normal case for a
- * daemon that dropped to `nobody`.  A missing /proc entry is treated the same
- * as ESRCH.  The check is a syscall pair, cheap enough to run on every poll
- * iteration, on HELLO and before refusing a connection for lack of a slot.
+ * daemon that dropped to `nobody`.  In addition the socket itself is peeked:
+ * a peer that has shut its end down reads as EOF even if its pid is alive, so
+ * reclaiming never depends on the poll loop having seen the HUP.  The check is
+ * two syscalls, cheap enough to run on every poll iteration, on HELLO and
+ * before refusing a connection for lack of a slot.
  *
  * Trade-off, documented in vc4d/README.md: a client that forks and keeps
  * *using* the inherited connection after the parent exits is reaped.  It must
@@ -939,13 +969,21 @@ static void client_destroy(int idx)
  */
 static int peer_alive(const struct client *c)
 {
-    if (c->pid <= 0)
-        return 1;                       /* no credential: do not guess */
-    if (kill(c->pid, 0) == 0)
-        return 1;
-    if (errno == EPERM)
-        return 1;                       /* exists, just not ours to signal */
-    return 0;                           /* ESRCH: the peer process is gone */
+    if (c->pid > 0) {
+        if (kill(c->pid, 0) != 0 && errno != EPERM)
+            return 0;                   /* ESRCH: the peer process is gone */
+    }
+    /* Independent of poll's POLLHUP: a peer that has shut down its end of the
+       socket reads as EOF.  A half-closed connection whose pid is still alive
+       (a client that leaked the fd, a fork, a process that closed the socket
+       but not its pid) would otherwise pin its regions until the pid exits;
+       the sweep must not depend on the poll loop having seen the HUP.  MSG_PEEK
+       does not consume a pending datagram, and -1/EAGAIN means "no data". */
+    char b;
+    ssize_t n = recv(c->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0)
+        return 0;                       /* EOF: the peer has gone away */
+    return 1;
 }
 
 static int client_nregions(const struct client *c)
@@ -1209,7 +1247,11 @@ int main(int argc, char **argv)
     }
 
     struct pollfd pfds[MAX_CLIENTS + 1];
-    struct client *who[MAX_CLIENTS + 1];
+    /* Who is at each poll slot, by *index*, not by pointer: serving one
+       client can reap another (HELLO sweeps dead peers, accept_client may
+       reclaim a departed slot), and a pointer cached before the sweep would
+       then dangle.  -1 is the listening socket. */
+    int who[MAX_CLIENTS + 1];
     while (!stop_flag) {
         /* Release arena held by clients whose process has exited, whether or
            not their socket is still open (see peer_alive()).  Once per poll
@@ -1221,14 +1263,14 @@ int main(int argc, char **argv)
         pfds[n].fd = listen_fd;
         pfds[n].events = POLLIN;
         pfds[n].revents = 0;
-        who[n] = NULL;
+        who[n] = -1;
         n++;
         for (int i = 0; i < MAX_CLIENTS; ++i) {
             if (clients[i]) {
                 pfds[n].fd = clients[i]->fd;
                 pfds[n].events = POLLIN;
                 pfds[n].revents = 0;
-                who[n] = clients[i];
+                who[n] = i;
                 n++;
             }
         }
@@ -1242,12 +1284,12 @@ int main(int argc, char **argv)
         for (int pi = 0; pi < n; ++pi) {
             if (!pfds[pi].revents)
                 continue;
-            if (!who[pi]) {
+            if (who[pi] < 0 || !clients[who[pi]]) {
                 if (pfds[pi].revents & POLLIN)
                     accept_client();
                 continue;
             }
-            struct client *c = who[pi];
+            struct client *c = clients[who[pi]];
             if (!(pfds[pi].revents & (POLLIN | POLLHUP | POLLERR)))
                 continue;
 

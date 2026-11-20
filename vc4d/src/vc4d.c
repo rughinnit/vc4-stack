@@ -1266,11 +1266,77 @@ static void accept_client(void)
  * open a bigger dma-buf itself, and keeping /dev/mem open in the unprivileged
  * process would give up the property the daemon exists for.
  *
- * The exit is gated on CMA *actually* being able to satisfy the request, so a
- * board that stays fragmented does not enter a restart loop.
+ * The exit is gated on CMA *being able* to satisfy the request.  The daemon's
+ * own arena counts towards that: exiting releases it.  That is the common
+ * upgrade case - the daemon holds 48 MiB, CMA has 72 MiB free, and 96 MiB only
+ * becomes available once the daemon lets go of its 48.
+ *
+ * A fragmented board can still fail the allocation after the restart, so each
+ * deliberate restart is spaced out (5 min, doubling to 6 h) by a stamp file in
+ * /run, which survives the restart but not a reboot.  A start that gets the
+ * full block removes the stamp, so a real recovery is immediate next time.
  */
+/* Keyed by the requested size: two daemons with different --arena-mb (the
+ * installed one and a test one, say) must not reset each other's backoff.
+ * The directory is created (owned by the drop user) before vc4d gives up its
+ * privileges, because the stamp is written after it has dropped them; /run is
+ * the unit's ReadWritePaths entry and survives a restart but not a reboot,
+ * which is exactly the lifetime this state should have. */
+#define ARENA_STAMP_FMT "%s/arena-restore-%zu.state"
+static const char *state_dir = "/tmp";
+#define ARENA_BACKOFF_MIN_S 60
+#define ARENA_BACKOFF_MAX_S 21600
+
 static uint64_t arena_restore_next;
-static int arena_wait_logged;
+static int arena_wait_logged;      /* "waiting for CMA" said once */
+static int arena_backoff_logged;   /* "a restore already failed" said once */
+
+static void arena_stamp_path(size_t want, char *out, size_t n)
+{
+    snprintf(out, n, ARENA_STAMP_FMT, state_dir, want >> 20);
+}
+
+static unsigned arena_backoff_attempts(size_t want)
+{
+    char path[128];
+    arena_stamp_path(want, path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    unsigned n = 0;
+    if (fscanf(f, "%u", &n) != 1)
+        n = 0;
+    fclose(f);
+    return n;
+}
+
+static time_t arena_stamp_mtime(size_t want)
+{
+    char path[128];
+    arena_stamp_path(want, path, sizeof(path));
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return 0;
+    return st.st_mtime;
+}
+
+static void arena_stamp_write(size_t want, unsigned attempts)
+{
+    char path[128];
+    arena_stamp_path(want, path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "%u\n", attempts);
+    fclose(f);
+}
+
+static void arena_stamp_clear(size_t want)
+{
+    char path[128];
+    arena_stamp_path(want, path, sizeof(path));
+    unlink(path);
+}
 
 static void arena_maybe_restore(void)
 {
@@ -1280,31 +1346,66 @@ static void arena_maybe_restore(void)
     if (now < arena_restore_next)
         return;
     arena_restore_next = now + 2000ull * 1000000ull;
-    if (A.used || st_clients || G.inflight) {
-        arena_wait_logged = 0;      /* the next idle window is a new chance */
-        return;
-    }
+    if (A.used || st_clients || G.inflight)
+        return;                     /* wait for an idle arena, quietly */
     if (A.want <= A.bytes)
         return;
     size_t total = 0, cfree = 0;
     arena_cma_info(&total, &cfree);
-    if (cfree < A.want + (4u << 20)) {
+    /* our own block is released by the exit, so it counts as available */
+    uint64_t avail = (uint64_t)cfree + (uint64_t)A.bytes;
+    if (avail < (uint64_t)A.want + (8u << 20)) {
         if (!arena_wait_logged)
-            logmsg("arena is %zu MiB of the %zu MiB requested and CMA has "
-                   "%zu MiB free: waiting for CMA before restoring it",
-                   A.bytes >> 20, A.want >> 20, cfree >> 20);
+            logmsg("arena is %zu MiB of the %zu MiB requested; CMA has %zu MiB "
+                   "free, %zu MiB would be free after a restart: waiting for "
+                   "CMA before restoring it", A.bytes >> 20, A.want >> 20,
+                   cfree >> 20, avail >> 20);
         arena_wait_logged = 1;
         return;
     }
+    unsigned n = arena_backoff_attempts(A.want);
+    unsigned backoff = ARENA_BACKOFF_MIN_S;
+    for (unsigned i = 1; i < n && backoff < ARENA_BACKOFF_MAX_S; ++i)
+        backoff *= 2;
+    if (backoff > ARENA_BACKOFF_MAX_S)
+        backoff = ARENA_BACKOFF_MAX_S;
+    time_t last = arena_stamp_mtime(A.want);
+    if (n && last && time(NULL) < last + (time_t)backoff) {
+        if (!arena_backoff_logged)
+            logmsg("arena restore: %u attempt(s) already failed; next try in "
+                   "%ld s (a fragmented CMA can refuse the full block even when "
+                   "enough is free in pieces).  Stop the other CMA user and "
+                   "restart vc4d to retry now.", n,
+                   (long)(last + (time_t)backoff - time(NULL)));
+        arena_backoff_logged = 1;
+        return;
+    }
     logmsg("arena was %zu MiB of the %zu MiB requested; CMA now has %zu MiB "
-           "free and the arena is idle - exiting so a fresh daemon claims the "
-           "full block (no reboot needed)", A.bytes >> 20, A.want >> 20,
-           cfree >> 20);
+           "free (%zu MiB after this daemon releases its block) and the arena "
+           "is idle - exiting so a fresh daemon claims the full block "
+           "(no reboot needed)", A.bytes >> 20, A.want >> 20, cfree >> 20,
+           avail >> 20);
+    arena_stamp_write(A.want, n + 1);
     restart_reason = "the arena was degraded and CMA has recovered";
     restart_needed = 1;
 }
 
 /* ------------------------------------------------------------ main loop */
+/* A directory the unprivileged daemon can write its own state into (the
+ * arena-restore backoff).  Created while still root, chowned to the drop user;
+ * falls back to /tmp (which the unit also allows) if /run is not writable. */
+static void state_dir_init(uid_t uid, gid_t gid)
+{
+    if (mkdir("/run/vc4d", 0755) == 0 || errno == EEXIST) {
+        if (chown("/run/vc4d", uid, gid) == 0 ||
+            (access("/run/vc4d", W_OK) == 0)) {
+            state_dir = "/run/vc4d";
+            return;
+        }
+    }
+    state_dir = "/tmp";
+}
+
 static void drop_privileges(void)
 {
     struct passwd *pw = getpwnam(opt.drop_user);
@@ -1312,6 +1413,7 @@ static void drop_privileges(void)
     gid_t dgid = pw ? pw->pw_gid : 65534;
     if (!pw)
         logmsg("user '%s' not found, dropping to 65534", opt.drop_user);
+    state_dir_init(uid, dgid);
     if (setgroups(0, NULL) != 0) {
         logmsg("setgroups: %s", strerror(errno));
         exit(1);
@@ -1415,6 +1517,8 @@ int main(int argc, char **argv)
     logmsg("arena %zu MiB%s at phys 0x%08x bus 0x%08x (requested %zu MiB)",
            A.bytes >> 20, A.degraded ? " DEGRADED" : "", A.phys, A.bus,
            A.want >> 20);
+    if (!A.degraded)
+        arena_stamp_clear(A.want);  /* a real restore resets the backoff */
 
     if (gpu_open(&G, err, sizeof(err)) != 0) {
         logmsg("gpu: %s", err);
@@ -1490,6 +1594,8 @@ int main(int argc, char **argv)
 
     if (opt.drop)
         drop_privileges();
+    else
+        state_dir_init(getuid(), getgid());
 
     /* close anything inherited that we do not need (0,1,2 are the journal) */
     for (int fd = 3; fd < 256; ++fd) {

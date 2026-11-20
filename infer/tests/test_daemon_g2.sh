@@ -151,6 +151,10 @@ wait_for_cma() {
     [ "$(free_mb)" -ge "$1" ]
 }
 
+# A previous failed attempt at this size leaves a backoff stamp in /run that
+# would (correctly) delay the restore; the test starts from a clean slate.
+$SUDO rm -f /run/vc4d/arena-restore-*.state /tmp/arena-restore-*.state
+
 VC4D=$VC4D_DIR/build/vc4d
 PROBE=$VC4D_DIR/build/arena_size
 CMA=$VC4D_DIR/build/cmahold

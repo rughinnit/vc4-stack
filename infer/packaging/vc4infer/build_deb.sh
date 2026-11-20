@@ -42,6 +42,7 @@ install -d "$stage/DEBIAN" \
 	"$stage/usr/bin" \
 	"$pkg/vc4infer/kgen" \
 	"$pkg/vc4infer/contrib" \
+	"$pkg/vc4infer/ort" \
 	"$stage/usr/lib/$triplet" \
 	"$stage/usr/lib/vc4infer/kgen" \
 	"$stage/usr/share/vc4infer/models" \
@@ -55,6 +56,7 @@ install -m 0755 "$root/cli/vc4infer" "$stage/usr/bin/vc4infer"
 install -m 0644 "$root/python/vc4infer"/*.py "$pkg/vc4infer/"
 install -m 0644 "$root/python/vc4infer/kgen"/*.py "$pkg/vc4infer/kgen/"
 install -m 0644 "$root/python/vc4infer/contrib"/*.py "$pkg/vc4infer/contrib/"
+install -m 0644 "$root/python/vc4infer/ort"/*.py "$pkg/vc4infer/ort/"
 
 # ---- engine library + header ------------------------------------------------
 install -m 0755 "$so" "$stage/usr/lib/$triplet/libvc4infer.so.1"
@@ -78,6 +80,8 @@ install -m 0644 "$here"/data/models/* "$stage/usr/share/vc4infer/models/"
 install -m 0644 "$root/../docs/VC4INFER.md" "$stage/usr/share/doc/vc4infer/README.md"
 install -m 0644 "$root/../docs/PYTHON-API.md" \
 	"$stage/usr/share/doc/vc4infer/PYTHON-API.md"
+install -m 0644 "$root/../docs/ONNXRUNTIME.md" \
+	"$stage/usr/share/doc/vc4infer/ONNXRUNTIME.md"
 install -m 0644 "$here/copyright" "$stage/usr/share/doc/vc4infer/copyright"
 if [ -f "$here/changelog.Debian.gz" ]; then
 	install -m 0644 "$here/changelog.Debian.gz" \
@@ -105,7 +109,7 @@ Architecture: $arch
 Maintainer: rughinnit <rughinnit@users.noreply.github.com>
 Installed-Size: $size
 Depends: python3 (>= 3.11), python3-numpy, python3-onnx (>= 1.14), python3-pil, libc6 (>= 2.38)
-Suggests: vc4d, vc4infer-dev
+Suggests: vc4d, vc4infer-dev, python3-onnxruntime
 Section: misc
 Priority: optional
 Homepage: https://github.com/rughinnit/vc4-stack

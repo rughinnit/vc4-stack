@@ -54,7 +54,7 @@ __all__ = [
     "__version__",
     "devices", "Device",
     "Engine", "Plan", "TensorSpec", "NodeInfo", "NodeBackend",
-    "postprocess", "yolo", "coverage",
+    "postprocess", "yolo", "coverage", "ort",
     "Vc4InferError", "DeviceError", "ShapeError", "UnsupportedNode",
     "HostNotAllowed", "HostNodeError", "NeedsDeviceDispatch",
     "Error", "Unsupported",
@@ -65,3 +65,6 @@ def default_cache_dir():
     """Kernel blob cache: ``$VC4INFER_CACHE`` or ``~/.cache/vc4infer/kcache``."""
     from ._runtime import default_cache_dir as _d
     return _d()
+
+
+from . import ort  # noqa: E402,F401  (ORT shim; onnxruntime is optional)

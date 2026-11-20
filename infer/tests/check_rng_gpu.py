@@ -29,9 +29,40 @@ from vc4infer import _binding as vc4infer                  # noqa: E402
 UOP_RNG = getattr(vc4infer, "UOP_RNG", None)
 
 
+# The arena of a shared daemon can be small (another client holds part of
+# it), and the engine has no free(): draw in blocks so the peak footprint is
+# two chunk-sized buffers rather than two n-sized ones.  Each block uses its
+# own launch key, so the blocks are independent draws of the same stream --
+# the statistics are over the pooled 10^6 values, not over one launch.
+CHUNK = int(os.environ.get("VC4_RNG_CHUNK", "250000"))
+
+
 def counters(eng, n):
     c = np.arange(n, dtype=np.uint32).view(np.float32)
     return eng.upload(c)
+
+
+def draw_blocks(eng, n, seed, base_call):
+    """n uniforms as ceil(n / CHUNK) independent blocks.
+
+    The counter and output buffers are allocated once and reused: the engine
+    has no free(), so a per-block allocation would accumulate 2*CHUNK floats
+    per block and fail on a small shared arena.
+    """
+    m = min(CHUNK, n)
+    cb = counters(eng, m)
+    ob = eng.alloc(m * 4)
+    parts = []
+    got, k = 0, 0
+    while got < n:
+        m = min(CHUNK, n - got)
+        key = rng_key(seed, base_call + k)
+        eng.unary(UOP_RNG, cb, ob, m, float(key & 0xFFFF),
+                  float(key >> 16), 0.0)
+        parts.append(eng.download(ob, m * 4).copy())
+        got += m
+        k += 1
+    return np.concatenate(parts) if len(parts) > 1 else parts[0]
 
 
 def rng_key(seed, call):
@@ -77,7 +108,9 @@ def main(argv):
     eng = vc4infer.Engine(cache_dir=cache)
     fails = []
     try:
-        u = draw(eng, n, args.seed, 0.0)
+        print("arena            %.1f MiB (blocks of %d)"
+              % (eng.arena_bytes / 2 ** 20, CHUNK))
+        u = draw_blocks(eng, n, args.seed, 0)
         ok = True
         lo, hi = float(u.min()), float(u.max())
         print("draws            %d" % n)
@@ -177,8 +210,8 @@ def main(argv):
 
         # Box-Muller normals, as the RandomNormal handler composes them
         n2 = min(n, 1 << 20)
-        u1 = draw(eng, n2, args.seed, 11.0).astype(np.float64)
-        u2 = draw(eng, n2, args.seed, 12.0).astype(np.float64)
+        u1 = draw_blocks(eng, n2, args.seed, 11).astype(np.float64)
+        u2 = draw_blocks(eng, n2, args.seed, 211).astype(np.float64)
         u1 = np.maximum(u1, 1.0 / (1 << 24))
         z = np.sqrt(-2.0 * np.log(u1)) * np.cos(2 * np.pi * u2)
         m, v = float(z.mean()), float(z.var())

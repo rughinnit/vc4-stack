@@ -256,36 +256,50 @@ randomness; every random value is produced by the QPU hash.
 
 ### 4.2 Statistical evidence (`tests/check_rng_gpu.py`)
 
-10^6 draws, seed 12345, one launch:
+10^6 draws, seed 12345 (four blocks of 250 000, each with its own launch key
+-- see below):
 
 ```
+arena            64.0 MiB (blocks of 250000)
 draws            1000000
-range            [0.000001252, 0.999999583)
-mean             0.500498   (0.5 +- 0.000866 at 3 sigma)
-variance         0.083387   (1/12 = 0.083333 +- 0.00086)
-chi2 16   bins   stat 21.47  df 15   p 0.122
-chi2 256  bins   stat 328.86 df 255  p 0.001
-KS distance      0.001143   (limit 0.001950 at p=1e-3)
-serial corr lag1 -0.001745   (limit +-0.004000 at 4 sigma)
-serial corr lag2 -0.001632
-serial corr lag3 -0.000056
-serial corr lag4  0.003174
-serial corr lag8  0.000279
-2-D chi2 64x64   stat 4135.7 df 4095 p 0.324
-bit balance      worst |p-0.5| 0.001180 (limit 0.001500)
+range            [0.000000536, 0.999999583)
+mean             0.500381   (0.5 +- 0.000866 at 3 sigma)
+variance         0.083362   (1/12 = 0.083333 +- 0.00086)
+chi2 16   bins   stat 13.87  df 15   p 0.536
+chi2 256  bins   stat 308.36 df 255  p 0.012
+KS distance      0.001022   (limit 0.001950 at p=1e-3)
+serial corr lag1 -0.001156   (limit +-0.004000 at 4 sigma)
+serial corr lag2 -0.000163
+serial corr lag3 -0.000858
+serial corr lag4  0.000732
+serial corr lag8  0.002101
+2-D chi2 64x64   stat 4203.8 df 4095 p 0.115
+bit balance      worst |p-0.5| 0.000997 (limit 0.001500)
 call-stream      chi2(16) 12.66 p 0.629   KS 0.0082 (limit 0.0305)
 reproducible     True (4096/4096 equal for one (seed,call))
 decorrelated     call: 0/4096 equal, seed: 0/4096 equal
-box-muller       mean 0.00215  var 1.00094  skew -0.00288  kurt 3.00012
-box-muller KS    0.01095  (limit 0.03047)
+box-muller       mean -0.00098 var 0.99958 skew -0.00055 kurt 2.99906
+box-muller KS    0.01254  (limit 0.03047)
 ```
 
 The full check (16-bin and 256-bin chi-square, a KS distance against U[0,1], a
 2-D chi-square on consecutive pairs — the test a Weyl sequence fails — bit
 balance of all 24 output bits, serial correlation at five lags, the same tests
 along the *call* axis, reproducibility and de-correlation) passes at seeds
-12345, 999 and 777; two other seeds reproduce every line above except the
-noise terms.
+12345, 999 and 777:
+
+| seed | mean | variance | chi2(16) p | KS | 2-D p | call-axis p |
+|---|---:|---:|---:|---:|---:|---:|
+| 12345 | 0.500381 | 0.083362 | 0.536 | 0.00102 | 0.115 | 0.629 |
+| 999 | 0.499918 | 0.083313 | 0.891 | 0.00062 | 0.272 | 0.758 |
+| 777 | 0.500059 | 0.083271 | 0.834 | 0.00059 | 0.162 | 0.648 |
+
+The draw is split into four 250 000-element blocks because the engine has no
+`free()`: a single 10^6-element launch needs two 4 MiB buffers at once, and a
+*shared* daemon whose arena has been whittled down by other clients can refuse
+that.  Each block uses its own launch key, so this is four independent samples
+of the same stream, not one; the pooled 10^6 values are what the table above
+tests.
 
 The *call* axis test is the one that changed the design: the first version
 streamed the call counter in as `idx + call*2^20`, so a graph that draws a few
@@ -449,7 +463,19 @@ REPS=1 VC4INFER_DAEMON=1 ./run_tests.sh               # the whole suite
 ```
 
 `run_tests.sh` runs the three new Python tests plus `check_rng_gpu.py` in its
-own sections, so a regression in this block fails the suite.
+own sections, so a regression in this block fails the suite.  With
+`REPS=1 VC4INFER_DAEMON=1` on this tree: `ALL TESTS PASSED`, peak 67.1 C, core
+400 MHz, `throttled=0x0`.
+
+One environmental note, because it cost two runs: start the suite against a
+**freshly restarted** `vc4d`.  The shared daemon's arena is a page bitmap and
+long use by many clients leaves too few contiguous pages for the next 64 MiB
+client, which then falls back to 16 MiB; the training sections
+(`test_train`, `test_convnet`) need more than that and fail with `out of arena
+memory`.  That is a daemon-side accounting condition, not an operator result:
+`test_convnet` passes immediately after `systemctl restart vc4d`, and the
+whole suite passes on a fresh daemon.  `check_rng_gpu.py` is written for the
+degraded case too (it draws in four blocks with reused buffers).
 
 ### Measured multi-step sequence (`tests/check_rnn_seq.py`)
 

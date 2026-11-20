@@ -7,7 +7,7 @@ check clean.
 
 Environment: Raspberry Pi 3B, Debian 13 arm64, **stock clocks** (core 400 MHz,
 V3D 300 MHz, `throttled=0x0`), one boot for every number below.  The board is
-shared with concurrent jobs; every GPU run was serialised by
+shared with concurrent work; every GPU run was serialised by
 `/tmp/vc4-gpu.lock` and the runs reported here were taken in a quiet window.
 
 ## What changed

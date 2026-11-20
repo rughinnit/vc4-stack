@@ -223,7 +223,7 @@
       "feasibility": "training after the PluggableDevice + N kernels",
       "memory": "16 B/param in the arena; same ceilings"
     },
-    "notes": "The 1.3 GB unpack did not finish on the shared 905 MiB board (three concurrent builds compiling/running); pip was at 235 MB after ~20 min and was stopped to protect the board. Static evidence is complete: PyPI cp313/aarch64 wheel, SE_InitPlugin at stream_executor.h:530, load_pluggable_device_library at tensorflow/python/framework/load_library.py:160. StreamExecutor requires allocator, stream, event, timer and blit implementations before a single TF op can run.",
+    "notes": "The 1.3 GB unpack did not finish on the shared 905 MiB board (three concurrent jobs compiling/running); pip was at 235 MB after ~20 min and was stopped to protect the board. Static evidence is complete: PyPI cp313/aarch64 wheel, SE_InitPlugin at stream_executor.h:530, load_pluggable_device_library at tensorflow/python/framework/load_library.py:160. StreamExecutor requires allocator, stream, event, timer and blit implementations before a single TF op can run.",
     "evidence": [
       "tensorflow/include/tensorflow/c/experimental/stream_executor/stream_executor.h:187,225,420,509,530",
       "tensorflow/python/framework/load_library.py:160",

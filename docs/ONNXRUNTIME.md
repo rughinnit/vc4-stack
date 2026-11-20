@@ -211,7 +211,7 @@ The provider adds Python-level partition dispatch and boundary copies, not
 compute: one partition means one `Runner.run` per inference, the same call
 `Engine.run` makes. The 518 ms figure is the acceptance run (`reps=2`); the
 699 ms figure is the median of 5 runs in the three-way benchmark, taken while
-concurrent jobs were using the board. The provider and the native runner are the
+the board was busy with concurrent work. The provider and the native runner are the
 same kernels, and repeated measurements on this shared Pi 3 varied by 25%
 between processes, so do not read a provider-vs-native difference into the
 table.

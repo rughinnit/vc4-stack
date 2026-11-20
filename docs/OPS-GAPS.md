@@ -214,7 +214,7 @@ takes its address from an accumulator and its load/pop order does not match
 `build_ew`'s two-deep pipeline; two candidate fixes still wedged the QPU.  A
 wedge here is not a failed test: it kills the vc4d context and, from the
 earlier record, sometimes needs a power cycle, which on a shared board takes
-every concurrent work with it.
+every concurrent change with it.
 
 What it would buy is launch *count*, not capability: a `Gather` of `n` rows is
 `n` launches here and one there.  The correctness path above needs no part of

@@ -119,8 +119,8 @@ be re-taken under `tools/thermal-guard.sh` before being quoted as a measurement.
 | G4 | **Uniform/address collision**: any float ≤ −2.0 cannot cross `vc4d` (bit pattern ≥ `0xC0000000` looks like a bus address) | `Pow(x,−2)`, `Clip(−3,…)`, `LeakyRelu(−2)` impossible in managed mode | `--backend direct`; a per-word value flag in the protocol is designed but **not implemented** | `docs/BACKENDS.md`, `vc4_guard.c` |
 | G5 | nv8 store path unexplained (`2^92` scale) | `Exp/Log/Round` limited to the nv4 path | works on nv4 | `docs/ONNX.md` §12 |
 | G6 | `Gelu`-erf **backward** impossible | 4,222 words against a 2,048-instruction slot | forward only | `docs/TRAINING.md` |
-| G7 | 5 kernels gated (B4, B5) | `DepthToSpace` refused; some ops use expensive compositions | refuse loudly | above |
-| G8 | ~74 of 152 expressible ONNX ops still refused | models using them fail by name | `vc4infer nodes` before running | `docs/COMPLETENESS.md` |
+| G7 | **five kernels are gated**: `vc4_gather`, `vc4_blit`, `vc4_reduce`, `vc4_cumsum`, `vc4_select3` | they are broken and refuse, so any op that would need them uses a composition instead (slower, still exact) | refusals only; `DepthToSpace` and the gather/scatter family were later implemented without them (`docs/OPS-GAPS.md`) |
+| G8 | **24 of 152 expressible ONNX ops still refused** (measured 2026-11-20, `docs/COMPLETENESS.md`) | models using them fail by name | `vc4infer nodes` before running; the list is geometry/detection (`ConvTranspose`, `GridSample`, `RoiAlign`, `NMS`, `Einsum`, `Det`, `DFT/STFT`), recurrent (`LSTM/GRU/RNN`), random/quantise, and `AffineGrid`/`Col2Im`/`DeformConv`/`MaxRoiPool` |
 
 G1, G9, G10 and G11 left this table on 2026-11-20: they are fixed and
 re-verified as **B9** (daemon no longer dies for good after a timeout),

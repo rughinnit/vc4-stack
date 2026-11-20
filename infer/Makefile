@@ -35,7 +35,7 @@ HDRS  = $(wildcard src/*.h) $(wildcard include/*.h) \
 
 # every binary run_tests.sh runs is built by `make`: a release is built
 # from a clean tree, and a test the build forgot is a test that never ran.
-TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_onnxops $(BUILD)/test_nhwc $(BUILD)/test_copyops $(BUILD)/test_coherency $(BUILD)/test_gate $(BUILD)/test_daemon_recover $(BUILD)/test_daemon_arena $(BUILD)/test_daemon_reap $(BUILD)/test_direct_lock $(BUILD)/bench_matmul
+TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_onnxops $(BUILD)/test_nhwc $(BUILD)/test_copyops $(BUILD)/test_coherency $(BUILD)/test_gate $(BUILD)/test_daemon_recover $(BUILD)/test_daemon_arena $(BUILD)/test_daemon_reap $(BUILD)/test_direct_lock $(BUILD)/bench_matmul $(BUILD)/test_daemon_kernels $(BUILD)/test_daemon_uni
 TRAIN_TESTS = $(BUILD)/test_train_ops $(BUILD)/test_grad $(BUILD)/test_train $(BUILD)/test_convgrad $(BUILD)/test_convnet $(BUILD)/test_bwd_one
 
 all: $(LIB) $(BUILD)/libvc4infer.so $(TESTS) $(TRAIN_TESTS)

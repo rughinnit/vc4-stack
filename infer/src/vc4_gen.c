@@ -181,17 +181,6 @@ vc4_status vc4_unary(vc4_ctx *ctx, vc4_uop op, const vc4_buf *a, vc4_buf *out,
         return VC4_ERR_TIMEOUT;
     if (a->bytes < n * 4 || out->bytes < n * 4)
         return VC4_ERR_INVAL;
-    {
-        char what[48];
-        const float pv[3] = { p0, p1, p2 };
-        snprintf(what, sizeof(what), "vc4_unary %s", uop_name(op));
-        for (int i = 0; i < 3; ++i) {
-            vc4_status g = vc4__check_uniform_value(ctx, what, pv[i]);
-            if (g != VC4_OK)
-                return g;
-        }
-    }
-
     /* The non-16 group path was element-verified on 2026-11-20: 0
      * mismatches over 105,264 elements for the whole unary family, five
      * shapes each (docs/NUMERICS.md, docs/ONNX.md sec. 12.3). */

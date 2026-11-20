@@ -21,9 +21,15 @@ shared with concurrent jobs; every GPU run was serialised by
   `vc4__kernel_load_file`, `vc4__wait_idle`, `vc4__health`, `vc4_shutdown`.
 - `vc4d` protocol version 2: `ALLOC` replies with the region's GPU bus
   address; `LAUNCH` gains `UNI_IN_ARENA` (uniform words read from the client's
-  arena, each word validated) and `WAIT` (kick → idle → counters → L2
-  write-back in one reply).  The daemon's per-client program limit is 64 and
-  the unit uses `--arena-mb 72` (CMA is 256 MiB; 72 leaves the engine's full 64 MiB client region).
+  arena) and `WAIT` (kick → idle → counters → L2 write-back in one reply).
+  Since 1.2.7 it also gains `UNI_MASK` (a per-slot mask saying which uniform
+  words are addresses, which is what makes parameters ≤ −2.0 possible), and
+  `UPLOAD` may carry the kernel name that keys the program-slot LRU.  Both are
+  opt-in: a client that sends neither gets the exact 1.2.6 behaviour.  The
+  daemon's program table is 128 slots (127 usable) and **evicts LRU-wise**, so
+  a session is no longer limited to 127 distinct kernels; the unit uses
+  `--arena-mb 72` (CMA is 256 MiB; 72 leaves the engine's full 64 MiB client
+  region).
 - Op code (`vc4_gemm.c`, `vc4_ew.c`, `vc4_conv.c`, `vc4_convbwd.c`,
   `vc4_train.c`) is unchanged except for dirty-range marks where the CPU
   writes buffers that the GPU later reads.
@@ -116,7 +122,7 @@ which is launch-bound.  First 128³ run after boot is colder (1.25 ms wall).
 - The daemon's per-client program table must hold a whole process's kernel
   set: one program per shape.  With 16 slots, later conv-gradient kernels
   failed to upload and the test reported a misleading "out of arena memory".
-  64 fixes it; the arena's code region only has room for ~67.
+  64 fixed it; the arena's code region only has room for ~67.
 - Arena sizing: a 64 MiB daemon arena leaves a client `64 − 2` MiB, one
   megabyte less than the direct path, which made `test_convgrad` run out
   late.  The unit uses 72 MiB, which yields the client's full 64 MiB region
@@ -125,6 +131,34 @@ which is launch-bound.  First 128³ run after boot is colder (1.25 ms wall).
   fell back to 64 MiB and reintroduced the failure.  The final suite ran with the
   64 MiB client region and the 72 MiB daemon; `test_convgrad` was also verified
   separately against this exact unit.
+
+## G2/G3/G4 (1.2.7): the three that turned a transient condition permanent
+
+Each of these was a case where a moment of bad luck (CMA busy, more shapes
+than slots, one parameter below −2.0) became a state the session could not
+leave.  Measured on this board, stock clocks, fanless:
+
+| # | before | after | test |
+|---|---|---|---|
+| G2 | `--arena-mb 16` under CMA pressure came up at **8 MiB**; 8 s after the pressure was released (31 MiB `CmaFree`) it was still **8 MiB**, i.e. until a reboot | retried 0/200/400 ms, then fell back **loudly**; on an idle arena with CMA recovered it exits 75 and the replacement daemon is at the full **16 MiB** | `infer/tests/test_daemon_g2.sh` |
+| G3 | 127/250 uploads; `upload #127 failed: out of arena/slots`, every later kernel unavailable | **250/250 uploaded, 250/250 launched**, 374 LRU evictions, 127 resident; the first kernel runs again after a re-upload. Engine side: 124/200 → **200/200** | `vc4d/test/test_prog_lru`, `infer/tests/test_daemon_kernels` |
+| G4 | `LeakyRelu(-2)` and `Clip(-3,3)` refused with `parameter -2 has bit pattern 0xc0000000`; `Pow(x,-2)` ran (it lowers to `reciprocal(x*x)` and never carried −2 as a uniform) | all three run through the daemon: `max|err|` 0, 0, 9.5e-07 | `vc4d/test/test_uni_mask`, `infer/tests/test_daemon_uni`, `infer/tests/test_daemon_values.py` |
+
+Why the G2 restore is a restart and not a re-allocation in place: by the time
+`vc4d` serves clients it has dropped to `nobody` with an empty capability set
+and closed `/dev/mem`, so it cannot open a larger dma-buf or map a new
+physical base.  Keeping `/dev/mem` open in the unprivileged process would give
+up the property the daemon exists for.  The exit is gated on `CmaFree >=
+requested + 4 MiB` and on an idle arena (`arena_used == 0`, no clients, no
+launch in flight), so a fragmented board does not enter a restart loop; the
+systemd unit already has `Restart=always`.
+
+The G4 wire change adds no bytes: `vc4d_launch_req.pad` became `uni_addr`, and
+the flag is `VC4D_LAUNCH_UNI_MASK` (bit 2).  Program names ride after the code
+in `UPLOAD` (`VC4D_UPLOAD_NAMED`, bit 0) so the request struct is unchanged.
+`HELLO.flags` advertises `VC4D_F_NAMED_PROGS`, `VC4D_F_UNI_MASK` and
+`VC4D_F_ARENA_RESTORE`; the engine checks them and falls back to the 1.2.6
+calls, which is why a new engine works against an old daemon and vice versa.
 - Lock topology: the daemon takes `/tmp/vc4-gpu.lock` per launch, so the
   tests must not hold it (otherwise both wait and the launch fails as busy).
   The engine retries `E_BUSY` for a minute, which is what let it coexist with

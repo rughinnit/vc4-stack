@@ -57,6 +57,8 @@ struct vc4_remote {
     vc4c_buf   region;                /* the one ALLOC: the whole arena */
     vc4c_prog  prog[VC4_MAX_KERNELS]; /* parallel to ctx->k[] */
     int        nprog;
+    int        have_named;            /* daemon keys slots by program name */
+    int        have_uni_mask;         /* daemon takes the address mask     */
     /* byte intervals the CPU has written since the last clean */
     struct { uint32_t off, len; } dirty[REMOTE_DIRTY_MAX];
     int        ndirty;
@@ -257,6 +259,8 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
         free(ctx);
         return VC4_ERR_IO;
     }
+    r->have_named = (info.flags & VC4D_F_NAMED_PROGS) != 0;
+    r->have_uni_mask = (info.flags & VC4D_F_UNI_MASK) != 0;
 
     /* The daemon hands out regions from its data heap only. */
     size_t max = info.arena_bytes > info.data_base
@@ -363,6 +367,10 @@ void vc4__remote_shutdown(vc4_ctx *ctx)
     if (!ctx)
         return;
     struct vc4_remote *r = ctx->remote;
+    for (int i = 0; i < ctx->nkern; ++i) {
+        free(ctx->k[i].code);
+        ctx->k[i].code = NULL;
+    }
     if (r) {
         if (r->region.map)
             munmap(r->region.map, r->region.len);
@@ -390,14 +398,19 @@ vc4_status vc4__remote_load(vc4_ctx *ctx, const char *name,
         vc4__set_err(ctx, "remote upload %s: nqpu=%d", name, nqpu);
         return VC4_ERR_INVAL;
     }
-    if (ctx->nkern >= VC4_MAX_KERNELS) {
-        vc4__set_err(ctx, "kernel cache full (%d entries)", VC4_MAX_KERNELS);
+
+    /* A free cache entry, or the least recently used one (G3).  Its uniform
+     * block and its daemon program slot are both indexed by the entry, so the
+     * new kernel simply takes them over. */
+    vc4_kernel *k = vc4__kern_slot(ctx);
+    if (!k) {
+        vc4__set_err(ctx, "remote kernel cache: no slot (all %d in use)",
+                     VC4_MAX_KERNELS);
         return VC4_ERR_NOMEM;
     }
-
-    vc4_kernel *k = &ctx->k[ctx->nkern];
-    k->code_off = VC4_CODE_BASE + (uint32_t)ctx->nkern * VC4_CODE_SLOT;
-    k->uni_off = VC4_UNI_BASE + (uint32_t)ctx->nkern * VC4_UNI_SLOT;
+    int slot = (int)(k - ctx->k);
+    k->code_off = VC4_CODE_BASE + (uint32_t)slot * VC4_CODE_SLOT;
+    k->uni_off = VC4_UNI_BASE + (uint32_t)slot * VC4_UNI_SLOT;
     if (k->uni_off + VC4_UNI_SLOT > VC4_DATA_BASE ||
         (size_t)k->uni_off + 64u * VC4_MAX_QPU > ctx->arena_bytes) {
         vc4__set_err(ctx, "kernel cache: uniform area does not fit the arena");
@@ -410,21 +423,72 @@ vc4_status vc4__remote_load(vc4_ctx *ctx, const char *name,
         ctx->dirty_top = (size_t)k->uni_off + VC4_UNI_SLOT;
     __sync_synchronize();
 
-    int rc = vc4c_upload(r->conn, words, bytes, (unsigned)nqpu,
-                         VC4_UNI_WORDS, &r->prog[ctx->nkern]);
+    /* Keep the code so a launch the daemon evicted can be re-uploaded without
+     * going back to the blob cache (and without a JIT). */
+    uint8_t *copy = malloc(bytes);
+    if (!copy) {
+        k->used = 0;
+        return VC4_ERR_NOMEM;
+    }
+    memcpy(copy, words, bytes);
+
+    int rc = vc4c_upload_named(r->conn, r->have_named ? name : NULL,
+                               words, bytes, (unsigned)nqpu,
+                               VC4_UNI_WORDS, &r->prog[slot]);
     if (rc != 0) {
+        free(copy);
+        k->used = 0;
         vc4_status st = remote_status(ctx, rc, "UPLOAD");
         return st == VC4_ERR_INVAL ? VC4_ERR_KERNEL : st;
     }
 
+    k->code = copy;
+    k->code_len = (uint32_t)bytes;
     k->code_words = (uint32_t)(bytes / 8);
     k->nqpu = (uint32_t)nqpu;
     k->used = 1;
+    k->used_at = ++ctx->kern_clock;
     snprintf(k->name, sizeof(k->name), "%s", name);
-    ctx->nkern++;
     r->nprog = ctx->nkern;
     *out = k;
     return VC4_OK;
+}
+
+/* The daemon evicted the program slot (G3): upload the same code again, under
+ * the same name, and let the LRU give it some other slot.  Returns 0 or a
+ * negative VC4D_E_*. */
+static int remote_reupload(struct vc4_remote *r, const vc4_kernel *k, int slot)
+{
+    if (!k->code || !k->code_len)
+        return -VC4D_E_NOENT;
+    return vc4c_upload_named(r->conn, r->have_named ? k->name : NULL,
+                             k->code, k->code_len, k->nqpu,
+                             VC4_UNI_WORDS, &r->prog[slot]);
+}
+
+/* Which uniform slots hold a GPU bus address?  A word is an address exactly
+ * when it points into this client's arena; the engine's pointers are always
+ * (arena offset + gpu_bus), and a value that happens to land in the same
+ * window is still inside the arena, so the mask can only ever be *more*
+ * permissive than the daemon's heuristic, never reject a valid launch.  The
+ * mask is per slot across QPUs: an address is marked only when every QPU's
+ * word at that slot is one. */
+static uint32_t remote_uni_mask(vc4_ctx *ctx, const vc4_kernel *k, int nqpu)
+{
+    uint32_t mask = 0;
+    for (uint32_t u = 0; u < VC4_UNI_WORDS; ++u) {
+        int all_addr = 1;
+        for (int i = 0; i < nqpu && all_addr; ++i) {
+            uint32_t w;
+            memcpy(&w, ctx->arena + k->uni_off + 64u * (uint32_t)i + 4u * u, 4);
+            if (!(w >= ctx->gpu_bus &&
+                  (uint64_t)w < (uint64_t)ctx->gpu_bus + ctx->arena_bytes))
+                all_addr = 0;
+        }
+        if (all_addr)
+            mask |= 1u << u;
+    }
+    return mask;
 }
 
 vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
@@ -447,6 +511,7 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
         vc4__set_err(ctx, "launch: kernel %s was not uploaded", k->name);
         return VC4_ERR_INVAL;
     }
+    ((vc4_kernel *)k)->used_at = ++ctx->kern_clock;
 
     vc4c_result res;
     memset(&res, 0, sizeof(res));
@@ -474,9 +539,28 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
     }
     int rc;
     for (unsigned attempt = 0;; ++attempt) {
-        rc = vc4c_launch_wait(r->conn, &r->prog[idx], (unsigned)nqpu,
-                              &r->region, k->uni_off, remote_timeout_ms(),
-                              &res);
+        uint32_t mask = r->have_uni_mask ? remote_uni_mask(ctx, k, nqpu) : 0;
+        if (r->have_uni_mask)
+            rc = vc4c_launch_wait_u(r->conn, &r->prog[idx], (unsigned)nqpu,
+                                    &r->region, k->uni_off, remote_timeout_ms(),
+                                    &res, mask);
+        else
+            rc = vc4c_launch_wait(r->conn, &r->prog[idx], (unsigned)nqpu,
+                                  &r->region, k->uni_off, remote_timeout_ms(),
+                                  &res);
+        /* The daemon evicted this program slot for a newer one (G3).  The code
+         * is in the cache, so put it back and launch again.  Attempts are
+         * bounded so a daemon that answers E_NOENT for a different reason
+         * cannot spin here. */
+        if (rc == -VC4D_E_NOENT && attempt < 2) {
+            if (getenv("VC4INFER_DEBUG"))
+                fprintf(stderr, "[vc4] %s: program slot evicted, re-uploading\n",
+                        k->name);
+            rc = remote_reupload(r, k, (int)idx);
+            if (rc != 0)
+                break;
+            continue;
+        }
         /* On a shared board another user may hold /tmp/vc4-gpu.lock for a
          * whole test run; the daemon's bounded wait then reports BUSY without
          * kicking anything, so wait and try again. */

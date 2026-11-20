@@ -29,7 +29,7 @@ extern "C" {
 
 #define VC4INFER_VERSION_MAJOR 0
 #define VC4INFER_VERSION_MINOR 1
-#define VC4INFER_VERSION_STRING "1.2.3"
+#define VC4INFER_VERSION_STRING "1.2.7"
 
 /* Default arena capacity.  One dma-buf, persistent user buffers + scratch. */
 #define VC4_ARENA_DEFAULT (64u << 20)

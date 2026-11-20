@@ -31,9 +31,10 @@
 
 #define MAX_CLIENTS     8
 #define MAX_REGIONS     64
-/* One client may cache up to all the daemon's program slots (64): the engine
+/* One client may cache up to all the daemon's program slots: the engine
  * uploads one program per kernel shape, and a test that runs several conv
- * shapes legitimately needs ~25.  MAX_PROGS_SLOTS bounds the total. */
+ * shapes legitimately needs ~25.  The table is global (MAX_PROGS_SLOTS) and
+ * evicted LRU-wise, so this is no longer a hard per-client cap (G3). */
 #define MAX_PROGS_CLI   128
 /* The last code/uniform slot is the daemon's own: it holds the known-good
  * probe launch that verifies a GPU context reset (see gpu_recover()). */
@@ -82,6 +83,8 @@ struct arena {
     uint32_t *bits;           /* one bit per page: 1 = allocated  */
     uint32_t npages;          /* pages in [A_DATA_BASE, bytes)    */
     uint32_t hint;            /* first-fit cursor                 */
+    size_t   want;            /* size requested at startup        */
+    int      degraded;        /* CMA refused `want`; bytes < want */
 };
 
 int  arena_open(struct arena *a, size_t want, char *err, size_t errn);
@@ -89,6 +92,8 @@ void arena_close(struct arena *a);
 int  arena_alloc(struct arena *a, uint32_t bytes, uint32_t *off);
 int  arena_free(struct arena *a, uint32_t off, uint32_t len);
 uint32_t arena_bus(const struct arena *a, uint32_t off);
+/* CMA accounting from /proc/meminfo, in bytes (0 if it cannot be read). */
+void arena_cma_info(size_t *total, size_t *free_bytes);
 
 /* ---- gpu --------------------------------------------------------------- */
 struct launch_result {

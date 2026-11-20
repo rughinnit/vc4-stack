@@ -325,19 +325,53 @@ static vc4_status blob_read(vc4_ctx *ctx, const char *path,
     return VC4_OK;
 }
 
+/* ------------------------------------------------------- kernel cache slots
+ *
+ * VC4_MAX_KERNELS entries, each owning a code slot and a uniform area (direct
+ * mode) or a daemon program slot (remote mode).  A session that touches more
+ * distinct kernels than that used to fail with "kernel cache full (128
+ * entries)" and every later shape was unusable until the process restarted
+ * (G3).  The cache is an LRU now: the least recently loaded/launched entry is
+ * replaced.  Callers use a vc4_kernel* only between returning it and launching
+ * it - every op loads, fills uniforms and launches in one function - so
+ * replacing the oldest entry cannot invalidate a live pointer. */
+vc4_kernel *vc4__kern_slot(vc4_ctx *ctx)
+{
+    int slot = -1;
+    if (ctx->nkern < VC4_MAX_KERNELS) {
+        slot = ctx->nkern++;
+    } else {
+        for (int i = 0; i < ctx->nkern; ++i) {
+            if (!ctx->k[i].used)
+                continue;
+            if (slot < 0 || ctx->k[i].used_at < ctx->k[slot].used_at)
+                slot = i;
+        }
+        if (slot < 0)
+            return NULL;
+        free(ctx->k[slot].code);        /* remote: the re-upload copy */
+    }
+    vc4_kernel *k = &ctx->k[slot];
+    memset(k, 0, sizeof(*k));
+    k->used_at = ++ctx->kern_clock;
+    return k;
+}
+
 vc4_status vc4__kernel_load_file(vc4_ctx *ctx, const char *name,
                                  const uint8_t *words, size_t bytes,
                                  int nqpu, vc4_kernel **out)
 {
     if (ctx->remote)
         return vc4__remote_load(ctx, name, words, bytes, nqpu, out);
-    if (ctx->nkern >= VC4_MAX_KERNELS) {
-        vc4__set_err(ctx, "kernel cache full (%d entries)", VC4_MAX_KERNELS);
+    vc4_kernel *k = vc4__kern_slot(ctx);
+    if (!k) {
+        vc4__set_err(ctx, "kernel cache: no slot (all %d in use)",
+                     VC4_MAX_KERNELS);
         return VC4_ERR_NOMEM;
     }
-    vc4_kernel *k = &ctx->k[ctx->nkern];
-    k->code_off = VC4_CODE_BASE + (uint32_t)ctx->nkern * VC4_CODE_SLOT;
-    k->uni_off = VC4_UNI_BASE + (uint32_t)ctx->nkern * VC4_UNI_SLOT;
+    int slot = (int)(k - ctx->k);
+    k->code_off = VC4_CODE_BASE + (uint32_t)slot * VC4_CODE_SLOT;
+    k->uni_off = VC4_UNI_BASE + (uint32_t)slot * VC4_UNI_SLOT;
     if (k->uni_off + VC4_UNI_SLOT > VC4_DATA_BASE) {
         vc4__set_err(ctx, "kernel cache: uniform area overlaps the data heap");
         return VC4_ERR_NOMEM;
@@ -352,7 +386,6 @@ vc4_status vc4__kernel_load_file(vc4_ctx *ctx, const char *name,
     memset(ctx->arena + k->uni_off, 0, VC4_UNI_SLOT);
     __sync_synchronize();
 
-    ctx->nkern++;
     *out = k;
     return VC4_OK;
 }
@@ -367,6 +400,7 @@ vc4_status vc4__kernel(vc4_ctx *ctx, const char *name, char *const gen_argv[],
                              name, ctx->k[i].nqpu, nqpu);
                 return VC4_ERR_INVAL;
             }
+            ctx->k[i].used_at = ++ctx->kern_clock;
             *out = &ctx->k[i];
             return VC4_OK;
         }

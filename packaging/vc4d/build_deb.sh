@@ -10,7 +10,7 @@ set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-ver=${1:-1.2.5}
+ver=${1:-1.2.7}
 out=$root/dist
 stage=$root/build/vc4d-deb
 

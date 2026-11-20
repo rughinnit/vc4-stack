@@ -108,9 +108,30 @@ echo "=== test_direct_lock (G11: direct mode and vc4d share the GPU lock)"
 sudo -n ./build/test_direct_lock "$TSOCK"
 board
 cool
+
+# G3/G4: the daemon side of both fixes, against the tree's own vc4d.
+echo "=== test_prog_lru (G3: 250 programs, LRU eviction, re-run the first)"
+"$VC4D_DIR/build/test_prog_lru" "$TSOCK"
+echo "=== test_uni_mask (G4: a uniform word that looks like an address)"
+"$VC4D_DIR/build/test_uni_mask" "$TSOCK"
+echo "=== test_daemon_kernels (G3: 200 kernels through the engine)"
+env VC4D_SOCKET="$TSOCK" VC4INFER_DAEMON=1 ./build/test_daemon_kernels 200
+echo "=== test_daemon_uni (G4: Clip/LeakyRelu/Affine <= -2.0)"
+env VC4D_SOCKET="$TSOCK" VC4INFER_DAEMON=1 ./build/test_daemon_uni
+echo "=== test_daemon_values (G4: Pow/Clip/LeakyRelu through the runner)"
+env VC4D_SOCKET="$TSOCK" VC4INFER_DAEMON=1 VC4INFER_LIB="$PWD/build/libvc4infer.so" \
+    PYTHONPATH="$PYTHONPATH:." timeout -k 5 600 python3 tests/test_daemon_values.py
+board
+cool
 sudo -n kill $TPID 2>/dev/null
 trap - EXIT
 sudo -n rm -f "$TSOCK"
+
+# G2: needs its own private daemons (it restarts one on purpose) and CMA that
+# it can hold and release, so it runs on its own sockets.  On a shared board it
+# reports SKIP when another process is holding CMA - that is not a failure.
+echo "=== test_daemon_g2 (G2: retry, loud degrade, restore without a reboot)"
+./tests/test_daemon_g2.sh "${G2_MB:-16}"
 
 echo "=== test_pool_sizing (G10: pool sized from the model, no 8 MiB floor)"
 timeout -k 5 300 $RUN PYTHONPATH=python TMPDIR="$TMPD" \

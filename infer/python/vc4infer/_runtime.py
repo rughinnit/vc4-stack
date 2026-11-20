@@ -4,6 +4,7 @@ Kept free of public-API imports so ``session``/``cli``/``__init__`` can all use
 it without an import cycle.
 """
 import os
+import sys
 import time
 
 from . import _binding, _onnxrun
@@ -54,6 +55,63 @@ def models_dir():
     return INSTALL_MODELS
 
 
+BACKENDS = ("managed", "direct")
+
+BACKEND_HELP = {
+    "managed": "vc4d daemon: unprivileged, validated, ~0.1 ms per launch",
+    "direct": "root + /dev/mem: no daemon, no per-launch overhead, no "
+              "validation",
+}
+
+
+def backend():
+    """The backend in effect: ``managed`` (vc4d) or ``direct`` (/dev/mem)."""
+    explicit = os.environ.get("VC4INFER_BACKEND")
+    if explicit in BACKENDS:
+        return explicit
+    daemon = os.environ.get("VC4INFER_DAEMON", "1") not in ("", "0")
+    return "managed" if daemon else "direct"
+
+
+def set_backend(name):
+    """Select the backend for this process.
+
+    ``managed`` is the default and the only supported one for normal use: the
+    QPUs are reached through vc4d, which validates every register write and
+    address, so a buggy or hostile client cannot take the machine down.
+
+    ``direct`` talks to /dev/mem itself.  It is what the benchmarks use to
+    show the cost of the daemon (7 % on a 256^3 GEMM, 15 % on YOLOv8n at 160)
+    and it needs root.  It performs no validation: a wrong offset corrupts
+    memory, and the GPU cannot be recovered without a reboot.
+    """
+    name = (name or "").strip().lower()
+    if name not in BACKENDS:
+        raise ValueError("backend must be one of: %s" % ", ".join(BACKENDS))
+    if name == "direct":
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            raise PermissionError(
+                "the direct backend needs root (it opens /dev/mem): "
+                "run with sudo, or use --backend managed")
+        if not os.path.exists("/dev/mem"):
+            raise FileNotFoundError(
+                "the direct backend needs /dev/mem, which is not present")
+        os.environ["VC4INFER_DAEMON"] = "0"
+        if not os.environ.get("VC4INFER_BACKEND"):
+            sys.stderr.write(
+                "vc4infer: direct backend - /dev/mem, no validation, root "
+                "only; run with --backend managed for the safe path\n")
+    else:
+        os.environ["VC4INFER_DAEMON"] = "1"
+    os.environ["VC4INFER_BACKEND"] = name
+    return name
+
+
+def backend_summary():
+    b = backend()
+    return "%s (%s)" % (b, BACKEND_HELP[b])
+
+
 def prepare_env():
     """The defaults the library and CLI run with.
 
@@ -61,11 +119,16 @@ def prepare_env():
     ``VC4INFER_KGEN`` points at the packaged kernel generator, so a wheel in a
     venv does not depend on the repository layout.
     """
-    os.environ.setdefault("VC4INFER_DAEMON", "1")
+    explicit = os.environ.get("VC4INFER_BACKEND")
+    if explicit in BACKENDS:
+        os.environ["VC4INFER_DAEMON"] = "1" if explicit == "managed" else "0"
+    else:
+        os.environ.setdefault("VC4INFER_DAEMON", "1")
     kg = default_kgen()
     if kg and not os.environ.get("VC4INFER_KGEN"):
         os.environ["VC4INFER_KGEN"] = kg
     return {
+        "backend": backend(),
         "daemon": os.environ.get("VC4INFER_DAEMON", "0") not in ("", "0"),
         "socket": SOCKET,
         "kgen": kg,
@@ -88,6 +151,15 @@ def open_engine(cache_dir=None, arena_mb=None, retry_s=3.0):
     if arena_mb:
         os.environ["VC4INFER_ARENA_MB"] = str(int(arena_mb))
     daemon = os.environ.get("VC4INFER_DAEMON", "0") not in ("", "0")
+    # The daemon reads VC4INFER_ARENA_MB itself; in direct mode the client owns
+    # the arena, so the size has to be passed to the library explicitly.
+    arena_bytes = 0
+    if not daemon:
+        try:
+            mb = int(os.environ.get("VC4INFER_ARENA_MB", "64"))
+        except ValueError:
+            mb = 64
+        arena_bytes = max(8, mb) << 20
     if daemon and not daemon_reachable():
         raise Error(
             "vc4d is not running (no %s). Start it with `sudo systemctl start "
@@ -95,7 +167,8 @@ def open_engine(cache_dir=None, arena_mb=None, retry_s=3.0):
     deadline = time.monotonic() + max(0.0, float(retry_s))
     while True:
         try:
-            return Engine(cache_dir=cache_dir or default_cache_dir())
+            return Engine(cache_dir=cache_dir or default_cache_dir(),
+                          arena_bytes=arena_bytes)
         except Error as e:
             if getattr(e, "code", None) == _binding.ERR_NOMEM and \
                     time.monotonic() < deadline:

@@ -117,6 +117,9 @@ def cmd_version(args):
     print("python:          %s" % sys.version.split()[0])
     print("onnx / numpy:    %s / %s" % (onnx_ver, np_ver))
     print("backend:         %s" % _backend_str())
+    print("backend choice:  %s  (managed = vc4d, unprivileged, ~0.1 ms/launch;"
+          "\n                 direct = root + /dev/mem, no launch overhead, no"
+          " validation)" % runtime.backend())
     print("kernel generator:%s" % (info["kgen"] or "MISSING"))
     print("kernel cache:    %s" % info["cache"])
     sc = _system_cache()
@@ -703,6 +706,9 @@ def build_parser():
                "See /usr/share/doc/vc4infer/README.md.")
     ap.add_argument("--version", action="store_true",
                     help="print version, engine, backend and cache paths")
+    ap.add_argument("--backend", choices=runtime.BACKENDS, default=None,
+                    help="managed (default, vc4d) or direct (root + /dev/mem, "
+                         "faster per launch, no validation)")
     sub = ap.add_subparsers(dest="cmd", metavar="<command>")
 
     p = sub.add_parser("run", help="run one inference and decode detections")
@@ -783,12 +789,27 @@ def build_parser():
     p.add_argument("--models", default=None, help="model directory")
     p.add_argument("--cache", default=None, help="kernel blob cache directory")
     p.set_defaults(func=cmd_selftest)
+
+    for _name, _sp in sub.choices.items():
+        if "--backend" not in _sp._option_string_actions:
+            _sp.add_argument("--backend", choices=runtime.BACKENDS,
+                             default=argparse.SUPPRESS,
+                             help="managed (default) or direct (root only)")
     return ap
 
 
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
+    if getattr(args, "backend", None):
+        try:
+            runtime.set_backend(args.backend)
+        except PermissionError as e:
+            sys.stderr.write("vc4infer: %s\n" % e)
+            return 7
+        except (ValueError, FileNotFoundError) as e:
+            sys.stderr.write("vc4infer: %s\n" % e)
+            return 2
     if getattr(args, "version", False):
         return cmd_version(args)
     if not getattr(args, "cmd", None):

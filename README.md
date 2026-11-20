@@ -12,7 +12,10 @@ curl -fsSL https://rughinnit.github.io/vc4-apt/install.sh | sudo sh
 ```
 
 One command: signed apt source, the whole stack, the `vc4d` helper, group
-membership, and a verification pass. `--fast` builds for speed on the board,
+membership, and a verification pass. At run time you choose the **managed**
+backend (unprivileged, ~0.1 ms/launch, the default) or **direct** (root,
+no launch overhead: 410 ms vs 488 ms on YOLOv8n) — see
+[`docs/BACKENDS.md`](docs/BACKENDS.md). `--fast` builds for speed on the board,
 `--torch` adds the PyTorch backend, `--pin-clocks` floors the core at its stock
 400 MHz, `--uninstall` removes it. Details: [`docs/INSTALL.md`](docs/INSTALL.md).
 

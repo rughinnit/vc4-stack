@@ -16,6 +16,7 @@ and every path below is relative to the repository root unless it starts with
 | [`../infer/README.md`](../infer/README.md) | libvc4infer: API, build, kernel JIT, daemon backend, op coverage, limits |
 | [`../training/README.md`](../training/README.md) | backward kernels and the MLP/conv trainer, how to run them |
 | [`../vc4d/README.md`](../vc4d/README.md) | the privileged helper daemon: protocol, build, install |
+| `BACKENDS.md` | the two backends: `managed` (vc4d, unprivileged, ~0.1 ms/launch) vs `direct` (root, no overhead) — measured 488 vs 410 ms on YOLOv8n, and when to use which |
 | `ECOSYSTEM.md` | every VC4 repository, what each owns, how the two execution paths fit, and which repo to open for what |
 | `MEDIUM-CLASSIFICATION.md` | lnstadrum (2021): a 225 K-param GLSL classifier on Pi Zero at 595 ms; the GLES 2.0 limits it documents, its 8-bit/channel-shuffle co-design, and the three ways it corroborates our launch-bound, CPU-supply-bound results |
 | `VC4CV.md` | Seneral/VC4CV (MIT): the QPU stencil programs, the 16-bit VDW stride confirmation, the ZeroCompat camera-buffer erratum, and why it cannot run on this stack |

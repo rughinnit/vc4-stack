@@ -22,6 +22,21 @@ never restarts a healthy daemon, and writes a log to `/var/log/vc4-install.log`.
 
 The same script lives at the root of this repository (`./install.sh`).
 
+## After installing: two backends
+
+The stack ships **`managed`** (through `vc4d`, unprivileged, validated, ~0.1 ms
+per launch) and **`direct`** (root + `/dev/mem`, no per-launch overhead, no
+validation). `managed` is the default and what the packages configure; `direct`
+is opt-in for benchmarking:
+
+```sh
+vc4infer util model.onnx                  # managed
+sudo -E vc4infer --backend direct util model.onnx
+```
+
+Measured on YOLOv8n 160: **488 ms (managed) vs 410 ms (direct)**, both 0/44,100
+over tolerance. Details and the trade-off: [`BACKENDS.md`](BACKENDS.md).
+
 ## The two paths in detail
 
 Two install paths, one repository:

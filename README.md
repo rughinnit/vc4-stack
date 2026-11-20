@@ -5,11 +5,29 @@ clocks** (core 400 MHz / V3D 300 MHz).  Everything that computes runs on the
 VC4 QPUs.  The ARM cores run the control plane only (allocation, I/O, byte
 movement); there is no CPU arithmetic fallback anywhere in this stack.
 
+## Start here
+
+New to the stack?  Follow the tutorial, in this order:
+
+1. [`docs/TUTORIAL.md`](docs/TUTORIAL.md) — stock Pi to a running YOLOv8n and a
+   trained `torch_vc4` model; every command was run on the board or is
+   explicitly marked as not re-run.
+2. [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — the failure modes we
+   actually hit, with symptom, cause and fix.
+3. [`docs/API.md`](docs/API.md) — `vc4infer` and `torch_vc4` reference, error
+   types, `host_policy`, op table.
+4. [`docs/README.md`](docs/README.md) — the full documentation index.
+
+The short version: `sudo apt install vc4infer`, make sure `vc4d` is running and
+your user is in the `vc4` group, then
+`vc4infer run model.onnx --input img.jpg --imgsz 160`.  The client never opens
+`/dev/mem`; the privileged helper is `vc4d`.
+
 ## Where each product lives
 
 | path | what it is | start here | status |
 |---|---|---|---|
-| `infer/` | **libvc4infer + vc4infer** — the engine (dma-buf arena, kernel JIT/cache, strict op registry, matmul/conv/elementwise), the ONNX executor, the Python API, the CLI, and the `.deb`/wheel builders | [`infer/README.md`](infer/README.md), [`docs/VC4INFER.md`](docs/VC4INFER.md) | active — vc4infer 1.1.2; YOLOv8n 160x160 runs end to end on the QPUs |
+| `infer/` | **libvc4infer + vc4infer** — the engine (dma-buf arena, kernel JIT/cache, strict op registry, matmul/conv/elementwise), the ONNX executor, the Python API, the CLI, and the `.deb`/wheel builders | [`infer/README.md`](infer/README.md), [`docs/VC4INFER.md`](docs/VC4INFER.md) | active — vc4infer **1.2.1**; YOLOv8n 160x160 runs end to end on the QPUs at **2.09 FPS** (stock clocks, quiet board) |
 | `kernels/` | hand-written QPU kernels: `wider-tile/asm6..asm10`, each with its NOTES/RESULTS and generator, plus the `attempt-asm10` history | [`kernels/wider-tile/`](kernels/wider-tile) | verified, frozen (results in `kernels/wider-tile/RESULTS*.md`) |
 | `training/` | backward kernels (`vc4_train.c`, `vc4_convbwd.c`) and the MLP/conv trainer with finite-difference checks | [`training/README.md`](training/README.md) | toy scale; gradients verified |
 | `tools/` | `build-fast.sh` (memory-aware `-j` + ccache), `qpu_disasm.py`, `xcheck/` (four independent encoders), `gput.sh` (locked GPU run + board check) | script headers | in use |
@@ -37,8 +55,11 @@ infer/packaging/build_wheel.sh               # -> dist/vc4infer-<ver>-py3-none-a
 ```
 
 **One GPU user at a time.**  Two concurrent workloads, or a wild kernel, can
-hang the V3D hard enough to need a power cycle.  The tests take
-`/tmp/vc4-gpu.lock` themselves and check `STATE: LIVE` after every stage.
+hang the V3D hard enough to need a power cycle.  In daemon mode `vc4d` takes
+`/tmp/vc4-gpu.lock` per launch; a client must **not** hold that lock itself
+(the daemon answers `E_BUSY` and the engine retries for ~60 s).  The direct-root
+test suite takes the lock itself and checks `STATE: LIVE` after every stage.
+See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) section 4.
 
 Builds on this board are memory-bound, not CPU-bound.  The engine is safe at
 `-j4` (171 MiB peak tree RSS, no swap); the VC4C compiler is not, because one
@@ -64,9 +85,16 @@ BUILD_FAST_TARGET=VC4CC tools/build-fast.sh /home/raspi/work/combined/build
 
 Structural peak: 12 QPUs x 16 lanes x 2 ALU ops x 1/4 instruction per clock x 300 MHz.
 
+The engine's public GEMM measures 8.5 GFLOP/s through `vc4d`; the hand-written
+`asm10` kernel's recorded stand-alone ceiling is 13.7 GFLOP/s.  See
+[`docs/ENGINE-RESULTS.md`](docs/ENGINE-RESULTS.md) and
+[`docs/TUTORIAL.md`](docs/TUTORIAL.md) section 7.3 for the provenance.
+
 ## Scope and honest limits
 
-- Inference: a fixed model family at low resolution; int8 is the performance path.
+- Inference: a fixed model family at low resolution, fp32 only.  int8 has no
+  exact packed byte MAC on this ISA (int8 MAC/s == fp32), so it is not a
+  performance shortcut.
 - Training: a toy trainer only. No fp16/bf16, no FMA, 76 MiB device memory, and the
   board browns out under sustained load. General training is out of scope.
 - Not CUDA/ROCm parity: no tensor cores, no fp16, no cuBLAS/cuDNN, no autograd library.

@@ -1,11 +1,17 @@
 # vc4-stack documentation index
 
-This directory is the single source of documentation.  Code lives in the product
-directories it describes; every path below is relative to the repository root
-unless it starts with `docs/`.
+**Start with [TUTORIAL.md](TUTORIAL.md).**  It takes a stock Pi 3B to a running
+YOLOv8n and a trained `torch_vc4` model, and every command in it was run on the
+board or is explicitly marked as not re-run.  This directory is the single
+source of documentation; code lives in the product directories it describes,
+and every path below is relative to the repository root unless it starts with
+`docs/`.
 
 | document | contents |
 |---|---|
+| [`TUTORIAL.md`](TUTORIAL.md) | **start here**: prerequisites, install (apt/pip/source), verify, YOLO three ways, PyTorch backend, ONNX export, measured performance |
+| [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | every failure mode we hit: symptom, cause, fix (JIT status=2, policy errors, GPU wedge, flock, coherency, arena/CMA, FPU, `/tmp`) |
+| [`API.md`](API.md) | reference for `vc4infer` (`Engine`/`Device`/`Detector`/`postprocess`/Ultralytics, errors, `host_policy`) and `torch_vc4` (op table, autograd, accuracy) |
 | [`../README.md`](../README.md) | project index: what lives where, status, measured ceilings, scope |
 | [`../infer/README.md`](../infer/README.md) | libvc4infer: API, build, kernel JIT, daemon backend, op coverage, limits |
 | [`../training/README.md`](../training/README.md) | backward kernels and the MLP/conv trainer, how to run them |
@@ -14,12 +20,13 @@ unless it starts with `docs/`.
 | `FINDINGS.md` | consolidated catalogue of everything measured, with what remains unproven |
 | `REFERENCES.md` | every external source used, with URL, purpose, status; claims -> source table; Emma Anholt's work |
 | `XCHECK.md` | independent decoder cross-validation (5,329 words, 0 unknown; 33/33 bit-exact rotates; corrections) |
-| `NUMERICS.md` | the QPU FPU truncates (round toward zero); 3-word dependent chains; register/field rules |
+| `NUMERICS.md` | the QPU FPU truncates (round toward zero), flushes denormals; 3-word dependent chains; register/field rules |
 | `BUILD.md` | build parallelism on 1 GB: engine -j4 safe, VC4C -j2/-j1, ccache, `tools/build-fast.sh` |
 | `CLOCK-VARIANCE.md` | core clock drooped 400->250 MHz under load *before* the fan; 89/89 samples at 400 MHz with it |
-| `ONNX.md` | ONNX graph path: supported nodes, runner usage, measured modelA/B/C numbers, stride-2/depthwise decompositions, YOLOv8n coverage gap |
+| `ONNX.md` | ONNX graph path: supported nodes, runner usage, measured modelA/B/C numbers, stride-2/depthwise decompositions, YOLOv8n coverage, the device byte invariant |
 | `VC4INFER.md` | the packaged product: install, `run`/`bench`/`nodes`/`selftest`, guarantees, measured performance, package layout |
-| `PYTHON-API.md` | `Engine`, `Device`, `Detector`, threading, error table, Ultralytics integration |
+| `PYTHON-API.md` | the earlier `Engine`, `Device`, `Detector`, threading, error and Ultralytics reference (kept for history; `API.md` is current) |
+| `FRAMEWORKS.md` | framework support survey: what runs today, what needs a relay, effort/evidence for each |
 | `TRAINING.md` | training design, backward kernels, capacity limits |
 | `TRAINING-RESULTS.md` | MLP 64-32-10 at 100% on SGD/Adam, gradchecks, throughput |
 | `CONV-RESULTS.md` | col2im, im2col-row, maxpool fwd/bwd, conv dX/dW, conv-net at 100% |
@@ -33,5 +40,7 @@ unless it starts with `docs/`.
 | `results/` | raw run records behind the numbers: `engine.md`, `daemon.md`, `build-fast.md`, `training.md` |
 | `logs/` | the suite and benchmark logs: `suite-REPS5.log`, `suite-daemon.log`, `suite-train.log`, `bench-final.log` |
 
-Raw results are kept verbatim, so work-tree paths inside `results/` and `logs/`
+`COMPLETENESS.md` (the $1 work's authoritative per-op table for
+`torch_vc4`) is linked from [API.md](API.md) when that document lands.  Raw
+results are kept verbatim, so work-tree paths inside `results/` and `logs/`
 refer to the machine the run was taken on, not to this layout.

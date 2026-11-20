@@ -1,0 +1,28 @@
+#!/bin/sh
+# vc4-toolkit-fast postrm: remove the runtime drop-in and its defaults file.
+# They are installed by postinst, not shipped, so dpkg does not know them.
+set -e
+
+if [ "$1" = purge ] || [ "$1" = remove ]; then
+	rm -f /etc/systemd/system/vc4d.service.d/10-fast.conf
+	rm -f /etc/vc4/vc4d-fast.default
+	rmdir /etc/systemd/system/vc4d.service.d 2>/dev/null || true
+	rmdir /etc/vc4 2>/dev/null || true
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload || true
+		systemctl try-restart vc4d.service || true
+	fi
+fi
+
+# Python wrote __pycache__ at import time (not owned by the package)
+if [ "$1" = purge ]; then
+	rm -rf /usr/lib/python3/dist-packages/vc4infer/__pycache__
+	find /usr/lib/python3/dist-packages/vc4infer -type d -name '__pycache__' \
+		-prune -exec rm -rf {} + 2>/dev/null || true
+	rm -rf /usr/lib/vc4infer/kgen/__pycache__
+fi
+
+# the per-user caches seeded from /usr/lib/vc4infer/kcache are the user's own
+# files; leave them alone (they are valid for the standard vc4infer too)
+
+exit 0

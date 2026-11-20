@@ -255,6 +255,11 @@ $(say "installed")
    python      $(vc4infer --version 2>/dev/null | head -1 || echo 'vc4infer not runnable')
    log         $LOG
 
+Run-time backend (same kernels, same results):
+   vc4infer --backend managed ...   unprivileged through vc4d, ~0.1 ms/launch (default)
+   sudo -E vc4infer --backend direct ...   root + /dev/mem, no launch overhead
+   Measured on YOLOv8n 160: 492 ms (managed) vs 412 ms (direct); see docs/BACKENDS.md
+
 Next steps:
    vc4infer run model.onnx --input image.jpg --imgsz 160
    vc4infer util model.onnx --reps 5

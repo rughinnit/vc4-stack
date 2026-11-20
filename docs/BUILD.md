@@ -141,3 +141,42 @@ build-fast: ccache hits=50/54(92.59%) misses=4/54(7.41%)
   heavy is running.  Never `-j4`.
 * Shared board: check `MemAvailable` and `pgrep cc1plus` before starting a big
   build; two LLVM-weight builds will swap no matter what `-j` says.
+
+## Scratch space: `/tmp` was RAM (`2026-11-20`)
+
+Raspberry Pi OS ships `tmpfs` for `/tmp` (452 MB of the board's 905 MB), so every
+worktree, kernel cache, venv or build log placed there was **RAM**, not SD card.
+On a 1 GB board that is not a detail: it is half the memory, and tmpfs pages
+cannot be reclaimed to disk, so the kernel has no choice but to evict page cache
+and swap.
+
+`tmp.mount` is now masked and `/tmp` is a directory on the root filesystem:
+
+```sh
+sudo systemctl mask tmp.mount     # symlink to /dev/null, survives reboot
+sudo reboot
+findmnt /tmp                      # prints nothing: /tmp is on / now
+df -hT /tmp                       # /dev/mmcblk0p2  ext4  58G
+```
+
+Use `$HOME/scratch/{tmp,refs,evidence,logs}` for anything large, and export
+`TMPDIR` (see `~/scratch/env.sh`); `mktemp -d` then follows it.  Lock files and
+sockets (`/tmp/vc4-gpu.lock`, `/run/vc4d.sock`) are fine either way.
+
+**Measured after the change** (YOLOv8n 160, stock clocks, `vc4infer util`):
+
+| | before | after |
+|---|---:|---:|
+| wall / FPS | 539-543 ms / 1.84 | **478.7 ms / 2.09** |
+| GPU (pack+kernel) | 321 ms | **259 ms** |
+| QPU duty | 59 % | 54 % |
+| MemAvailable at run time | ~189 MB free | **647 MB free** |
+
+That is a before/after observation, not a controlled A/B - the board cannot be
+returned to the old memory layout without re-enabling the tmpfs - but the
+mechanism is ordinary memory pressure, and the run-to-run variance across 3 reps
+was small (478.7 ms mean).
+
+Still tmpfs and deliberately so: `/run` (200 MB, sockets/state) and `/dev/shm`
+(500 MB, POSIX shared memory).  Do not put model data or build output there
+either.

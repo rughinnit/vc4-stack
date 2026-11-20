@@ -1,288 +1,63 @@
-# ONNX operator completeness: graph-validity pass (generated)
+# ONNX operator completeness (generated)
 
 This file is **generated** by `infer/tools/op_matrix.py`; do not edit
-it by hand.  This revision contains the operator enumeration and the
-graph-validity pass only.  **No row is scored as supported:** the
-vc4 sweep is deferred while the installed stack is being rebuilt.
+it by hand.  It is the result of running the shipped runner against
+synthesised single-operator graphs, not of reading a table.
 
 | | |
 |---|---|
-| Generated | 2026-11-20T02:08:43Z |
-| Engine | not imported (`ImportError: cannot import name '_runtime' from 'vc4infer' (unknown location)`) |
-| Validity | `onnx.checker.check_model` + `onnx.reference.ReferenceEvaluator` 1.17.0 |
+| Generated | 2026-11-20T04:35:31Z |
+| Engine | vc4infer 1.2.2 |
+| Runner | `mode=hybrid`, `host_policy=device` |
 | ONNX / opset | onnx 1.17.0, default domain opset **22** |
-| Tolerance (reserved for the sweep) | `abs(got-ref) <= 0.0001 + 0.0001*max(|ref|,1)` |
+| Oracle | onnx.reference.ReferenceEvaluator 1.17.0 |
+| Tolerance | `abs(got-ref) <= 0.0001 + 0.0001*max(|ref|,1)` |
 | Hardware | Raspberry Pi 3 Model B Rev 1.2, kernel 6.18.50+rpt-rpi-v8, stock clocks |
 | Scope | ONNX default domain (`ai.onnx`); other domains are not enumerated |
-| Provenance | graph-validity pass only; the vc4 sweep is deferred while the installed stack is rebuilt |
+| Provenance | vc4infer 1.2.2 (in-tree infer/python + infer/build/libvc4infer.so, HEAD 87fcd46; the installed dist-packages deb is stale at 35 ops); stock clocks (core 400 MHz / V3D 300 MHz); clean kernel cache; quiet board (no GPU client, vc4-smi idle 0%, no throttle/undervoltage/ERRSTAT); run_tests.sh REPS=1 SUITE_EXIT=0 ALL TESTS PASSED |
 
-> An `unmeasured` row is **not** a supported row.  It stays outside
-> the numerator until a sweep on a stable stack records `vc4`,
-> `refused`, `hang` or `mismatch` for it.
+## Headline
 
-## Denominators
+Two different denominators.  The first is the whole standard at
+opset 22; the second removes only the operators a static fp32 device
+cannot express *structurally* (shape/metadata, string, sequence or
+optional values, control flow, and integer/bool-only tensor ops, including int8/uint8 quantized operators, because the runner accepts fp32 graph inputs only).  The
+second number is never presented as the first.
 
-| denominator | ops | graphs built | checker-valid | oracle-verified | with an oracle gap | invalid | measured on vc4 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| all ops in opset 22 | 193 | 152 | 152 | 145 | 7 | 0 | **0 (unmeasured)** |
-| ops not structurally host-only | 152 | 152 | 152 | 145 | 7 | 0 | **0 (unmeasured)** |
+| denominator | ops | **complete (vc4)** | vc4-limited | refused | mismatch | hang | folded | unmeasured | invalid | excluded | **pct_complete** | pct_expressible |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| all ops in opset 22 | 193 | **40** | 4 | 104 | 1 | 0 | 3 | 0 | 0 | 41 | **20.73%** | 22.80% |
+| ops not structurally host-only | 152 | **40** | 4 | 104 | 1 | 0 | 3 | 0 | 0 | 0 | **26.32%** | 28.95% |
 
-| cases | built | checker-valid | oracle-verified | oracle gap | invalid | unmeasured |
-|---:|---:|---:|---:|---:|---:|---:|
-| 222 | 222 | 222 | 215 | 7 | 0 | 222 |
+`folded` = resolved by the engine at plan time with the host
+reference evaluator (constant table generators).  It is reported,
+but never counted as vc4.  `complete (vc4)` = every required form
+tested here, including the attribute variants listed below, ran
+within tolerance.  `pct_expressible`
+counts a working general case (`vc4` + `vc4-limited`); it is not the
+same number as `pct_complete` and is never presented as it.
 
-`checker-valid` is the graph-validity guarantee: the model passes
-`onnx.checker` (attributes, types, ranks, output shapes).  `oracle-verified`
-additionally means `onnx.reference` executed it and produced a
-reference tensor.  The 7-case gap is recorded below.
+Structural exclusions from the second denominator: **41** operators (control-flow 3, deprecated 2, io-decode 1, metadata 4, non-fp32 14, sequence/optional 12, string 5).  They are listed with their exact reason in `completeness.json` under `excluded`.
 
-Structural exclusions from the second denominator: **41** operators (control-flow 3, deprecated 2, io-decode 1, metadata 4, non-fp32 14, sequence/optional 12, string 5).
+Sensitivity: if the 14 integer/bool-only operators (including the quantized ones) were counted as expressible, the denominator would be **166** and the complete figure **40/166 = 24.10%**.  They are excluded because `Runner.__init__` accepts fp32 graph inputs only, so no valid instance of those operators can reach the arena.
 
-## Operators by domain
+## MISMATCHES (bugs, highest priority)
 
-### `ai.onnx`
+| op | variant | max abs | max rel | worst ref -> got | explanation |
+|---|---|---:|---:|---|---|
+| `Resize` | nearest_half_pixel | 1.97 | 142 | 0.979 -> -0.992 | the engine computes floor((s+0.5)*scale-0.5) for every nearest mode; ONNX's default nearest_mode=round_prefer_floor rounds that coordinate, so pixels at .75 differ (docs/ONNX.md does not state a nearest_mode constraint). The floor variant of the same case passes. |
+| `Resize` | sizes | 1.98 | 153 | 0.987 -> -0.991 | same half_pixel rounding bug: the sizes form also uses ONNX's default coordinate_transformation_mode=half_pixel. |
 
-| ops | unmeasured | invalid | host-only |
-|---:|---:|---:|---:|
-| 193 | 152 | 0 | 41 |
+## Internal engine errors (bug reports)
 
-#### Activation / elementwise
+These are not policy refusals: the node was dispatched, the
+engine's own call failed, and the runner wrapped the library
+error in `UnsupportedNode`.  No output was produced, so they are
+scored as `refused`, but they are engine bugs, not constraints.
 
-| op | since | graph | checker | oracle | vc4 | note |
-|---|---:|---|---|---|---|---|
-| `Abs` | 13 | built | ok | verified | unmeasured |  |
-| `Acos` | 22 | built | ok | verified | unmeasured |  |
-| `Acosh` | 22 | built | ok | verified | unmeasured |  |
-| `Add` | 14 | built | ok | verified | unmeasured |  |
-| `Asin` | 22 | built | ok | verified | unmeasured |  |
-| `Asinh` | 22 | built | ok | verified | unmeasured |  |
-| `Atan` | 22 | built | ok | verified | unmeasured |  |
-| `Atanh` | 22 | built | ok | verified | unmeasured |  |
-| `Ceil` | 13 | built | ok | verified | unmeasured |  |
-| `Celu` | 12 | built | ok | verified | unmeasured |  |
-| `Clip` | 13 | built | ok | verified | unmeasured |  |
-| `Cos` | 22 | built | ok | verified | unmeasured |  |
-| `Cosh` | 22 | built | ok | verified | unmeasured |  |
-| `Div` | 14 | built | ok | verified | unmeasured |  |
-| `Elu` | 22 | built | ok | verified | unmeasured |  |
-| `Erf` | 13 | built | ok | verified | unmeasured |  |
-| `Exp` | 13 | built | ok | verified | unmeasured |  |
-| `Floor` | 13 | built | ok | verified | unmeasured |  |
-| `Gelu` | 20 | built | ok | verified | unmeasured |  |
-| `HardSigmoid` | 22 | built | ok | verified | unmeasured |  |
-| `HardSwish` | 22 | built | ok | verified | unmeasured |  |
-| `Hardmax` | 13 | built | ok | verified | unmeasured |  |
-| `IsInf` | 20 | built | ok | verified | unmeasured |  |
-| `IsNaN` | 20 | built | ok | verified | unmeasured |  |
-| `LeakyRelu` | 16 | built | ok | verified | unmeasured |  |
-| `Log` | 13 | built | ok | verified | unmeasured |  |
-| `LogSoftmax` | 13 | built | ok | verified | unmeasured |  |
-| `Max` | 13 | built | ok | verified | unmeasured |  |
-| `Mean` | 13 | built | ok | verified | unmeasured |  |
-| `Min` | 13 | built | ok | verified | unmeasured |  |
-| `Mish` | 22 | built | ok | verified | unmeasured |  |
-| `Mod` | 13 | built | ok | verified | unmeasured |  |
-| `Mul` | 14 | built | ok | verified | unmeasured |  |
-| `Neg` | 13 | built | ok | verified | unmeasured |  |
-| `PRelu` | 16 | built | ok | verified | unmeasured |  |
-| `Pow` | 15 | built | ok | verified | unmeasured |  |
-| `Reciprocal` | 13 | built | ok | verified | unmeasured |  |
-| `Relu` | 14 | built | ok | verified | unmeasured |  |
-| `Round` | 22 | built | ok | verified | unmeasured |  |
-| `Selu` | 22 | built | ok | verified | unmeasured |  |
-| `Shrink` | 9 | built | ok | verified | unmeasured |  |
-| `Sigmoid` | 13 | built | ok | verified | unmeasured |  |
-| `Sign` | 13 | built | ok | verified | unmeasured |  |
-| `Sin` | 22 | built | ok | verified | unmeasured |  |
-| `Sinh` | 22 | built | ok | verified | unmeasured |  |
-| `Softmax` | 13 | built | ok | verified | unmeasured |  |
-| `Softplus` | 22 | built | ok | verified | unmeasured |  |
-| `Softsign` | 22 | built | ok | verified | unmeasured |  |
-| `Sqrt` | 13 | built | ok | verified | unmeasured |  |
-| `Sub` | 14 | built | ok | verified | unmeasured |  |
-| `Sum` | 13 | built | ok | verified | unmeasured |  |
-| `Tan` | 22 | built | ok | verified | unmeasured |  |
-| `Tanh` | 13 | built | ok | verified | unmeasured |  |
-| `ThresholdedRelu` | 22 | built | ok | verified | unmeasured |  |
-
-#### Signal / random / other
-
-| op | since | graph | checker | oracle | vc4 | note |
-|---|---:|---|---|---|---|---|
-| `AffineGrid` | 20 | built | ok | verified | unmeasured |  |
-| `Bernoulli` | 22 | built | ok | verified | unmeasured |  |
-| `BlackmanWindow` | 17 | built | ok | verified | unmeasured |  |
-| `DFT` | 20 | built | ok | gap | unmeasured | onnx.reference 1.17.0 cannot evaluate this checker-valid graph (TypeError) |
-| `HammingWindow` | 17 | built | ok | verified | unmeasured |  |
-| `HannWindow` | 17 | built | ok | verified | unmeasured |  |
-| `ImageDecoder` | 20 | - | - | - | excluded |  |
-| `MelWeightMatrix` | 17 | built | ok | gap | unmeasured | onnx.reference 1.17.0 cannot evaluate this checker-valid graph (TypeError) |
-| `Multinomial` | 22 | built | ok | gap | unmeasured | onnx.reference 1.17.0 cannot evaluate this checker-valid graph (RuntimeImplementationError) |
-| `NonMaxSuppression` | 11 | built | ok | verified | unmeasured |  |
-| `NonZero` | 13 | built | ok | verified | unmeasured |  |
-| `RandomNormal` | 22 | built | ok | verified | unmeasured |  |
-| `RandomNormalLike` | 22 | built | ok | verified | unmeasured |  |
-| `RandomUniform` | 22 | built | ok | verified | unmeasured |  |
-| `RandomUniformLike` | 22 | built | ok | verified | unmeasured |  |
-| `STFT` | 17 | built | ok | gap | unmeasured | onnx.reference 1.17.0 cannot evaluate this checker-valid graph (TypeError) |
-
-#### Logical / comparison
-
-| op | since | graph | checker | oracle | vc4 | note |
-|---|---:|---|---|---|---|---|
-| `And` | 7 | - | - | - | excluded |  |
-| `BitShift` | 11 | - | - | - | excluded |  |
-| `BitwiseAnd` | 18 | - | - | - | excluded |  |
-| `BitwiseNot` | 18 | - | - | - | excluded |  |
-| `BitwiseOr` | 18 | - | - | - | excluded |  |
-| `BitwiseXor` | 18 | - | - | - | excluded |  |
-| `Equal` | 19 | built | ok | verified | unmeasured |  |
-| `Greater` | 13 | built | ok | verified | unmeasured |  |
-| `GreaterOrEqual` | 16 | built | ok | verified | unmeasured |  |
-| `Less` | 13 | built | ok | verified | unmeasured |  |
-| `LessOrEqual` | 16 | built | ok | verified | unmeasured |  |
-| `Not` | 1 | - | - | - | excluded |  |
-| `Or` | 7 | - | - | - | excluded |  |
-| `Where` | 16 | built | ok | verified | unmeasured |  |
-| `Xor` | 7 | - | - | - | excluded |  |
-
-#### Matrix / reduction / loss
-
-| op | since | graph | checker | oracle | vc4 | note |
-|---|---:|---|---|---|---|---|
-| `ArgMax` | 13 | built | ok | verified | unmeasured |  |
-| `ArgMin` | 13 | built | ok | verified | unmeasured |  |
-| `CumSum` | 14 | built | ok | verified | unmeasured |  |
-| `Det` | 22 | built | ok | verified | unmeasured |  |
-| `Einsum` | 12 | built | ok | verified | unmeasured |  |
-| `Gemm` | 13 | built | ok | verified | unmeasured |  |
-| `MatMul` | 13 | built | ok | verified | unmeasured |  |
-| `NegativeLogLikelihoodLoss` | 22 | built | ok | verified | unmeasured |  |
-| `ReduceL1` | 18 | built | ok | verified | unmeasured |  |
-| `ReduceL2` | 18 | built | ok | verified | unmeasured |  |
-| `ReduceLogSum` | 18 | built | ok | verified | unmeasured |  |
-| `ReduceLogSumExp` | 18 | built | ok | verified | unmeasured |  |
-| `ReduceMax` | 20 | built | ok | verified | unmeasured |  |
-| `ReduceMean` | 18 | built | ok | verified | unmeasured |  |
-| `ReduceMin` | 20 | built | ok | verified | unmeasured |  |
-| `ReduceProd` | 18 | built | ok | verified | unmeasured |  |
-| `ReduceSum` | 13 | built | ok | verified | unmeasured |  |
-| `ReduceSumSquare` | 18 | built | ok | verified | unmeasured |  |
-| `SoftmaxCrossEntropyLoss` | 13 | built | ok | verified | unmeasured |  |
-| `TopK` | 11 | built | ok | verified | unmeasured |  |
-| `Unique` | 11 | built | ok | verified | unmeasured |  |
-
-#### NN / convolution / pooling
-
-| op | since | graph | checker | oracle | vc4 | note |
-|---|---:|---|---|---|---|---|
-| `AveragePool` | 22 | built | ok | verified | unmeasured |  |
-| `BatchNormalization` | 15 | built | ok | verified | unmeasured |  |
-| `Col2Im` | 18 | built | ok | gap | unmeasured | onnx.reference 1.17.0 cannot evaluate this checker-valid graph (IndexError) |
-| `Conv` | 22 | built | ok | verified | unmeasured |  |
-| `ConvInteger` | 10 | - | - | - | excluded |  |
-| `ConvTranspose` | 22 | built | ok | verified | unmeasured |  |
-| `DeformConv` | 22 | built | ok | verified | unmeasured |  |
-| `DepthToSpace` | 13 | built | ok | verified | unmeasured |  |
-| `Dropout` | 22 | built | ok | verified | unmeasured |  |
-| `GlobalAveragePool` | 22 | built | ok | verified | unmeasured |  |
-| `GlobalLpPool` | 22 | built | ok | gap | unmeasured | onnx.reference 1.17.0 cannot evaluate this checker-valid graph (RuntimeImplementationError) |
-| `GlobalMaxPool` | 22 | built | ok | verified | unmeasured |  |
-| `GridSample` | 22 | built | ok | verified | unmeasured |  |
-| `GroupNormalization` | 21 | built | ok | verified | unmeasured |  |
-| `InstanceNormalization` | 22 | built | ok | verified | unmeasured |  |
-| `LRN` | 13 | built | ok | verified | unmeasured |  |
-| `LayerNormalization` | 17 | built | ok | verified | unmeasured |  |
-| `LpNormalization` | 22 | built | ok | verified | unmeasured |  |
-| `LpPool` | 22 | built | ok | verified | unmeasured |  |
-| `MaxPool` | 22 | built | ok | verified | unmeasured |  |
-| `MaxRoiPool` | 22 | built | ok | gap | unmeasured | onnx.reference 1.17.0 cannot evaluate this checker-valid graph (RuntimeImplementationError) |
-| `MaxUnpool` | 22 | built | ok | verified | unmeasured |  |
-| `MeanVarianceNormalization` | 13 | built | ok | verified | unmeasured |  |
-| `RoiAlign` | 22 | built | ok | verified | unmeasured |  |
-| `SpaceToDepth` | 13 | built | ok | verified | unmeasured |  |
-
-#### Tensor / shape manipulation
-
-| op | since | graph | checker | oracle | vc4 | note |
-|---|---:|---|---|---|---|---|
-| `Cast` | 21 | built | ok | verified | unmeasured |  |
-| `CastLike` | 21 | built | ok | verified | unmeasured |  |
-| `CenterCropPad` | 18 | built | ok | verified | unmeasured |  |
-| `Compress` | 11 | built | ok | verified | unmeasured |  |
-| `Concat` | 13 | built | ok | verified | unmeasured |  |
-| `Constant` | 21 | - | - | - | excluded |  |
-| `ConstantOfShape` | 21 | - | - | - | excluded |  |
-| `Expand` | 13 | built | ok | verified | unmeasured |  |
-| `EyeLike` | 22 | built | ok | verified | unmeasured |  |
-| `Flatten` | 21 | built | ok | verified | unmeasured |  |
-| `Gather` | 13 | built | ok | verified | unmeasured |  |
-| `GatherElements` | 13 | built | ok | verified | unmeasured |  |
-| `GatherND` | 13 | built | ok | verified | unmeasured |  |
-| `Identity` | 21 | built | ok | verified | unmeasured |  |
-| `OneHot` | 11 | built | ok | verified | unmeasured |  |
-| `Pad` | 21 | built | ok | verified | unmeasured |  |
-| `Range` | 11 | built | ok | verified | unmeasured |  |
-| `Reshape` | 21 | built | ok | verified | unmeasured |  |
-| `Resize` | 19 | built | ok | verified | unmeasured |  |
-| `ReverseSequence` | 10 | built | ok | verified | unmeasured |  |
-| `Scatter` | 11 | - | - | - | excluded |  |
-| `ScatterElements` | 18 | built | ok | verified | unmeasured |  |
-| `ScatterND` | 18 | built | ok | verified | unmeasured |  |
-| `Shape` | 21 | - | - | - | excluded |  |
-| `Size` | 21 | - | - | - | excluded |  |
-| `Slice` | 13 | built | ok | verified | unmeasured |  |
-| `Split` | 18 | built | ok | verified | unmeasured |  |
-| `Squeeze` | 21 | built | ok | verified | unmeasured |  |
-| `Tile` | 13 | built | ok | verified | unmeasured |  |
-| `Transpose` | 21 | built | ok | verified | unmeasured |  |
-| `Trilu` | 14 | built | ok | verified | unmeasured |  |
-| `Unsqueeze` | 21 | built | ok | verified | unmeasured |  |
-| `Upsample` | 10 | - | - | - | excluded |  |
-
-#### Control flow / sequence / string
-
-| op | since | graph | checker | oracle | vc4 | note |
-|---|---:|---|---|---|---|---|
-| `ConcatFromSequence` | 11 | - | - | - | excluded |  |
-| `If` | 21 | - | - | - | excluded |  |
-| `Loop` | 21 | - | - | - | excluded |  |
-| `Optional` | 15 | - | - | - | excluded |  |
-| `OptionalGetElement` | 18 | - | - | - | excluded |  |
-| `OptionalHasElement` | 18 | - | - | - | excluded |  |
-| `RegexFullMatch` | 20 | - | - | - | excluded |  |
-| `Scan` | 21 | - | - | - | excluded |  |
-| `SequenceAt` | 11 | - | - | - | excluded |  |
-| `SequenceConstruct` | 11 | - | - | - | excluded |  |
-| `SequenceEmpty` | 11 | - | - | - | excluded |  |
-| `SequenceErase` | 11 | - | - | - | excluded |  |
-| `SequenceInsert` | 11 | - | - | - | excluded |  |
-| `SequenceLength` | 11 | - | - | - | excluded |  |
-| `SequenceMap` | 17 | - | - | - | excluded |  |
-| `SplitToSequence` | 11 | - | - | - | excluded |  |
-| `StringConcat` | 20 | - | - | - | excluded |  |
-| `StringNormalizer` | 10 | - | - | - | excluded |  |
-| `StringSplit` | 20 | - | - | - | excluded |  |
-| `TfIdfVectorizer` | 9 | - | - | - | excluded |  |
-
-#### Quantization
-
-| op | since | graph | checker | oracle | vc4 | note |
-|---|---:|---|---|---|---|---|
-| `DequantizeLinear` | 21 | - | - | - | excluded |  |
-| `DynamicQuantizeLinear` | 11 | built | ok | verified | unmeasured |  |
-| `MatMulInteger` | 10 | - | - | - | excluded |  |
-| `QLinearConv` | 10 | - | - | - | excluded |  |
-| `QLinearMatMul` | 21 | - | - | - | excluded |  |
-| `QuantizeLinear` | 21 | built | ok | verified | unmeasured |  |
-
-#### Recurrent
-
-| op | since | graph | checker | oracle | vc4 | note |
-|---|---:|---|---|---|---|---|
-| `GRU` | 22 | built | ok | verified | unmeasured |  |
-| `LSTM` | 22 | built | ok | verified | unmeasured |  |
-| `RNN` | 22 | built | ok | verified | unmeasured |  |
+| op | variant | engine error |
+|---|---|---|
+| `Conv` | group2_3x3 | `engine error: copy2d_x: invalid argument ()` |
 
 ## Excluded operators (with the reason)
 
@@ -333,12 +108,416 @@ because the engine fails it; the reason is structural.
 | `Upsample` | deprecated | removed from the opset (last schema v10); an opset-22 model may not contain it |
 | `Xor` | non-fp32 | bool tensors; the engine arena is fp32 activations only |
 
+## Operators by domain
+
+### `ai.onnx`
+
+| ops | vc4 | vc4-limited | refused | mismatch | untested | host-only |
+|---:|---:|---:|---:|---:|---:|---:|
+| 193 | 40 | 4 | 104 | 1 | 3 | 41 |
+
+#### Activation / elementwise
+
+| op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| `Abs` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.107 |  |
+| `Acos` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Acosh` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Add` | 14 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.13e-07 | 0.0791 |  |
+| `Asin` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Asinh` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Atan` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Atanh` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Ceil` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0787 |  |
+| `Celu` | 12 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Clip` | 13 | **vc4** | 3/3 | 0/0 | 0 | 0 | 0.084 |  |
+| `Cos` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 1.09e-07 | 0.0776 |  |
+| `Cosh` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Div` | 14 | refused | 0/1 | 0/0 | - | - | - | Div Div_generic: divisor is not a scalar constant |
+| `Elu` | 22 | **vc4** | 1/1 | 0/0 | 1.85e-06 | 6.49e-06 | 0.0784 |  |
+| `Erf` | 13 | **vc4** | 1/1 | 0/0 | 8.94e-07 | 1.55e-06 | 0.0778 |  |
+| `Exp` | 13 | **vc4** | 1/1 | 0/0 | 1.79e-06 | 1.38e-06 | 0.0779 |  |
+| `Floor` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0776 |  |
+| `Gelu` | 20 | **vc4** | 1/1 | 0/0 | 5.36e-07 | 2.82e-06 | 0.38 |  |
+| `HardSigmoid` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 1.02e-07 | 0.0822 |  |
+| `HardSwish` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 2.34e-07 | 0.0784 |  |
+| `Hardmax` | 13 | refused | 0/2 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `IsInf` | 20 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `IsNaN` | 20 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `LeakyRelu` | 16 | **vc4** | 1/1 | 0/0 | 4.66e-10 | 1.14e-07 | 0.0776 |  |
+| `Log` | 13 | **vc4** | 1/1 | 0/0 | 8.94e-08 | 3.01e-07 | 0.0786 |  |
+| `LogSoftmax` | 13 | refused | 0/2 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Max` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Mean` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Min` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Mish` | 22 | **vc4** | 1/1 | 0/0 | 3.58e-07 | 1.35e-06 | 0.227 |  |
+| `Mod` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Mul` | 14 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0807 |  |
+| `Neg` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0768 |  |
+| `PRelu` | 16 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Pow` | 15 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Reciprocal` | 13 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 9.93e-08 | 0.0782 |  |
+| `Relu` | 14 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.079 |  |
+| `Round` | 22 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0801 |  |
+| `Selu` | 22 | **vc4** | 1/1 | 0/0 | 2.03e-06 | 8.34e-06 | 0.0766 |  |
+| `Shrink` | 9 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Sigmoid` | 13 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 5.63e-07 | 0.0796 |  |
+| `Sign` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0796 |  |
+| `Sin` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 1.18e-07 | 0.0786 |  |
+| `Sinh` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Softmax` | 13 | vc4-limited | 1/2 | 0/0 | 4.47e-07 | 2.72e-06 | 0.239 | Softmax Softmax_axis1_c4_4d: axis 1 of 4 classes needs the last axis or the NHWC layout (16 classes) |
+| `Softplus` | 22 | **vc4** | 1/1 | 0/0 | 1.07e-06 | 3.20e-06 | 0.0892 |  |
+| `Softsign` | 22 | **vc4** | 1/1 | 0/0 | 2.98e-08 | 8.68e-08 | 0.0801 |  |
+| `Sqrt` | 13 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.28e-07 | 0.0786 |  |
+| `Sub` | 14 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.18e-07 | 0.171 |  |
+| `Sum` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Tan` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Tanh` | 13 | **vc4** | 1/1 | 0/0 | 7.75e-07 | 5.03e-06 | 0.0768 |  |
+| `ThresholdedRelu` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+
+#### Signal / random / other
+
+| op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| `AffineGrid` | 20 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Bernoulli` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `BlackmanWindow` | 17 | folded (host) | 0/1 | 0/0 | 0 | 0 | - |  |
+| `DFT` | 20 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `HammingWindow` | 17 | folded (host) | 0/1 | 0/0 | 0 | 0 | - |  |
+| `HannWindow` | 17 | folded (host) | 0/1 | 0/0 | 0 | 0 | - |  |
+| `ImageDecoder` | 20 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `MelWeightMatrix` | 17 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Multinomial` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `NonMaxSuppression` | 11 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `NonZero` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `RandomNormal` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `RandomNormalLike` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `RandomUniform` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `RandomUniformLike` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `STFT` | 17 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+
+#### Logical / comparison
+
+| op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| `And` | 7 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `BitShift` | 11 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `BitwiseAnd` | 18 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `BitwiseNot` | 18 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `BitwiseOr` | 18 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `BitwiseXor` | 18 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `Equal` | 19 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Greater` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `GreaterOrEqual` | 16 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Less` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `LessOrEqual` | 16 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Not` | 1 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `Or` | 7 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `Where` | 16 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Xor` | 7 | excluded | 0/0 | 0/0 | - | - | - |  |
+
+#### Matrix / reduction / loss
+
+| op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| `ArgMax` | 13 | refused | 0/2 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ArgMin` | 13 | refused | 0/2 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `CumSum` | 14 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Det` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Einsum` | 12 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Gemm` | 13 | **vc4** | 1/1 | 1/1 | 3.58e-07 | 3.26e-07 | 0.234 |  |
+| `MatMul` | 13 | **vc4** | 1/1 | 0/0 | 4.77e-07 | 1.14e-06 | 0.153 |  |
+| `NegativeLogLikelihoodLoss` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ReduceL1` | 18 | refused | 0/3 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ReduceL2` | 18 | refused | 0/3 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ReduceLogSum` | 18 | refused | 0/3 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ReduceLogSumExp` | 18 | refused | 0/3 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ReduceMax` | 20 | refused | 0/3 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ReduceMean` | 18 | refused | 0/3 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ReduceMin` | 20 | refused | 0/3 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ReduceProd` | 18 | refused | 0/3 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ReduceSum` | 13 | refused | 0/3 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ReduceSumSquare` | 18 | refused | 0/3 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `SoftmaxCrossEntropyLoss` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `TopK` | 11 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Unique` | 11 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+
+#### NN / convolution / pooling
+
+| op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| `AveragePool` | 22 | refused | 0/3 | 0/1 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `BatchNormalization` | 15 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Col2Im` | 18 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Conv` | 22 | vc4-limited | 8/9 | 1/1 | 1.34e-04 | 0.232 | 0.74 | engine error: copy2d_x: invalid argument () |
+| `ConvInteger` | 10 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `ConvTranspose` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `DeformConv` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `DepthToSpace` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Dropout` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `GlobalAveragePool` | 22 | **vc4** | 1/1 | 0/0 | 8.94e-08 | 1.49e-06 | 0.161 |  |
+| `GlobalLpPool` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `GlobalMaxPool` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `GridSample` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `GroupNormalization` | 21 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `InstanceNormalization` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `LRN` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `LayerNormalization` | 17 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `LpNormalization` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `LpPool` | 22 | refused | 0/3 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `MaxPool` | 22 | **vc4** | 3/3 | 0/1 | 0 | 0 | 0.0795 | numeric op with no VC4 kernel: ceil_mode |
+| `MaxRoiPool` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `MaxUnpool` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `MeanVarianceNormalization` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `RoiAlign` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `SpaceToDepth` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+
+#### Tensor / shape manipulation
+
+| op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| `Cast` | 21 | refused | 0/1 | 0/1 | - | - | - | metadata node could not be resolved at plan time (metadata/control type conversion (Cast to INT32)) |
+| `CastLike` | 21 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `CenterCropPad` | 18 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Compress` | 11 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Concat` | 13 | **vc4** | 1/1 | 0/2 | 0 | 0 | - | Concat Concat_rank2_axis1: axis 1 of rank 2 |
+| `Constant` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `ConstantOfShape` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `Expand` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `EyeLike` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Flatten` | 21 | **vc4** | 1/1 | 1/1 | 0 | 0 | - |  |
+| `Gather` | 13 | refused | 0/1 | 0/0 | - | - | - | Gather on activation data (only int64 shape tensors are implemented) |
+| `GatherElements` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `GatherND` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Identity` | 21 | **vc4** | 1/1 | 0/0 | 0 | 0 | - |  |
+| `OneHot` | 11 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Pad` | 21 | refused | 0/1 | 0/2 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Range` | 11 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Reshape` | 21 | **vc4** | 2/2 | 1/1 | 0 | 0 | - |  |
+| `Resize` | 19 | **MISMATCH** | 3/4 | 0/3 | 1.98 | 153 | 0.528 | see MISMATCHES above |
+| `ReverseSequence` | 10 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Scatter` | 11 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `ScatterElements` | 18 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `ScatterND` | 18 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Shape` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `Size` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `Slice` | 13 | vc4-limited | 2/3 | 0/1 | 0 | 0 | 0.0825 | Slice Slice_two_axes: two sliced axes |
+| `Split` | 18 | **vc4** | 2/2 | 0/0 | 0 | 0 | 0.156 |  |
+| `Squeeze` | 21 | **vc4** | 2/2 | 0/0 | 0 | 0 | - |  |
+| `Tile` | 13 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Transpose` | 21 | vc4-limited | 1/2 | 0/1 | 0 | 0 | 0.0722 | Transpose Transpose_perm_0132: perm [0, 1, 3, 2] needs a general permute kernel (the affine copy covers the head's [0,2,1,3]) |
+| `Trilu` | 14 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `Unsqueeze` | 21 | **vc4** | 1/1 | 0/0 | 0 | 0 | - |  |
+| `Upsample` | 10 | excluded | 0/0 | 0/0 | - | - | - |  |
+
+#### Control flow / sequence / string
+
+| op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| `ConcatFromSequence` | 11 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `If` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `Loop` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `Optional` | 15 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `OptionalGetElement` | 18 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `OptionalHasElement` | 18 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `RegexFullMatch` | 20 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `Scan` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `SequenceAt` | 11 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `SequenceConstruct` | 11 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `SequenceEmpty` | 11 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `SequenceErase` | 11 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `SequenceInsert` | 11 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `SequenceLength` | 11 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `SequenceMap` | 17 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `SplitToSequence` | 11 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `StringConcat` | 20 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `StringNormalizer` | 10 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `StringSplit` | 20 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `TfIdfVectorizer` | 9 | excluded | 0/0 | 0/0 | - | - | - |  |
+
+#### Quantization
+
+| op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| `DequantizeLinear` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `DynamicQuantizeLinear` | 11 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `MatMulInteger` | 10 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `QLinearConv` | 10 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `QLinearMatMul` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
+| `QuantizeLinear` | 21 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+
+#### Recurrent
+
+| op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| `GRU` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `LSTM` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+| `RNN` | 22 | refused | 0/1 | 0/0 | - | - | - | numeric op with no VC4 kernel: no implementation |
+
+## Refusals, verbatim
+
+Every row is the engine's own exception text for a graph that the
+ReferenceEvaluator accepted.  `plan` means the policy refused before
+any node executed; `run` means it refused during execution.
+
+| op | variant | phase | exception | invariant |
+|---|---|---|---|---|
+| `Acos` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Acosh` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `AffineGrid` | theta_1x2x3 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ArgMax` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ArgMax` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ArgMin` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ArgMin` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Asin` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Asinh` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Atan` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Atanh` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `AveragePool` | k2_s2_no_pad | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `AveragePool` | k3_s1_pad1 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `AveragePool` | k3_s2_pad1 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `AveragePool` | count_include_pad | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `BatchNormalization` | inference_c16 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Bernoulli` | p_uniform | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Cast` | f32_to_i32 | plan | `HostNotAllowed` | `metadata node could not be resolved at plan time (metadata/control type conversion (Cast to INT32))` |
+| `Cast` | f32_to_f32 | plan | `HostNotAllowed` | `metadata node could not be resolved at plan time (metadata/control type conversion (Cast to FLOAT))` |
+| `CastLike` | f32_to_f32 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Celu` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `CenterCropPad` | crop_last_axis | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Col2Im` | 4x4_blocks2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Compress` | axis0 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Concat` | rank2_axis1 | run | `UnsupportedNode` | `Concat Concat_rank2_axis1: axis 1 of rank 2` |
+| `Concat` | axis0 | run | `UnsupportedNode` | `Concat Concat_axis0: axis 0 of rank 2` |
+| `Conv` | group2_3x3 | run | `UnsupportedNode` | `engine error: copy2d_x: invalid argument ()` |
+| `ConvTranspose` | 3x3_s2_p1 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Cosh` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `CumSum` | axis1 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `DFT` | real_onesided | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `DeformConv` | 3x3_offset_group1 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `DepthToSpace` | blocksize2_dcr | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Det` | batched_3x3 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Div` | generic | run | `UnsupportedNode` | `Div Div_generic: divisor is not a scalar constant` |
+| `Dropout` | inference_identity | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `DynamicQuantizeLinear` | float_input | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Einsum` | ij_jk_ik | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Equal` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Expand` | broadcast | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `EyeLike` | 4x4 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `GRU` | t2_b2_h2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Gather` | axis1_indices_2x2 | plan | `HostNotAllowed` | `Gather on activation data (only int64 shape tensors are implemented)` |
+| `GatherElements` | axis1 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `GatherND` | batch_dims0 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `GlobalLpPool` | p2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `GlobalMaxPool` | 1x16x4x4 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Greater` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `GreaterOrEqual` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `GridSample` | bilinear | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `GroupNormalization` | groups2_c4 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Hardmax` | last_axis_2d | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Hardmax` | axis1_c16_4d | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Hardmax` | axis1_c4_4d | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `InstanceNormalization` | c4 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `IsInf` | default | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `IsNaN` | default | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `LRN` | size3 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `LSTM` | t2_b2_h2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `LayerNormalization` | last_axis | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Less` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `LessOrEqual` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `LogSoftmax` | last_axis_2d | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `LogSoftmax` | axis1_c16_4d | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `LogSoftmax` | axis1_c4_4d | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `LpNormalization` | axis_last_p2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `LpPool` | k2_s2_no_pad | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `LpPool` | k3_s1_pad1 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `LpPool` | k3_s2_pad1 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Max` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `MaxPool` | ceil_mode | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: ceil_mode` |
+| `MaxRoiPool` | 2_rois_2x2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `MaxUnpool` | 2x2_s2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Mean` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `MeanVarianceNormalization` | axes_0_2_3 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `MelWeightMatrix` | 4mel_dft8 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Min` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Mod` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Multinomial` | 2x4_sample3 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `NegativeLogLikelihoodLoss` | mean | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `NonMaxSuppression` | 4_boxes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `NonZero` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `OneHot` | depth4 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `PRelu` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Pad` | constant_pads | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Pad` | reflect | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Pad` | axes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Pow` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `QuantizeLinear` | scale01_zp0 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `RNN` | t2_b2_h2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `RandomNormal` | shape_2x3 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `RandomNormalLike` | like | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `RandomUniform` | shape_2x3 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `RandomUniformLike` | like | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Range` | float_0_1_0p2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceL1` | all_axes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceL1` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceL1` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceL2` | all_axes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceL2` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceL2` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceLogSum` | all_axes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceLogSum` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceLogSum` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceLogSumExp` | all_axes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceLogSumExp` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceLogSumExp` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceMax` | all_axes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceMax` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceMax` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceMean` | all_axes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceMean` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceMean` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceMin` | all_axes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceMin` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceMin` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceProd` | all_axes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceProd` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceProd` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceSum` | all_axes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceSum` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceSum` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceSumSquare` | all_axes | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceSumSquare` | axis1_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ReduceSumSquare` | axis_last_no_keepdims | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Resize` | cubic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: mode=cubic (nearest, linear)` |
+| `Resize` | align_corners | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: coordinate_transformation_mode=align_corners` |
+| `ReverseSequence` | batch0_time1 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `RoiAlign` | 2_rois | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `STFT` | frame8_step4 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ScatterElements` | axis1 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ScatterND` | rank2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Shrink` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Sinh` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Slice` | two_axes | run | `UnsupportedNode` | `Slice Slice_two_axes: two sliced axes` |
+| `Slice` | step2 | run | `UnsupportedNode` | `Slice Slice_step2: step 2` |
+| `Softmax` | axis1_c4_4d | run | `UnsupportedNode` | `Softmax Softmax_axis1_c4_4d: axis 1 of 4 classes needs the last axis or the NHWC layout (16 classes)` |
+| `SoftmaxCrossEntropyLoss` | mean | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `SpaceToDepth` | blocksize2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Sum` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Tan` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `ThresholdedRelu` | generic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Tile` | 2x2 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `TopK` | k3_axis_last | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Transpose` | perm_0132 | run | `UnsupportedNode` | `Transpose Transpose_perm_0132: perm [0, 1, 3, 2] needs a general permute kernel (the affine copy covers the head's [0,2,1,3])` |
+| `Transpose` | rank2 | run | `UnsupportedNode` | `Transpose Transpose_rank2: perm [1, 0] needs a general permute kernel (the affine copy covers the head's [0,2,1,3])` |
+| `Trilu` | upper_k0 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Unique` | axis0 | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+| `Where` | cond_init | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: no implementation` |
+
 ## Oracle gaps
 
-These graphs are checker-valid but `onnx.reference` cannot
-evaluate them in this onnx release, so a future sweep can score
-a refusal but cannot verify a computed result.  The exact error
-is in `completeness.json`.
+These graphs are **valid** (the ONNX checker accepts them) but
+`onnx.reference` cannot evaluate them, so only the engine's
+refusal could be scored.  The exact reference error is in
+`completeness.json` (`oracle_error`).
 
 | op | variant | reference evaluator error |
 |---|---|---|
@@ -350,52 +529,46 @@ is in `completeness.json`.
 | `Multinomial` | 2x4_sample3 | `RuntimeImplementationError: No registered implementation for operator 'Multinomial' and domain '', schema.has_function is False, schema.has_context_dependent_function is False. You` |
 | `STFT` | frame8_step4 | `TypeError: Issues with types [<class 'numpy.ndarray'>, <class 'numpy.ndarray'>, <class 'numpy.ndarray'>] and attributes ['onesided'] and linked attributes=[] (operator 'STFT').` |
 
-## Unmeasured operators that real models use
+## Top refusals by real-model usage
 
-Ranked over a local corpus of 13 distinct ONNX models (modelA.onnx, modelB.onnx, modelC.onnx, yolov8n_160.onnx, light_bvlc_alexnet.onnx, light_densenet121.onnx, light_inception_v1.onnx, light_inception_v2.onnx, light_resnet50.onnx, light_shufflenet.onnx, light_squeezenet.onnx, light_vgg19.onnx, light_zfnet512.onnx).  This is the order in which the deferred sweep matters, not a result.
+Ranked over a local corpus of 13 distinct real ONNX models (modelA.onnx, modelB.onnx, modelC.onnx, yolov8n_160.onnx, light_bvlc_alexnet.onnx, light_densenet121.onnx, light_inception_v1.onnx, light_inception_v2.onnx, light_resnet50.onnx, light_shufflenet.onnx, light_squeezenet.onnx, light_vgg19.onnx, light_zfnet512.onnx): the number of models that contain the operator, then node count.
 
-| # | op | models | nodes |
-|---:|---|---:|---:|
-| 1 | `Conv` | 13 | 471 |
-| 2 | `Relu` | 12 | 392 |
-| 3 | `MaxPool` | 12 | 40 |
-| 4 | `Softmax` | 10 | 10 |
-| 5 | `Gemm` | 9 | 15 |
-| 6 | `Reshape` | 8 | 48 |
-| 7 | `Concat` | 7 | 106 |
-| 8 | `AveragePool` | 5 | 17 |
-| 9 | `BatchNormalization` | 4 | 292 |
-| 10 | `Dropout` | 4 | 6 |
+The corpus contains **7 refused operators** in total; all of them are listed (there is no tenth).
+
+| # | op | status | models | nodes |
+|---:|---|---|---:|---:|
+| 1 | `AveragePool` | refused | 5 | 17 |
+| 2 | `BatchNormalization` | refused | 4 | 292 |
+| 3 | `Dropout` | refused | 4 | 6 |
+| 4 | `LRN` | refused | 3 | 6 |
+| 5 | `Sum` | refused | 2 | 29 |
+| 6 | `Div` | refused | 1 | 2 |
+| 7 | `Gather` | refused | 1 | 1 |
 
 ## Method
 
-* Operator list: `onnx.defs.get_all_schemas_with_history()`, filtered to the default domain and to schemas in force at opset 22.
-* One node per graph, seeded inputs.  Structural parameters (axes,
-  pads, shape, starts/ends) are initialisers; only fp32 activations
-  are graph inputs.
-* Every graph is checked with `onnx.checker.check_model` first.  If
-  the checker rejects it, the case is `invalid-model` and is never
-  scored.
-* The graph then runs through `onnx.reference.ReferenceEvaluator` to
-  produce the oracle tensor.  A reference-implementation gap is
-  recorded, not treated as an engine result.
-* The vc4 sweep is the same set of graphs through
-  `Runner(mode='hybrid', host_policy='device')`, compared with the
-  tolerance above.  It was **not run** for this revision.
+* Operator list: `onnx.defs.get_all_schemas_with_history()`, filtered
+  to the default domain and to schemas in force at opset 22.
+* Each graph is one node with seeded random inputs.  Conv weights and
+  all structural parameters (axes, pads, shape, starts/ends) are
+  initialisers; only fp32 activations are graph inputs.
+* The oracle runs first.  If it rejects the graph, the case is
+  `invalid-model` (a bug in this tool, never scored) and the run
+  stops there.
+* Then `Runner(...).check_policy()` runs.  A refusal at this point
+  allocates no GPU work.  Only accepted graphs execute.
+* Non-float outputs must match exactly; float outputs use the
+  tolerance above, with NaN==NaN and matching infinities allowed.
+* `gpu_ms` is the engine's own pack+kernel time for the node, not wall
+  time, and is reported per case in `completeness.json`.
 
-## Command for the deferred sweep
+## What is not measured
 
-Run only when the installed package is stable and no a concurrent job is
-using the GPU (one process, one arena, one operator at a time):
-
-```sh
-cd ~/work/vc4-stack
-TMPDIR=$HOME/scratch/tmp python3 infer/tools/op_matrix.py \
-    --note "vc4infer $(python3 -c 'import vc4infer;print(vc4infer.__version__)'), clean kernel cache"
-```
-
-A subset is `--only Conv,Resize,Softmax`; the no-GPU pass is
-`--skip-gpu`.  Every accepted graph runs sequentially; a case that
-does not return in `--case-timeout` seconds is recorded as `hang`,
-and a lost daemon stops the sweep instead of failing the report.
+* Other ONNX domains (`ai.onnx.ml`, `ai.onnx.preview.training`,
+  vendor domains).
+* Multi-node graphs: fusion, layout propagation and allocation are
+  out of scope; every case is a single operator.
+* Performance: `gpu_ms` is reported for information only.
+* Operators excluded as structurally host-only are listed with their
+  reason in `completeness.json` (`excluded`).
 

@@ -94,7 +94,7 @@ except Exception as _vc4err:                      # noqa: BLE001
 
 # Set when a run loses the device (timeout, dead daemon).  The remaining cases
 # are recorded as ``hang`` instead of failing the whole sweep.
-GPU_STATE = {"fatal": None}
+GPU_STATE = {"dead": None}
 CASE_TIMEOUT_S = 60.0
 
 TOL_ABS = 1e-4
@@ -357,17 +357,6 @@ def rec_elementwise(op, rng, o):
                       {"B": f32(0.7)}, edge=True,
                       note="documented: QPU Mul by a folded constant"))
     return out
-
-
-def rec_unary(op, rng, o):
-    lo, hi = {
-        "Acos": (-0.9, 0.9), "Asin": (-0.9, 0.9), "Atanh": (-0.9, 0.9),
-        "Acosh": (1.1, 2.0), "Log": (0.5, 1.5), "Sqrt": (0.5, 1.5),
-        "Reciprocal": (0.5, 1.5), "Pow": (0.5, 1.5),
-        "LogSoftmax": (-1.0, 1.0), "Softmax": (-1.0, 1.0),
-        "Softplus": (-2.0, 2.0),
-    }.get(op, (None, None))
-    return [sp(op, "default", ["X"], {"X": arr(rng, (2, 3, 4), lo, hi)})]
 
 
 def rec_clip(op, rng, o):
@@ -778,7 +767,7 @@ def rec_topk(op, rng, o):
 
 def rec_onehot(op, rng, o):
     return [sp(op, "depth4", ["indices", "depth", "values"],
-               {"indices": i64(0, 2, 3), "depth": i64(4),
+               {"indices": f32(0.0, 2.0, 3.0), "depth": f32(4.0),
                 "values": f32(0.0, 1.0)}, attrs={"axis": -1})]
 
 
@@ -896,17 +885,17 @@ def rec_stft(op, rng, o):
 def rec_mel(op, rng, o):
     return [sp(op, "4mel_dft8", ["num_mel_bins", "dft_length", "sample_rate",
                                  "lower_edge_hertz", "upper_edge_hertz"],
-               {"num_mel_bins": i64(4), "dft_length": i64(8),
-                "sample_rate": i64(8000),
-                "lower_edge_hertz": f32(20.0),
-                "upper_edge_hertz": f32(4000.0)},
+               {}, {"num_mel_bins": i64(4), "dft_length": i64(8),
+                    "sample_rate": i64(8000),
+                    "lower_edge_hertz": f32(20.0),
+                    "upper_edge_hertz": f32(4000.0)},
                out_types=[TensorProto.FLOAT], oracle_gap=True,
                note="onnx.reference 1.17 MelWeightMatrix passes 0-d ints to "
                     "np.zeros")]
 
 
 def rec_window(op, rng, o):
-    return [sp(op, "size8", ["size"], {"size": i64(8)},
+    return [sp(op, "size8", ["size"], {}, {"size": i64(8)},
                out_types=[TensorProto.FLOAT])]
 
 
@@ -1098,6 +1087,19 @@ class SynthesisError(Exception):
     pass
 
 
+# Input domains for the elementwise long tail.  These are the operator's
+# mathematical domain, not an engine constraint: log/sqrt/reciprocal get
+# positive data, acos/asin/atanh get (-1, 1), acosh gets > 1.
+DOMAIN = {
+    "Acos": (-0.9, 0.9), "Acosh": (1.1, 2.0), "Asin": (-0.9, 0.9),
+    "Atanh": (-0.9, 0.9), "Log": (0.5, 1.5), "Reciprocal": (0.5, 1.5),
+    "Sqrt": (0.5, 1.5), "Pow": (0.5, 1.5), "Div": (0.5, 1.5),
+    "Mod": (0.5, 1.5), "LogSoftmax": (-1.0, 1.0),
+    "Softmax": (-1.0, 1.0), "Softplus": (-2.0, 2.0),
+    "Hardmax": (-1.0, 1.0),
+}
+
+
 def generic_recipe(op, rng, schema, opset):
     """Schema-driven fallback for the elementwise long tail."""
     inputs = []
@@ -1129,7 +1131,8 @@ def generic_recipe(op, rng, schema, opset):
         name = p.name
         if elem in (TensorProto.FLOAT, TensorProto.DOUBLE,
                     TensorProto.FLOAT16):
-            feeds[name] = arr(rng, (2, 3, 4), -1, 1)
+            lo, hi = DOMAIN.get(op, (-1.0, 1.0))
+            feeds[name] = arr(rng, (2, 3, 4), lo, hi)
         else:
             inits[name] = np.zeros((1,), ONNX2NP[elem])
         inputs.append(name)
@@ -1334,20 +1337,35 @@ def run_case(spec, schema, default_opset, workdir, eng, do_engine=True,
                          do_engine)
 
 
-def _looks_like_device_loss(e):
-    """A dead daemon / lost device is not an operator result."""
+def _daemon_dead(e):
+    """The daemon itself is gone.  That is *not* an operator result: the case
+    and every case after it must be recorded as unmeasured."""
     msg = str(e).lower()
     return any(k in msg for k in (
-        "vc4d", "socket", "connection", "connect ", "i/o error",
-        "device lost", "no device", "daemon", "timed out", "timeout"))
+        "daemon is dead", "daemon not running", "daemon is not running",
+        "vc4d", "connect to", "connection refused", "broken pipe",
+        "socket", "no such device", "device lost"))
+
+
+def _wedge(e):
+    """The daemon is alive but the launch did not complete; name it hang."""
+    msg = str(e).lower()
+    return "timed out" in msg or "timeout" in msg
+
+
+def _mark_unmeasured(rec, e, stage):
+    GPU_STATE["dead"] = "%s: %s" % (stage, e)
+    rec.update(status="unmeasured", stage=stage, measured=False,
+               daemon_dead="%s: %s" % (type(e).__name__, e))
+    return rec
 
 
 def _engine_phase(spec, rec, feeds, ref_vals, oracle, eng, path, do_engine):
     """Run one already-validated graph on the VC4 runner and compare."""
-    if GPU_STATE["fatal"]:
-        rec.update(status="hang", stage="run", measured=False,
-                   hang={"reason": "skipped: the device was lost earlier",
-                         "after": GPU_STATE["fatal"]})
+    if GPU_STATE["dead"]:
+        rec.update(status="unmeasured", stage="run", measured=False,
+                   daemon_dead="skipped: vc4d died earlier (%s)" %
+                               GPU_STATE["dead"])
         return rec
     # ---- engine
     runner = None
@@ -1361,14 +1379,22 @@ def _engine_phase(spec, rec, feeds, ref_vals, oracle, eng, path, do_engine):
                               runner.coverage_report()["nodes"]]
         runner.check_policy()
     except (UnsupportedNode, HostNotAllowed, NeedsDeviceDispatch) as e:
+        if _daemon_dead(e):
+            return _mark_unmeasured(rec, e, "plan")
+        if _wedge(e):
+            rec.update(status="hang", stage="plan", measured=False,
+                       hang={"reason": "launch did not complete",
+                             "text": str(e)})
+            return rec
         rec.update(status="refused", stage="plan", refusal=refusal_info(e))
         rec["engine_ms"] = round((time.perf_counter() - t0) * 1e3, 3)
         return rec
     except Exception as e:
-        if _looks_like_device_loss(e):
-            GPU_STATE["fatal"] = "plan: %s" % e
+        if _daemon_dead(e):
+            return _mark_unmeasured(rec, e, "plan")
+        if _wedge(e):
             rec.update(status="hang", stage="plan", measured=False,
-                       hang={"reason": "device lost while opening the graph",
+                       hang={"reason": "launch did not complete",
                              "text": "%s: %s" % (type(e).__name__, e)})
         else:
             rec.update(status="error", stage="plan",
@@ -1384,6 +1410,13 @@ def _engine_phase(spec, rec, feeds, ref_vals, oracle, eng, path, do_engine):
         rec["engine_ms"] = round((time.perf_counter() - t0) * 1e3, 3)
     except (UnsupportedNode, HostNotAllowed, NeedsDeviceDispatch,
             HostNodeError) as e:
+        if _daemon_dead(e):
+            return _mark_unmeasured(rec, e, "run")
+        if _wedge(e):
+            rec.update(status="hang", stage="run", measured=False,
+                       hang={"reason": "launch did not complete",
+                             "text": str(e)})
+            return rec
         rec.update(status="refused", stage="run", refusal=refusal_info(e))
         rec["engine_ms"] = round((time.perf_counter() - t0) * 1e3, 3)
         return rec
@@ -1396,10 +1429,11 @@ def _engine_phase(spec, rec, feeds, ref_vals, oracle, eng, path, do_engine):
                          "text": str(e)})
         return rec
     except Exception as e:
-        if _looks_like_device_loss(e):
-            GPU_STATE["fatal"] = "run: %s" % e
+        if _daemon_dead(e):
+            return _mark_unmeasured(rec, e, "run")
+        if _wedge(e):
             rec.update(status="hang", stage="run", measured=False,
-                       hang={"reason": "device lost during the run",
+                       hang={"reason": "launch did not complete",
                              "text": "%s: %s" % (type(e).__name__, e)})
         else:
             rec.update(status="error", stage="run",
@@ -1416,10 +1450,13 @@ def _engine_phase(spec, rec, feeds, ref_vals, oracle, eng, path, do_engine):
     rec["launches"] = int(sum(p.get("launches", 0) for p in prof))
     rec["backends"] = [p.get("backend") for p in prof]
     rec["measured"] = True
+    # A metadata node the engine resolved at plan time produced a value with
+    # no QPU work.  That is not a vc4 run and must not be scored as one.
+    folded = bool(prof) and all(p.get("backend") == "folded" for p in prof)
     rec["got"] = [_summary(v) for v in out]
 
     if oracle != "ok":
-        rec["status"] = "vc4-unverified"
+        rec["status"] = "folded" if folded else "vc4-unverified"
         return rec
 
     all_ok = True
@@ -1430,7 +1467,12 @@ def _engine_phase(spec, rec, feeds, ref_vals, oracle, eng, path, do_engine):
         stats.append(s)
         all_ok = all_ok and ok
     rec["compare"] = stats
-    rec["status"] = "vc4" if all_ok else "mismatch"
+    if not all_ok:
+        rec["status"] = "mismatch"
+    elif folded:
+        rec["status"] = "folded"
+    else:
+        rec["status"] = "vc4"
     return rec
 
 
@@ -1525,12 +1567,14 @@ def op_status(cases):
     if any(c["status"] == "hang" for c in live):
         return "hang"
     measured = [c for c in live if c["status"] in
-                ("vc4", "vc4-unverified", "refused", "error")]
+                ("vc4", "vc4-unverified", "refused", "error", "folded")]
     unmeasured = [c for c in live if c["status"] == "unmeasured"]
     if unmeasured and not measured:
         return "unmeasured"
     if not measured:
         return "unmeasured"
+    if all(c["status"] == "folded" for c in measured):
+        return "folded"
     ran = [c for c in measured if c["status"] in ("vc4", "vc4-unverified")]
     if not ran:
         return "refused"
@@ -1851,23 +1895,34 @@ def write_markdown(path, payload):
         "fp32 graph inputs only).  The")
     add("second number is never presented as the first.")
     add("")
-    add("| denominator | ops | working general case | **complete** "
-        "(all required forms) | refused | mismatch | invalid | untested "
-        "| structurally excluded |")
-    add("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    add("| denominator | ops | **complete (vc4)** | vc4-limited | refused "
+        "| mismatch | hang | folded | unmeasured | invalid | excluded "
+        "| **pct_complete** | pct_expressible |")
+    add("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for row in (s["all"], s["expressible"]):
-        add("| %s | %d | %d (%.2f%%) | **%d (%.2f%%)** | %d | %d | %d | %d "
-            "| %d |" % (
-                row["label"], row["total"], row["expressible"],
-                row["pct_expressible"], row["complete"], row["pct_complete"],
-                row["refused"], row["mismatch"], row["invalid-model"],
-                row["untested"], row["excluded"]))
+        add("| %s | %d | **%d** | %d | %d | %d | %d | %d | %d | %d | %d "
+            "| **%s** | %s |" % (
+                row["label"], row["total"], row["complete"],
+                row["vc4-limited"], row["refused"], row["mismatch"],
+                row["hang"], row["folded"], row["unmeasured"],
+                row["invalid-model"], row["excluded"],
+                _pct(row["pct_complete"]),
+                _pct(row["pct_expressible"])))
     add("")
-    add("`working general case` = the operator's ordinary ONNX form ran on")
-    add("the QPUs within tolerance (`vc4` + `vc4-limited`).")
-    add("`complete` = every required form tested here, including the")
-    add("attribute variants listed below, ran within tolerance (`vc4`).")
+    add("`folded` = resolved by the engine at plan time with the host")
+    add("reference evaluator (constant table generators).  It is reported,")
+    add("but never counted as vc4.  `complete (vc4)` = every required form")
+    add("tested here, including the attribute variants listed below, ran")
+    add("within tolerance.  `pct_expressible`")
+    add("counts a working general case (`vc4` + `vc4-limited`); it is not the")
+    add("same number as `pct_complete` and is never presented as it.")
     add("")
+    if payload.get("daemon_dead"):
+        add("> **The sweep stopped early: vc4d died.**  `%s`  Every case")
+        add("> after that point is `unmeasured`, never `refused` or `hang`;")
+        add("> a dead daemon is not an engine result." %
+            _esc(str(payload["daemon_dead"])))
+        add("")
     add("Structural exclusions from the second denominator: **%d** operators "
         "(%s).  They are listed with their exact reason in "
         "`completeness.json` under `excluded`." % (
@@ -2061,6 +2116,10 @@ def write_markdown(path, payload):
     os.replace(tmp, path)
 
 
+def _pct(v):
+    return "not measured" if v is None else "%.2f%%" % v
+
+
 def _fmt(v):
     if v is None:
         return "-"
@@ -2078,7 +2137,8 @@ def _esc(s):
 def _badge(status):
     return {"vc4": "**vc4**", "vc4-limited": "vc4-limited",
             "refused": "refused", "mismatch": "**MISMATCH**",
-            "hang": "**HANG**", "invalid-model": "invalid-model",
+            "hang": "**HANG**", "folded": "folded (host)",
+            "invalid-model": "invalid-model",
             "untested": "unmeasured (no graph)",
             "unmeasured": "unmeasured",
             "vc4-unverified": "vc4-unverified"}.get(status, status)
@@ -2325,7 +2385,7 @@ def main(argv=None):
     def tally(group):
         t = {"total": len(group)}
         for st in ("vc4", "vc4-limited", "refused", "mismatch", "hang",
-                   "invalid-model", "untested", "unmeasured",
+                   "folded", "invalid-model", "untested", "unmeasured",
                    "vc4-unverified"):
             t[st] = sum(1 for r in group if r["status"] == st)
         t["complete"] = t["vc4"]
@@ -2490,6 +2550,7 @@ def main(argv=None):
         "measured": bool(gpu),
         "mode": "full" if gpu else "graph-validity",
         "vc4_import_error": VC4_IMPORT_ERROR,
+        "daemon_dead": GPU_STATE["dead"],
         "case_timeout_s": CASE_TIMEOUT_S,
         "tool": "infer/tools/op_matrix.py",
         "opset": args.opset,
@@ -2572,7 +2633,12 @@ def main(argv=None):
     if args.stage == "all":
         print("wrote %s" % md_path)
     print("models kept in %s" % workdir)
+    if GPU_STATE["dead"]:
+        print("SWEEP STOPPED: vc4d died (%s); the remaining cases are "
+              "recorded as unmeasured" % GPU_STATE["dead"], file=sys.stderr)
 
+    if GPU_STATE["dead"]:
+        return 4
     if expr_t["invalid-model"]:
         print("ERROR: %d operators have an invalid synthesised model; fix the "
               "tool before scoring" % expr_t["invalid-model"], file=sys.stderr)

@@ -292,9 +292,7 @@ vc4_status vc4_select3(vc4_ctx *ctx, vc4_selop op, const vc4_buf *a,
         return VC4_ERR_INVAL;
     {
         vc4_status g = vc4__refuse_unverified(ctx, "vc4_select3",
-            "it shares the pad_stream/TMU lane pattern of vc4_reduce: WHERE "
-            "returns VC4_OK with every element wrong (measured on 2026-11-20, "
-            "one launch per process)");
+            "the 256-float group store wrote only its first 64 B (kops._prologue left the DMA chunk step at the group size instead of 256 B) and WHERE tested the sign bit instead of nonzero.  Both are fixed and the body is exact in the ALU/TMU model, but on silicon (measured 2026-11-21, one launch per process) the output is still not this kernel's: a marker body that stores 42.0 returns a previous launch's bytes, so the group's load/store path is not yet closed.  See docs/KERNELS.md");
         if (g != VC4_OK)
             return g;
     }
@@ -370,8 +368,7 @@ vc4_status vc4_gather(vc4_ctx *ctx, const vc4_buf *tab, vc4_buf *out,
         return VC4_ERR_INVAL;
     {
         vc4_status g = vc4__refuse_unverified(ctx, "vc4_gather",
-            "the TMU1 setup word takes its address from an accumulator and "
-            "its load/pop order does not match build_ew; it wedges the QPU");
+            "the TMU address was taken from an accumulator, the 256-float store wrote only its first 64 B, and the fill select kept the gathered word's exponent bits.  All three are fixed and the body is exact in the ALU/TMU model, but on silicon (measured 2026-11-21, one launch per process) the kernel returns another launch's data, so its load/store path is not yet closed.  See docs/KERNELS.md");
         if (g != VC4_OK)
             return g;
     }
@@ -431,30 +428,10 @@ vc4_status vc4_gather(vc4_ctx *ctx, const vc4_buf *tab, vc4_buf *out,
 }
 
 /* -------------------------------------------------------------------- blit */
-struct blit_base {
-    uint32_t a, o;
-};
-
-static void blit_fill(uint32_t *u, uint32_t g, uint32_t nq, const uint32_t *b)
-{
-    const struct blit_base *x = (const struct blit_base *)b;
-    u[0] = x->a;
-    u[1] = x->o;
-    u[2] = 1;
-    u[3] = g;
-    u[4] = nq;
-}
-
 vc4_status vc4_blit(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t bytes)
 {
     if (!ctx || !a || !out || !bytes)
         return VC4_ERR_INVAL;
-    {
-        vc4_status g = vc4__refuse_unverified(ctx, "vc4_blit",
-            "it uses build_ew's 4-vector store path, which writes no output");
-        if (g != VC4_OK)
-            return g;
-    }
     if (bytes % 64) {
         vc4__set_err(ctx, "vc4_blit: %zu bytes is not a multiple of 64 B; the "
                      "gather table handles unaligned copies", bytes);
@@ -464,13 +441,16 @@ vc4_status vc4_blit(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t bytes)
         return VC4_ERR_TIMEOUT;
     if (a->bytes < bytes || out->bytes < bytes)
         return VC4_ERR_INVAL;
-    struct blit_base x;
-    x.a = vc4_bus_addr(ctx, a);
-    x.o = vc4_bus_addr(ctx, out);
-    char *argv[] = { (char *)"blit", NULL };
-    uint32_t ngroups = (uint32_t)(bytes / 64);
-    vc4_status st = launch_groups(ctx, "blit_v64", argv, ngroups, blit_fill,
-                                  (const uint32_t *)&x);
+    /* A contiguous copy is exactly one copy2d row per 64 B, vpr=1 vector,
+     * slane=4 (a lane reads one word) -- the layout kernel that carries the
+     * verified 4-row VPM->DMA store and the per-QPU row loop.  The separate
+     * "blit" kops kernel used a single-vector store whose VPM rows came from
+     * the group index instead of the physical QPU and aliased between
+     * launches; there is no reason to keep a second copy path.
+     * vc4_copy2d_n takes units=1 (one 16-word row per store), so `bytes`
+     * keeps its 64 B granularity. */
+    vc4_status st = vc4_copy2d_n(ctx, a, out, (uint32_t)(bytes / 64), 1,
+                                 64, 64, 64, 64, 4, 16, 1, 16);
     if (st == VC4_OK)
         ctx->st.flops += bytes / 4;
     return st;
@@ -640,7 +620,7 @@ vc4_status vc4_fill2d(vc4_ctx *ctx, vc4_buf *out, uint32_t rows, uint32_t vpr,
 
 /* ------------------------------------------------------------------ reduce */
 struct red_base {
-    uint32_t a, o, red, op, vstr, ingap, lanestride;
+    uint32_t a, o, red, inv, vstr, ingap, lanestride;
     uint32_t inbase, outbase, outgap;
 };
 
@@ -655,7 +635,7 @@ __attribute__((unused)) static void red_fill(uint32_t *u, uint32_t g, uint32_t n
     u[3] = g;
     u[4] = nq;
     u[5] = x->red;
-    u[6] = x->op;
+    u[6] = x->inv;                  /* 1/red: the mean's scale, not the op */
     u[7] = x->vstr;
     u[8] = g * x->vstr * 16;        /* group byte offset in the input  */
     u[9] = g * 1024;                /* group byte offset in the output */
@@ -674,9 +654,7 @@ vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
         return VC4_ERR_INVAL;
     {
         vc4_status g = vc4__refuse_unverified(ctx, "vc4_reduce",
-            "it walks a fixed 256-output group (reading past the caller's "
-            "buffer into unmapped memory) and seeds r4 instead of r0; every "
-            "shape, including outer=256 red=16, kills the QPU context");
+            "the accumulator seed/stride registers were encoded as the special writes 36/37/38/39 (tmu_noswap, rep_all, irq, NOP) because the E-helper pseudo indices were passed to a raw builder call, the total 256-output group walked past the caller's buffer, 1/red was read from the op-index word, and argmin seeded -inf.  All are fixed and the body is exact in the ALU/TMU model, but on silicon (measured 2026-11-21) the output is not this kernel's.  See docs/KERNELS.md");
         if (g != VC4_OK)
             return g;
     }
@@ -707,7 +685,14 @@ vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
     struct red_base x;
     x.a = vc4_bus_addr(ctx, a);
     x.red = red;
-    x.op = (uint32_t)op;
+    /* u6 is the mean's scale.  It used to carry the op index, which the
+     * kernel read as "1/red": a Mean multiplied by the *bit pattern* of the
+     * integer 1 (a denormal, flushed to zero), so every mean was 0.  The op
+     * is compile-time (the kernel name carries it). */
+    {
+        float inv = 1.0f / (float)red;
+        memcpy(&x.inv, &inv, 4);
+    }
     x.vstr = red * 64;                     /* 16 outputs x red floats x 4 B */
     x.lanestride = red * 4;
     x.ingap = 0;
@@ -768,7 +753,7 @@ vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
             u[3] = g;
             u[4] = nql;
             u[5] = x.red;
-            u[6] = x.op;
+            u[6] = x.inv;
             u[7] = x.vstr;
             u[8] = g * x.vstr * 16;        /* input base for this group   */
             u[9] = g * 1024;               /* output base                 */
@@ -814,8 +799,7 @@ vc4_status vc4_cumsum(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
         return VC4_ERR_INVAL;
     {
         vc4_status g = vc4__refuse_unverified(ctx, "vc4_cumsum",
-            "it uses the TMU setup that wedges vc4_gather; every shape kills "
-            "the QPU context (measured on 2026-11-20, one launch per process)");
+            "its masks and carry were written to the wrong B registers (raw builder destinations 200+n), the scan added float bit patterns with the integer ALU and the carry replicated with a plain write instead of the rep_all port.  All are fixed and the body is exact in the ALU/TMU model, but on silicon (measured 2026-11-21) the output is not this kernel's.  See docs/KERNELS.md");
         if (g != VC4_OK)
             return g;
     }

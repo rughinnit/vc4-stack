@@ -224,6 +224,13 @@ timeout -k 5 300 $RUN ./build/test_copyops
 board
 cool
 
+echo "=== test_gated (gather/blit/reduce/cumsum/select3, element-wise)"
+for t in gather blit reduce cumsum sel3; do
+    timeout -k 5 300 $RUN ./build/test_gated "$t"
+done
+board
+cool
+
 echo "=== test_coherency (cacheable arena mapping maintenance)"
 timeout -k 5 300 $RUN ./build/test_coherency
 board

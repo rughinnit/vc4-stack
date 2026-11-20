@@ -1402,7 +1402,13 @@ def _prologue(k, b, nvec, vpmq16, consts):
     gb = nvec * 64
     shift = {4: 2, 8: 3, 16: 4}[nvec] + 6
     b.e(k.ldi(64, B_C64, ws=1))
-    b.e(k.ldi(gb, B_CSTEP, ws=1))
+    # The 16-vector store is four chunks of four rows, and a chunk is 256 B
+    # (4 x 64 B) whether a group is 4, 8 or 16 vectors: emit_store16 advances
+    # the DMA address by B_CSTEP after each chunk.  Leaving this at `gb`
+    # (1024 B for nvec=16) scattered chunks 2..4 to out+1024/+2048/+3072, so
+    # only the first 64 B of every 256-float group landed in the caller's
+    # buffer -- the rest of the group was left as it was.
+    b.e(k.ldi(256, B_CSTEP, ws=1))
     b.e(k.ldi(M32, B_NEG1, ws=1))
     b.e(k.add_(k.ADD_SHL, B_STEP, k.areg(A_NQ), k.imm(shift), ws=1))
     b.e(k.add_(k.ADD_ADD, A_T2, k.areg(A_NQ), k.breg(B_NEG1)))
@@ -1418,10 +1424,27 @@ def _prologue(k, b, nvec, vpmq16, consts):
     b.e(k.nop(), k.nop())
 
 
+def _aw(reg):
+    """Destination word for a raw k.add_/k.add_or call.
+
+    The E helpers accept the 100+n pseudo-accumulator indices and map them
+    with `_d()`; a raw builder call encodes `add_out & 0x3F`, so 100..103
+    silently become the *special* writes 36 (tmu_noswap), 37 (rep_all), 38
+    (irq) and 39 (NOP).  That was B4: the stream bases lost the bus address
+    (dest 39), reduce's seed landed in tmu_noswap and cumsum's masks and
+    carry in the wrong B registers.  Every raw destination goes through here.
+    """
+    if 100 <= reg < 200:
+        return 32 + reg - 100
+    if 200 <= reg < 300:
+        return reg - 200
+    return reg
+
+
 def _stream_base(k, b, bus_reg, ptr_reg):
-    b.e(k.add_(k.ADD_OR, ACC3, k.areg(bus_reg), k.areg(bus_reg)))
+    b.e(k.add_(k.ADD_OR, _aw(ACC3), k.areg(bus_reg), k.areg(bus_reg)))
     b.e(k.nop(), k.nop())
-    b.e(k.add_(k.ADD_ADD, ACC3, k.acc(3), k.areg(A_T1)))
+    b.e(k.add_(k.ADD_ADD, _aw(ACC3), k.acc(3), k.areg(A_T1)))
     b.e(k.nop(), k.nop())
     b.e(k.add_(k.ADD_ADD, ptr_reg, k.acc(3), k.areg(A_T0)))
     b.e(k.nop(), k.nop())
@@ -1495,10 +1518,12 @@ UOP_ORDER = ['abs', 'neg', 'identity', 'clip', 'leakyrelu', 'floor', 'ceil',
 # The unary ops ride on kgen.build_ew's *verified* harness (TMU priming, the
 # 16-vector group, the VPM->DMA store, the counter branch).  Only the body is
 # new, so a body bug can make a wrong number but cannot change control flow.
-# Register budget inside build_ew: B0..B20 and B26 are free for constants
-# (B21..B25, B27..B29 are harness state), A16..A18, A20, A24, A27, A30, A31 are
-# dead once the group loop starts.
-UOP_B = list(range(0, 21)) + [26]
+# Register budget inside build_ew: B0..B7, B9..B21 and B26 are free for
+# constants (B21 is free because the group counter is an immediate subtract;
+# B8 is the b operand, B22..B25/B27..B29 are harness state), plus B30/B31 when
+# the op has fewer than two parameters -- ew_consts adds those.  A16..A18,
+# A20, A24, A27, A30, A31 are dead once the group loop starts.
+UOP_B = list(range(0, 22)) + [26]
 UOP_A = [16, 17, 18, 20, 24, 27, 30, 31]
 
 
@@ -1804,21 +1829,29 @@ def b2_gelu_bwd(e, IN, G, OUT):
 
 
 def b2_gelu_erf_bwd(e, IN, G, OUT):
-    """0.5(1+erf(x/sqrt2)) + x*exp(-x^2/2)/sqrt(2 pi)."""
+    """0.5(1+erf(x/sqrt2)) + x*exp(-x^2/2)/sqrt(2 pi).
+
+    -x^2/2 is formed as (x*x)*0.5 with the sign bit flipped (SIGNB is already
+    a constant of the erf body), which keeps the constant count at 26: this
+    body embeds both the erf and the exp core, and the code slot only allows
+    it at 4 vectors per group (kops.EWB_HEAVY)."""
     k = e.k
     u = e.ctx.tb()
-    t = e.ctx.tb()
+    # The erf-half plus the 0.5(1+erf) scale stays in OUT (the store register
+    # A j), which is not part of the temp pool: the fused body needs seven
+    # live A registers and the pools only leave seven.
     e.mul(u, IN, e.ctx.k('INV_SQRT2'))
-    _uni(UOPS['erf'][1])(e, u, None, t)
-    e.op(k.ADD_FADD, t, t, e.ctx.k('ONE'))
-    e.mul(t, t, e.ctx.k('HALF'))              # 0.5(1+erf)
+    _uni(UOPS['erf'][1])(e, u, None, OUT)
+    e.op(k.ADD_FADD, OUT, OUT, e.ctx.k('ONE'))
+    e.mul(OUT, OUT, e.ctx.k('HALF'))          # 0.5(1+erf)
     e.mul(u, IN, IN)
-    e.mul(u, u, e.ctx.k('NHALF'))             # -x^2/2
+    e.mul(u, u, e.ctx.k('HALF'))
+    e.op(k.ADD_XOR, u, u, e.ctx.k('SIGNB'))   # -x^2/2
     _uni(UOPS['exp'][1])(e, u, None, u)
     e.mul(u, u, IN)
     e.mul(u, u, e.ctx.k('INV_SQRT2PI'))
-    e.op(k.ADD_FADD, t, t, u)
-    e.mul(OUT, G, t)
+    e.op(k.ADD_FADD, OUT, OUT, u)
+    e.mul(OUT, G, OUT)
 
 
 def b2_erf_bwd(e, IN, G, OUT):
@@ -1849,6 +1882,12 @@ def b2_rcp(e, IN, G, OUT):
     e.ctx.rel(a)
 
 
+# erf + exp share the exp2 core; the only constant the exp body adds on top
+# of ERF_C is LOG2E (ERF_C has its negative).  ONE_I in E_CORE is used by
+# neither, and dropping it buys the last A-register temp the fused body needs.
+_GELU_ERF_BWD_C = ERF_C + tuple(c for c in E_CORE if c != 'ONE_I') + \
+    ('INV_SQRT2', 'INV_SQRT2PI')
+
 EWB = {
     'sub':            ((), b2_sub, ()),
     'max':            ((), b2_max, ()),
@@ -1867,6 +1906,10 @@ EWB = {
     'hardsigmoid_bwd': (('ZERO', 'ONE'), b2_hardsigmoid_bwd, ('ALPHA', 'BETA')),
     'hardswish_bwd':  (('ZERO', 'ONE'), b2_hardswish_bwd, ('ALPHA', 'BETA')),
     'erf_bwd':        (EXP_C2 + ('NONE', 'TWO_OVER_SQRTPI'), b2_erf_bwd, ()),
+    # the exact erf-form GELU derivative: 0.5(1+erf(x/sqrt2)) +
+    # x*exp(-x^2/2)/sqrt(2 pi).  It embeds the erf and exp bodies, so the
+    # 16-vector form is 4222 words (> 2048); at 4 vectors per group it fits.
+    'gelu_erf_bwd':   (_GELU_ERF_BWD_C, b2_gelu_erf_bwd, ()),
     # unary helpers on the same (verified) 16-vector store path; the body is
     # the one UOPS pinned, together with the constant list it was written for
     'exp':            (UOPS['exp'][0], _uni(UOPS['exp'][1]), ()),
@@ -1878,19 +1921,21 @@ EWB = {
 
 EWB_ORDER = list(EWB.keys())
 
-# Bodies that do not fit the 16 KiB code slot at 16 vectors per group.
-# The 4-vector store (_store4 via build_ew's nvec!=16 arm) does not write its
-# result on this board and the blit kernel built on it wedges the QPU, so no
-# op here may select it: every body below is generated with 16 vectors per
-# group and must fit the 16 KiB code slot.  b_gelu (the tanh-form GELU
-# derivative) does not, so that one is composed in C from the ops that do.
-EWB_HEAVY = set()
+# Bodies that do not fit the 16 KiB code slot at 16 vectors per group; they
+# are generated with 4 vectors per group (build_ew's nvec==4 arm: a serial
+# TMU load, the 4-row store, 64 floats per group).  The C side in vc4_ew.c
+# must agree: EWB_DESC's `heavy` flag is 1 for exactly these names.
+EWB_HEAVY = {'gelu_erf_bwd'}
 
 
 def ewb_consts(k, b, code):
     names, body, params = EWB[EWB_ORDER[code]]
-    pool = list(UOP_B2)
-    apool = list(UOP_A)
+    # B30/B31 are the parameter slots; with fewer than two parameters the
+    # spare ones are ordinary constants (a 0-parameter body like gelu_erf_bwd
+    # needs all 24 B registers plus the A file).
+    pool = [r for r in UOP_B2]
+    pool += [r for r in (30, 31) if r not in (30, 31)[:len(params)]]
+    apool = [r for r in UOP_A if not (len(params) > 2 and r == 24)]
     consts = {}
     for n in dict.fromkeys(names):
         if n not in STD:
@@ -1925,7 +1970,12 @@ def ewb_body(k, b, code, j):
     ctx.a0 = list(ctx.a_free)
     ctx.b0 = list(ctx.b_free)
     e = E(k, b, ctx)
-    body(e, 26, 8, j)          # a = A26 (E_AV), b/g = B8 (B_VB)
+    # a = A26 (E_AV), b/g = B8 (B_VB).  The emitter's register convention is
+    # 200+n for the B file, 0..31 for A: passing the bare 8 read A8, which
+    # nothing writes, so every body that used the gradient stream multiplied
+    # by zero (found by emulating gelu_erf_bwd; the training path's
+    # exp/log/sqrt/rcp re-exports ignore G, which hid it).
+    body(e, 26, 208, j)
 
 
 def build_ewb(k, op):
@@ -1958,11 +2008,11 @@ def build_sel3(k, op):
     _stream_base(k, b, A_OB, A_OB2)
     A_BP, A_CP = A_P0, A_P1
     for reg, bus in ((A_BP, A_BP), (A_CP, A_CP)):
-        b.e(k.add_(k.ADD_OR, ACC1, k.areg(bus), k.areg(bus)))
+        b.e(k.add_(k.ADD_OR, _aw(ACC1), k.areg(bus), k.areg(bus)))
         b.e(k.nop(), k.nop())
-        b.e(k.add_(k.ADD_ADD, ACC1, k.acc(1), k.areg(A_T1)))
+        b.e(k.add_(k.ADD_ADD, _aw(ACC1), k.acc(1), k.areg(A_T1)))
         b.e(k.nop(), k.nop())
-        b.e(k.add_(k.ADD_ADD, ACC1, k.acc(1), k.areg(A_T0)))
+        b.e(k.add_(k.ADD_ADD, _aw(ACC1), k.acc(1), k.areg(A_T0)))
         b.e(k.nop(), k.nop())
         b.e(k.add_(k.ADD_OR, reg, k.acc(1), k.acc(1)))
         b.e(k.nop(), k.nop())
@@ -1974,25 +2024,36 @@ def build_sel3(k, op):
         _load(k, b, A_CP, 2, tmu=0)
         ctx.reset()
         e = E(k, b, ctx)
+        # ACC2 is the emitter's bank-conflict staging register (and `opi`
+        # moves a B operand through it), so the c operand must leave ACC2
+        # before any helper runs: WHERE's eq0_mask() destroyed it and every
+        # false-branch element came back as whatever had been staged.
+        ca = ctx.ta()
+        e.mov(ca, ACC2)
         if op == 'where':
+            # ONNX Where(cond, x, y): x where cond is *nonzero*, y where it is
+            # zero (-0.0 counts as zero, NaN as nonzero).  The original test
+            # took the sign bit of cond and then gt_mask(), i.e. "cond < 0",
+            # so a 0/1 condition selected y for every element.
+            mb = ctx.tb()
             m = ctx.tb()
-            e.op(k.ADD_AND, m, ACC0, ctx.k('ABSM'))
-            gt_mask(e, m, m)
-            t = ctx.tb()
-            sel(e, ACC1, m, ACC1, ACC2, t)
-            ctx.rel(m, t)
+            u = ctx.tb()
+            e.op(k.ADD_AND, mb, ACC0, ctx.k('ABSM'))
+            eq0_mask(e, m, mb, u)          # m = -1 iff cond == +-0
+            e.op(k.ADD_NOT, m, m, m)       # m = -1 iff cond != 0
+            sel(e, j, m, ACC1, ca, u)
+            ctx.rel(mb, m, u)
         elif op == 'clip3':
-            e.op(k.ADD_FMAX, ACC1, ACC1, ACC0)
-            e.op(k.ADD_FMIN, ACC1, ACC1, ACC2)
+            e.op(k.ADD_FMAX, j, ACC1, ACC0)
+            e.op(k.ADD_FMIN, j, j, ca)
         else:
             m = ctx.tb()
             t = ctx.tb()
             u = ctx.tb()
             gt_mask(e, m, ACC0)
             e.mul(t, ACC0, ACC1)
-            sel(e, ACC1, m, ACC0, t, u)
+            sel(e, j, m, ACC0, t, u)
             ctx.rel(m, t, u)
-        b.e(k.add_or(j, k.acc(1), k.acc(1)))
         b.e(k.add_(k.ADD_ADD, A_IB, k.areg(A_IB), k.breg(B_C64)))
         b.e(k.add_(k.ADD_ADD, A_BP, k.areg(A_BP), k.breg(B_C64)))
         b.e(k.add_(k.ADD_ADD, A_CP, k.areg(A_CP), k.breg(B_C64)))
@@ -2027,9 +2088,18 @@ def build_gather(k):
         tg = ctx.ta()
         e.mov(tg, ACC0)
         e.opi(k.ADD_ASR, m, tg, 31)             # -1 iff negative
+        # The add ALU does not forward its own accumulator result to the next
+        # word either (only mul -> add is exact at 0 nops), so every
+        # accumulator-to-accumulator step below keeps three words.  Without the
+        # gaps the address staged for the TMU was the table entry *before*
+        # the base was added, and the gather re-read the table.
+        b.e(k.nop(), k.nop())
         e.op(k.ADD_NOT, ACC0, m, m)
+        b.e(k.nop(), k.nop())
         e.op(k.ADD_AND, ACC0, tg, ACC0)         # 0 for negative entries
+        b.e(k.nop(), k.nop())
         e.op(k.ADD_ADD, ACC0, ACC0, A_P0)       # absolute bus address
+        b.e(k.nop(), k.nop())
         # The TMU setup word takes its address from an *A-file* register, not
         # from an accumulator (`areg(100)` encodes a different register, and a
         # TMU read of that value wedges the QPU).  Stage the per-lane address
@@ -2041,10 +2111,15 @@ def build_gather(k):
         b.e(k.add_or(30, k.acc(0), k.acc(0)))
         b.e(k.nop(), k.nop())
         _load(k, b, 30, 0, tmu=1)               # per-lane gather
-        e.op(k.ADD_AND, m, m, A_P1)             # fill where negative
+        # fill where the table entry was negative.  `tg` is dead once the
+        # address is staged, so it holds the fill bits; the *mask* must stay in
+        # m until the gathered value has been masked with ~m (overwriting m
+        # with the fill was B5's value defect: every negative entry kept the
+        # top exponent bits of whatever lane 0 read).
+        e.op(k.ADD_AND, tg, m, A_P1)            # tg = fill where negative
         e.op(k.ADD_NOT, ACC1, m, m)
-        e.op(k.ADD_AND, ACC1, ACC1, ACC0)
-        e.op(k.ADD_OR, ACC1, ACC1, m)
+        e.op(k.ADD_AND, ACC1, ACC1, ACC0)       # else the gathered word
+        e.op(k.ADD_OR, ACC1, ACC1, tg)
         ctx.rel(m, tg)
         b.e(k.add_or(j, k.acc(1), k.acc(1)))
         b.e(k.add_(k.ADD_ADD, A_IB, k.areg(A_IB), k.breg(B_C64)))
@@ -2092,6 +2167,14 @@ def build_reduce(k, op):
     b_vstr = _free_bs(consts, 7)[6]
     ctx = Ctx(consts)
     ctx.no_a()
+    # The kernel's own scalars (red, 1/red, the strides) live for the whole
+    # launch, but Ctx's temp pool starts in the same registers: the argmax/
+    # argmin body allocated its temps from B3.. and overwrote the reduction
+    # count, so the inner loop ran 2 more times on the next vector and never
+    # terminated.  Reserve them.
+    _scalars = {b_red, b_inv, b_ogap, b_ostep, b_ls, b_ingap, b_vstr}
+    ctx.b_free = [r for r in ctx.b_free if r not in _scalars]
+    ctx.b0 = list(ctx.b_free)
     nvec = 16
     b, p = _head(k, nvec, True, consts)
     b.read_uni(A_AB)
@@ -2113,22 +2196,23 @@ def build_reduce(k, op):
     b.e(k.add_(k.ADD_SHL, A_VPMQ, k.areg(A_QID), k.imm(2)))
     b.e(k.add_(k.ADD_SHL, B_VPMQ7, k.areg(A_QID), k.imm(7), ws=1))
     # lane * lane_stride  and  lane * 4
-    b.e(k.add_(k.ADD_OR, ACC0, k.areg(k.R_ELEM_NUM), k.areg(k.R_ELEM_NUM)))
+    b.e(k.add_(k.ADD_OR, _aw(ACC0), k.areg(k.R_ELEM_NUM),
+               k.areg(k.R_ELEM_NUM)))
     b.e(k.nop(), k.nop())
     b.e(dict(mul_op=k.MUL_MUL24, mul_out=32 + 1, mul_a=k.acc(0),
              mul_b=k.breg(b_ls), ws=0, sig=k.SIG_NONE))
     b.e(k.nop(), k.nop())
-    b.e(k.add_(k.ADD_OR, ACC3, k.areg(A_AB), k.areg(A_AB)))
+    b.e(k.add_(k.ADD_OR, _aw(ACC3), k.areg(A_AB), k.areg(A_AB)))
     b.e(k.nop(), k.nop())
-    b.e(k.add_(k.ADD_ADD, ACC3, k.acc(3), k.areg(A_INBASE)))
+    b.e(k.add_(k.ADD_ADD, _aw(ACC3), k.acc(3), k.areg(A_INBASE)))
     b.e(k.nop(), k.nop())
     b.e(k.add_(k.ADD_ADD, A_IB, k.acc(3), k.acc(1)))
     b.e(k.nop(), k.nop())
-    b.e(k.add_(k.ADD_SHL, ACC2, k.acc(0), k.imm(2)))
+    b.e(k.add_(k.ADD_SHL, _aw(ACC2), k.acc(0), k.imm(2)))
     b.e(k.nop(), k.nop())
-    b.e(k.add_(k.ADD_OR, ACC3, k.areg(A_OB), k.areg(A_OB)))
+    b.e(k.add_(k.ADD_OR, _aw(ACC3), k.areg(A_OB), k.areg(A_OB)))
     b.e(k.nop(), k.nop())
-    b.e(k.add_(k.ADD_ADD, ACC3, k.acc(3), k.areg(A_OUTBASE)))
+    b.e(k.add_(k.ADD_ADD, _aw(ACC3), k.acc(3), k.areg(A_OUTBASE)))
     b.e(k.nop(), k.nop())
     b.e(k.add_(k.ADD_ADD, A_OB2, k.acc(3), k.acc(2)))
     b.e(k.nop(), k.nop())
@@ -2140,11 +2224,16 @@ def build_reduce(k, op):
         b.e(k.ldi(0, A_RIDX, ws=0))
         b.e(k.ldi(0, A_BESTI, ws=0))
         if op in ('sum', 'mean'):
-            b.e(k.add_or(ACC0, k.breg(consts['ZERO'][1]), k.breg(consts['ZERO'][1])))
-        elif op == 'min':
-            b.e(k.add_or(ACC0, k.breg(consts['POSINF'][1]), k.breg(consts['POSINF'][1])))
+            b.e(k.add_or(_aw(ACC0), k.breg(consts['ZERO'][1]),
+                         k.breg(consts['ZERO'][1])))
+        elif op in ('min', 'argmin'):
+            # argmin seeded -inf too, so `best - new` was -inf and the
+            # comparison never fired: every window reported index 0.
+            b.e(k.add_or(_aw(ACC0), k.breg(consts['POSINF'][1]),
+                         k.breg(consts['POSINF'][1])))
         else:
-            b.e(k.add_or(ACC0, k.breg(consts['NEGINF'][1]), k.breg(consts['NEGINF'][1])))
+            b.e(k.add_or(_aw(ACC0), k.breg(consts['NEGINF'][1]),
+                         k.breg(consts['NEGINF'][1])))
         b.e(k.nop(), k.nop())
         p.label('r%d' % j)
         _load(k, b, A_RA, 1)
@@ -2158,15 +2247,19 @@ def build_reduce(k, op):
             e.op(k.ADD_FMIN, ACC0, ACC0, ACC1)
         else:
             t = ctx.tb()
-            u = ctx.tb()
             if op == 'argmax':
                 e.op(k.ADD_FSUB, t, ACC1, ACC0)
             else:
                 e.op(k.ADD_FSUB, t, ACC0, ACC1)
             gt_mask(e, t, t)
-            sel(e, ACC0, t, ACC1, ACC0, u)
-            sel(e, A_BESTI, t, A_RIDX, A_BESTI, u)
-            ctx.rel(t, u)
+            # keep_sel, not sel: `sel` writes the destination before reading
+            # the false operand, and the destination *is* the false operand
+            # here (ACC0 / A_BESTI).  The builder's padding turns that read
+            # into ~mask, so min/argmin kept the first element of every window
+            # whenever the comparison fired on a later one.
+            keep_sel(e, ACC0, t, ACC1)
+            keep_sel(e, A_BESTI, t, A_RIDX)
+            ctx.rel(t)
         b.e(k.add_(k.ADD_ADD, A_RA, k.areg(A_RA), k.imm(4)))
         b.e(k.add_(k.ADD_ADD, A_RIDX, k.areg(A_RIDX), k.imm(1)))
         b.e(k.add_(k.ADD_SUB, A_NR, k.areg(A_NR), k.imm(1), sf=1))
@@ -2212,34 +2305,37 @@ def build_cumsum(k):
     _stream_base(k, b, A_OB, A_OB2)
     # mask_s = all ones iff lane >= s
     for s, reg in ((1, b_m1), (2, b_m2), (4, b_m4), (8, b_m8)):
-        b.e(k.add_(k.ADD_SUB, ACC0, k.areg(k.R_ELEM_NUM), k.imm(s)))
+        b.e(k.add_(k.ADD_SUB, _aw(ACC0), k.areg(k.R_ELEM_NUM), k.imm(s)))
         b.e(k.nop(), k.nop())
-        b.e(k.add_(k.ADD_ASR, ACC0, k.acc(0), k.imm(31)))
+        b.e(k.add_(k.ADD_ASR, _aw(ACC0), k.acc(0), k.imm(31)))
         b.e(k.nop(), k.nop())
-        b.e(k.add_(k.ADD_NOT, 200 + reg, k.acc(0), k.acc(0), ws=1))
+        b.e(k.add_(k.ADD_NOT, reg, k.acc(0), k.acc(0), ws=1))
         b.e(k.nop(), k.nop())
     p.label('grp')
     b.e(k.add_or(A_CADR, k.areg(A_OB2), k.areg(A_OB2)))
-    b.e(k.add_(k.ADD_OR, 200 + b_carry, k.breg(consts['ZERO'][1]),
+    b.e(k.add_(k.ADD_OR, b_carry, k.breg(consts['ZERO'][1]),
                k.breg(consts['ZERO'][1]), ws=1))
     b.e(k.nop(), k.nop())
     for j in range(nvec):
         _load(k, b, A_IB, 0)
-        b.e(k.add_(k.ADD_OR, ACC1, k.acc(0), k.acc(0)))
+        b.e(k.add_(k.ADD_OR, _aw(ACC1), k.acc(0), k.acc(0)))
         b.e(k.nop(), k.nop())
         for s, reg in ((1, b_m1), (2, b_m2), (4, b_m4), (8, b_m8)):
             b.e(k.mul_rot(2, 1, s))
             b.e(k.nop(), k.nop())
-            b.e(k.add_(k.ADD_AND, 200 + b_t, k.acc(2), k.breg(reg), ws=1))
+            b.e(k.add_(k.ADD_AND, b_t, k.acc(2), k.breg(reg), ws=1))
             b.e(k.nop(), k.nop())
-            b.e(k.add_(k.ADD_ADD, ACC1, k.acc(1), k.breg(b_t)))
+            b.e(k.add_(k.ADD_FADD, _aw(ACC1), k.acc(1), k.breg(b_t)))
             b.e(k.nop(), k.nop())
-        b.e(k.add_(k.ADD_FADD, ACC1, k.acc(1), k.breg(b_carry)))
+        b.e(k.add_(k.ADD_FADD, _aw(ACC1), k.acc(1), k.breg(b_carry)))
         b.e(k.nop(), k.nop())
         b.e(k.mul_rot(2, 1, 1))                 # lane0 <- lane15
         b.e(k.nop(), k.nop())
-        b.e(k.add_or(37, k.acc(2), k.acc(2)))   # replicate lane 0
-        b.e(k.add_(k.ADD_OR, 200 + b_carry, k.acc(5), k.acc(5), ws=1))
+        # the rep_all write port (dest 37, ws=1): r5 receives lane 0 in every
+        # lane.  A plain write leaves r5 per-lane, so the next vector's scan
+        # added a[0], a[1], ... instead of the total.
+        b.e(k.rep_all(2))
+        b.e(k.add_(k.ADD_OR, b_carry, k.acc(5), k.acc(5), ws=1))
         b.e(k.nop(), k.nop())
         b.e(k.add_or(j, k.acc(1), k.acc(1)))
         b.e(k.add_(k.ADD_ADD, A_IB, k.areg(A_IB), k.breg(B_C64)))
@@ -2280,7 +2376,12 @@ def build_cumsum(k):
 # refused by vc4d's uniform policy because it looks like a GPU bus address.
 A_SRC, A_DST, A_ROWS = 16, 17, 18
 A_SB, A_DB, A_S, A_D, A_VCNT, A_BCNT = 19, 20, 21, 22, 23, 24
-A_TA, A_CADR = 26, 27
+# NOTE: these are build_copy2d's own registers.  They must not reuse the
+# module-level names above (A_CADR): a later `A_TA, A_CADR = ...` at module
+# scope redefines the global, and every kernel that took A_CADR from it
+# (gather/sel3/cumsum/reduce) then stored through A27, which their per-vector
+# temp pool also uses -- the store address was the sign mask.
+A_TA2, A_CD2 = 26, 27
 A_MASK, A_NMASK, A_FILLN, A_STRCO = 28, 29, 30, 31
 B_SVEC, B_DVEC, B_SLANE, B_SSTEP, B_DSTEP = 0, 1, 2, 3, 4
 B_C4D, B_STRIDE, B_VPMQ, B_VPMQ7, B_FILL, B_C64, B_VPR = 5, 6, 7, 8, 9, 10, 11
@@ -2344,8 +2445,8 @@ def build_copy2d(k, fill=0, units=4, depth=16):
     b.e(k.add_or(34, k.breg(B_DVEC), k.breg(B_DVEC)))
     b.e(k.add_(k.ADD_SHL, B_C4D, k.acc(2), k.imm(_ushift(units)), ws=1))
     # lane mask: mask = -1 for lane < nlane, 0 otherwise
-    b.e(k.add_(k.ADD_SUB, A_TA, k.areg(k.R_ELEM_NUM), k.breg(B_NLANE)))
-    b.e(k.add_(k.ADD_ASR, A_MASK, k.areg(A_TA), k.imm(31)))
+    b.e(k.add_(k.ADD_SUB, A_TA2, k.areg(k.R_ELEM_NUM), k.breg(B_NLANE)))
+    b.e(k.add_(k.ADD_ASR, A_MASK, k.areg(A_TA2), k.imm(31)))
     b.e(k.add_(k.ADD_NOT, A_NMASK, k.areg(A_MASK), k.areg(A_MASK)))
     b.e(k.add_(k.ADD_AND, A_FILLN, k.breg(B_FILL), k.areg(A_NMASK)))
     # lane * slane, in the B file so a vector address is one A + one B read
@@ -2363,12 +2464,12 @@ def build_copy2d(k, fill=0, units=4, depth=16):
     b.e(k.add_or(A_D, k.areg(A_DB), k.areg(A_DB)))
     b.e(k.add_or(A_VCNT, k.breg(B_VPR), k.breg(B_VPR)))
     p.label('chunk')
-    b.e(k.add_or(A_CADR, k.areg(A_D), k.areg(A_D)))
+    b.e(k.add_or(A_CD2, k.areg(A_D), k.areg(A_D)))
     for r in range(units):
         # lanes >= nlane read at the vector base instead of past the source
         b.e(k.add_(k.ADD_AND, 33, k.breg(B_LV), k.areg(A_MASK)))
-        b.e(k.add_(k.ADD_ADD, A_TA, k.acc(1), k.areg(A_S)))
-        b.e(k.add_or(k.W_TMU0_S, k.areg(A_TA), k.areg(A_TA), ws=1))
+        b.e(k.add_(k.ADD_ADD, A_TA2, k.acc(1), k.areg(A_S)))
+        b.e(k.add_or(k.W_TMU0_S, k.areg(A_TA2), k.areg(A_TA2), ws=1))
         b.e(k.nop(), k.nop(), k.nop(), k.nop())
         b.e(k.nop(), k.nop(), k.nop(), k.nop())
         b.e(k.alu(sig=k.SIG_LOAD_TMU0, cond_add=k.COND_NEVER,
@@ -2378,7 +2479,7 @@ def build_copy2d(k, fill=0, units=4, depth=16):
         b.e(k.add_or(35, k.acc(1), k.areg(A_FILLN)))
         b.e(k.add_or(r, k.acc(3), k.acc(3)))           # store row r
         b.e(k.add_(k.ADD_ADD, A_S, k.areg(A_S), k.breg(B_SVEC)))
-    _store_var(b, k, A_CADR, B_VPMQ, B_VPMQ7, A_STRCO, B_STRIDE,
+    _store_var(b, k, A_CD2, B_VPMQ, B_VPMQ7, A_STRCO, B_STRIDE,
                units, depth)
     b.e(k.add_(k.ADD_ADD, A_D, k.areg(A_D), k.breg(B_C4D)))
     b.e(k.add_(k.ADD_SUB, A_VCNT, k.areg(A_VCNT), k.imm(units), sf=1))
@@ -2417,48 +2518,6 @@ def build(k, kind, opts):
         return build_reduce(k, opts.get('op'))
     if kind == 'cumsum':
         return build_cumsum(k)
-    if kind == 'blit':
-        return build_copy(k)
     raise ValueError("kops: unknown kind %r" % (kind,))
 
 
-def build_copy(k):  # kind "blit"
-    """Contiguous QPU copy: 64 B per group (one 16-float vector).
-
-    The 4-row store writes the same 64 B four times (stride 0), which is
-    idempotent, so a single vector per group is enough.  The C layer requires
-    a length that is a multiple of 64 B and uses the gather table for
-    everything else (strided rows, permutations, broadcasts)."""
-    nvec = 4
-    consts = _consts_for(k, ())
-    b, p = _head(k, nvec, False, consts)
-    b.read_uni(A_AB)
-    b.read_uni(A_OB)
-    b.read_uni(A_CNT)
-    b.read_uni(A_QID)
-    b.read_uni(A_NQ)
-    b.read_uni(A_P0)
-    b.read_uni(A_P1)
-    b.read_uni(A_P2)
-    # A_BSTEP: group stride in bytes (64 unless the caller wants another unit)
-    b.e(k.ldi(64, B_C64, ws=1))
-    b.e(k.ldi(64, B_CSTEP, ws=1))
-    b.e(k.ldi(M32, B_NEG1, ws=1))
-    b.e(k.add_(k.ADD_SHL, B_V4, k.areg(A_QID), k.imm(2), ws=1))
-    b.e(k.add_(k.ADD_SHL, B_V9, k.areg(A_QID), k.imm(9), ws=1))
-    b.e(k.add_(k.ADD_SHL, A_T1, k.areg(A_QID), k.imm(8)))
-    b.e(k.add_(k.ADD_SHL, A_T0, k.areg(k.R_ELEM_NUM), k.imm(2)))
-    b.e(k.add_(k.ADD_SHL, B_STEP, k.areg(A_NQ), k.imm(8), ws=1))
-    b.e(k.add_(k.ADD_ADD, A_T2, k.areg(A_NQ), k.breg(B_NEG1)))
-    b.e(k.add_(k.ADD_SHL, B_GAP, k.areg(A_T2), k.imm(8), ws=1))
-    _stream_base(k, b, A_AB, A_IB)
-    _stream_base(k, b, A_OB, A_OB2)
-    p.label('grp')
-    b.e(k.add_or(A_CADR, k.areg(A_OB2), k.areg(A_OB2)))
-    for j in range(4):
-        _load(k, b, A_IB, 0)
-        b.e(k.add_or(j, k.acc(0), k.acc(0)))
-        b.e(k.add_(k.ADD_ADD, A_IB, k.areg(A_IB), k.breg(B_C64)))
-    _store(k, b, 4, False)
-    _group_tail(k, b, nvec)
-    return p

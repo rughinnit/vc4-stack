@@ -20,6 +20,7 @@ and every path below is relative to the repository root unless it starts with
 | [`../infer/README.md`](../infer/README.md) | libvc4infer: API, build, kernel JIT, daemon backend, op coverage, limits |
 | [`../training/README.md`](../training/README.md) | backward kernels and the MLP/conv trainer, how to run them |
 | [`../vc4d/README.md`](../vc4d/README.md) | the privileged helper daemon: protocol, build, install |
+| `BUGS.md` | every bug, its root cause, the fix, the verification and the commit — plus the open ones with workarounds and the process failures that cost time |
 | `BENCHMARKS.md` | **the registry**: hardware envelope, GEMM, YOLOv8n progression, 320/640, per-op torch_vc4 vs CPU, training, builds, copy bandwidth, ORT, backend overhead, clocks, completeness, framework effort |
 | `BACKENDS.md` | the two backends: `managed` (vc4d, unprivileged, ~0.1 ms/launch) vs `direct` (root, no overhead) — measured 488 vs 410 ms on YOLOv8n, and when to use which |
 | `ECOSYSTEM.md` | every VC4 repository, what each owns, how the two execution paths fit, and which repo to open for what |

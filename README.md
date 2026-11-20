@@ -37,7 +37,9 @@ channel.
 | `VC4CLStdLib` | GPU-side OpenCL standard library (fork) |
 
 Every measured number — GEMM, YOLOv8n, per-op vs CPU, training, builds,
-clocks, completeness — is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+clocks, completeness — is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), and
+every bug with its cause, fix and verification is in
+[`docs/BUGS.md`](docs/BUGS.md) (the open ones are listed there too).
 
 Full table, the two execution paths and a "which repo do I open" guide:
 [`docs/ECOSYSTEM.md`](docs/ECOSYSTEM.md).

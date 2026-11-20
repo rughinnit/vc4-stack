@@ -112,6 +112,11 @@ board
 
 echo "=== test_onnxops (generic maxpool, forward softmax)"
 timeout -k 5 300 $RUN ./build/test_onnxops
+
+# Pooling / normalisation / softmax variants / losses through the ONNX runner.
+# Python, so it uses the interpreter that has vc4infer importable (the tree).
+echo "=== test_onnx_norm (17 ops through the runner)"
+PYTHONPATH=$PYTHONPATH:. timeout -k 5 600 python3 tests/test_onnx_norm.py
 board
 
 echo "=== test_copyops (layout copy kernels, byte-exact)"

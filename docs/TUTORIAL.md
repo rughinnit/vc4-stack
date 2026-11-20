@@ -1027,12 +1027,12 @@ is not reliable then.  The 1,323 ms row is the recorded run from
 
 **Why 640 does not fit.**  The 320 run already uses a 113 MiB graph pool and a
 33.4 MiB peak, plus ~23 MiB of per-conv scratch; the 150 MiB daemon arena is
-tight.  A 640 export is 4x the spatial area: the stem plane alone is ~26 MB,
-the im2col panel ~65 MB, and the activation pool ~4x.  That is well past the
-256 MiB CMA on this board (and past what the 1 GB ARM can hold alongside the
-DRM framebuffers).  No 640 export has been run here; the honest statement is
-"320 is the largest measured size, and 640 is out of the board's memory
-budget."
+tight.  A 640 export is 4x the spatial area: scaling the measured 320 sizes,
+the stem plane alone is ~26 MB, the im2col panel ~65 MB, and the activation
+pool ~4x.  That is well past the 256 MiB CMA on this board (and past what the
+1 GB ARM can hold alongside the DRM framebuffers).  No 640 export has been run
+here; the honest statement is "320 is the largest measured size, and 640 is out
+of the board's memory budget."
 
 The default 72 MiB daemon / 64 MiB client fails 320 at plan time with:
 

@@ -11,7 +11,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 ver=${1:-1.2.2}
-out=$root/../dist
+out=$root/dist
 stage=$root/build/vc4infer-dev-deb
 triplet=aarch64-linux-gnu
 

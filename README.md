@@ -27,7 +27,7 @@ your user is in the `vc4` group, then
 
 | path | what it is | start here | status |
 |---|---|---|---|
-| `infer/` | **libvc4infer + vc4infer** — the engine (dma-buf arena, kernel JIT/cache, strict op registry, matmul/conv/elementwise), the ONNX executor, the Python API, the CLI, and the `.deb`/wheel builders | [`infer/README.md`](infer/README.md), [`docs/VC4INFER.md`](docs/VC4INFER.md) | active — vc4infer **1.2.2**; YOLOv8n 160x160 runs end to end on the QPUs at **2.09 FPS** (stock clocks, quiet board) |
+| `infer/` | **libvc4infer + vc4infer** — the engine (dma-buf arena, kernel JIT/cache, strict op registry, matmul/conv/elementwise), the ONNX executor, the Python API, the CLI, and the `.deb`/wheel builders | [`infer/README.md`](infer/README.md), [`docs/VC4INFER.md`](docs/VC4INFER.md) | active — vc4infer **1.2.1**; YOLOv8n 160x160 runs end to end on the QPUs at **2.09 FPS** (stock clocks, quiet board) |
 | `kernels/` | hand-written QPU kernels: `wider-tile/asm6..asm10`, each with its NOTES/RESULTS and generator, plus the `attempt-asm10` history | [`kernels/wider-tile/`](kernels/wider-tile) | verified, frozen (results in `kernels/wider-tile/RESULTS*.md`) |
 | `training/` | backward kernels (`vc4_train.c`, `vc4_convbwd.c`) and the MLP/conv trainer with finite-difference checks | [`training/README.md`](training/README.md) | toy scale; gradients verified |
 | `tools/` | `build-fast.sh` (memory-aware `-j` + ccache), `qpu_disasm.py`, `xcheck/` (four independent encoders), `gput.sh` (locked GPU run + board check) | script headers | in use |

@@ -10,7 +10,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 ver=${1:-1.2.2}
-out=$root/../dist
+out=$root/dist
 stage=$root/build/vc4-toolkit-deb
 
 rm -rf "$stage"

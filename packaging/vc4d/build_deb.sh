@@ -11,7 +11,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 ver=${1:-1.2.1}
-out=$root/../dist
+out=$root/dist
 stage=$root/build/vc4d-deb
 
 make -C "$root/vc4d" build/vc4d >/dev/null

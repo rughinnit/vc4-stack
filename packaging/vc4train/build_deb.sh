@@ -13,7 +13,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 ver=${1:-1.0.0}
-out=$root/../dist
+out=$root/dist
 stage=$root/build/vc4train-deb
 build=$root/build/vc4train
 
@@ -33,9 +33,22 @@ gcc -O2 -g -Wall -Wextra -std=gnu11 \
 	-L"$root/infer/build" -l:libvc4infer.so -lm
 
 rm -rf "$stage"
-install -d "$stage/usr/bin" "$stage/usr/share/man/man1" "$stage/usr/share/doc/vc4train"
-install -m 0755 "$build/vc4train" "$stage/usr/bin/vc4train"
-strip --strip-unneeded "$stage/usr/bin/vc4train"
+install -d "$stage/usr/bin" "$stage/usr/lib/vc4train" \
+	"$stage/usr/share/man/man1" "$stage/usr/share/doc/vc4train"
+install -m 0755 "$build/vc4train" "$stage/usr/lib/vc4train/vc4train"
+strip --strip-unneeded "$stage/usr/lib/vc4train/vc4train"
+
+# The C demo calls vc4_init() directly, so it needs VC4INFER_DAEMON=1 to use
+# the socket.  Login shells get it from /etc/profile.d/vc4.sh, but a script or
+# `ssh host vc4train` does not source that; the wrapper makes the documented
+# one-command form work everywhere.  VC4INFER_DAEMON=0 still selects /dev/mem.
+cat > "$stage/usr/bin/vc4train" <<'W'
+#!/bin/sh
+: "${VC4INFER_DAEMON:=1}"
+export VC4INFER_DAEMON
+exec /usr/lib/vc4train/vc4train "$@"
+W
+chmod 0755 "$stage/usr/bin/vc4train"
 
 gzip -9n -c "$here/vc4train.1" > "$stage/usr/share/man/man1/vc4train.1.gz"
 chmod 0644 "$stage/usr/share/man/man1/vc4train.1.gz"

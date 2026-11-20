@@ -1,0 +1,13 @@
+#!/bin/sh
+# vc4infer postrm: Python writes __pycache__ at import time, so the bytecode
+# is not owned by the package.  Debian's dh_python3 would run py3clean; the
+# package is assembled by hand, so do it here on purge.
+set -e
+
+if [ "$1" = purge ]; then
+	rm -rf /usr/lib/python3/dist-packages/vc4infer/__pycache__
+	find /usr/lib/python3/dist-packages/vc4infer -type d -name '__pycache__' \
+		-prune -exec rm -rf {} + 2>/dev/null || true
+fi
+
+exit 0

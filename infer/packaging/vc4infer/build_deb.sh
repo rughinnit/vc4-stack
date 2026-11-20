@@ -131,6 +131,11 @@ Description: ONNX inference on the Raspberry Pi VideoCore IV QPUs
 EOF
 chmod 0644 "$stage/DEBIAN/control"
 
+# Python bytecode is created at import time and is not owned by the
+# package; the postrm removes it on purge (hand-assembled package, no
+# dh_python3/py3clean).
+install -m 0755 "$here/vc4infer.postrm" "$stage/DEBIAN/postrm"
+
 ( cd "$stage" && find . -type f ! -path './DEBIAN/*' -printf '%P\0' \
 	| xargs -0 md5sum > DEBIAN/md5sums )
 chmod 0644 "$stage/DEBIAN/md5sums"

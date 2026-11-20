@@ -11,7 +11,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 ver=${1:-1.0.0}
-out=$root/../dist
+out=$root/dist
 stage=$root/build/vc4-smi-deb
 build=$root/build/vc4-smi
 

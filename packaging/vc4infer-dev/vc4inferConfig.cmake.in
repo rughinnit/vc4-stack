@@ -6,7 +6,8 @@
 # The engine needs libm and pthread at link time; both are attached to the
 # imported target so a caller does not have to know.
 
-get_filename_component(_vc4_prefix "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+# <prefix>/lib/<triplet>/cmake/vc4infer/vc4inferConfig.cmake -> <prefix>
+get_filename_component(_vc4_prefix "${CMAKE_CURRENT_LIST_DIR}/../../../.." ABSOLUTE)
 
 set(VC4INFER_VERSION "@VERSION@")
 set(VC4INFER_INCLUDE_DIR "${_vc4_prefix}/include")

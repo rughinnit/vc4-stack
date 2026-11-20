@@ -145,17 +145,12 @@ def _extra_handlers():
     """
     global _EXTRA_HANDLERS, _EXTRA_OVERRIDES
     if _EXTRA_HANDLERS is None:
-        from . import (_dispatch_extra, _dispatch_norm, _dispatch_rnn,
-                       _dispatch_sig)
+        from . import _dispatch_extra, _dispatch_norm
         _EXTRA_HANDLERS = dict(_dispatch_extra.HANDLERS)
         _EXTRA_HANDLERS.update(_dispatch_norm.HANDLERS)
-        _EXTRA_HANDLERS.update(_dispatch_rnn.HANDLERS)
-        _EXTRA_HANDLERS.update(_dispatch_sig.HANDLERS)
         _EXTRA_OVERRIDES = (
             frozenset(getattr(_dispatch_norm, "OVERRIDES", ()))
-            | frozenset(getattr(_dispatch_extra, "OVERRIDES", ()))
-            | frozenset(getattr(_dispatch_rnn, "OVERRIDES", ()))
-            | frozenset(getattr(_dispatch_sig, "OVERRIDES", ())))
+            | frozenset(getattr(_dispatch_extra, "OVERRIDES", ())))
     return _EXTRA_HANDLERS
 
 

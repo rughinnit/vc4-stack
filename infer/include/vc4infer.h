@@ -369,7 +369,6 @@ typedef enum {
      * docs/OPS-UNARY.md has the method, domain and measured accuracy */
     VC4_UOP_ACOS, VC4_UOP_ACOSH, VC4_UOP_ASIN, VC4_UOP_ASINH,
     VC4_UOP_ATAN, VC4_UOP_ATANH, VC4_UOP_TAN, VC4_UOP_SINH, VC4_UOP_COSH,
-    VC4_UOP_RNG,             /* uniform [0,1) from a counter (kops.b_rng)   */
     VC4_UOP_COUNT
 } vc4_uop;
 

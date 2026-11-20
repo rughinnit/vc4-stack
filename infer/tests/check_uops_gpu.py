@@ -73,6 +73,17 @@ OPS = {
                  0.7978845608028654 * (x + 0.044715 * x ** 3))), (), (-6, 6)),
     "sin": (B.UOP_SIN, np.sin, (), (-6.0, 6.0)),
     "cos": (B.UOP_COS, np.cos, (), (-6.0, 6.0)),
+    # inverse / hyperbolic (docs/OPS-UNARY.md).  The range is the kernel's
+    # verified domain, not the whole float line: each op refuses outside it.
+    "asin": (B.UOP_ASIN, np.arcsin, (), (-1.0, 1.0)),
+    "acos": (B.UOP_ACOS, np.arccos, (), (-1.0, 1.0)),
+    "atan": (B.UOP_ATAN, np.arctan, (), (-1e5, 1e5)),
+    "atanh": (B.UOP_ATANH, np.arctanh, (), (-0.9999, 0.9999)),
+    "asinh": (B.UOP_ASINH, np.arcsinh, (), (-1e5, 1e5)),
+    "acosh": (B.UOP_ACOSH, np.arccosh, (), (1.0, 1e5)),
+    "sinh": (B.UOP_SINH, np.sinh, (), (-88.0, 88.0)),
+    "cosh": (B.UOP_COSH, np.cosh, (), (-88.0, 88.0)),
+    "tan": (B.UOP_TAN, np.tan, (), (-3.0, 3.0)),
 }
 
 # edge vectors: 16 hand-picked boundary values, resized to the shape
@@ -105,9 +116,44 @@ EDGE = {
              1e10, 0.5, -0.5, 2.0, -2.0, 0.25],
     "gelu_erf": [-1e10, -30.0, -10.0, -1.0, -1e-8, 0.0, 1e-8, 1.0, 10.0,
                  30.0, 1e10, 0.5, -0.5, 2.0, -2.0, 0.25],
+    # the inverse family's own edges: the branch points (|x| = 0.5, 1), the
+    # smallest fp32 step below 1, and the domains' limits
+    "asin": [-1.0, -0.99999994, -0.75, -0.5, -0.50000006, -1e-8, 0.0, 1e-8,
+             0.49999994, 0.5, 0.50000006, 0.75, 0.99999994, 1.0, -0.25, 0.25],
+    "acos": [-1.0, -0.99999994, -0.75, -0.5, -0.50000006, -1e-8, 0.0, 1e-8,
+             0.49999994, 0.5, 0.50000006, 0.75, 0.99999994, 1.0, -0.25, 0.25],
+    "atan": [-1e5, -1e10, -1e3, -2.5, -1.0000001, -1.0, -0.5, -1e-8, 0.0,
+             1e-8, 0.5, 1.0, 1.0000001, 2.5, 1e3, 1e5],
+    "atanh": [-0.99999994, -0.99, -0.9, -0.5, -1e-8, 0.0, 1e-8, 0.5, 0.9,
+              0.99, 0.99999994, -0.25, 0.25, -0.75, 0.75, -0.1],
+    "asinh": [-1e5, -1e3, -100.0, -10.0, -1.0, -1e-8, 0.0, 1e-8, 1.0, 10.0,
+              100.0, 1e3, 1e5, -0.5, 0.5, 2.0],
+    "acosh": [1.0, 1.0000001, 1.000001, 1.00000012, 1.001, 1.25, 1.5, 2.0,
+              3.0, 7.0, 10.0, 100.0, 1e3, 1e5, 1.0000002, 1.1],
+    "sinh": [-88.0, -80.0, -44.0, -20.0, -10.0, -1.0, -1e-8, 0.0, 1e-8, 1.0,
+             10.0, 20.0, 44.0, 80.0, 88.0, 0.5],
+    "cosh": [-88.0, -80.0, -44.0, -20.0, -10.0, -1.0, -1e-8, 0.0, 1e-8, 1.0,
+             10.0, 20.0, 44.0, 80.0, 88.0, 0.5],
+    # tan: the poles are at +-pi/2 (~1.5708) and +-3pi/2; these sit just far
+    # enough away that |cos| >= 0.05, plus the reduction's own limit
+    "tan": [-1e5, -3.0, -1.52, -1.5, -1.0, -0.5, -1e-8, 0.0, 1e-8, 0.5, 1.0,
+            1.5, 1.52, 3.0, 1e5, 0.7],
 }
 EDGE_DEFAULT = [0.0, -0.0, 1e-8, -1e-8, -10.0, 10.0, 0.5, -0.5, 1.0, -1.0,
                 2.0, -2.0, 3.5, -3.5, 1e5, -1e5]
+
+
+# tan's domain is not an interval: the executor refuses |cos(x)| < 0.05, so
+# the random part of the vector is resampled until it is inside that domain
+# (the leading edge vector is already chosen inside it).
+def off_poles(x, first, lo, hi, rng):
+    for _ in range(64):
+        bad = np.zeros(len(x), bool)
+        bad[first:] = np.abs(np.cos(x[first:].astype(np.float64))) < 0.05
+        if not bad.any():
+            return x
+        x[bad] = rng.uniform(lo, hi, int(bad.sum())).astype(np.float32)
+    return x
 
 
 def check(got, ref):
@@ -146,6 +192,8 @@ def main(argv):
                 x[:16] = edge
             else:
                 x[:16] = edge
+            if name == "tan":
+                x = off_poles(x, 16 if n > 16 else n, lo, hi, rng)
             a = eng.upload(x)
             o = eng.alloc(n * 4 + 64)
             p = list(params) + [0.0] * (3 - len(params))

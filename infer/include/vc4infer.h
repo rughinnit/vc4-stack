@@ -365,6 +365,10 @@ typedef enum {
     VC4_UOP_SIN, VC4_UOP_COS,
     VC4_UOP_AFFINE,          /* out = a*p0 + p1 (gradient broadcast scale)   */
     VC4_UOP_MISH,            /* x*tanh(softplus(x))                          */
+    /* inverse / hyperbolic family (2026-11-20): log- and exp-based bodies,
+     * docs/OPS-UNARY.md has the method, domain and measured accuracy */
+    VC4_UOP_ACOS, VC4_UOP_ACOSH, VC4_UOP_ASIN, VC4_UOP_ASINH,
+    VC4_UOP_ATAN, VC4_UOP_ATANH, VC4_UOP_TAN, VC4_UOP_SINH, VC4_UOP_COSH,
     VC4_UOP_COUNT
 } vc4_uop;
 

@@ -25,6 +25,7 @@ and every path below is relative to the repository root unless it starts with
 | `NUMERICS.md` | the QPU FPU truncates (round toward zero), flushes denormals; 3-word dependent chains; register/field rules |
 | `BUILD.md` | build parallelism on 1 GB: engine -j4 safe, VC4C -j2/-j1, ccache, `tools/build-fast.sh` |
 | `CLOCK-VARIANCE.md` | core clock drooped 400->250 MHz under load *before* the fan; 89/89 samples at 400 MHz with it |
+| [`OPS-UNARY.md`](OPS-UNARY.md) | the inverse/hyperbolic unary family (asin/acos/atan/atanh/asinh/acosh/sinh/cosh/tan): per-op method, enforced domain, measured accuracy, the refusals and their exact limits |
 | `ONNX.md` | ONNX graph path: supported nodes, runner usage, measured modelA/B/C numbers, stride-2/depthwise decompositions, YOLOv8n coverage, the device byte invariant |
 | `VC4INFER.md` | the packaged product: install, `run`/`bench`/`nodes`/`selftest`, guarantees, measured performance, package layout |
 | `PYTHON-API.md` | the earlier `Engine`, `Device`, `Detector`, threading, error and Ultralytics reference (kept for history; `API.md` is current) |

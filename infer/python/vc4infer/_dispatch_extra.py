@@ -1259,6 +1259,84 @@ class LogSoftmax(_Base, _ReduceMixin):
 
 
 # =====================================================================
+# inverse / hyperbolic unary family (docs/OPS-UNARY.md)
+# =====================================================================
+class Trig(_Base):
+    """One QPU kernel per op, each with the domain its body can answer.
+
+    The bodies are range reduction + polynomial (asin/acos/atan/tan) or the
+    verified log/exp cores (asinh/acosh/atanh/sinh/cosh); see
+    docs/OPS-UNARY.md for the method and the measured accuracy per op.  A
+    value the kernel cannot answer is *refused by name* here, never answered
+    wrongly - the rule Log/Sqrt/Sin already follow (docs/ONNX.md 12).
+
+    ``Tan`` is the one op whose limit is not a plain interval: near a pole the
+    Cody-Waite reduction's absolute error in the reduced r becomes a relative
+    error of the answer, so inputs with |cos(x)| below ``TAN_COS_MIN`` are
+    refused.  The gate is a domain check on the operand (the same class of
+    work as the min/max test Log needs), not a computed result.
+    """
+
+    UOP = {
+        "Acos": vc4infer.UOP_ACOS, "Acosh": vc4infer.UOP_ACOSH,
+        "Asin": vc4infer.UOP_ASIN, "Asinh": vc4infer.UOP_ASINH,
+        "Atan": vc4infer.UOP_ATAN, "Atanh": vc4infer.UOP_ATANH,
+        "Tan": vc4infer.UOP_TAN, "Sinh": vc4infer.UOP_SINH,
+        "Cosh": vc4infer.UOP_COSH,
+    }
+    # (lo, hi) of the operand; None is unbounded, +-inf is refused everywhere
+    RANGE = {
+        "Asin": (-1.0, 1.0), "Acos": (-1.0, 1.0), "Atanh": (-1.0, 1.0),
+        "Acosh": (1.0, None), "Asinh": (None, None), "Atan": (None, None),
+        "Tan": (-1e5, 1e5), "Sinh": (-88.0, 88.0), "Cosh": (-88.0, 88.0),
+    }
+    # atanh(+-1) is +-inf and atanh(x) is real only for |x| < 1: this op's
+    # bounds are open where the others' are closed
+    STRICT = ("Atanh",)
+    TAN_COS_MIN = 0.05
+
+    def run(self):
+        node = self.node
+        op = node.op_type
+        x = self.ten(node.input[0])
+        lo, hi = self.RANGE[op]
+
+        strict = op in self.STRICT
+
+        def in_domain(a):
+            if not np.isfinite(a).all():
+                return False
+            if lo is not None:
+                if float(np.min(a)) < lo or \
+                        (strict and float(np.min(a)) <= lo):
+                    return False
+            if hi is not None:
+                if float(np.max(a)) > hi or \
+                        (strict and float(np.max(a)) >= hi):
+                    return False
+            if op == "Tan":
+                return bool(np.min(np.abs(np.cos(a.astype(np.float64))))
+                            >= self.TAN_COS_MIN)
+            return True
+
+        if lo is None and hi is None:
+            span = "every finite x"
+        elif strict:
+            span = "%g < x < %g" % (lo, hi)
+        else:
+            span = "%g <= x <= %s" % (lo, "+inf" if hi is None else "%g" % hi)
+        if op == "Asin" or op == "Acos":
+            span = "-1 <= x <= 1"
+        if op == "Tan":
+            span = "|x| <= 1e5 and |cos(x)| >= %g" % self.TAN_COS_MIN
+        self.download_check(
+            x, in_domain,
+            "%s: the QPU kernel's verified domain is %s (a value outside it "
+            "is refused rather than answered)" % (op, span))
+        return self.unary(x, self.UOP[op])
+
+
+# =====================================================================
 # dispatch table
 # =====================================================================
 _REDUCE = ("ReduceSum", "ReduceMean", "ReduceMax", "ReduceMin", "ReduceProd",
@@ -1304,3 +1382,5 @@ HANDLERS.update({
     "Hardmax": _mk(Hardmax),
     "LogSoftmax": _mk(LogSoftmax),
 })
+for _op in Trig.UOP:
+    HANDLERS[_op] = _mk(Trig)

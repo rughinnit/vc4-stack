@@ -40,6 +40,36 @@ entry point, and `tests/`, `examples/`, `packaging/` and `pyproject.toml` belong
 to the same product.  The backward kernels are compiled into the same library
 from `training/src/`.
 
+## Install
+
+The stack installs from a signed apt repository, the way CUDA or TensorRT do:
+
+```sh
+curl -fsSL https://rughinnit.github.io/vc4-apt/key.asc \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/vc4-apt.gpg
+echo "deb [signed-by=/etc/apt/keyrings/vc4-apt.gpg] https://rughinnit.github.io/vc4-apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/vc4-apt.list
+sudo apt update
+sudo apt install vc4-toolkit
+```
+
+`vc4-toolkit` is the single install command: `vc4d` (daemon), `vc4infer`
+(engine, Python API, CLI), `vc4infer-dev` (header + pkg-config + CMake),
+`vc4-query` (the `deviceQuery` analogue), `vc4-smi` (the `nvidia-smi`
+analogue), `vc4train` (training demo) and `vc4top`/`vc4top-dkms`.
+
+```sh
+vc4-query             # what did I just install?
+vc4-smi               # is the GPU healthy?
+vc4infer selftest     # 4/4 bundled models
+```
+
+For the speed-tuned rebuild of the same stack (`-O3 -march=native`, a
+prewarmed read-only kernel cache and a tuned daemon), install
+`vc4-toolkit-fast` instead.  Both paths, the pip index (`vc4infer`,
+`torch-vc4`) and the framework support table are in
+[docs/INSTALL.md](docs/INSTALL.md).
+
 ## Build and run
 
 ```sh

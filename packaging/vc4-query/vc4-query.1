@@ -1,0 +1,31 @@
+.TH VC4-QUERY 1 "2026-11-20" "vc4-stack" "User Commands"
+.SH NAME
+vc4-query \- report the VideoCore IV stack's device and driver state
+.SH SYNOPSIS
+.B vc4-query
+[\fB\-\-json\fR]
+.SH DESCRIPTION
+.B vc4-query
+prints the engine and daemon versions, the kernel, the V3D revision and QPU
+count, the stock core and V3D clocks, die temperature, the throttle register,
+CMA total/free, the daemon arena size, the op registry counts, whether the
+installed engine carries the training/backward kernels, the system kernel cache
+and the installed vc4 package versions.
+.PP
+It reads
+.I /sys/kernel/vc4mon
+and runs
+.BR vcgencmd .
+It never opens
+.IR /dev/mem .
+.SH OPTIONS
+.TP
+.B \-\-json
+Print one JSON object instead of the aligned text report.
+.SH EXIT STATUS
+0 when the report was produced, 1 if the engine library could not be loaded,
+2 on a bad argument.
+.SH SEE ALSO
+.BR vc4-smi (1),
+.BR vc4infer (1),
+.BR vc4top (1)

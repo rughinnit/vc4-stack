@@ -1,0 +1,30 @@
+#!/bin/sh
+# vc4-toolkit-fast postinst: enable the tuned vc4d drop-in unless the admin
+# has explicitly turned it off with `vc4fast off` (which leaves a marker).
+set -e
+
+install -d -m 0755 /etc/vc4 /etc/systemd/system/vc4d.service.d
+install -m 0644 /usr/share/vc4-toolkit-fast/vc4d-fast.default \
+	/etc/vc4/vc4d-fast.default
+
+if [ -e /etc/vc4/.vc4fast-off ]; then
+	rm -f /etc/systemd/system/vc4d.service.d/10-fast.conf
+else
+	install -m 0644 /usr/share/vc4-toolkit-fast/10-fast.conf \
+		/etc/systemd/system/vc4d.service.d/10-fast.conf
+fi
+
+# make the engine's writable per-user cache unnecessary for the bundled models
+# on the very first call from a login shell
+if [ -d /run/systemd/system ]; then
+	systemctl daemon-reload || true
+	systemctl try-restart vc4d.service || systemctl restart vc4d.service || true
+fi
+
+cat <<'EOF'
+vc4-toolkit-fast: prewarmed kernel cache at /usr/lib/vc4infer/kcache.
+  vc4d is running the tuned recipe (arena 150 MiB).  `vc4fast status` shows it,
+  `vc4fast off` returns to the safe defaults.  No clocks were changed.
+EOF
+
+exit 0

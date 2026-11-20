@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import statistics
+import subprocess
 import sys
 import time
 
@@ -80,6 +81,34 @@ def _backend_str():
     return "direct /dev/mem (root)"
 
 
+def _installed_packages():
+    """Version of every vc4 package dpkg knows about (empty in a source tree)."""
+    names = ("vc4infer", "vc4d", "vc4infer-dev", "vc4-query", "vc4-smi",
+             "vc4train", "vc4top", "vc4top-dkms", "vc4-toolkit",
+             "vc4-toolkit-fast")
+    try:
+        run = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Package} ${Version}\n"] + list(names),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    except OSError:
+        return []
+    have = {}
+    for line in run.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            have[parts[0]] = parts[1]
+    return [(n, have[n]) for n in names if n in have]
+
+
+def _system_cache():
+    """The read-only prewarmed cache shipped by vc4-toolkit-fast, if any."""
+    import glob
+    d = "/usr/lib/vc4infer/kcache"
+    if not os.path.isdir(d):
+        return None
+    return d, len(glob.glob(os.path.join(d, "*.bin")))
+
+
 def cmd_version(args):
     lib, onnx_ver, np_ver = _engine_info()
     info = runtime.prepare_env()
@@ -90,6 +119,15 @@ def cmd_version(args):
     print("backend:         %s" % _backend_str())
     print("kernel generator:%s" % (info["kgen"] or "MISSING"))
     print("kernel cache:    %s" % info["cache"])
+    sc = _system_cache()
+    if sc:
+        print("system kcache:   %s (%d blobs, prewarmed read-only)" % sc)
+    pkgs = _installed_packages()
+    if pkgs:
+        print("packages:        %s"
+              % ", ".join("%s %s" % p for p in pkgs))
+    else:
+        print("packages:        (not installed from a .deb)")
     return 0
 
 

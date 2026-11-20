@@ -1,0 +1,38 @@
+.TH VC4TRAIN 1 "2026-11-20" "vc4-stack" "User Commands"
+.SH NAME
+vc4train \- toy QPU trainer (MLP 64-32-10) for the VideoCore IV engine
+.SH SYNOPSIS
+.B vc4train
+[\fB\-\-opt\fR \fIsgd\fR|\fIadam\fR] [\fB\-\-steps\fR \fIN\fR]
+[\fB\-\-seed\fR \fIS\fR]
+.SH DESCRIPTION
+Trains a two-layer MLP full batch on a fixed synthetic 10-class dataset.
+Every multiply-accumulate, activation, the fused softmax + cross-entropy
+gradient and the optimizer step run as QPU kernels; the ARM only prepares
+buffers and prints the loss.
+.PP
+The program exits non-zero unless the training loss drops at least 5x and the
+test accuracy reaches 90%.  It is a check that the installed engine has working
+backward kernels, not a training framework.
+.PP
+With
+.B VC4INFER_DAEMON=1
+(set by
+.IR /etc/profile.d/vc4.sh )
+launches go through
+.IR /run/vc4d.sock
+unprivileged; otherwise the binary needs root and
+.IR /dev/mem .
+.SH OPTIONS
+.TP
+.B \-\-opt \fIsgd\fR|\fIadam\fR
+Optimizer (default sgd).
+.TP
+.B \-\-steps \fIN\fR
+Number of optimizer steps (default 300).
+.TP
+.B \-\-seed \fIS\fR
+PRNG seed (default 12345).
+.SH SEE ALSO
+.BR vc4-query (1),
+.BR vc4infer (1)

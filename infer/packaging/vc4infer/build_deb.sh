@@ -45,7 +45,6 @@ install -d "$stage/DEBIAN" \
 	"$pkg/vc4infer/ort" \
 	"$stage/usr/lib/$triplet" \
 	"$stage/usr/lib/vc4infer/kgen" \
-	"$stage/usr/include" \
 	"$stage/usr/share/vc4infer/models" \
 	"$stage/usr/share/doc/vc4infer" \
 	"$stage/usr/share/man/man1" \
@@ -61,7 +60,7 @@ install -m 0644 "$root/python/vc4infer/ort"/*.py "$pkg/vc4infer/ort/"
 
 # ---- engine library + header ------------------------------------------------
 install -m 0755 "$so" "$stage/usr/lib/$triplet/libvc4infer.so.1"
-install -m 0644 "$root/include/vc4infer.h" "$stage/usr/include/vc4infer.h"
+# the header, the .so symlink and the build files live in vc4infer-dev
 
 # ---- kernel generator for C clients (the Python package has its own copy) ---
 for f in kgen.py kops.py qenc.py gen.py vpmwords.py; do
@@ -110,14 +109,14 @@ Architecture: $arch
 Maintainer: rughinnit <rughinnit@users.noreply.github.com>
 Installed-Size: $size
 Depends: python3 (>= 3.11), python3-numpy, python3-onnx (>= 1.14), python3-pil, libc6 (>= 2.38)
-Suggests: vc4d, python3-onnxruntime
+Suggests: vc4d, vc4infer-dev, python3-onnxruntime
 Section: misc
 Priority: optional
 Homepage: https://github.com/rughinnit/vc4-stack
 Description: ONNX inference on the Raspberry Pi VideoCore IV QPUs
  vc4infer executes fixed-shape fp32 ONNX graphs on the VideoCore IV (V3D) QPUs
  of the Raspberry Pi 1/2/3, Zero and CM1/CM3.  It ships the libvc4infer engine
- library and headers, a CLI (run, bench, nodes, selftest), the QPU kernel
+ library, a CLI (run, bench, nodes, selftest), the QPU kernel
  generator, a set of reference models, and the Python package system-wide
  (vc4infer.Engine, vc4infer.Device, vc4infer.postprocess, vc4infer.yolo).
  .

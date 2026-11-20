@@ -38,7 +38,7 @@ HDRS  = $(wildcard src/*.h) $(wildcard include/*.h) \
 TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_onnxops $(BUILD)/test_nhwc $(BUILD)/test_copyops $(BUILD)/test_coherency $(BUILD)/test_gate $(BUILD)/test_gated $(BUILD)/test_daemon_recover $(BUILD)/test_daemon_arena $(BUILD)/test_daemon_reap $(BUILD)/test_direct_lock $(BUILD)/bench_matmul $(BUILD)/test_daemon_kernels $(BUILD)/test_daemon_uni
 TRAIN_TESTS = $(BUILD)/test_train_ops $(BUILD)/test_grad $(BUILD)/test_train $(BUILD)/test_convgrad $(BUILD)/test_convnet $(BUILD)/test_bwd_one
 
-all: $(LIB) $(BUILD)/libvc4infer.so $(TESTS) $(TRAIN_TESTS)
+all: $(LIB) $(BUILD)/libvc4infer.so $(BUILD)/libvc4infer.so.1 $(TESTS) $(TRAIN_TESTS)
 
 $(BUILD):
 	mkdir -p $(BUILD) kcache
@@ -54,6 +54,13 @@ $(LIB): $(OBJ) $(VC4D_DIR)/build/libvc4client.a
 
 $(BUILD)/libvc4infer.so: $(OBJ) $(VC4D_DIR)/build/libvc4client.a
 	$(CC) -shared -Wl,-soname,libvc4infer.so.1 -o $@ $^
+
+# The soname is libvc4infer.so.1, so a consumer that links against the build
+# tree records that name and cannot find the file under the plain .so name the
+# link step produces.  Without the link it silently loads whatever copy the
+# system has installed.
+$(BUILD)/libvc4infer.so.1: $(BUILD)/libvc4infer.so
+	ln -sf libvc4infer.so $@
 
 # Not just "if missing": a stale libvc4client.a is a wire-protocol mismatch,
 # which is exactly as expensive to debug as the struct one above.

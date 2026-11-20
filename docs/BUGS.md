@@ -17,6 +17,12 @@ after** — otherwise it is "gated" (it refuses) or "open".
 Severity: **S1** silent wrong answer · **S2** crash/wedge/hang · **S3** wrong but
 loud · **S4** build/package/test defect · **S5** measurement artifact.
 
+**Measurement conditions.** Rows dated before **2026-11-20 (fan removed)** were
+taken without temperature logging, so a long one may have drifted into a
+different thermal regime (`docs/BENCHMARKS.md` rule 4). The B12 row and the
+re-run acceptance below it carry start/peak temperatures; anything older should
+be re-taken under `tools/thermal-guard.sh` before being quoted as a measurement.
+
 ---
 
 ## A. Silent wrong answers (the dangerous class)

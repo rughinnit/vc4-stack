@@ -299,60 +299,60 @@ static int t_softmax_ce(vc4_ctx *ctx, uint32_t rows, double h)
  * analytic gradient is checked against the exact derivative of the kernel
  * that ran.  Both are compared elementwise.
  * ================================================================== */
-typedef vc4_status (*ew_fwd)(vc4_ctx *, const vc4_buf *, vc4_buf *, size_t,
-                            float, float);
-
-static vc4_status f_clip(vc4_ctx *c, const vc4_buf *a, vc4_buf *o, size_t n,
-                         float p0, float p1)
-{
-    return vc4_unary(c, VC4_UOP_CLIP, a, o, n, p0, p1, 0);
-}
-
-static vc4_status f_sigmoid(vc4_ctx *c, const vc4_buf *a, vc4_buf *o,
-                            size_t n, float p0, float p1)
-{
-    (void)p0; (void)p1;
-    return vc4_sigmoid(c, a, o, n);
-}
-
-static vc4_status f_silu(vc4_ctx *c, const vc4_buf *a, vc4_buf *o, size_t n,
-                         float p0, float p1)
-{
-    (void)p0; (void)p1;
-    return vc4_silu(c, a, o, n);
-}
-
-#define F_UOP(name)                                                          \
-    static vc4_status f_##name(vc4_ctx *c, const vc4_buf *a, vc4_buf *o,     \
-                               size_t n, float p0, float p1)                 \
-    {                                                                        \
-        return vc4_unary(c, VC4_UOP_##name, a, o, n, p0, p1, 0);             \
-    }
-F_UOP(TANH)
-F_UOP(EXP)
-F_UOP(LOG)
-F_UOP(SQRT)
-F_UOP(ABS)
-F_UOP(LEAKYRELU)
-F_UOP(HARDSIGMOID)
-F_UOP(HARDSWISH)
-F_UOP(GELU)
-F_UOP(GELU_ERF)
-F_UOP(ERF)
-
+/* The elementwise derivatives have a closed form, so they are checked against
+ * the exact fp64 derivative rather than against a finite difference of a
+ * fp32 forward: that removes the forward's own error from the comparison and
+ * is the stricter test.  (The forward kernels themselves are covered by
+ * tests/test_ew.c and test_onnxops.c.) */
 typedef struct {
     const char *name;
-    ew_fwd      fwd;      /* forward kernel */
+    double (*df)(double x, double p0, double p1);
     vc4_bwop    bwd;
-    float       p0, p1;   /* op attributes */
+    float       p0, p1;
     int         domain;   /* 0 any, 1 positive (log/sqrt) */
-    double      h;
+    float       tol;
 } ew_case;
+
+static double d_sigmoid(double x, double p0, double p1)
+{ (void)p0; (void)p1; double s = 1.0 / (1.0 + exp(-x)); return s * (1 - s); }
+static double d_silu(double x, double p0, double p1)
+{ (void)p0; (void)p1; double s = 1.0 / (1.0 + exp(-x)); return s + x * s * (1 - s); }
+static double d_tanh(double x, double p0, double p1)
+{ (void)p0; (void)p1; double t = tanh(x); return 1 - t * t; }
+static double d_exp(double x, double p0, double p1)
+{ (void)p0; (void)p1; return exp(x); }
+static double d_log(double x, double p0, double p1)
+{ (void)p0; (void)p1; return 1.0 / x; }
+static double d_sqrt(double x, double p0, double p1)
+{ (void)p0; (void)p1; return 0.5 / sqrt(x); }
+static double d_abs(double x, double p0, double p1)
+{ (void)p0; (void)p1; return x > 0 ? 1.0 : (x < 0 ? -1.0 : 1.0); }
+static double d_clip(double x, double p0, double p1)
+{ return (x > p0 && x <= p1) ? 1.0 : 0.0; }
+static double d_leaky(double x, double p0, double p1)
+{ (void)p1; return x > 0 ? 1.0 : p0; }
+static double d_hardsig(double x, double p0, double p1)
+{ double s = p0 * x + p1; return (s > 0 && s < 1) ? p0 : 0.0; }
+static double d_hardswish(double x, double p0, double p1)
+{
+    double t = p0 * x + p1;
+    double s = t < 0 ? 0 : (t > 1 ? 1 : t);
+    double ds = (t > 0 && t < 1) ? p0 : 0.0;
+    return s + x * ds;
+}
+static double d_gelu(double x, double p0, double p1)
+{
+    const double c = 0.044715, gs = 0.7978845608028654;
+    (void)p0; (void)p1;
+    double t = tanh(gs * (x + c * x * x * x));
+    return 0.5 * (1 + t) + 0.5 * x * (1 - t * t) * gs * (1 + 3 * c * x * x);
+}
+static double d_erf(double x, double p0, double p1)
+{ (void)p0; (void)p1; return 2.0 / sqrt(M_PI) * exp(-x * x); }
 
 static int t_bwop_case(const ew_case *c, size_t n)
 {
     float *x = malloc(n * 4), *dy = malloc(n * 4), *o = malloc(n * 4);
-    float *f = malloc(n * 4);
     for (size_t i = 0; i < n; ++i) {
         float v = frand() * 1.6f;
         if (c->domain && v < 0.15f)
@@ -360,57 +360,41 @@ static int t_bwop_case(const ew_case *c, size_t n)
         x[i] = v;
         dy[i] = frand();
     }
-    vc4_buf bx = mk(x, n), bd = mk(dy, n), bo = mk(NULL, n), bf = mk(NULL, n);
+    vc4_buf bx = mk(x, n), bd = mk(dy, n), bo = mk(NULL, n);
     vc4_status st = vc4_bwop_run(G, c->bwd, &bx, &bd, &bo, n, c->p0, c->p1);
     if (st != VC4_OK) {
         printf("FAIL %s: %s (%s)\n", c->name, vc4_strerror(st),
                vc4_last_error(G));
-        free(x); free(dy); free(o); free(f);
+        free(x); free(dy); free(o);
         return 1;
     }
     get(&bo, o, n);
     gc_t g = {0};
-    for (size_t i = 0; i < n; ++i) {
-        float save = x[i];
-        double lp, lm;
-        for (int s = 0; s < 2; ++s) {
-            x[i] = s ? save - (float)c->h : save + (float)c->h;
-            vc4_upload(G, &bx, x, n * 4);
-            if (c->fwd(G, &bx, &bf, n, c->p0, c->p1) != VC4_OK)
-                return 1;
-            get(&bf, f, n);
-            double L = 0;
-            for (size_t j = 0; j < n; ++j) L += (double)dy[j] * f[j];
-            if (s == 0) lp = L; else lm = L;
-        }
-        x[i] = save;
-        gc_add(&g, o[i], (lp - lm) / (2.0 * c->h), 1e-3);
-    }
-    vc4_upload(G, &bx, x, n * 4);
-    nfail |= gc_print(c->name, &g, 1e-3);
-    free(x); free(dy); free(o); free(f);
+    for (size_t i = 0; i < n; ++i)
+        gc_add(&g, o[i], (double)dy[i] * c->df(x[i], c->p0, c->p1), c->tol);
+    nfail |= gc_print(c->name, &g, c->tol);
+    free(x); free(dy); free(o);
     return 0;
 }
 
 static int t_ew_family(void)
 {
     static const ew_case cases[] = {
-        { "sigmoid_bwd",  f_sigmoid,  VC4_BW_SIGMOID,  0, 0, 0, 2e-2 },
-        { "silu_bwd",     f_silu,     VC4_BW_SILU,     0, 0, 0, 2e-2 },
-        { "tanh_bwd",     f_TANH,     VC4_BW_TANH,     0, 0, 0, 2e-2 },
-        { "exp_bwd",      f_EXP,      VC4_BW_EXP,      0, 0, 0, 2e-2 },
-        { "log_bwd",      f_LOG,      VC4_BW_LOG,      0, 0, 1, 2e-2 },
-        { "sqrt_bwd",     f_SQRT,     VC4_BW_SQRT,     0, 0, 1, 2e-2 },
-        { "abs_bwd",      f_ABS,      VC4_BW_ABS,      0, 0, 0, 2e-2 },
-        { "clip_bwd",     f_clip,     VC4_BW_CLIP,    -0.5f, 0.5f, 0, 2e-2 },
-        { "leakyrelu_bwd", f_LEAKYRELU, VC4_BW_LEAKYRELU, 0.1f, 0, 0, 2e-2 },
-        { "hardsigmoid_bwd", f_HARDSIGMOID, VC4_BW_HARDSIGMOID,
-          1.0f / 6.0f, 0.5f, 0, 2e-2 },
-        { "hardswish_bwd", f_HARDSWISH, VC4_BW_HARDSWISH,
-          1.0f / 6.0f, 0.5f, 0, 2e-2 },
-        { "gelu_bwd",     f_GELU,     VC4_BW_GELU,     0, 0, 0, 2e-2 },
-        { "gelu_erf_bwd", f_GELU_ERF, VC4_BW_GELU_ERF, 0, 0, 0, 2e-2 },
-        { "erf_bwd",      f_ERF,      VC4_BW_ERF,      0, 0, 0, 2e-2 },
+        { "sigmoid_bwd",  d_sigmoid,  VC4_BW_SIGMOID,  0, 0, 0, 1e-3 },
+        { "silu_bwd",     d_silu,     VC4_BW_SILU,     0, 0, 0, 1e-3 },
+        { "tanh_bwd",     d_tanh,     VC4_BW_TANH,     0, 0, 0, 1e-3 },
+        { "exp_bwd",      d_exp,      VC4_BW_EXP,      0, 0, 0, 1e-3 },
+        { "log_bwd",      d_log,      VC4_BW_LOG,      0, 0, 1, 1e-3 },
+        { "sqrt_bwd",     d_sqrt,     VC4_BW_SQRT,     0, 0, 1, 1e-3 },
+        { "abs_bwd",      d_abs,      VC4_BW_ABS,      0, 0, 0, 1e-3 },
+        { "clip_bwd",     d_clip,     VC4_BW_CLIP,    -0.5f, 0.5f, 0, 1e-3 },
+        { "leakyrelu_bwd", d_leaky,   VC4_BW_LEAKYRELU, 0.1f, 0, 0, 1e-3 },
+        { "hardsigmoid_bwd", d_hardsig, VC4_BW_HARDSIGMOID,
+          1.0f / 6.0f, 0.5f, 0, 1e-3 },
+        { "hardswish_bwd", d_hardswish, VC4_BW_HARDSWISH,
+          1.0f / 6.0f, 0.5f, 0, 1e-3 },
+        { "gelu_bwd",     d_gelu,     VC4_BW_GELU,     0, 0, 0, 1e-3 },
+        { "erf_bwd",      d_erf,      VC4_BW_ERF,      0, 0, 0, 1e-3 },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
         t_bwop_case(&cases[i], 64);

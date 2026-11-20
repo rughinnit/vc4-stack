@@ -2320,6 +2320,48 @@ def build_probe_seq(seq):
     _tmu_load_a(b, 0, A_ADDR, A_IN)
 
     b.check = False
+    if head == 'store':
+        # diagnostic: four known rows through the verified _store4, no math
+        for i, val in enumerate((0x3F800000, 0x40000000, 0x40400000,
+                                 0x40800000)):
+            b.e(ldi(val, 5 + i, ws=1))
+            b.e(nop(), nop(), nop())
+            b.e(add_or(i, breg(5 + i), breg(5 + i)), nop(), nop())
+        _store4(b, B_V4, B_V9, A_OUT, 0)
+        b.e(end_program())
+        b.e(nop(), nop(), nop())
+        return p
+    if head == 'pipe4':
+        # the build_ew TMU pipeline for nvec=4, copy-only (no body)
+        A_ADDR2 = 17
+        B_C64 = 10
+        b.e(ldi(64, B_C64, ws=1))
+        b.e(nop(), nop(), nop())
+        b.e(add_or(A_ADDR2, areg(A_ADDR), areg(A_ADDR)), nop(), nop())
+        for _ in range(2):
+            b.e(add_or(W_TMU0_S, areg(A_ADDR), areg(A_ADDR), ws=1))
+            b.e(add_or(W_TMU1_S, areg(A_ADDR2), areg(A_ADDR2), ws=1))
+            b.e(nop(), nop())
+            b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_C64)))
+            b.e(add_(ADD_ADD, A_ADDR2, areg(A_ADDR2), breg(B_C64)))
+            b.e(nop(), nop())
+        for j in range(4):
+            if j + 2 < 4:
+                b.e(add_or(W_TMU0_S, areg(A_ADDR), areg(A_ADDR), ws=1))
+                b.e(add_or(W_TMU1_S, areg(A_ADDR2), areg(A_ADDR2), ws=1))
+                b.e(nop(), nop())
+                b.e(add_(ADD_ADD, A_ADDR, areg(A_ADDR), breg(B_C64)))
+                b.e(add_(ADD_ADD, A_ADDR2, areg(A_ADDR2), breg(B_C64)))
+                b.e(nop(), nop())
+            b.e(alu(sig=SIG_LOAD_TMU0, cond_add=COND_NEVER, cond_mul=COND_NEVER), nop())
+            b.e(add_or(A_IN, acc(4), acc(4)), nop())
+            b.e(alu(sig=SIG_LOAD_TMU1, cond_add=COND_NEVER, cond_mul=COND_NEVER), nop())
+            b.e(add_or(B_VB, ws=1, a=acc(4), b=acc(4)), nop())
+            b.e(add_or(j, areg(A_IN), areg(A_IN)), nop(), nop())
+        _store4(b, B_V4, B_V9, A_OUT, 0)
+        b.e(end_program())
+        b.e(nop(), nop(), nop())
+        return p
     if head in ('acc', 'bmov', 'add', 'packfadd'):
         b.e(dict(mul_op=MUL_FMUL, mul_out=32 + 0, ws=0,
                  mul_a=areg(A_IN), mul_b=breg(B_C2)))

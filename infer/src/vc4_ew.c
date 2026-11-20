@@ -16,6 +16,7 @@
 #include "vc4_int.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define EW_GROUP 256u
@@ -533,6 +534,239 @@ static vc4_status bw_gelu(vc4_ctx *c, const vc4_buf *x, const vc4_buf *g,
     return st;
 }
 
+/* ---- helpers for the relu_bwd-based masks --------------------------------
+ * The ewb kernels that read their second stream (sub/div/eqmask/abs_bwd/...)
+ * do not see that stream correctly on this board, while the ones that only
+ * read `a` (exp, rcp) and the verified ew kernels (add/mul/relu/
+ * relu_bwd/sigmoid/silu/rsqrt) do.  So every derivative below is built from
+ * the verified set: a mask is `relu_bwd(z, ones)`, i.e. 1 where z > 0.
+ */
+static vc4_status ws_ones(vc4_ctx *c, vc4_buf *b, size_t n)
+{
+    *b = (vc4_buf){ 0, 0 };
+    if (!vc4__ws_alloc(c, n * 4, b))
+        return VC4_ERR_NOMEM;
+    float *o = malloc(n * 4);
+    if (!o)
+        return VC4_ERR_NOMEM;
+    for (size_t i = 0; i < n; ++i) o[i] = 1.0f;
+    memcpy(c->arena + b->off, o, n * 4);
+    vc4__mark_dirty(c, b->off, n * 4);
+    free(o);
+    return VC4_OK;
+}
+
+/* out = g * (a > 0 ? 1 : 0) */
+static vc4_status bw_relu(vc4_ctx *c, const vc4_buf *x, const vc4_buf *g,
+                          vc4_buf *o, size_t n)
+{
+    return vc4_relu_backward(c, x, g, o, n);
+}
+
+/* out = g / z  (g * rcp(z)) */
+static vc4_status bw_div_by(vc4_ctx *c, const vc4_buf *g, const vc4_buf *z,
+                            vc4_buf *o, size_t n)
+{
+    size_t top = vc4__ws_begin(c);
+    vc4_buf r;
+    float *p = vc4__ws_alloc(c, n * 4, &r);
+    vc4_status st = p ? VC4_OK : VC4_ERR_NOMEM;
+    if (st == VC4_OK)
+        st = vc4__ewb(c, "rcp", 0, z, z, &r, n, 0, 0);
+    if (st == VC4_OK)
+        st = vc4_elementwise(c, VC4_OP_MUL, g, &r, o, n);
+    vc4__ws_end(c, top);
+    return st;
+}
+
+/* out = g * 1[x in (lo, hi]] : relu_bwd(x-lo,g) - relu_bwd(x-hi,g) */
+static vc4_status bw_clip(vc4_ctx *c, const vc4_buf *x, const vc4_buf *g,
+                          vc4_buf *o, size_t n, float lo, float hi)
+{
+    size_t top = vc4__ws_begin(c);
+    vc4_buf a, b, t;
+    float *p1 = vc4__ws_alloc(c, n * 4, &a);
+    float *p2 = vc4__ws_alloc(c, n * 4, &t);
+    vc4_status st = (p1 && p2) ? VC4_OK : VC4_ERR_NOMEM;
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, x, &t, n, 1.0f, -lo, 0);
+    if (st == VC4_OK)
+        st = vc4_relu_backward(c, &t, g, &a, n);
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, x, &t, n, 1.0f, -hi, 0);
+    if (st == VC4_OK) {
+        b = t;
+        st = vc4_relu_backward(c, &b, g, &t, n);
+    }
+    if (st == VC4_OK) {
+        /* a - t */
+        vc4_buf nm;
+        float *p3 = vc4__ws_alloc(c, n * 4, &nm);
+        if (!p3)
+            st = VC4_ERR_NOMEM;
+        else {
+            st = vc4_unary(c, VC4_UOP_AFFINE, &t, &nm, n, -1.0f, 0.0f, 0);
+            if (st == VC4_OK)
+                st = vc4_elementwise(c, VC4_OP_ADD, &a, &nm, o, n);
+        }
+    }
+    vc4__ws_end(c, top);
+    return st;
+}
+
+/* leakyrelu: g*(x>0 ? 1 : alpha) */
+static vc4_status bw_leaky(vc4_ctx *c, const vc4_buf *x, const vc4_buf *g,
+                           vc4_buf *o, size_t n, float alpha)
+{
+    size_t top = vc4__ws_begin(c);
+    vc4_buf m, t;
+    float *p1 = vc4__ws_alloc(c, n * 4, &m);
+    float *p2 = vc4__ws_alloc(c, n * 4, &t);
+    vc4_status st = (p1 && p2) ? VC4_OK : VC4_ERR_NOMEM;
+    if (st == VC4_OK)
+        st = vc4_relu_backward(c, x, g, &m, n);          /* g where x>0 */
+    if (st == VC4_OK)
+        st = vc4_elementwise(c, VC4_OP_ADD, g, &m, &t, n);
+    if (st == VC4_OK) {
+        /* t = g + (-1)*m = g - m */
+        vc4_buf nm;
+        float *p3 = vc4__ws_alloc(c, n * 4, &nm);
+        if (!p3)
+            st = VC4_ERR_NOMEM;
+        else {
+            st = vc4_unary(c, VC4_UOP_AFFINE, &m, &nm, n, -1.0f, 0.0f, 0);
+            if (st == VC4_OK)
+                st = vc4_elementwise(c, VC4_OP_ADD, g, &nm, &t, n);
+        }
+    }
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, &t, &t, n, alpha, 0.0f, 0);
+    if (st == VC4_OK)
+        st = vc4_elementwise(c, VC4_OP_ADD, &m, &t, o, n);
+    vc4__ws_end(c, top);
+    return st;
+}
+
+/* hardsigmoid: alpha * 1[0 < alpha*x+beta < 1] * g */
+static vc4_status bw_hardsig(vc4_ctx *c, const vc4_buf *x, const vc4_buf *g,
+                             vc4_buf *o, size_t n, float alpha, float beta)
+{
+    size_t top = vc4__ws_begin(c);
+    vc4_buf s, ones, m1, m2, t;
+    float *p1 = vc4__ws_alloc(c, n * 4, &s);
+    float *p2 = vc4__ws_alloc(c, n * 4, &m1);
+    float *p3 = vc4__ws_alloc(c, n * 4, &m2);
+    float *p4 = vc4__ws_alloc(c, n * 4, &t);
+    vc4_status st = (p1 && p2 && p3 && p4) ? VC4_OK : VC4_ERR_NOMEM;
+    if (st == VC4_OK)
+        st = ws_ones(c, &ones, n);
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, x, &s, n, alpha, beta, 0);
+    if (st == VC4_OK)
+        st = vc4_relu_backward(c, &s, &ones, &m1, n);          /* s > 0 */
+    if (st == VC4_OK) {
+        vc4_buf u;
+        float *p5 = vc4__ws_alloc(c, n * 4, &u);
+        if (!p5)
+            st = VC4_ERR_NOMEM;
+        else {
+            st = vc4_unary(c, VC4_UOP_AFFINE, &s, &u, n, 1.0f, -1.0f, 0);
+            if (st == VC4_OK)
+                st = vc4_relu_backward(c, &u, &ones, &m2, n);  /* s > 1 */
+        }
+    }
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, &m2, &m2, n, -1.0f, 1.0f, 0);
+    if (st == VC4_OK)
+        st = vc4_elementwise(c, VC4_OP_MUL, &m1, &m2, &t, n);
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, &t, &t, n, alpha, 0.0f, 0);
+    if (st == VC4_OK)
+        st = vc4_elementwise(c, VC4_OP_MUL, g, &t, o, n);
+    vc4__ws_end(c, top);
+    return st;
+}
+
+/* hardswish: g * (s + x*alpha*1[0<s<1]), s = clip(alpha*x+beta,0,1) */
+static vc4_status bw_hardswish(vc4_ctx *c, const vc4_buf *x, const vc4_buf *g,
+                               vc4_buf *o, size_t n, float alpha, float beta)
+{
+    size_t top = vc4__ws_begin(c);
+    vc4_buf s, ones, m1, m2, m, t, d;
+    float *p1 = vc4__ws_alloc(c, n * 4, &s);
+    float *p2 = vc4__ws_alloc(c, n * 4, &m1);
+    float *p3 = vc4__ws_alloc(c, n * 4, &m2);
+    float *p4 = vc4__ws_alloc(c, n * 4, &m);
+    float *p5 = vc4__ws_alloc(c, n * 4, &t);
+    float *p6 = vc4__ws_alloc(c, n * 4, &d);
+    vc4_status st = (p1 && p2 && p3 && p4 && p5 && p6) ? VC4_OK : VC4_ERR_NOMEM;
+    if (st == VC4_OK)
+        st = ws_ones(c, &ones, n);
+    /* s = min(max(t,0),1) = 1 - relu(1 - relu(t)) */
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, x, &t, n, alpha, beta, 0);
+    if (st == VC4_OK)
+        st = vc4_relu(c, &t, &t, n);
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, &t, &t, n, -1.0f, 1.0f, 0);
+    if (st == VC4_OK)
+        st = vc4_relu(c, &t, &t, n);
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, &t, &s, n, -1.0f, 1.0f, 0);
+    /* mask = 1[0<s<1] */
+    if (st == VC4_OK)
+        st = vc4_relu_backward(c, &s, &ones, &m1, n);
+    if (st == VC4_OK) {
+        vc4_buf u;
+        float *p7 = vc4__ws_alloc(c, n * 4, &u);
+        if (!p7)
+            st = VC4_ERR_NOMEM;
+        else {
+            st = vc4_unary(c, VC4_UOP_AFFINE, &s, &u, n, 1.0f, -1.0f, 0);
+            if (st == VC4_OK)
+                st = vc4_relu_backward(c, &u, &ones, &m2, n);
+        }
+    }
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, &m2, &m2, n, -1.0f, 1.0f, 0);
+    if (st == VC4_OK)
+        st = vc4_elementwise(c, VC4_OP_MUL, &m1, &m2, &m, n);
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, &m, &m, n, alpha, 0.0f, 0);
+    if (st == VC4_OK)
+        st = vc4_elementwise(c, VC4_OP_MUL, x, &m, &m, n);
+    if (st == VC4_OK)
+        st = vc4_elementwise(c, VC4_OP_ADD, &s, &m, &d, n);
+    if (st == VC4_OK)
+        st = vc4_elementwise(c, VC4_OP_MUL, g, &d, o, n);
+    vc4__ws_end(c, top);
+    return st;
+}
+
+/* |x| derivative: g*sign(x) = relu_bwd(x,g) - relu_bwd(-x,g) */
+static vc4_status bw_abs(vc4_ctx *c, const vc4_buf *x, const vc4_buf *g,
+                         vc4_buf *o, size_t n)
+{
+    size_t top = vc4__ws_begin(c);
+    vc4_buf pos, neg, t;
+    float *p1 = vc4__ws_alloc(c, n * 4, &pos);
+    float *p2 = vc4__ws_alloc(c, n * 4, &neg);
+    float *p3 = vc4__ws_alloc(c, n * 4, &t);
+    vc4_status st = (p1 && p2 && p3) ? VC4_OK : VC4_ERR_NOMEM;
+    if (st == VC4_OK)
+        st = vc4_relu_backward(c, x, g, &pos, n);
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, x, &t, n, -1.0f, 0.0f, 0);
+    if (st == VC4_OK)
+        st = vc4_relu_backward(c, &t, g, &neg, n);
+    if (st == VC4_OK)
+        st = vc4_unary(c, VC4_UOP_AFFINE, &neg, &neg, n, -1.0f, 0.0f, 0);
+    if (st == VC4_OK)
+        st = vc4_elementwise(c, VC4_OP_ADD, &pos, &neg, o, n);
+    vc4__ws_end(c, top);
+    return st;
+}
+
 vc4_status vc4_bwop_run(vc4_ctx *ctx, vc4_bwop op, const vc4_buf *x,
                         const vc4_buf *g, vc4_buf *out, size_t n, float p0,
                         float p1)
@@ -548,22 +782,20 @@ vc4_status vc4_bwop_run(vc4_ctx *ctx, vc4_bwop op, const vc4_buf *x,
     case VC4_BW_SILU:        return bw_silu(ctx, x, g, out, n);
     case VC4_BW_TANH:        return bw_tanh(ctx, x, g, out, n);
     case VC4_BW_EXP:         return bw_exp(ctx, x, g, out, n);
-    case VC4_BW_LOG:         return bw_log(ctx, x, g, out, n);
+    case VC4_BW_LOG:         return bw_div_by(ctx, g, x, out, n);
     case VC4_BW_SQRT:        return bw_sqrt(ctx, x, g, out, n);
     case VC4_BW_ERF:         return bw_erf(ctx, x, g, out, n);
     case VC4_BW_GELU:        return bw_gelu(ctx, x, g, out, n);
     case VC4_BW_GELU_ERF:
         vc4__set_err(ctx, "vc4_bwop: the erf-form GELU derivative needs an erf "
-                     "kernel, and the erf body does not fit the 2048-"
-                     "instruction code slot at the verified 16-vector store "
-                     "granularity; use the tanh form (VC4_BW_GELU) or compose "
-                     "it from vc4_bwop_run(VC4_BW_ERF) pieces");
+                     "kernel and the erf body does not fit the code slot at "
+                     "16 vectors; use the tanh form (VC4_BW_GELU)");
         return VC4_ERR_UNSUPPORTED;
-    case VC4_BW_ABS:         return vc4__ewb(ctx, "abs_bwd", 0, x, g, out, n, p0, p1);
-    case VC4_BW_CLIP:        return vc4__ewb(ctx, "clip_bwd", 0, x, g, out, n, p0, p1);
-    case VC4_BW_LEAKYRELU:   return vc4__ewb(ctx, "leakyrelu_bwd", 0, x, g, out, n, p0, p1);
-    case VC4_BW_HARDSWISH:   return vc4__ewb(ctx, "hardswish_bwd", 0, x, g, out, n, p0, p1);
-    case VC4_BW_HARDSIGMOID: return vc4__ewb(ctx, "hardsigmoid_bwd", 0, x, g, out, n, p0, p1);
+    case VC4_BW_ABS:         return bw_abs(ctx, x, g, out, n);
+    case VC4_BW_CLIP:        return bw_clip(ctx, x, g, out, n, p0, p1);
+    case VC4_BW_LEAKYRELU:   return bw_leaky(ctx, x, g, out, n, p0);
+    case VC4_BW_HARDSWISH:   return bw_hardswish(ctx, x, g, out, n, p0, p1);
+    case VC4_BW_HARDSIGMOID: return bw_hardsig(ctx, x, g, out, n, p0, p1);
     default:                 return VC4_ERR_UNSUPPORTED;
     }
 }

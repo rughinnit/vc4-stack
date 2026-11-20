@@ -1384,6 +1384,23 @@ def b2_erf_bwd(e, IN, G, OUT):
     e.mul(OUT, G, t)
 
 
+def b2_rcp(e, IN, G, OUT):
+    """1/x with 3 Newton steps: the 4-step UOPS body is 2146 instructions at
+    16 vectors per group and the code slot holds 2048."""
+    k = e.k
+    a = e.ctx.tb()
+    e.op(k.ADD_FMAX, a, IN, e.ctx.k('TINY'))
+    e.op(k.ADD_FMIN, a, a, e.ctx.k('BIG'))
+    e.op(k.ADD_SUB, OUT, e.ctx.k('RCPM'), a)
+    for _ in range(3):
+        q = e.ctx.tb()
+        e.mul(q, OUT, a)
+        e.op(k.ADD_FSUB, q, e.ctx.k('TWO'), q)
+        e.mul(OUT, OUT, q)
+        e.ctx.rel(q)
+    e.ctx.rel(a)
+
+
 EWB = {
     'sub':            ((), b2_sub, ()),
     'max':            ((), b2_max, ()),
@@ -1407,7 +1424,7 @@ EWB = {
     'exp':            (UOPS['exp'][0], _uni(UOPS['exp'][1]), ()),
     'log':            (UOPS['log'][0], _uni(UOPS['log'][1]), ()),
     'sqrt':           (UOPS['sqrt'][0], _uni(UOPS['sqrt'][1]), ()),
-    'rcp':            (UOPS['reciprocal'][0], _uni(UOPS['reciprocal'][1]), ()),
+    'rcp':            (('TINY', 'BIG', 'RCPM', 'TWO'), b2_rcp, ()),
     'tanh':           (UOPS['tanh'][0], _uni(UOPS['tanh'][1]), ()),
 }
 

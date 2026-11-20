@@ -27,7 +27,7 @@
 static int uop_nvec(vc4_uop op)
 {
     switch (op) {
-    case VC4_UOP_ABS: case VC4_UOP_LOG: case VC4_UOP_TANH: case VC4_UOP_ERF: case VC4_UOP_ELU:
+    case VC4_UOP_LOG: case VC4_UOP_TANH: case VC4_UOP_ERF: case VC4_UOP_ELU:
     case VC4_UOP_SELU: case VC4_UOP_SOFTPLUS: case VC4_UOP_SOFTSIGN:
     case VC4_UOP_GELU: case VC4_UOP_GELU_ERF: case VC4_UOP_SIN:
     case VC4_UOP_COS: case VC4_UOP_ROUND: case VC4_UOP_SQRT:

@@ -89,11 +89,21 @@ class E:
         self.k, self.b, self.ctx = k, b, ctx
 
     def _fit(self, a, bb):
+        """Make the operands addressable by one ALU word.
+
+        The VC4 word has one A and one B read slot, so two operands from the
+        same file are staged through ACC2.  `self.staged` records that the
+        move happened: the *multiply* ALU cannot read an add-ALU accumulator
+        result in the next word (measured; NUMERICS.md), so mul() pads two
+        words before consuming it.  The add ALU may read it immediately.
+        """
+        self.staged = False
         if bb is None or a == bb:
             return a, bb
         ba, bbb = _bank(a), _bank(bb)
         if ba == bbb and ba in ('A', 'B'):
             self.mov(ACC2, bb)
+            self.staged = True
             return a, ACC2
         return a, bb
 
@@ -116,6 +126,8 @@ class E:
 
     def mul(self, out, a, bb):
         a, bb = self._fit(a, bb)
+        if getattr(self, 'staged', False):
+            self.b.e(self.k.nop(), self.k.nop())    # add-ALU ACC -> mul ALU
         if 100 <= out < 200:
             o = 32 + out - 100
         else:
@@ -128,6 +140,8 @@ class E:
 
     def mul24(self, out, a, bb):
         a, bb = self._fit(a, bb)
+        if getattr(self, 'staged', False):
+            self.b.e(self.k.nop(), self.k.nop())
         assert 100 <= out < 200, "MUL24 result must be an accumulator"
         self.b.e(dict(mul_op=self.k.MUL_MUL24, mul_out=32 + out - 100, ws=0,
                       mul_a=_s(self.k, a), mul_b=_s(self.k, bb)))

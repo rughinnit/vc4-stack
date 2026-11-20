@@ -66,6 +66,7 @@ Batch N is supported for the NHWC conv path, pool, upsample, concat,
 elementwise and softmax; the NCHW fallback, Gemm and GlobalAveragePool are
 batch 1 and raise otherwise.
 """
+import functools
 import os
 import sys
 import time
@@ -122,6 +123,22 @@ ENGINE = _first_dir(os.environ.get("VC4INFER_ENGINE"),
 
 def _align16(v):
     return (int(v) + 15) & ~15
+
+
+_EXTRA_HANDLERS = None
+
+
+def _extra_handlers():
+    """The lazy second dispatch table (imported once, on first use).
+
+    It is imported lazily because it is built on this module's ``Tensor`` and
+    ``Runner`` helpers; a module-level import would be circular.
+    """
+    global _EXTRA_HANDLERS
+    if _EXTRA_HANDLERS is None:
+        from . import _dispatch_extra
+        _EXTRA_HANDLERS = _dispatch_extra.HANDLERS
+    return _EXTRA_HANDLERS
 
 
 class Pool:
@@ -2331,6 +2348,12 @@ class Runner:
             for name in _UNARY_NV4_STAGED:
                 d.pop(name, None)
         fn = d.get(op)
+        if fn is None:
+            # the reduction / comparison / shape-and-arith family lives in its
+            # own dispatch module (docs/OPS-REDUCE.md)
+            h = _extra_handlers().get(op)
+            if h is not None:
+                fn = functools.partial(h, self)
         if fn is None:
             raise UnsupportedNode(node.name, op, "unsupported op %s" % op)
         try:

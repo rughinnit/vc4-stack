@@ -34,13 +34,24 @@ static int ew_kgen_op(vc4_op op)
     case VC4_OP_SILU:    return 4;
     case VC4_OP_RELU_BWD:return 5;
     case VC4_OP_RSQRT:   return 6;
+    /* the comparison/predicate family: fixed bodies in kgen._ew_cmp */
+    case VC4_OP_CMP_EQ:  return 10;
+    case VC4_OP_CMP_GT:  return 11;
+    case VC4_OP_CMP_GE:  return 12;
+    case VC4_OP_CMP_LT:  return 13;
+    case VC4_OP_CMP_LE:  return 14;
+    case VC4_OP_ISNAN:   return 15;
+    case VC4_OP_ISINF:   return 16;
     default:             return -1;
     }
 }
 
 static int ew_is_binary(vc4_op op)
 {
-    return op == VC4_OP_ADD || op == VC4_OP_MUL || op == VC4_OP_RELU_BWD;
+    return op == VC4_OP_ADD || op == VC4_OP_MUL || op == VC4_OP_RELU_BWD ||
+           op == VC4_OP_CMP_EQ || op == VC4_OP_CMP_GT ||
+           op == VC4_OP_CMP_GE || op == VC4_OP_CMP_LT ||
+           op == VC4_OP_CMP_LE;
 }
 
 static int ew_op_ok(vc4_op op)
@@ -53,6 +64,13 @@ static int ew_op_ok(vc4_op op)
     case VC4_OP_SILU:
     case VC4_OP_RELU_BWD:
     case VC4_OP_RSQRT:
+    case VC4_OP_CMP_EQ:
+    case VC4_OP_CMP_GT:
+    case VC4_OP_CMP_GE:
+    case VC4_OP_CMP_LT:
+    case VC4_OP_CMP_LE:
+    case VC4_OP_ISNAN:
+    case VC4_OP_ISINF:
         return 1;
     default:
         return 0;

@@ -143,6 +143,14 @@ static const vc4_op_info OPS[] = {
       "additive scatter; a target hit more than 64 times is refused", 1 },
     { "scatter_bwd", "qpu gather table", 1, "out[idx[i]] = x[i] -> dx[i] = g[idx[i]]", 1 },
     { "affine", "qpu uop(affine)", 1, "a*p0 + p1 (the scalar scale/offset)", 0 },
+    { "cmp/eq", "qpu ew bit-compare", 1,
+      "a==b; exact for every fp32, NaN gives 0, -0.0==+0.0", 1 },
+    { "cmp/gt", "qpu ew bit-compare", 1, "a>b; exact, NaN gives 0", 1 },
+    { "cmp/ge", "qpu ew bit-compare", 1, "a>=b; exact, NaN gives 0", 1 },
+    { "cmp/lt", "qpu ew bit-compare", 1, "a<b; exact, NaN gives 0", 1 },
+    { "cmp/le", "qpu ew bit-compare", 1, "a<=b; exact, NaN gives 0", 1 },
+    { "isnan", "qpu ew bit-test", 1, "|bits| > 0x7F800000", 1 },
+    { "isinf", "qpu ew bit-test", 1, "|bits| == 0x7F800000 (both signs)", 1 },
 
     /* not implemented -- listed so the table is an honest coverage statement */
     { "conv2d/5x5", "-", 0, "no kernel; would need another im2col tap schedule", 0 },
@@ -217,6 +225,13 @@ const char *vc4_op_name(vc4_op op)
     case VC4_OP_SCATTER_BWD: return "scatter_bwd";
     case VC4_OP_GLOBAL_AVGPOOL: return "global_avgpool";
     case VC4_OP_GLOBAL_AVGPOOL_BWD: return "global_avgpool_bwd";
+    case VC4_OP_CMP_EQ:  return "cmp/eq";
+    case VC4_OP_CMP_GT:  return "cmp/gt";
+    case VC4_OP_CMP_GE:  return "cmp/ge";
+    case VC4_OP_CMP_LT:  return "cmp/lt";
+    case VC4_OP_CMP_LE:  return "cmp/le";
+    case VC4_OP_ISNAN:   return "isnan";
+    case VC4_OP_ISINF:   return "isinf";
     default:             return "?";
     }
 }

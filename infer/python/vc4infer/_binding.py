@@ -76,6 +76,12 @@ _STATUS = {
 }
 
 OP_MATMUL, OP_CONV2D, OP_ADD, OP_MUL, OP_RELU, OP_SIGMOID, OP_SILU = range(7)
+# exact FP32 comparisons / predicates (vc4infer.h: appended after the forward
+# and training op set, so the first seven numbers never move)
+OP_CMP_EQ, OP_CMP_GT, OP_CMP_GE, OP_CMP_LT, OP_CMP_LE, OP_ISNAN, OP_ISINF = \
+    range(45, 52)
+# the two forward ops the composition handlers name directly
+OP_RELU_BWD = 7
 LAYOUT_ROW_MAJOR = 0
 
 # vc4_uop (mirrors infer/include/vc4infer.h)

@@ -2127,6 +2127,13 @@ def build_pool(H, W, op, mode):
 
 # =============================================================== elementwise
 OP_ADD, OP_MUL, OP_RELU, OP_SIGMOID, OP_SILU, OP_RELU_BWD, OP_RSQRT = 0, 1, 2, 3, 4, 5, 6
+# FP32 comparison / predicate family (exact, IEEE bit tests; 0.0/1.0 output).
+# Codes 7..99 are unused by the harness and by kops.py (100 = generic unary,
+# 200 = generic binary/backward), so they are free for fixed bodies.
+OP_CMP_EQ, OP_CMP_GT, OP_CMP_GE, OP_CMP_LT, OP_CMP_LE = 10, 11, 12, 13, 14
+OP_ISNAN, OP_ISINF = 15, 16
+OP_CMP_ALL = (OP_CMP_EQ, OP_CMP_GT, OP_CMP_GE, OP_CMP_LT, OP_CMP_LE, OP_ISNAN,
+              OP_ISINF)
 
 E_AB, E_BB, E_OB = 16, 17, 18
 E_CNT, E_LANE = 19, 20
@@ -2872,6 +2879,13 @@ def build_copy_nhwc(Csrc, Cdst):
 
 # =============================================================== elementwise
 OP_ADD, OP_MUL, OP_RELU, OP_SIGMOID, OP_SILU, OP_RELU_BWD, OP_RSQRT = 0, 1, 2, 3, 4, 5, 6
+# FP32 comparison / predicate family (exact, IEEE bit tests; 0.0/1.0 output).
+# Codes 7..99 are unused by the harness and by kops.py (100 = generic unary,
+# 200 = generic binary/backward), so they are free for fixed bodies.
+OP_CMP_EQ, OP_CMP_GT, OP_CMP_GE, OP_CMP_LT, OP_CMP_LE = 10, 11, 12, 13, 14
+OP_ISNAN, OP_ISINF = 15, 16
+OP_CMP_ALL = (OP_CMP_EQ, OP_CMP_GT, OP_CMP_GE, OP_CMP_LT, OP_CMP_LE, OP_ISNAN,
+              OP_ISINF)
 
 E_AB, E_BB, E_OB = 16, 17, 18
 E_CNT, E_LANE = 19, 20
@@ -2946,7 +2960,16 @@ def build_ew(op, depth=2, nvec=16):
         b.e(ldi(0x3FC00000, 1, ws=1))      # B1: 1.5
         b.e(ldi(0x3F000000, 2, ws=1))      # B2: 0.5
         b.e(nop(), nop())
-    if op >= 200:
+    if op in OP_CMP_ALL:
+        # comparison / predicate constants.  B9..B12 are free for a fixed
+        # body: the harness only keeps B8 (the b stream), B17..B29 (loop
+        # state) and the sigmoid/mul constant blocks.
+        b.e(ldi(0x7FFFFFFF, 9, ws=1))      # B9 : |x| mask
+        b.e(ldi(0x7F800001, 10, ws=1))     # B10: first NaN pattern
+        b.e(ldi(0x7F800000, 11, ws=1))     # B11: +inf
+        b.e(ldi(0x3F800000, 12, ws=1), nop())   # B12: 1.0f
+        b.e(nop(), nop())
+    elif op >= 200:
         # generic binary / backward op from kops.py (op-200 indexes EWB)
         import kops
         kops.ewb_consts(sys.modules[__name__], b, op - 200)
@@ -3155,6 +3178,8 @@ def _ew_compute(b, op, j):
         b.e(_ops(add_op=ADD_ASR, add_out=32 + 0, add_a=acc(0), add_b=imm(31)))
         b.e(_ops(add_op=ADD_NOT, add_out=32 + 1, add_a=acc(0), add_b=acc(0)))
         b.e(_ops(add_op=ADD_AND, add_out=j, add_a=acc(1), add_b=bb))
+    elif op in OP_CMP_ALL:
+        _ew_cmp(b, op, j, aa, bb)
     elif op in (OP_SIGMOID, OP_SILU):
         b.e(_ops(mul_op=MUL_FMUL, mul_out=32 + 0, ws=0, mul_a=aa,
                  mul_b=breg(K['NLOG2E'])))
@@ -3216,6 +3241,142 @@ def _ew_compute(b, op, j):
 
 
 # =============================================================== softmax+CE
+
+def _ew_cmp(b, op, j, aa, bb):
+    """Exact FP32 comparison / predicate, 0.0 or 1.0 out (vector j).
+
+    Pure integer ALU work on IEEE-754 bit patterns: no floating-point
+    operation is used, so nothing is rounded and nothing is flushed (the QPU
+    FPU flushes denormals, ONNX.md 11.1, and a comparison must not).  The
+    result is the ONNX answer for every input: NaN compares false everywhere
+    including Equal, -0.0 == +0.0, +-inf compare by value, denormals compare
+    by value.
+
+    Ordering uses the monotonic integer key of a float:
+
+        key(x) = bits(x) ^ ((bits(x) >> 31) & 0x7FFFFFFF)     (arithmetic >>)
+
+    which maps -inf .. +inf onto a strictly increasing *signed* int32, so the
+    key is injective and key(x) >= 0 exactly when x >= 0.0.  Two keys of the
+    same sign cannot overflow when subtracted, and across signs the answer is
+    the sign of the first operand, so no overflow correction is needed.
+
+    Register map (all dead once the group loop starts): A16 both-zero term,
+    A17 dneg/sb scratch, A18 lt, A20 key(a), A24 both-non-NaN, A27 eq,
+    A30 lt&mn, A31 scratch; B13 sign(a), B14 key(b), B15 |b|; constants B9
+    |x| mask, B10 first NaN pattern, B11 +inf, B12 1.0f; accumulators r0..r3.
+    """
+    ACC0, ACC1, ACC2, ACC3 = 100, 101, 102, 103   # kops scheme
+    ABSM, NANP1, INFB, ONEB = 9, 10, 11, 12
+    A_Z, A_DNEG, A_LT, A_KA, A_MN, A_EQ, A_LTm, A_T = 16, 17, 18, 20, 24, 27, 30, 31
+    B_SA, B_KB, B_AB = 13, 14, 15
+
+    def emit(aop, out, a, c=None, ws=0):
+        d = dict(add_op=aop, add_out=(32 + out - 100 if out >= 100 else out),
+                 ws=ws, add_a=a)
+        if c is not None:
+            d["add_b"] = c
+        b.e(d)
+
+    def eqzero_or(src, out):
+        """-1 iff src == 0 (src must be a non-negative int register)."""
+        emit(ADD_OR, ACC2, src, src)
+        emit(ADD_SUB, ACC2, acc(2), imm(1))        # -1 iff src <= 0
+        emit(ADD_ASR, ACC2, acc(2), imm(31))
+        emit(ADD_OR, out, acc(2), acc(2))
+
+    if op == OP_ISNAN:
+        emit(ADD_AND, ACC0, areg(E_AV), breg(ABSM))
+        emit(ADD_SUB, ACC0, acc(0), breg(NANP1))
+        emit(ADD_ASR, ACC0, acc(0), imm(31))       # -1 iff not NaN
+        emit(ADD_NOT, ACC2, acc(0), acc(0))
+        emit(ADD_AND, ACC2, acc(2), breg(ONEB))
+        emit(ADD_OR, j, acc(2), acc(2))
+        return
+    if op == OP_ISINF:
+        emit(ADD_AND, ACC0, areg(E_AV), breg(ABSM))
+        emit(ADD_SUB, ACC0, acc(0), breg(INFB))    # signed: 0 iff +-inf
+        emit(ADD_OR, A_T, acc(0), acc(0))
+        emit(ADD_OR, ACC2, acc(0), acc(0))
+        emit(ADD_SUB, ACC2, acc(2), imm(1))        # -1 iff <= 0
+        emit(ADD_ASR, ACC2, acc(2), imm(31))
+        emit(ADD_ASR, ACC3, areg(A_T), imm(31))    # -1 iff < 0
+        emit(ADD_NOT, ACC3, acc(3), acc(3))
+        emit(ADD_AND, ACC2, acc(2), acc(3))        # -1 iff == 0
+        emit(ADD_AND, ACC2, acc(2), breg(ONEB))
+        emit(ADD_OR, j, acc(2), acc(2))
+        return
+
+    # ---- |b| (B15) and |a| (A31), then the "both operands are zero" term
+    emit(ADD_OR, ACC3, breg(B_VB), breg(B_VB))
+    emit(ADD_AND, ACC3, acc(3), breg(ABSM))
+    emit(ADD_OR, B_AB, acc(3), acc(3), ws=1)
+    emit(ADD_AND, ACC0, areg(E_AV), breg(ABSM))
+    emit(ADD_OR, A_T, acc(0), acc(0))
+    emit(ADD_OR, ACC2, areg(A_T), breg(B_AB))
+    eqzero_or(acc(2), A_Z)                        # -1 iff both are zero
+    # ---- monotonic keys
+    emit(ADD_ASR, ACC0, areg(E_AV), imm(31))       # sign(a)
+    emit(ADD_AND, ACC0, acc(0), breg(ABSM))
+    emit(ADD_OR, B_SA, acc(0), acc(0), ws=1)
+    emit(ADD_XOR, A_KA, areg(E_AV), acc(0))       # key(a)
+    emit(ADD_OR, ACC3, breg(B_VB), breg(B_VB))
+    emit(ADD_ASR, ACC0, acc(3), imm(31))          # sign(b)
+    emit(ADD_AND, ACC0, acc(0), breg(ABSM))
+    emit(ADD_OR, A_DNEG, acc(0), acc(0))          # sb, scratch
+    emit(ADD_XOR, ACC3, acc(3), acc(0))           # key(b)
+    emit(ADD_OR, B_KB, acc(3), acc(3), ws=1)
+    # ---- d, sign difference, lt
+    emit(ADD_SUB, ACC1, areg(A_KA), breg(B_KB))   # d = key(a) - key(b)
+    emit(ADD_XOR, ACC0, breg(B_SA), areg(A_DNEG))  # signs differ?
+    emit(ADD_ASR, A_DNEG, acc(1), imm(31))        # -1 iff d < 0
+    emit(ADD_NOT, ACC2, acc(0), acc(0))           # same sign
+    emit(ADD_AND, ACC2, areg(A_DNEG), acc(2))     # d < 0 and same sign
+    emit(ADD_AND, A_LT, acc(0), breg(B_SA))       # signs differ and a < 0
+    emit(ADD_OR, A_LT, acc(2), areg(A_LT))        # lt
+    emit(ADD_NOT, ACC2, areg(A_Z), areg(A_Z))     # not both zero (-0.0 == +0.0)
+    emit(ADD_AND, A_LT, areg(A_LT), acc(2))       # lt, zero-pair excluded
+    # ---- both non-NaN
+    emit(ADD_AND, ACC0, areg(E_AV), breg(ABSM))
+    emit(ADD_SUB, ACC0, acc(0), breg(NANP1))
+    emit(ADD_ASR, ACC0, acc(0), imm(31))
+    emit(ADD_NOT, ACC2, acc(0), acc(0))           # not NaN(a)
+    emit(ADD_OR, ACC3, breg(B_VB), breg(B_VB))
+    emit(ADD_AND, ACC3, acc(3), breg(ABSM))
+    emit(ADD_SUB, ACC3, acc(3), breg(NANP1))
+    emit(ADD_ASR, ACC3, acc(3), imm(31))
+    emit(ADD_NOT, ACC3, acc(3), acc(3))           # not NaN(b)
+    emit(ADD_OR, A_T, acc(3), acc(3))
+    emit(ADD_OR, ACC2, acc(2), areg(A_T))
+    emit(ADD_NOT, A_MN, acc(2), acc(2))           # both non-NaN
+    # ---- equality: (d == 0) | both-zero, then & non-NaN
+    emit(ADD_OR, ACC2, acc(1), acc(1))
+    emit(ADD_SUB, ACC2, acc(2), imm(1))           # -1 iff d <= 0
+    emit(ADD_ASR, ACC2, acc(2), imm(31))
+    emit(ADD_NOT, A_DNEG, areg(A_DNEG), areg(A_DNEG))
+    emit(ADD_AND, ACC2, acc(2), areg(A_DNEG))     # -1 iff d == 0
+    emit(ADD_OR, ACC2, acc(2), areg(A_Z))         # | both zero
+    emit(ADD_AND, A_EQ, acc(2), areg(A_MN))       # eq
+    # ---- select
+    emit(ADD_OR, ACC2, areg(A_LT), areg(A_LT))
+    emit(ADD_AND, A_LTm, acc(2), areg(A_MN))      # lt, NaN-safe
+    if op == OP_CMP_EQ:
+        emit(ADD_OR, ACC2, areg(A_EQ), areg(A_EQ))
+    elif op == OP_CMP_LT:
+        emit(ADD_OR, ACC2, areg(A_LTm), areg(A_LTm))
+    elif op == OP_CMP_LE:                         # lt | eq
+        emit(ADD_OR, ACC3, areg(A_LTm), areg(A_LTm))
+        emit(ADD_OR, ACC3, acc(3), areg(A_EQ))
+        emit(ADD_OR, ACC2, acc(3), acc(3))
+    elif op == OP_CMP_GT:                         # mn & ~(lt | eq)
+        emit(ADD_OR, ACC3, areg(A_LTm), areg(A_LTm))
+        emit(ADD_OR, ACC3, acc(3), areg(A_EQ))
+        emit(ADD_SUB, ACC2, areg(A_MN), acc(3))
+    else:                                         # OP_CMP_GE: mn & ~lt
+        emit(ADD_OR, ACC2, areg(A_MN), areg(A_MN))
+        emit(ADD_SUB, ACC2, acc(2), areg(A_LTm))
+    emit(ADD_AND, j, acc(2), breg(ONEB))
+
 def build_softmax(depth=2, probe=None):
     """Fused row softmax + cross-entropy backward, ONE 8-row group per launch.
 

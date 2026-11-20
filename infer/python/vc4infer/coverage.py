@@ -93,6 +93,49 @@ OPS = {
     "Selu": "QPU unary (UOP_SELU, alpha/gamma uniforms, max abs 8.7e-7)",
     "Gelu": "QPU unary (UOP_GELU tanh / composed erf, max abs 5.0e-7)",
     "Mish": "QPU Softplus+Tanh+MUL composition (max abs 4.1e-7)",
+    # the reduction / comparison / shape-and-arith family (_dispatch_extra.py,
+    # docs/OPS-REDUCE.md).  Each entry names the kernels the handler composes.
+    "ReduceSum": "QPU reduce (sum) + copy2d axis-to-last",
+    "ReduceMean": "QPU reduce (sum) + QPU affine 1/count",
+    "ReduceMax": "QPU reduce (max) + copy2d axis-to-last",
+    "ReduceMin": "QPU reduce (min) + copy2d axis-to-last",
+    "ReduceProd": "QPU MUL chain over the reduced slices + copy2d",
+    "ReduceL1": "QPU Abs + reduce (sum)",
+    "ReduceL2": "QPU MUL + reduce (sum) + QPU Sqrt",
+    "ReduceSumSquare": "QPU MUL + reduce (sum)",
+    "ReduceLogSum": "QPU reduce (sum) + QPU Log",
+    "ReduceLogSumExp": "QPU Exp + reduce (sum) + QPU Log (|x| <= 88)",
+    "Equal": "QPU ew bit-compare (exact), bool output",
+    "Greater": "QPU ew bit-compare (exact), bool output",
+    "GreaterOrEqual": "QPU ew bit-compare (exact), bool output",
+    "Less": "QPU ew bit-compare (exact), bool output",
+    "LessOrEqual": "QPU ew bit-compare (exact), bool output",
+    "Where": "QPU select3 (where)",
+    "PRelu": "QPU select3 (prelu)",
+    "IsNaN": "QPU ew bit-test (|bits| > 0x7F800000)",
+    "IsInf": "QPU ew bit-test + QPU ReluBwd sign filter",
+    "ArgMax": "QPU reduce (argmax), int64 index output",
+    "ArgMin": "QPU reduce (argmin), int64 index output",
+    "CumSum": "QPU cumsum + copy2d transpose/padding",
+    "Expand": "QPU copy2d broadcast (lane copies)",
+    "Tile": "QPU copy2d repeat (lane copies)",
+    "Pad": "QPU fill2d + copy2d (constant/reflect/edge/wrap)",
+    "Compress": "QPU copy2d row select",
+    "OneHot": "host-built constant pattern + QPU affine",
+    "Trilu": "host-built triangle mask + QPU Mul",
+    "Range": "host-built constant sequence",
+    "EyeLike": "host-built constant identity",
+    "CastLike": "view (fp32) / dtype conversion",
+    "SpaceToDepth": "QPU copy2d laned gather",
+    "Shrink": "QPU ew bit-compare + Mul/Add",
+    "ThresholdedRelu": "QPU affine + ReluBwd",
+    "Celu": "QPU Relu/Exp/Affine composition",
+    "Hardmax": "QPU reduce (argmax) + host-built mask + copy2d",
+    "LogSoftmax": "QPU Exp + reduce + Log (|x| <= 88)",
+    "Pow": "QPU Log/Exp/Reciprocal chain (small integer exponents are exact "
+           "multiply chains)",
+    "Mod": "QPU Reciprocal/Floor/Sign + Mul/Sub (fmod and floor semantics)",
+    "DepthToSpace": "needs an element-level scatter (see the refusal)",
 }
 
 # Registered after the 2026-11-20 clean-window verification.  Set
@@ -385,7 +428,72 @@ def _check_clip(node, shapes, inits):
     return "supported", "scalar limits"
 
 
+def _check_reduce(node, shapes, inits):
+    axes = _attr(node, "axes", None)
+    if len(node.input) > 1 and node.input[1]:
+        axes = inits.get(node.input[1])
+        if axes is None:
+            return "unknown", "axes is a runtime tensor"
+    if axes is not None and len(list(np.asarray(axes).ravel())) == 0:
+        return "supported", "no axes (noop_with_empty_axes)"
+    return "supported", "%s axes" % ("all" if axes is None else
+                                     list(np.asarray(axes).ravel()))
+
+
+def _check_pad(node, shapes, inits):
+    mode = _attr(node, "mode", "constant")
+    if mode not in ("constant", "reflect", "edge", "wrap"):
+        return "unsupported", "mode=%s (constant, reflect, edge, wrap)" % mode
+    if len(node.input) > 3 and node.input[3] and node.input[3] not in inits:
+        return "unsupported", "axes is a runtime tensor"
+    return "supported", mode
+
+
+def _check_compress(node, shapes, inits):
+    if _attr(node, "axis", None) is None:
+        return "unsupported", ("axis=None selects single elements from the "
+                               "flattened input (a per-element scatter)")
+    return "supported", "axis %d" % int(_attr(node, "axis", 0))
+
+
+def _check_cumsum(node, shapes, inits):
+    if len(node.input) > 1 and node.input[1] and node.input[1] not in inits:
+        return "unsupported", "axis is a runtime tensor"
+    return "supported", "prefix sum, axis in a constant"
+
+
+def _check_depthtospace(node, shapes, inits):
+    return "unsupported", (
+        "DepthToSpace needs an element-level scatter: an output row "
+        "[ow*blocksize + j] alternates between blocksize input channels, and a "
+        "copy2d destination vector is 16 contiguous words, so no lane stride "
+        "expresses it.  vc4_gather, which would, is refused on this board "
+        "(it wedges the QPU).  SpaceToDepth, its inverse, runs.")
+
+
+def _check_eargmax(node, shapes, inits):
+    if int(_attr(node, "select_last_index", 0)):
+        return "supported", "select_last_index=1 (reversed copy)"
+    return "supported", "arg reduce"
+
+
 _CHECKS = {
+    "ReduceSum": _check_reduce,
+    "ReduceMean": _check_reduce,
+    "ReduceMax": _check_reduce,
+    "ReduceMin": _check_reduce,
+    "ReduceProd": _check_reduce,
+    "ReduceL1": _check_reduce,
+    "ReduceL2": _check_reduce,
+    "ReduceLogSum": _check_reduce,
+    "ReduceLogSumExp": _check_reduce,
+    "ReduceSumSquare": _check_reduce,
+    "Pad": _check_pad,
+    "Compress": _check_compress,
+    "CumSum": _check_cumsum,
+    "DepthToSpace": _check_depthtospace,
+    "ArgMax": _check_eargmax,
+    "ArgMin": _check_eargmax,
     "Conv": _check_conv,
     "Clip": _check_clip,
     "MaxPool": _check_maxpool,

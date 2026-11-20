@@ -102,6 +102,14 @@ typedef enum {
     VC4_OP_SCATTER_BWD,     /* = gather                                       */
     VC4_OP_GLOBAL_AVGPOOL,  /* mean over H,W                                  */
     VC4_OP_GLOBAL_AVGPOOL_BWD, /* uniform scatter over H,W                   */
+    /* exact FP32 comparisons and predicates (0.0f / 1.0f, bit-exact) */
+    VC4_OP_CMP_EQ,          /* a == b                                        */
+    VC4_OP_CMP_GT,          /* a >  b                                        */
+    VC4_OP_CMP_GE,          /* a >= b                                        */
+    VC4_OP_CMP_LT,          /* a <  b                                        */
+    VC4_OP_CMP_LE,          /* a <= b                                        */
+    VC4_OP_ISNAN,           /* a is NaN                                      */
+    VC4_OP_ISINF,           /* a is +inf or -inf                             */
     VC4_OP_COUNT
 } vc4_op;
 

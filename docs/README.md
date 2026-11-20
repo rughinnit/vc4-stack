@@ -1,5 +1,9 @@
 # vc4-stack documentation index
 
+**Start with [TUTORIAL.md](TUTORIAL.md)** for the walkthrough, and
+**[BENCHMARKS.md](BENCHMARKS.md)** for every measured number and comparison in
+one table.
+
 **Start with [TUTORIAL.md](TUTORIAL.md).**  It takes a stock Pi 3B to a running
 YOLOv8n and a trained `torch_vc4` model, and every command in it was run on the
 board or is explicitly marked as not re-run.  This directory is the single
@@ -16,6 +20,7 @@ and every path below is relative to the repository root unless it starts with
 | [`../infer/README.md`](../infer/README.md) | libvc4infer: API, build, kernel JIT, daemon backend, op coverage, limits |
 | [`../training/README.md`](../training/README.md) | backward kernels and the MLP/conv trainer, how to run them |
 | [`../vc4d/README.md`](../vc4d/README.md) | the privileged helper daemon: protocol, build, install |
+| `BENCHMARKS.md` | **the registry**: hardware envelope, GEMM, YOLOv8n progression, 320/640, per-op torch_vc4 vs CPU, training, builds, copy bandwidth, ORT, backend overhead, clocks, completeness, framework effort |
 | `BACKENDS.md` | the two backends: `managed` (vc4d, unprivileged, ~0.1 ms/launch) vs `direct` (root, no overhead) — measured 488 vs 410 ms on YOLOv8n, and when to use which |
 | `ECOSYSTEM.md` | every VC4 repository, what each owns, how the two execution paths fit, and which repo to open for what |
 | `MEDIUM-CLASSIFICATION.md` | lnstadrum (2021): a 225 K-param GLSL classifier on Pi Zero at 595 ms; the GLES 2.0 limits it documents, its 8-bit/channel-shuffle co-design, and the three ways it corroborates our launch-bound, CPU-supply-bound results |

@@ -36,6 +36,9 @@ channel.
 | `VC4CL` | OpenCL runtime (fork; Debian 13 + unprivileged fixes) |
 | `VC4CLStdLib` | GPU-side OpenCL standard library (fork) |
 
+Every measured number — GEMM, YOLOv8n, per-op vs CPU, training, builds,
+clocks, completeness — is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
 Full table, the two execution paths and a "which repo do I open" guide:
 [`docs/ECOSYSTEM.md`](docs/ECOSYSTEM.md).
 

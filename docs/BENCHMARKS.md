@@ -202,7 +202,7 @@ Rule: **the overhead is per launch, not per FLOP.**
 **38 more operators were verified after that sweep** (reductions, comparisons,
 argmax/cumsum, shape/arith) and the unary family was verified separately, so the
 true figure is ≈78/152 — **but the global sweep has not been re-run, so this
-table still shows the last measured sweep.** `/` `infer/tools/op_matrix.py`.
+table still shows the last measured sweep.** Tool: `infer/tools/op_matrix.py`.
 
 ## 12. Framework support effort (surveyed, not measured)
 
@@ -215,7 +215,7 @@ table still shows the last measured sweep.** `/` `infer/tools/op_matrix.py`.
 | TFLite / LiteRT | `tflite_plugin_create_delegate` | medium |
 | Apache TVM | Relax BYOC | large |
 | JAX | PJRT C API | large |
-| TensorFlow | StreamExecutor `SE_PluggedDevice` | large |
+| TensorFlow | StreamExecutor `SE_InitPlugin` | large |
 | OpenVINO | `Core::register_plugin` | large |
 | MXNet | custom-op only | not viable (`libarmpl` missing) |
 

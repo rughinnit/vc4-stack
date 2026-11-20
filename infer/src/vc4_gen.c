@@ -37,6 +37,11 @@ static int uop_nvec(vc4_uop op)
     case VC4_UOP_RECIPROCAL: case VC4_UOP_MISH:
     case VC4_UOP_TANH: case VC4_UOP_ERF: case VC4_UOP_ELU:
     case VC4_UOP_EXP: case VC4_UOP_LOG: case VC4_UOP_ROUND:
+    /* inverse / hyperbolic (docs/OPS-UNARY.md): asin/acos/atan are the
+     * shortest, but the 16-vector copy of every one of them is over 28 KiB */
+    case VC4_UOP_ACOS: case VC4_UOP_ACOSH: case VC4_UOP_ASIN:
+    case VC4_UOP_ASINH: case VC4_UOP_ATAN: case VC4_UOP_ATANH:
+    case VC4_UOP_TAN: case VC4_UOP_SINH: case VC4_UOP_COSH:
         return 4;
     default:
         return 16;
@@ -73,6 +78,15 @@ static const char *uop_name(vc4_uop op)
     case VC4_UOP_COS: return "cos";
     case VC4_UOP_AFFINE: return "affine";
     case VC4_UOP_MISH: return "mish";
+    case VC4_UOP_ACOS: return "acos";
+    case VC4_UOP_ACOSH: return "acosh";
+    case VC4_UOP_ASIN: return "asin";
+    case VC4_UOP_ASINH: return "asinh";
+    case VC4_UOP_ATAN: return "atan";
+    case VC4_UOP_ATANH: return "atanh";
+    case VC4_UOP_TAN: return "tan";
+    case VC4_UOP_SINH: return "sinh";
+    case VC4_UOP_COSH: return "cosh";
     default: return NULL;
     }
 }

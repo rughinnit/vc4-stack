@@ -250,3 +250,16 @@ a reminder to run the harness-level model, not just the body.
 `1e-4 + 1e-4*max(|ref|,1)`.  `Gelu` (erf form) and `Mish` are composed from
 the verified Erf / Softplus / Tanh kernels and are checked at the graph level
 by `infer/tests/check_onnx_unary.py`.
+
+## Inverse / hyperbolic unary family (2026-11-20, same window)
+
+Added after that table: `asin acos atan atanh asinh acosh sinh cosh tan`, one
+4-vector body each, measured the same way (**0 mismatches over 144,738
+elements / 165 runs** for the whole family, which re-runs the 26 kernels
+above).  Domains are enforced by the executor, so these are refused rather
+than answered outside them: `asin`/`acos` `[-1,1]`, `atanh` `(-1,1)`, `acosh`
+`[1, inf)`, `sinh`/`cosh` `[-88,88]`, `tan` `|x| <= 1e5` with `|cos(x)| >=
+0.05` (the pole rule - the reduction's absolute error in the reduced argument
+becomes a relative error there), and every op refuses non-finite input.
+Method, per-op accuracy and the three defects the emulator caught first are in
+`docs/OPS-UNARY.md`.

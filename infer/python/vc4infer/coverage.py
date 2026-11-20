@@ -93,6 +93,16 @@ OPS = {
     "Selu": "QPU unary (UOP_SELU, alpha/gamma uniforms, max abs 8.7e-7)",
     "Gelu": "QPU unary (UOP_GELU tanh / composed erf, max abs 5.0e-7)",
     "Mish": "QPU Softplus+Tanh+MUL composition (max abs 4.1e-7)",
+    # inverse / hyperbolic (docs/OPS-UNARY.md): one kernel each, nv4 bodies
+    "Asin": "QPU unary (UOP_ASIN, 2-branch poly, -1<=x<=1, max abs 2.9e-7; refused outside)",
+    "Acos": "QPU unary (UOP_ACOS, pi/2 - asin, -1<=x<=1, max abs 2.9e-7; refused outside)",
+    "Atan": "QPU unary (UOP_ATAN, deg-13 odd poly + 1/x fold, finite x, max abs 4.6e-7)",
+    "Atanh": "QPU unary (UOP_ATANH, log core of (1+x)/(1-x), -1<x<1, max abs 1.7e-6; refused outside)",
+    "Asinh": "QPU unary (UOP_ASINH, log core of x+sqrt(x^2+1), finite x, max abs 1.6e-6 (rel 1.7e-7))",
+    "Acosh": "QPU unary (UOP_ACOSH, log core of x+sqrt((x-1)(x+1)), x>=1, max abs 1.6e-6 (rel 1.7e-7); refused below 1)",
+    "Sinh": "QPU unary (UOP_SINH, (e^|x| - e^-|x|)/2, |x|<=88, max rel 9.3e-6; refused outside)",
+    "Cosh": "QPU unary (UOP_COSH, (e^|x| + e^-|x|)/2, |x|<=88, max rel 9.6e-6; refused outside)",
+    "Tan": "QPU unary (UOP_TAN, Cody-Waite + tan poly, |x|<=1e5 and |cos|>=0.05, max abs 4.9e-6 (rel 1.1e-6); refused outside)",
     # the reduction / comparison / shape-and-arith family (_dispatch_extra.py,
     # docs/OPS-REDUCE.md).  Each entry names the kernels the handler composes.
     "ReduceSum": "QPU reduce (sum) + copy2d axis-to-last",

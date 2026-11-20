@@ -490,7 +490,18 @@ def b_exp(e, IN, OUT):
     e.ctx.rel(t)
 
 
-def b_log(e, IN, OUT):
+def core_ln(e, IN, OUT, terms=5):
+    """ln(IN) for a positive normal: the verified `Log` body, factored out.
+
+    `b_log` is the wrapper with `terms=5`, so the emitted words are unchanged
+    (the same sequence that was element-verified on 2026-11-20).  The
+    asinh/acosh/atanh bodies reuse it with `terms=4`: their argument is always
+    near or above 1, and dropping the u^9 term costs 1.5e-9 relative, but
+    saves the B-register slot the five-term form would need.
+
+    Note: this *overwrites* IN with max(IN, 2^-126), exactly like the body it
+    came from, so callers passing an argument they still need must copy it.
+    """
     k = e.k
     ee = e.ctx.tb()
     m = e.ctx.tb()
@@ -520,8 +531,10 @@ def b_log(e, IN, OUT):
     u2 = e.ctx.tb()
     p = e.ctx.tb()
     e.mul(u2, num, num)
-    e.op(k.ADD_OR, p, e.ctx.k('L4'), e.ctx.k('L4'))
-    for c in ('L3', 'L2', 'L1', 'L0'):
+    top = 5 if terms >= 5 else 4
+    e.op(k.ADD_OR, p, e.ctx.k('L%d' % (top - 1)),
+         e.ctx.k('L%d' % (top - 1)))
+    for c in ('L3', 'L2', 'L1', 'L0') if top == 5 else ('L2', 'L1', 'L0'):
         e.mul(p, p, u2)
         e.op(k.ADD_FADD, p, p, e.ctx.k(c))
     e.mul(p, p, num)
@@ -531,6 +544,9 @@ def b_log(e, IN, OUT):
     e.op(k.ADD_FADD, OUT, ee, p)
     e.ctx.rel(num, u2, p, m, ee)
 
+
+def b_log(e, IN, OUT):
+    core_ln(e, IN, OUT)
 
 
 def b_sqrt(e, IN, OUT):
@@ -838,6 +854,296 @@ def b_cos(e, IN, OUT):
     e.ctx.rel(sp, cp, b0, b1, m, t)
 
 
+# ------------------------------------------- inverse / hyperbolic (2026-11-20)
+def core_asin(e, IN, OUT):
+    """asin(IN) for |IN| <= 1; the executor refuses anything else.
+
+    Two branches, one polynomial.  With a = |x|,
+        a <= 0.5:  asin(a) = a + a^3 Q(a^2)                (Q on [0, 0.25])
+        a >  0.5:  s = sqrt((1-a)/2)  (in [0, 0.5]; 1-a is exact there)
+                   asin(a) = pi/2 - 2*(s + s^3 Q(s^2))
+    The second branch is fdlibm's: it never subtracts two numbers near 1, so
+    asin(1-2^-24) keeps its absolute accuracy (the sqrt carries the 2^-12
+    structure of the answer).  The -2p is formed as 2p and one fsub.
+    """
+    k = e.k
+    a = e.ctx.tb()
+    m = e.ctx.tb()
+    u = e.ctx.tb()
+    s = e.ctx.tb()
+    q = e.ctx.tb()
+    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_FSUB, m, a, e.ctx.k('HALF'))
+    gt_mask(e, m, m)
+    e.op(k.ADD_FSUB, u, e.ctx.k('ONE'), a)     # exact for a in [0.5, 1]
+    e.mul(u, u, e.ctx.k('HALF'))
+    e.op(k.ADD_FMAX, u, u, e.ctx.k('TINY'))    # keeps 1/sqrt(0) out of the body
+    core_rsqrt(e, u, s, q)
+    e.mul(s, s, u)                             # s = sqrt((1-a)/2)
+    sel(e, u, m, s, a, q)                      # z = m ? s : a, both in [0, .5]
+    e.mul(q, u, u)                             # t = z^2
+    e.op(k.ADD_OR, s, e.ctx.k('AS4'), e.ctx.k('AS4'))
+    for c in ('AS3', 'AS2', 'AS1', 'AS0'):
+        e.mul(s, s, q)
+        e.op(k.ADD_FADD, s, s, e.ctx.k(c))
+    e.mul(s, s, q)
+    e.mul(s, s, u)
+    e.op(k.ADD_FADD, s, s, u)                  # asin(z)
+    e.op(k.ADD_FADD, q, s, s)                  # 2 asin(z)
+    e.op(k.ADD_FSUB, q, e.ctx.k('PI2'), q)     # pi/2 - 2 asin(z)
+    keep_sel(e, s, m, q)
+    e.op(k.ADD_AND, q, IN, e.ctx.k('SIGNB'))
+    e.op(k.ADD_OR, OUT, s, q)
+
+
+def b_asin(e, IN, OUT):
+    core_asin(e, IN, OUT)
+
+
+def b_acos(e, IN, OUT):
+    """acos = pi/2 - asin.
+
+    At x -> 1 the subtraction cancels and costs one ulp of pi/2 (1.2e-7
+    absolute against a 1e-4 absolute tolerance); measured, not assumed
+    (docs/OPS-UNARY.md).
+    """
+    core_asin(e, IN, OUT)
+    e.op(e.k.ADD_FSUB, OUT, e.ctx.k('PI2'), OUT)
+
+
+def b_atan(e, IN, OUT):
+    """atan: r = min(|x|, 1/|x|) in [0,1], then pi/2 - atan(r) for |x| > 1.
+
+    The reciprocal is the verified Newton core (the same one log/softsign
+    use); |x| is clamped to BIG first so a non-finite input cannot make it
+    NaN.
+    """
+    k = e.k
+    a = e.ctx.tb()
+    m = e.ctx.tb()
+    r = e.ctx.tb()
+    p = e.ctx.tb()
+    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_FSUB, m, a, e.ctx.k('ONE'))
+    gt_mask(e, m, m)
+    e.op(k.ADD_FMIN, p, a, e.ctx.k('BIG'))
+    core_rcp(e, p, r, e.ctx.tb())              # r = 1/|x| (finite)
+    sel(e, p, m, r, a, e.ctx.tb())             # arg = m ? 1/a : a
+    e.mul(r, p, p)                             # t = arg^2
+    e.op(k.ADD_OR, OUT, e.ctx.k('AT6'), e.ctx.k('AT6'))
+    for c in ('AT5', 'AT4', 'AT3', 'AT2', 'AT1', 'AT0'):
+        e.mul(OUT, OUT, r)
+        e.op(k.ADD_FADD, OUT, OUT, e.ctx.k(c))
+    e.mul(OUT, OUT, r)
+    e.mul(OUT, OUT, p)
+    e.op(k.ADD_FADD, OUT, OUT, p)              # atan(arg)
+    e.op(k.ADD_FSUB, r, e.ctx.k('PI2'), OUT)   # pi/2 - atan(1/a)
+    keep_sel(e, OUT, m, r)
+    e.op(k.ADD_AND, r, IN, e.ctx.k('SIGNB'))
+    e.op(k.ADD_OR, OUT, OUT, r)
+
+
+def b_sinh(e, IN, OUT):
+    """sinh = sign(x)*(t - 1/t)/2 with t = e^|x|.
+
+    |x| <= 88.6: above that e^|x| overflows and 1/t flushes, so the answer
+    would be a finite lie instead of +-inf - the executor refuses it.
+    """
+    k = e.k
+    a = e.ctx.tb()
+    t = e.ctx.tb()
+    q = e.ctx.tb()
+    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    e.mul(t, a, e.ctx.k('LOG2E'))
+    core_exp2(e, t, t, e.ctx.tb(), e.ctx.tb())
+    # the reciprocal's bit-trick seed is only valid below 2^126; e^|x| reaches
+    # 3e38 at the top of the domain, where 1/t is 1e-38 and its exact value is
+    # irrelevant to the sum, so clamp the input instead of the algorithm.
+    e.op(k.ADD_FMIN, q, t, e.ctx.k('R125'))
+    core_rcp(e, q, q, e.ctx.tb())
+    e.op(k.ADD_FSUB, t, t, q)
+    e.mul(t, t, e.ctx.k('HALF'))
+    # x = +-0: (t - 1/t)/2 leaves the reciprocal core's 3e-8 residue, so force
+    # the exact signed zero the FPU defines
+    gt_mask(e, q, a)
+    e.op(k.ADD_AND, t, t, q)
+    e.op(k.ADD_AND, q, IN, e.ctx.k('SIGNB'))
+    e.op(k.ADD_OR, OUT, t, q)
+
+
+def b_cosh(e, IN, OUT):
+    """cosh = (t + 1/t)/2 with t = e^|x|; same |x| <= 88.6 limit."""
+    k = e.k
+    a = e.ctx.tb()
+    t = e.ctx.tb()
+    q = e.ctx.tb()
+    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    e.mul(t, a, e.ctx.k('LOG2E'))
+    core_exp2(e, t, t, e.ctx.tb(), e.ctx.tb())
+    e.op(k.ADD_FMIN, q, t, e.ctx.k('R125'))    # see b_sinh
+    core_rcp(e, q, q, e.ctx.tb())
+    e.op(k.ADD_FADD, t, t, q)
+    e.mul(OUT, t, e.ctx.k('HALF'))
+    # cosh(0) is exactly 1; the reciprocal core's residue would make it
+    # 0.99999994
+    eq0_mask(e, q, a, e.ctx.tb())
+    keep_sel(e, OUT, q, e.ctx.k('ONE'))
+
+
+def b_tan(e, IN, OUT):
+    """tan from the same Cody-Waite reduction as sin/cos.
+
+        q = round(x*2/pi), r = x - q*pi/2   (|r| <= pi/4)
+        tan(x) = tan(r)       q even
+        tan(x) = -1/tan(r)    q odd
+
+    tan(r) is one degree-11 odd polynomial, so the pole accuracy is the
+    *relative* accuracy of the reduced r, not the difference of two O(1)
+    values: near a pole r is small and tan(r) = r*(1+...) keeps its relative
+    error.  What the kernel cannot fix is the reduction's absolute error in r
+    (~|x|*2^-24 of pi/2), which becomes a relative error when |r| is small;
+    the executor therefore refuses inputs with |cos(x)| below the measured
+    threshold in docs/OPS-UNARY.md.
+    """
+    k = e.k
+    t = e.ctx.tb()
+    q = e.ctx.tb()
+    r = e.ctx.tb()
+    h = e.ctx.tb()
+    r2 = e.ctx.tb()
+    p = e.ctx.tb()
+    e.mul(t, IN, e.ctx.k('TWO_OVER_PI'))
+    e.op(k.ADD_FADD, q, t, e.ctx.k('HALF'))
+    e.op(k.ADD_FADD, q, q, e.ctx.k('MAGIC'))
+    e.op(k.ADD_FSUB, t, q, e.ctx.k('MAGIC'))
+    e.op(k.ADD_FTOI, q, q, q)
+    e.mul(r, t, e.ctx.k('PIO2_HI'))
+    e.op(k.ADD_FSUB, r, IN, r)
+    e.mul(h, t, e.ctx.k('PIO2_MID'))
+    e.op(k.ADD_FSUB, r, r, h)
+    e.mul(h, t, e.ctx.k('PIO2_LO'))
+    e.op(k.ADD_FSUB, r, r, h)
+    e.mul(r2, r, r)
+    e.op(k.ADD_OR, p, e.ctx.k('TN5'), e.ctx.k('TN5'))
+    for c in ('TN4', 'TN3', 'TN2', 'TN1', 'TN0'):
+        e.mul(p, p, r2)
+        e.op(k.ADD_FADD, p, p, e.ctx.k(c))
+    e.mul(p, p, r2)
+    e.mul(p, p, r)
+    e.op(k.ADD_FADD, p, p, r)                  # tan(r)
+    e.op(k.ADD_AND, h, p, e.ctx.k('ABSM'))
+    e.op(k.ADD_FMAX, h, h, e.ctx.k('TINY'))    # 0 -> 1/2^-126, never inf
+    core_rcp(e, h, h, r2)
+    e.op(k.ADD_AND, r2, p, e.ctx.k('SIGNB'))
+    e.op(k.ADD_XOR, r2, r2, e.ctx.k('SIGNB'))
+    e.op(k.ADD_OR, h, h, r2)                   # -1/tan(r)
+    e.opi(k.ADD_SHL, r2, q, 31)
+    e.opi(k.ADD_ASR, r2, r2, 31)               # all-ones iff the quadrant is odd
+    sel(e, OUT, r2, h, p, t)
+
+
+def core_asinh_acosh(e, IN, OUT, acosh):
+    """log(a + sqrt(a^2 +- 1)) through the verified log core.
+
+    The forms that keep the small-argument accuracy: 1-a is exact, x^2-1 is
+    factored as (x-1)(x+1) (so nothing cancels), and |a| >= 2^63 switches to
+    log|a| + ln2 because a^2 would overflow.  The log core's (m-1)/(m+1)
+    series then has an absolute error of about one ulp of 1, which is what
+    both functions need near their branch point.
+    """
+    k = e.k
+    a = e.ctx.tb()
+    big = e.ctx.tb()
+    t = e.ctx.tb()
+    s = e.ctx.tb()
+    u = e.ctx.tb()
+    if acosh:
+        e.op(k.ADD_OR, a, IN, IN)
+    else:
+        e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_SUB, big, a, e.ctx.k('T63'))
+    gt_mask(e, big, big)
+    if acosh:
+        e.op(k.ADD_FSUB, t, a, e.ctx.k('ONE'))     # exact in [1,2]
+        e.op(k.ADD_FADD, u, a, e.ctx.k('ONE'))
+        e.mul(t, t, u)                             # x^2-1, factored
+    else:
+        e.mul(t, a, a)
+        e.op(k.ADD_FADD, t, t, e.ctx.k('ONE'))
+    e.op(k.ADD_FMAX, t, t, e.ctx.k('TINY'))
+    core_rsqrt(e, t, s, u)
+    e.mul(s, s, t)                                 # sqrt(a^2 +- 1)
+    e.op(k.ADD_FADD, u, a, s)
+    keep_sel(e, u, big, a)                         # the log argument
+    # The log core is the widest point of the body (six live temps, and this
+    # body's constant list leaves only eight): free everything else and
+    # rebuild |x| from the input afterwards.
+    e.ctx.rel(t, s, a)
+    core_ln(e, u, OUT, 4)
+    e.ctx.rel(u)
+    a = e.ctx.tb()
+    t = e.ctx.tb()
+    s = e.ctx.tb()
+    if not acosh:
+        e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    else:
+        e.op(k.ADD_OR, a, IN, IN)
+    e.op(k.ADD_AND, t, big, e.ctx.k('LN2'))
+    e.op(k.ADD_FADD, OUT, OUT, t)                  # + ln2 on the big half
+    # non-finite: |a| >= inf -> +-inf, a nan stays nan.  keep_sel reads its
+    # a_true, so the constant registers are used directly: cloning one into a
+    # temp would need a register the pool no longer has (and `u` is dead).
+    e.op(k.ADD_SUB, t, a, e.ctx.k('POSINF'))
+    e.op(k.ADD_ADD, t, t, e.ctx.k('ONE_I'))
+    gt_mask(e, s, t)
+    keep_sel(e, OUT, s, e.ctx.k('POSINF'))
+    e.op(k.ADD_SUB, t, a, e.ctx.k('POSINF'))
+    gt_mask(e, s, t)
+    keep_sel(e, OUT, s, e.ctx.k('NAN'))
+    if not acosh:
+        # x = +-0: log(0+sqrt(1)) is 0 only to the reciprocal core's residue,
+        # so force the exact signed zero
+        gt_mask(e, s, a)
+        e.op(k.ADD_AND, OUT, OUT, s)
+        e.op(k.ADD_AND, t, IN, e.ctx.k('SIGNB'))
+        e.op(k.ADD_OR, OUT, OUT, t)
+
+
+def b_asinh(e, IN, OUT):
+    core_asinh_acosh(e, IN, OUT, False)
+
+
+def b_acosh(e, IN, OUT):
+    core_asinh_acosh(e, IN, OUT, True)
+
+
+def b_atanh(e, IN, OUT):
+    """atanh = ln((1+a)/(1-a))/2, sign restored; |x| < 1 (refused outside).
+
+    1-a is exact for a in [0.5,1], and the log core's (m-1) form keeps the
+    error near a = 0 at the ulp of 1 (6e-8), well inside the 1e-4 absolute
+    tolerance.
+    """
+    k = e.k
+    a = e.ctx.tb()
+    t = e.ctx.tb()
+    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_FADD, t, a, e.ctx.k('ONE'))
+    e.op(k.ADD_FSUB, a, e.ctx.k('ONE'), a)      # 1-|x| (exact in [0.5,1])
+    e.op(k.ADD_FMAX, a, a, e.ctx.k('TINY'))
+    core_rcp(e, a, a, e.ctx.tb())
+    e.mul(t, t, a)                              # (1+a)/(1-a)
+    core_ln(e, t, OUT, 4)
+    e.mul(OUT, OUT, e.ctx.k('HALF'))
+    # x = +-0: atanh(0) is 0, not the reciprocal core's residue (`a` has been
+    # reused for 1/(1-|x|) by now, so test |x| from the input)
+    e.op(k.ADD_AND, t, IN, e.ctx.k('ABSM'))
+    gt_mask(e, t, t)
+    e.op(k.ADD_AND, OUT, OUT, t)
+    e.op(k.ADD_AND, t, IN, e.ctx.k('SIGNB'))
+    e.op(k.ADD_OR, OUT, OUT, t)
+
+
 # ---------------------------------------------------------------- constants
 STD = {
     'ABSM': (0x7FFFFFFF, 0), 'SIGNB': (0x80000000, 0),
@@ -881,7 +1187,19 @@ STD = {
     'INV_SQRT2PI': (_fb(0.39894228040143267794), 0),
     'NEGINF': (0xFF800000, 0), 'POSINF': (0x7F800000, 0),
     'NAN': (0x7FC00000, 0), 'INFI': (0x7F800000, 1),
-}
+    # inverse / hyperbolic (2026-11-20): minimax coefficients, fitted in
+    # float64 and rounded to fp32 (docs/OPS-UNARY.md has the fit errors)
+    'PI2': (0x3FC90FDB, 0),                       # pi/2
+    'R125': (0x7E800000, 0),      # 2^125: the Newton reciprocal's seed range
+    'T63': (0x5F000000, 0),                       # 2^63, an integer compare
+    'AT0': (0xBEAAAA98, 0), 'AT1': (0x3E4CBDC1, 0), 'AT2': (0xBE114220, 0),
+    'AT3': (0x3DD5A3A5, 0), 'AT4': (0xBD8A713C, 0), 'AT5': (0x3CF9A2FB, 0),
+    'AT6': (0xBBD696D4, 0),                       # atan, deg 13 odd
+    'AS0': (0x3E2AAAAF, 0), 'AS1': (0x3D999346, 0), 'AS2': (0x3D386070, 0),
+    'AS3': (0x3CD8E023, 0), 'AS4': (0x3D1CA8E0, 0),   # asin, deg 9 odd
+    'TN0': (0x3EAAAAA7, 0), 'TN1': (0x3E088B7B, 0), 'TN2': (0x3D5C373A, 0),
+    'TN3': (0x3CBE2686, 0), 'TN4': (0x3BA3FC1D, 0), 'TN5': (0x3C082E24, 0),
+}                                                 # tan, deg 11 odd
 
 E_CORE = ('LOG2E', 'E5', 'E4', 'E3', 'E2', 'E1', 'MAGIC', 'HALF', 'ONE',
           'EXP_LO', 'EXP_HI', 'ONE_I')
@@ -891,6 +1209,26 @@ LOGP_C = ('L4', 'L3', 'L2', 'L1', 'L0')
 SIN_C = ('TWO_OVER_PI', 'MAGIC', 'HALF', 'PIO2_HI', 'PIO2_MID', 'PIO2_LO', 'THREE',
          'S1', 'S2', 'S3', 'S4', 'C1P', 'C2P', 'C3P', 'C4P', 'ONE', 'SIGNB',
          'ONE_I', 'ZERO')
+# the log core without the u^9 term: enough for fp32 (the dropped term is
+# 1.5e-9 at the largest series argument).  asinh/acosh/atanh use this form
+# because their constant list (21) plus a 5-term log does not fit the pool.
+LOG_C4 = ('SQRT2', 'MANT', 'C127', 'ONE', 'LN2', 'TINY')
+LOGP_C4 = ('L3', 'L2', 'L1', 'L0')
+LOG4_C = LOG_C4 + LOGP_C4 + RCP_C
+ASIN_C = ('HALF', 'ONE', 'TINY', 'ABSM', 'SIGNB', 'PI2',
+          'RSQRTC', 'THREEH', 'AS0', 'AS1', 'AS2', 'AS3', 'AS4')
+ATAN_C = ('BIG', 'ONE', 'ABSM', 'SIGNB', 'PI2') + RCP_C + \
+    ('AT0', 'AT1', 'AT2', 'AT3', 'AT4', 'AT5', 'AT6')
+SINH_C = ('LOG2E',) + E_CORE[1:-1] + RCP_C + ('ABSM', 'SIGNB', 'R125')
+COSH_C = ('LOG2E',) + E_CORE[1:-1] + RCP_C + ('ABSM', 'R125')
+TAN_C = ('TWO_OVER_PI', 'MAGIC', 'HALF', 'PIO2_HI', 'PIO2_MID', 'PIO2_LO',
+         'ABSM', 'SIGNB', 'TINY') + RCP_C + \
+    ('TN0', 'TN1', 'TN2', 'TN3', 'TN4', 'TN5')
+ASINH_C = LOG4_C + ('RSQRTC', 'THREEH', 'HALF', 'ABSM', 'SIGNB', 'T63',
+                    'POSINF', 'NAN', 'ONE_I')
+ACOSH_C = LOG4_C + ('RSQRTC', 'THREEH', 'HALF', 'T63', 'POSINF', 'NAN',
+                    'ONE_I', 'SIGNB')
+ATANH_C = LOG4_C + ('HALF', 'ABSM', 'SIGNB', 'ONE_I')
 # erf needs every E_CORE-2^f constant except ONE_I (integer one, used by
 # log/round only): the 23-slot B budget after excluding B8 is tight.
 E_CORE_ERF = tuple(c for c in E_CORE[1:] if c != 'ONE_I')
@@ -932,10 +1270,21 @@ UOPS = {
     'affine':     ((), b_affine, ('P0', 'P1')),
     'sin':        (SIN_C, b_sin, ()),
     'cos':        (SIN_C, b_cos, ()),
+    'acos':       (ASIN_C, b_acos, ()),
+    'acosh':      (ACOSH_C, b_acosh, ()),
+    'asin':       (ASIN_C, b_asin, ()),
+    'asinh':      (ASINH_C, b_asinh, ()),
+    'atan':       (ATAN_C, b_atan, ()),
+    'atanh':      (ATANH_C, b_atanh, ()),
+    'tan':        (TAN_C, b_tan, ()),
+    'sinh':       (SINH_C, b_sinh, ()),
+    'cosh':       (COSH_C, b_cosh, ()),
 }
 
 HEAVY = {'log', 'tanh', 'erf', 'elu', 'selu', 'softplus', 'softsign', 'gelu', 'mish',
-         'gelu_erf', 'sin', 'cos', 'round', 'sqrt', 'reciprocal'}
+         'gelu_erf', 'sin', 'cos', 'round', 'sqrt', 'reciprocal',
+         'acos', 'acosh', 'asin', 'asinh', 'atan', 'atanh', 'tan', 'sinh',
+         'cosh'}
 
 
 def _consts_for(k, names, extra=()):
@@ -1047,7 +1396,9 @@ def _group_tail(k, b, nvec, gap_regs=()):
 UOP_ORDER = ['abs', 'neg', 'identity', 'clip', 'leakyrelu', 'floor', 'ceil',
              'round', 'sign', 'exp', 'log', 'sqrt', 'reciprocal', 'tanh',
              'erf', 'elu', 'selu', 'softplus', 'softsign', 'gelu', 'gelu_erf',
-             'hardsigmoid', 'hardswish', 'sin', 'cos', 'affine', 'mish']
+             'hardsigmoid', 'hardswish', 'sin', 'cos', 'affine', 'mish',
+             'acos', 'acosh', 'asin', 'asinh', 'atan', 'atanh', 'tan', 'sinh',
+             'cosh']
 
 # The unary ops ride on kgen.build_ew's *verified* harness (TMU priming, the
 # 16-vector group, the VPM->DMA store, the counter branch).  Only the body is

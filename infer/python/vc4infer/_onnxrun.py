@@ -56,7 +56,8 @@ Supported nodes
     Div, Sub      lowered to GPU Mul / Mul+Add (constant operand for Div)
     Softmax       any axis (host permute to the last, <= 16 classes, rows%8)
     Transpose     host permute
-    Resize        nearest or linear (linear: GPU Mul/Add), asymmetric/half_pixel
+    Resize        nearest (4 nearest_mode values) or linear (GPU Mul/Add),
+                  all 6 coordinate_transformation_mode values
     MatMul, Gemm  2-D
     Flatten, Reshape, Squeeze, Unsqueeze, Cast, Identity, Constant
     Shape, Gather int64 host tensors (static shapes)
@@ -723,11 +724,19 @@ class Runner:
             raise UnsupportedNode("to_nhwc: NHWC re-pad C%d -> %d"
                                   % (c, cp))
         units = 4 if w % 4 == 0 else (2 if w % 2 == 0 else 1)
+        # One call moves one 16-channel block of every pixel: the 16 lanes are
+        # the channels (source lane stride H*W*4, NCHW planes), a row is a
+        # pixel row of W pixels, and the vector stride inside a pixel is the
+        # destination pixel pitch.  C > 16 needs one call per channel block:
+        # copy2d_x's lane mask is shared by every block of a row, so a single
+        # call cannot zero-pad a partial last block (nlane <= 16 always).
         for i in range(n):
-            self._x(self._buf_at(t, i * c * h * w * 4),
-                    self._buf_at(out, i * h * w * cp * 4),
-                    h, w, w * 4, w * cp * 4, 4, cp * 4, h * w * 4,
-                    nlane=c, units=units)
+            for k0 in range(0, c, 16):
+                nlan = min(16, c - k0)
+                self._x(self._buf_at(t, (i * c + k0) * h * w * 4),
+                        self._buf_at(out, i * h * w * cp * 4 + k0 * 4),
+                        h, w, w * 4, w * cp * 4, 4, cp * 4, h * w * 4,
+                        nlane=nlan, units=units)
         return out
 
     def _prepad(self, x, pads, value=0.0):
@@ -1525,55 +1534,166 @@ class Runner:
                 off += sz
         return outs
 
+    # Resize-19 attribute domain.  The coordinate mapping is one source
+    # coordinate per output index (float64, computed the way the ONNX reference
+    # evaluator computes it), and the nearest index or the bilinear tap pair
+    # and weight both derive from that one table.
+    _RESIZE_COORD_MODES = ("half_pixel", "half_pixel_symmetric",
+                           "pytorch_half_pixel", "asymmetric", "align_corners",
+                           "tf_crop_and_resize")
+    _RESIZE_NEAREST_MODES = ("round_prefer_floor", "round_prefer_ceil",
+                             "floor", "ceil")
+
+    @staticmethod
+    def _resize_src(n_in, n_out, scale, coord, roi=None):
+        """Source coordinate of each output index along one axis (Resize-19).
+
+        roi is (start, end) in input-pixel units, only used by
+        tf_crop_and_resize.
+        """
+        s = np.arange(n_out, dtype=np.float64)
+        if coord == "half_pixel":
+            return (s + 0.5) / scale - 0.5
+        if coord == "half_pixel_symmetric":
+            # keeps the centre of the implicit ROI on the centre of the canvas
+            adjustment = n_out / (scale * n_in)
+            offset = (n_in / 2.0) * (1.0 - adjustment)
+            return offset + (s + 0.5) / scale - 0.5
+        if coord == "pytorch_half_pixel":
+            if n_out > 1:
+                return (s + 0.5) / scale - 0.5
+            return np.zeros(n_out)
+        if coord == "asymmetric":
+            return s / scale
+        if coord == "align_corners":
+            if n_out > 1:
+                return s * (n_in - 1) / (n_out - 1)
+            return np.zeros(n_out)
+        if coord == "tf_crop_and_resize":
+            r0, r1 = float(roi[0]), float(roi[1])
+            if n_out > 1:
+                src = s * (r1 - r0) * (n_in - 1) / (n_out - 1)
+            else:
+                src = np.full(n_out, (r1 - r0) * (n_in - 1) / 2.0)
+            return src + r0 * (n_in - 1)
+        raise UnsupportedNode("Resize: coordinate_transformation_mode=%s"
+                              % coord)
+
+    @staticmethod
+    def _resize_nearest(src, n_in, nearest_mode):
+        """The one nearest source index per output position (Resize-19)."""
+        if nearest_mode == "round_prefer_floor":
+            idx = np.ceil(src - 0.5)        # exact .5 -> the lower index
+        elif nearest_mode == "round_prefer_ceil":
+            idx = np.floor(src + 0.5)       # exact .5 -> the higher index
+        elif nearest_mode == "floor":
+            idx = np.floor(src)
+        elif nearest_mode == "ceil":
+            idx = np.ceil(src)
+        else:
+            raise UnsupportedNode("Resize: nearest_mode=%s" % nearest_mode)
+        return np.clip(idx, 0, n_in - 1).astype(np.int64)
+
     def _resize(self, node):
         x = self._float(node.input[0])
         mode = _attr(node, "mode", "nearest")
         coord = _attr(node, "coordinate_transformation_mode", "half_pixel")
+        nmode = _attr(node, "nearest_mode", "round_prefer_floor")
         if mode not in ("nearest", "linear"):
-            raise UnsupportedNode("Resize %s: mode=%s" % (node.name, mode))
-        if coord not in ("asymmetric", "half_pixel"):
+            raise UnsupportedNode("Resize %s: mode=%s (nearest, linear)"
+                                  % (node.name, mode))
+        if coord not in self._RESIZE_COORD_MODES:
             raise UnsupportedNode("Resize %s: coord=%s" % (node.name, coord))
-        scales = None
-        sizes = None
-        if len(node.input) > 2 and node.input[2]:
-            v = self.host.get(node.input[2], self.values.get(node.input[2]))
-            scales = np.asarray(v, dtype=np.float64)
-        if len(node.input) > 3 and node.input[3]:
-            v = self.host.get(node.input[3], self.values.get(node.input[3]))
-            sizes = np.asarray(v, dtype=np.int64)
-        nhwc = x.layout == "nhwc"
-        h, w = (x.shape[2], x.shape[3])
+        if int(_attr(node, "antialias", 0)):
+            raise UnsupportedNode("Resize %s: antialias=1" % node.name)
+        if _attr(node, "axes", None):
+            raise UnsupportedNode("Resize %s: axes=%s (spatial H/W only)"
+                                  % (node.name, list(_attr(node, "axes"))))
+        kap = _attr(node, "keep_aspect_ratio_policy", "stretch")
+        if kap != "stretch":
+            raise UnsupportedNode("Resize %s: keep_aspect_ratio_policy=%s"
+                                  % (node.name, kap))
+        # nearest_mode is only read by mode=nearest; linear ignores it.
+        if mode == "nearest" and nmode not in self._RESIZE_NEAREST_MODES:
+            raise UnsupportedNode("Resize %s: nearest_mode=%s"
+                                  % (node.name, nmode))
+
+        def operand(i):
+            """A host-visible input (roi / scales / sizes)."""
+            if len(node.input) <= i or not node.input[i]:
+                return None
+            nm = node.input[i]
+            return self.host.get(nm, self.values.get(nm))
+
+        roi = operand(1)
+        scales = operand(2)
+        sizes = operand(3)
+        if roi is not None:
+            roi = np.asarray(roi, dtype=np.float64).ravel()
+        if scales is not None:
+            scales = np.asarray(scales, dtype=np.float64).ravel()
         if sizes is not None:
+            sizes = np.asarray(sizes, dtype=np.int64).ravel()
+
+        nhwc = x.layout == "nhwc"
+        n_in, c_in, h, w = (int(v) for v in x.shape)
+        if sizes is not None:
+            if sizes.size != 4:
+                raise UnsupportedNode("Resize %s: sizes rank %d (4 only)"
+                                      % (node.name, sizes.size))
+            if int(sizes[0]) != n_in or int(sizes[1]) != c_in:
+                raise UnsupportedNode("Resize %s: sizes scale N/C (%d,%d -> "
+                                      "%d,%d); only H/W is resized"
+                                      % (node.name, n_in, c_in,
+                                         int(sizes[0]), int(sizes[1])))
             Ho, Wo = int(sizes[2]), int(sizes[3])
+            scy, scx = Ho / float(h), Wo / float(w)
         elif scales is not None:
-            Ho = int(round(h * float(scales[2])))
-            Wo = int(round(w * float(scales[3])))
+            if scales.size != 4:
+                raise UnsupportedNode("Resize %s: scales rank %d (4 only)"
+                                      % (node.name, scales.size))
+            if float(scales[0]) != 1.0 or float(scales[1]) != 1.0:
+                raise UnsupportedNode("Resize %s: scales %g/%g on N/C; only "
+                                      "H/W is resized"
+                                      % (node.name, float(scales[0]),
+                                         float(scales[1])))
+            scy, scx = float(scales[2]), float(scales[3])
+            # ONNX: output_dim = floor(input_dim * scale)
+            Ho = int(np.floor(h * scy))
+            Wo = int(np.floor(w * scx))
         else:
             raise UnsupportedNode("Resize %s: no scales/sizes" % node.name)
+        if Ho <= 0 or Wo <= 0:
+            raise UnsupportedNode("Resize %s: empty output %dx%d"
+                                  % (node.name, Ho, Wo))
 
-        def axis(n_in, n_out):
-            s = np.arange(n_out, dtype=np.float64)
-            if coord == "asymmetric":
-                src = s * (n_in / n_out)
-            else:
-                src = (s + 0.5) * (n_in / n_out) - 0.5
-            i0u = np.floor(src).astype(np.int64)
-            if mode == "nearest":
-                if coord == "asymmetric":
-                    idx = np.floor(s * (n_in / n_out)).astype(np.int64)
-                else:
-                    idx = np.floor((s + 0.5) * (n_in / n_out) - 0.5).astype(np.int64)
-                return np.clip(idx, 0, n_in - 1), None, None
-            return (np.clip(i0u, 0, n_in - 1), np.clip(i0u + 1, 0, n_in - 1),
-                    src - i0u)
+        ry = rx = None
+        if coord == "tf_crop_and_resize":
+            if roi is None or roi.size != 8:
+                raise UnsupportedNode("Resize %s: tf_crop_and_resize needs a "
+                                      "roi input of 2*rank values" % node.name)
+            ry = (roi[2], roi[6])
+            rx = (roi[3], roi[7])
+        sy = self._resize_src(h, Ho, scy, coord, ry)
+        sx = self._resize_src(w, Wo, scx, coord, rx)
+        if coord == "tf_crop_and_resize":
+            if sy.min() < 0 or sy.max() > h - 1 or sx.min() < 0 or \
+                    sx.max() > w - 1:
+                raise UnsupportedNode("Resize %s: tf_crop_and_resize window "
+                                      "leaves the input (extrapolation)"
+                                      % node.name)
 
-        iy0, iy1, wy = axis(h, Ho)
-        ix0, ix1, wx = axis(w, Wo)
         if mode == "nearest":
+            iy = self._resize_nearest(sy, h, nmode)
+            ix = self._resize_nearest(sx, w, nmode)
             if nhwc and Ho == 2 * h and Wo == 2 * w and \
-                    coord == "asymmetric":
-                # exact 2x, the shape both YOLOv8n resizes have: the NHWC
-                # upsample kernel does the pixel duplication on the QPU
+                    np.array_equal(iy, np.repeat(np.arange(h), 2)) and \
+                    np.array_equal(ix, np.repeat(np.arange(w), 2)):
+                # exact 2x pixel duplication, the shape both YOLOv8n resizes
+                # have: the NHWC upsample kernel does the duplication on the
+                # QPU.  The index test above is what proves the mode/coord
+                # combination is that duplication (2x half_pixel
+                # round_prefer_floor and 2x asymmetric both are).
                 op = _align16(Wo)
                 out = self._alloc_t((x.shape[0], x.shape[1], Ho, op), "nhwc",
                                     op)
@@ -1585,37 +1705,26 @@ class Runner:
                 return Tensor(out.buf, (x.shape[0], x.shape[1], Ho, Wo),
                               "nhwc", op)
             if nhwc:
-                # general nearest: one call per destination row parity, the
-                # lanes are the C/16 blocks of a pixel (the source pixel is
-                # duplicated per axis, which a single affine stride cannot
-                # express, so this is the per-parity form)
-                out = self._alloc_t((x.shape[0], x.shape[1], Ho, Wo), "nhwc",
-                                    Wo)
-                ch = x.shape[1]
-                sy, sx = np.asarray(sizes if sizes is not None else
-                                    [x.shape[2] * 2, x.shape[3] * 2])
-                for i in range(x.shape[0]):
-                    for y in range(Ho):
-                        syi = min(int(np.floor(y * (h / float(Ho)))), h - 1)
-                        for xd in range(Wo):
-                            sxi = min(int(np.floor(xd * (w / float(Wo)))),
-                                      w - 1)
-                            self._x(
-                                self._buf_at(x, ((i * h + syi) * x.pitch
-                                                 + sxi) * ch * 4),
-                                self._buf_at(out, ((i * Ho + y) * Wo + xd)
-                                             * ch * 4),
-                                1, 1, 0, 0, 0, 0, 4, 16, 1, 64, 64, 1, 16)
-                return out
+                # A nearest resize is a pure gather with no arithmetic: one
+                # host pass over the NHWC image, not one QPU launch per output
+                # pixel (the 2x fast path above keeps the hot case on the QPU).
+                a = self.download_nhwc(x)
+                y = np.ascontiguousarray(a[:, iy][:, :, ix])
+                return self.upload_nhwc(y, (n_in, c_in, Ho, Wo))
             a = self.download(x)
-            y = np.ascontiguousarray(a[:, :, iy0][:, :, :, ix0])
-            return self.upload(y)
-            y = np.ascontiguousarray(a[:, :, iy0][:, :, :, ix0])
+            y = np.ascontiguousarray(a[:, :, iy][:, :, :, ix])
             return self.upload(y)
 
         # Bilinear.  The ARM only gathers the four neighbours and builds the
         # coordinate weights; the four multiplies and three adds that touch
         # the activations run on the QPUs (vc4_elementwise MUL/ADD).
+        def tap1d(src, n_in):
+            i0 = np.floor(src).astype(np.int64)
+            return (np.clip(i0, 0, n_in - 1), np.clip(i0 + 1, 0, n_in - 1),
+                    src - i0)
+
+        iy0, iy1, wy = tap1d(sy, h)
+        ix0, ix1, wx = tap1d(sx, w)
         a = self.download_nhwc(x) if nhwc else self.download(x)
         if nhwc:
             taps = [a[:, iy0][:, :, ix0], a[:, iy0][:, :, ix1],
@@ -1639,7 +1748,6 @@ class Runner:
             shp = (a.shape[0], x.shape[1], Ho, Wo)
             wts = [np.broadcast_to(z, shp) for z in wts]
         return self._lerp4(taps, wts, shp, nhwc)
-
     def _lerp4(self, taps, weights, shape, nhwc):
         """sum taps[i]*weights[i] with GPU MUL/ADD (no new QPU kernel)."""
         def up(arr):

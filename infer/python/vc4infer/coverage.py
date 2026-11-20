@@ -309,11 +309,24 @@ def _check_softmax(node, shapes, inits):
 def _check_resize(node, shapes, inits):
     mode = _attr(node, "mode", "nearest")
     coord = _attr(node, "coordinate_transformation_mode", "half_pixel")
+    nmode = _attr(node, "nearest_mode", "round_prefer_floor")
     if mode not in ("nearest", "linear"):
         return "unsupported", "mode=%s (nearest, linear)" % mode
-    if coord not in ("asymmetric", "half_pixel"):
+    if coord not in ("half_pixel", "half_pixel_symmetric",
+                     "pytorch_half_pixel", "asymmetric", "align_corners",
+                     "tf_crop_and_resize"):
         return "unsupported", "coordinate_transformation_mode=%s" % coord
-    return "supported", "nearest/%s" % coord
+    if mode == "nearest" and nmode not in ("round_prefer_floor",
+                                           "round_prefer_ceil", "floor",
+                                           "ceil"):
+        return "unsupported", "nearest_mode=%s" % nmode
+    if int(_attr(node, "antialias", 0)):
+        return "unsupported", "antialias=1"
+    if _attr(node, "axes", None):
+        return "unsupported", "axes (spatial H/W only)"
+    if mode == "nearest":
+        return "supported", "nearest/%s/%s" % (coord, nmode)
+    return "supported", "linear/%s" % coord
 
 
 def _check_gemm(node, shapes, inits):

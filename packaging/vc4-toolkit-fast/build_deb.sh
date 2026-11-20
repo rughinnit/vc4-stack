@@ -15,7 +15,7 @@ set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-ver=${1:-1.2.2}
+ver=${1:-1.2.3}
 out=$root/dist
 stage=$root/build/vc4-toolkit-fast-deb
 build=$root/build/vc4-toolkit-fast
@@ -183,7 +183,7 @@ install -m 0644 "$root/docs/PYTHON-API.md" \
 PKG=vc4-toolkit-fast
 VER=$ver
 ARCH=arm64
-DEPENDS="vc4d (>= 1.2.1), vc4infer-dev (>= 1.2.2), vc4-query (>= 1.0.0), vc4-smi (>= 1.0.0), vc4train (>= 1.0.0), vc4top (>= 1.0.5), vc4top-dkms (>= 1.0.5), python3 (>= 3.11), python3-numpy, python3-onnx (>= 1.14), python3-pil, libc6 (>= 2.38)"
+DEPENDS="vc4d (>= 1.2.1), vc4infer-dev (>= 1.2.3), vc4-query (>= 1.0.0), vc4-smi (>= 1.0.0), vc4train (>= 1.0.0), vc4top (>= 1.0.5), vc4top-dkms (>= 1.0.5), python3 (>= 3.11), python3-numpy, python3-onnx (>= 1.14), python3-pil, libc6 (>= 2.38)"
 SECTION=metapackages
 SHORT="VideoCore IV toolkit built from source with -O3 -march=native (speed path)"
 LONG="The vc4-toolkit stack rebuilt on the target board with speed as the only

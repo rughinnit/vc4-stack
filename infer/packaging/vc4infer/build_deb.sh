@@ -67,6 +67,65 @@ for f in kgen.py kops.py qenc.py gen.py vpmwords.py; do
 	install -m 0644 "$root/tools/$f" "$stage/usr/lib/vc4infer/kgen/$f"
 done
 
+# ---- release integrity ------------------------------------------------------
+# The measured artefact must be the shipped one.  The 1.2.2 deb shipped 35
+# ops while the tree had 51+ (the deb was built from an older tree than the
+# one that was measured), which no check caught.  Three checks make that class
+# of failure impossible to ship:
+#   * the packaged ONNX op table must equal the tree's, name for name and note
+#     for note (this is the count the sweep and `vc4infer nodes` measure);
+#   * the packaged __version__ must equal the deb version;
+#   * the engine library must be newer than every C source and header it is
+#     built from (a stale libvc4infer.so is the same bug one layer down).
+python3 - "$root" "$pkg/vc4infer" "$ver" <<'PYEOF'
+import importlib.util
+import os
+import sys
+
+root, payload, ver = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def load(d, name):
+    spec = importlib.util.spec_from_file_location(name,
+                                                  os.path.join(d, name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+tree = load(os.path.join(root, "python", "vc4infer"), "coverage").OPS
+stand = load(payload, "coverage").OPS
+if tree != stand:
+    print("refusing to build: the packaged op table (%d ops) is not the "
+          "tree's (%d ops)" % (len(stand), len(tree)), file=sys.stderr)
+    print("  only in tree: %s" % sorted(set(tree) - set(stand)),
+          file=sys.stderr)
+    print("  only in deb:  %s" % sorted(set(stand) - set(tree)),
+          file=sys.stderr)
+    for k in sorted(set(tree) & set(stand)):
+        if tree[k] != stand[k]:
+            print("  note differs for %s" % k, file=sys.stderr)
+    sys.exit(1)
+import re
+with open(os.path.join(payload, "__init__.py")) as fh:
+    m = re.search(r'__version__ = "([^"]+)"', fh.read())
+modver = m.group(1) if m else "?"
+if modver != ver:
+    print("refusing to build: packaged __version__ %s != deb version %s"
+          % (modver, ver), file=sys.stderr)
+    sys.exit(1)
+print("  op table: %d ops, packaged == tree; __version__ %s" % (len(stand),
+                                                               modver))
+PYEOF
+
+src_newest=$(ls -t "$root"/src/*.c "$root"/include/*.h 2>/dev/null | head -1)
+if [ -n "$src_newest" ] && [ ! "$so" -nt "$src_newest" ]; then
+	echo "refusing to build: $so is older than $src_newest" >&2
+	echo "rebuild the engine first: make -C infer" >&2
+	exit 1
+fi
+echo "  library: $so newer than $(basename "$src_newest")"
+
 # ---- examples ---------------------------------------------------------------
 install -d "$stage/usr/share/doc/vc4infer/examples/models"
 install -m 0644 "$root/examples"/*.py "$stage/usr/share/doc/vc4infer/examples/"

@@ -7,6 +7,8 @@
  *   depthwise 3x3 pad 1
  *   maxpool 5x5 stride 1 pad 2 (SPPF shape)
  *   channel concat, nearest 2x upsample
+ *   NCHW -> NHWC layout conversion (C > 16) feeding a grouped conv, which
+ *   is the path the ONNX runner takes
  *
  * usage: test_nhwc [reps]
  */
@@ -460,6 +462,157 @@ static int one_group(vc4_ctx *ctx, int Cin, int Cout, int groups, int H, int W,
     return clean == reps ? 0 : 1;
 }
 
+/* ------------------------------------- NCHW -> NHWC layout, then grouped conv */
+/*
+ * The ONNX runner holds activations in NCHW and converts them on the QPUs
+ * before an NHWC conv: 16 lanes are 16 channels, and one copy2d_x call moves
+ * one 16-channel block of every pixel (an NCHW plane of H*W floats is the lane
+ * stride).  Cin > 16 therefore needs one call per channel block -- copy2d_x
+ * rejects nlane > 16, which is exactly how the 32->32 g2 Conv of the ONNX sweep
+ * failed ("copy2d_x: invalid argument").  one_group() above starts from an NHWC
+ * buffer built on the ARM, so it never exercised the conversion.
+ */
+static int one_group_nchw(vc4_ctx *ctx, int Cin, int Cout, int groups, int H,
+                          int W, int KH, int KW, int stride, int pad, int nimg,
+                          int reps)
+{
+    const int cg = Cin / groups, og = Cout / groups;
+    const int ho = (H + 2 * pad - KH) / stride + 1;
+    const int wo = (W + 2 * pad - KW) / stride + 1;
+    const int Wg = (wo + 15) & ~15;
+    const int cp = Cin;
+    const size_t nin = (size_t)nimg * Cin * H * W;        /* NCHW */
+    const size_t nn = (size_t)nimg * H * W * cp;          /* NHWC */
+    const size_t nwt = (size_t)Cout * cg * KH * KW;
+    const size_t nout = (size_t)nimg * ho * Wg * Cout;
+    const size_t nwg = (size_t)og * cg * KH * KW;
+    const uint32_t units = (uint32_t)(W % 4 == 0 ? 4 : (W % 2 == 0 ? 2 : 1));
+
+    float *nchw = malloc(nin * 4), *nhwc = malloc(nn * 4);
+    float *wt = malloc(nwt * 4), *bi = malloc((size_t)Cout * 4);
+    float *out = malloc(nout * 4), *got = malloc(nn * 4);
+    double *ref = malloc(nout * sizeof(double));
+    int ok = 1;
+    if (!nchw || !nhwc || !wt || !bi || !out || !got || !ref)
+        return 1;
+    for (size_t i = 0; i < nin; ++i) nchw[i] = frand();
+    for (size_t i = 0; i < nwt; ++i) wt[i] = frand() * 0.15f;
+    for (int i = 0; i < Cout; ++i) bi[i] = frand();
+    for (int n = 0; n < nimg; ++n)
+        for (int c = 0; c < Cin; ++c)
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    nhwc[(((size_t)n * H + y) * W + x) * cp + c] =
+                        nchw[((size_t)n * Cin + c) * H * W + (size_t)y * W + x];
+
+    vc4_buf bn = alloc_up(ctx, nchw, nin, &ok);
+    vc4_buf bt = alloc_up(ctx, NULL, nn, &ok);
+    vc4_buf bout = alloc_up(ctx, out, nout, &ok);
+    vc4_buf *bwt = calloc((size_t)groups, sizeof(*bwt));
+    vc4_buf *bwp = calloc((size_t)groups, sizeof(*bwp));
+    vc4_buf *bbi = calloc((size_t)groups, sizeof(*bbi));
+    const vc4_buf **wpl = calloc((size_t)groups, sizeof(*wpl));
+    for (int g = 0; g < groups && ok; ++g) {
+        bwt[g] = alloc_up(ctx, wt + (size_t)g * nwg, nwg, &ok);
+        bbi[g] = alloc_up(ctx, bi + (size_t)g * og, (size_t)og, &ok);
+        wpanel_alloc(ctx, cg, og, KH, KW, 1, &bwp[g], &ok);
+        wpl[g] = &bwp[g];
+        if (ok && vc4_conv_nhwc_pack_w(ctx, &bwt[g], cg, og, KH, KW, &bbi[g],
+                                       &bwp[g]) != VC4_OK) {
+            printf("FAIL: group_nchw pack_w: %s\n", vc4_last_error(ctx));
+            return 1;
+        }
+    }
+    if (!ok)
+        return 1;
+    /* pitch is in pixels, the channel block is not part of it */
+    ref_group(nhwc, Cin, H, W, W, wt, Cout, groups, KH, KW, bi, stride, pad,
+              ref, Wg, ho, wo, nimg);
+
+    int clean = 0;
+    double best_ms = 0;
+    for (int rep = 0; rep < reps; ++rep) {
+        vc4_upload(ctx, &bout, out, nout * 4);
+        vc4_stats s0, s1;
+        vc4_get_stats(ctx, &s0);
+        uint64_t t0 = now_ns();
+        /* ---- the NCHW -> NHWC conversion, one call per 16-channel block */
+        for (int n = 0; n < nimg; ++n)
+            for (int k0 = 0; k0 < Cin; k0 += 16) {
+                const int nlan = Cin - k0 < 16 ? Cin - k0 : 16;
+                const uint32_t so =
+                    (uint32_t)(((size_t)n * Cin + k0) * H * W * 4);
+                const uint32_t dof =
+                    (uint32_t)((size_t)n * H * W * cp * 4 + (size_t)k0 * 4);
+                vc4_buf s = bn, d = bt;
+                s.off = bn.off + so;
+                s.bytes = bn.bytes - so;
+                d.off = bt.off + dof;
+                d.bytes = bt.bytes - dof;
+                vc4_status cst = vc4_copy2d_x(
+                    ctx, &s, &d, (uint32_t)H, (uint32_t)W, (uint32_t)(W * 4),
+                    (uint32_t)(W * cp * 4), 4, (uint32_t)(cp * 4),
+                    (uint32_t)(H * W * 4), (uint32_t)nlan, 1, 64, 64, units,
+                    16);
+                if (cst != VC4_OK) {
+                    printf("FAIL: nchw->nhwc block %d C%d %dx%d -> %s (%s)\n",
+                           k0 / 16, Cin, H, W, vc4_strerror(cst),
+                           vc4_last_error(ctx));
+                    return 1;
+                }
+            }
+        int gho = 0, gwo = 0, gp = 0;
+        vc4_status st = vc4_conv_nhwc_group(ctx, &bt, nimg, Cin, H, W, W, wpl,
+                                            Cout, groups, KH, KW, stride, pad, 1,
+                                            &bout, &gho, &gwo, &gp);
+        uint64_t t1 = now_ns();
+        if (st != VC4_OK) {
+            printf("FAIL: conv_group_nchw(%d->%d g%d %dx%d) -> %s (%s)\n", Cin,
+                   Cout, groups, H, W, vc4_strerror(st), vc4_last_error(ctx));
+            return 1;
+        }
+        vc4_get_stats(ctx, &s1);
+        /* the conversion is a byte copy: it must be exact */
+        vc4_download(ctx, &bt, got, nn * 4);
+        long lay = 0;
+        for (size_t i = 0; i < nn; ++i)
+            if (got[i] != nhwc[i])
+                ++lay;
+        if (lay) {
+            printf("FAIL: nchw->nhwc C%d %dx%d: %ld/%zu words differ\n", Cin, H,
+                   W, lay, nn);
+            return 1;
+        }
+        if (gho != ho || gwo != wo || gp != Wg) {
+            printf("FAIL: conv_group_nchw geometry %dx%d p%d, expected %dx%d "
+                   "p%d\n", gho, gwo, gp, ho, wo, Wg);
+            return 1;
+        }
+        vc4_download(ctx, &bout, out, nout * 4);
+        check_t ck = { 0, 0, 0, 1 };
+        check_plane(&ck, out, ref, nimg, ho, Wg, Cout, wo, TOL_CONV);
+        double gpu_ms = (double)((s1.pack_ns - s0.pack_ns) +
+                                 (s1.kernel_ns - s0.kernel_ns)) / 1e6;
+        double wall_ms = (double)(t1 - t0) / 1e6;
+        double flops = 2.0 * nimg * Cout * ho * wo * cg * KH * KW;
+        if (rep == 0 || wall_ms < best_ms)
+            best_ms = wall_ms;
+        printf("  convn %d->%d g%d %dx%d k%d s%d p%d n%d rep%d: mism=%ld/%zu "
+               "maxabs=%.3g maxrel=%.3g | gpu %.2f ms %.2f GFLOP/s wall %.2f ms "
+               "launches %llu\n",
+               Cin, Cout, groups, H, W, KH, stride, pad, nimg, rep,
+               ck.mismatches, nout, ck.max_abs, ck.max_rel, gpu_ms,
+               gpu_ms > 0 ? flops / gpu_ms / 1e6 : 0, wall_ms,
+               (unsigned long long)(s1.launches - s0.launches));
+        if (ck.mismatches == 0)
+            ++clean;
+    }
+    printf("%s convn %d->%d g%d %dx%d k%d s%d p%d n%d: %d/%d clean, best "
+           "wall %.2f ms\n", clean == reps ? "PASS" : "FAIL", Cin, Cout, groups,
+           H, W, KH, stride, pad, nimg, clean, reps, best_ms);
+    return clean == reps ? 0 : 1;
+}
+
 /* ---------------------------------------------------------- depthwise test */
 static int one_depthwise(vc4_ctx *ctx, int C, int H, int W, int nimg, int reps)
 {
@@ -717,6 +870,10 @@ int main(int argc, char **argv)
     bad |= one_group(ctx, 64, 64, 2, 16, 16, 3, 3, 1, 1, 1, reps);
     bad |= one_group(ctx, 64, 64, 4, 16, 16, 3, 3, 2, 1, 2, reps);
     bad |= one_group(ctx, 96, 96, 3, 16, 16, 3, 3, 1, 1, 2, reps);
+    /* the ONNX runner path: NCHW input, converted to NHWC on the QPUs first
+     * (Cin > 16 exercises the per-channel-block copy2d_x loop) */
+    bad |= one_group_nchw(ctx, 32, 32, 2, 8, 8, 3, 3, 1, 1, 1, reps);
+    bad |= one_group_nchw(ctx, 48, 48, 3, 8, 8, 3, 3, 1, 1, 1, reps);
     /* 3. depthwise, SPPF-style pool, concat, upsample */
     bad |= one_depthwise(ctx, 32, 24, 24, 1, reps);
     bad |= one_depthwise(ctx, 64, 16, 16, 2, reps);

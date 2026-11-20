@@ -10,7 +10,7 @@ set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-ver=${1:-1.2.2}
+ver=${1:-1.2.3}
 out=$root/dist
 stage=$root/build/vc4infer-dev-deb
 triplet=aarch64-linux-gnu
@@ -75,7 +75,7 @@ EOF
 PKG=vc4infer-dev
 VER=$ver
 ARCH=arm64
-DEPENDS="vc4infer (>= 1.2.2) | vc4-toolkit-fast (>= 1.2.2), libc6 (>= 2.38)"
+DEPENDS="vc4infer (>= 1.2.3) | vc4-toolkit-fast (>= 1.2.3), libc6 (>= 2.38)"
 SECTION=libdevel
 SHORT="Headers and build files for libvc4infer (VideoCore IV engine)"
 LONG="Installs /usr/include/vc4infer.h, the libvc4infer.so linker symlink, a

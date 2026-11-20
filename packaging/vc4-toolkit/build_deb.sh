@@ -9,7 +9,7 @@ set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-ver=${1:-1.2.2}
+ver=${1:-1.2.3}
 out=$root/dist
 stage=$root/build/vc4-toolkit-deb
 
@@ -20,7 +20,7 @@ install -m 0644 "$here/README.md" "$stage/usr/share/doc/vc4-toolkit/README.md"
 PKG=vc4-toolkit
 VER=$ver
 ARCH=arm64
-DEPENDS="vc4d (>= 1.2.1), vc4infer (>= 1.2.2), vc4infer-dev (>= 1.2.2), vc4-query (>= 1.0.0), vc4-smi (>= 1.0.0), vc4train (>= 1.0.0), vc4top (>= 1.0.5), vc4top-dkms (>= 1.0.5)"
+DEPENDS="vc4d (>= 1.2.1), vc4infer (>= 1.2.3), vc4infer-dev (>= 1.2.3), vc4-query (>= 1.0.0), vc4-smi (>= 1.0.0), vc4train (>= 1.0.0), vc4top (>= 1.0.5), vc4top-dkms (>= 1.0.5)"
 SECTION=metapackages
 SHORT="VideoCore IV toolkit: daemon, engine, headers, query, monitor, trainer"
 LONG="The single install command for the whole vc4-stack:

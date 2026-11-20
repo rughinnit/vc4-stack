@@ -148,10 +148,17 @@ Why the G2 restore is a restart and not a re-allocation in place: by the time
 `vc4d` serves clients it has dropped to `nobody` with an empty capability set
 and closed `/dev/mem`, so it cannot open a larger dma-buf or map a new
 physical base.  Keeping `/dev/mem` open in the unprivileged process would give
-up the property the daemon exists for.  The exit is gated on `CmaFree >=
-requested + 4 MiB` and on an idle arena (`arena_used == 0`, no clients, no
-launch in flight), so a fragmented board does not enter a restart loop; the
-systemd unit already has `Restart=always`.
+up the property the daemon exists for.  The exit is gated on an idle arena
+(`arena_used == 0`, no clients, no launch in flight) **and** on
+`CmaFree + arena_bytes >= requested + 8 MiB` — the daemon's own block counts,
+because exiting releases it.  Deliberate restarts are spaced by a stamp in
+`/run/vc4d/arena-restore-<MiB>.state` (1 min doubling to 6 h, cleared by a
+start that gets the full size), so a genuinely fragmented board cannot turn
+the restore into a restart loop.  Measured on this board after the upgrade:
+48 MiB of 96 → the gate fired, the daemon exited 75, and the replacement got
+96 MiB; and in a deliberately fragmented state (107 MiB of `CmaFree`, no
+96 MiB block) it stayed at 48 MiB and logged `arena restore: 1 attempt(s)
+already failed; next try in 55 s`.
 
 The G4 wire change adds no bytes: `vc4d_launch_req.pad` became `uni_addr`, and
 the flag is `VC4D_LAUNCH_UNI_MASK` (bit 2).  Program names ride after the code

@@ -489,7 +489,20 @@ share.  A 150 MiB block needs an unusually clean boot.
 
    If CMA never recovers the daemon stays up at the smaller size and logs that
    it is waiting, instead of looping — free CMA (steps 1-3) and it restores
-   itself within a couple of seconds.
+   itself.  Repeated failed attempts are spaced out (1 min doubling to 6 h):
+
+   ```
+   vc4d: arena restore: 1 attempt(s) already failed; next try in 55 s (a
+         fragmented CMA can refuse the full block even when enough is free in
+         pieces).  Stop the other CMA user and restart vc4d to retry now.
+   ```
+
+   To retry immediately, free CMA and run `sudo systemctl restart vc4d` (a
+   restart clears the stamp).  The state is one file per requested size,
+   `/run/vc4d/arena-restore-<MiB>.state`; delete it to clear the backoff by
+   hand.  A board whose CMA is fragmented so that the block cannot be had at
+   any `CmaFree` value (measured here: 107 MiB free, a 96 MiB block refused)
+   needs a reboot — CMA fragmentation is not defragmentable from user space.
 
 ## 7a. A parameter of −2.0 or below is refused in managed mode
 

@@ -107,10 +107,28 @@ static int srq_reset(struct gpu *g)
     return 0;
 }
 
+static int queue_idle(struct gpu *g)
+{
+    uint32_t s = g->regs[R_SRQCS / 4];
+    return (s & 0x3F) == 0 && ((s >> 16) & 0xFF) == 0 && !(s & (1u << 7));
+}
+
+/* Counter setup shared by a client launch and the recovery probe. */
+static void arm_counters(struct gpu *g)
+{
+    g->regs[R_PCTR_EN / 4] |= (1u << 31) | (1u << 0);
+    g->regs[R_PCTR_MAP / 4 + 0 * 2] = CTR_EXEC_CYCLES & 0x1F;
+    g->regs[R_PCTR_VAL / 4 + 0 * 2] = 0;
+    g->regs[R_PCTR_EN / 4] |= (1u << 31) | (1u << 1);
+    g->regs[R_PCTR_MAP / 4 + 1 * 2] = CTR_INSTR_HITS & 0x1F;
+    g->regs[R_PCTR_VAL / 4 + 1 * 2] = 0;
+    g->regs[R_PCTR_CLR / 4] = 3;
+}
+
 int gpu_kick(struct gpu *g, uint32_t code_bus, const uint32_t *uni_bus,
              int nqpu, uint32_t timeout_ms, char *err, size_t errn)
 {
-    if (g->dead) {
+    if (g->dead && !g->recovering) {
         snprintf(err, errn, "daemon is dead after a previous GPU timeout");
         return VC4D_E_DEAD;
     }
@@ -128,13 +146,7 @@ int gpu_kick(struct gpu *g, uint32_t code_bus, const uint32_t *uni_bus,
         return VC4D_E_GPU;
     }
     barrier();
-    g->regs[R_PCTR_EN / 4] |= (1u << 31) | (1u << 0);
-    g->regs[R_PCTR_MAP / 4 + 0 * 2] = CTR_EXEC_CYCLES & 0x1F;
-    g->regs[R_PCTR_VAL / 4 + 0 * 2] = 0;
-    g->regs[R_PCTR_EN / 4] |= (1u << 31) | (1u << 1);
-    g->regs[R_PCTR_MAP / 4 + 1 * 2] = CTR_INSTR_HITS & 0x1F;
-    g->regs[R_PCTR_VAL / 4 + 1 * 2] = 0;
-    g->regs[R_PCTR_CLR / 4] = 3;
+    arm_counters(g);
     barrier();
     g->regs[R_VPMBASE / 4] = 16;
     barrier();
@@ -196,11 +208,139 @@ int gpu_finish(struct gpu *g, struct launch_result *r, char *err, size_t errn)
 void gpu_abort(struct gpu *g)
 {
     /* A stuck QPU cannot be reset from the ARM.  Clear the queue word so the
-       board is not wedged for the next user, then refuse further launches. */
+       board is not wedged for the next user, then refuse further launches
+       until gpu_recover() has reset the context and proved it with a probe. */
     if (g->regs)
         g->regs[R_SRQCS / 4] = (1u << 0) | (1u << 7) | (1u << 8) | (1u << 16);
     g->inflight = 0;
     g->dead = 1;
+}
+
+/* ---- context reset ------------------------------------------------------
+ *
+ * A launch timeout used to turn `dead` on and leave it on: the daemon stayed
+ * alive but refused every later launch ("daemon is dead (GPU timeout
+ * earlier)") until systemd restarted it.  Measured after a timeout, the GPU is
+ * usually fine: SRQCS reads back idle and ERRSTAT is back to its boot-time
+ * 0x1000 once the abort write has flushed the queue.  So instead of declaring
+ * the daemon dead for good, reset the context and *prove* it with a launch of
+ * the daemon's own 4-instruction probe program.  Only a probe that completes
+ * with no new ERRSTAT bits re-enables client launches; anything else makes the
+ * caller exit so systemd (Restart=always) brings up a clean daemon.
+ *
+ * The register *mapping* cannot be re-created here, and does not need to be:
+ * it is a MAP_SHARED /dev/mem mapping of the V3D window, it stays valid for
+ * the life of the process, and re-mmap would need CAP_SYS_RAWIO and /dev/mem,
+ * both of which the daemon deliberately gives up before serving clients (see
+ * drop_privileges()).  What is re-initialised is the register *state*: VPM
+ * base, L2/SLC caches, the error latch, the counters and the instruction
+ * queue.  The probe is what makes that claim checkable rather than assumed.
+ */
+
+void gpu_use_probe(struct gpu *g, uint32_t code_bus, uint32_t uni_bus)
+{
+    g->probe_code_bus = code_bus;
+    g->probe_uni_bus = uni_bus;
+    g->probe_ready = 1;
+}
+
+/* Reset the register state and wait for the queue to drain.  Returns 0 when
+ * the context is idle and clean. */
+static int gpu_reset(struct gpu *g, char *err, size_t errn)
+{
+    if (!g->regs) {
+        snprintf(err, errn, "no V3D register mapping");
+        return -1;
+    }
+    if (!gpu_health(g)) {
+        snprintf(err, errn, "V3D IDENT0=0xdeadbeef (V3D is powered down)");
+        return -1;
+    }
+
+    /* A launch that missed its deadline can still be draining: give it a
+       bounded grace before deciding the queue is really stuck. */
+    uint64_t limit = now_ns() + 1000ull * 1000000ull;
+    while (!queue_idle(g) && now_ns() < limit)
+        usleep(200);
+    if (!queue_idle(g)) {
+        snprintf(err, errn, "queue still busy after 1000 ms (SRQCS=0x%08x)",
+                 g->regs[R_SRQCS / 4]);
+        return -1;
+    }
+
+    barrier();
+    g->regs[R_L2CACTL / 4] = 1u << 2;          /* write back + invalidate */
+    barrier();
+    g->regs[R_SLCACTL / 4] = 0xFFFFFFFFu;      /* instruction/data caches */
+    barrier();
+    g->regs[R_ERRSTAT / 4] = 0xFFFFFFFFu;      /* W1C the stale error latch */
+    barrier();
+    g->regs[R_VPMBASE / 4] = 16;
+    barrier();
+    arm_counters(g);
+    barrier();
+    if (!srq_reset(g)) {
+        snprintf(err, errn, "SRQ reset failed (SRQCS=0x%08x)",
+                 g->regs[R_SRQCS / 4]);
+        return -1;
+    }
+    /* Keep the boot-time idle bits (VCD_IDLE) in the mask: they are set again
+       as soon as the queue is idle, and gpu_finish() subtracts them. */
+    g->inflight = 0;
+    return 0;
+}
+
+/* Launch the daemon's known-good program once and require completion with no
+ * new error bits.  Called by gpu_recover() only. */
+static int gpu_probe_launch(struct gpu *g, uint32_t timeout_ms,
+                            char *err, size_t errn)
+{
+    if (!g->probe_ready) {
+        snprintf(err, errn, "no probe program configured");
+        return -1;
+    }
+    uint32_t uni = g->probe_uni_bus;
+    int rc = gpu_kick(g, g->probe_code_bus, &uni, 1, timeout_ms, err, errn);
+    if (rc != VC4D_OK) {
+        snprintf(err, errn, "probe launch failed: %s",
+                 rc == VC4D_E_DEAD ? "still marked dead" : "kick error");
+        return -1;
+    }
+    int pr = 0;
+    while ((pr = gpu_poll(g)) == 0 && now_ns() <= g->deadline)
+        usleep(20);
+    if (pr != 1) {
+        gpu_abort(g);
+        snprintf(err, errn, "probe did not complete (SRQCS=0x%08x)",
+                 g->regs[R_SRQCS / 4]);
+        return -1;
+    }
+    struct launch_result lr;
+    char ferr[128] = "";
+    int frc = gpu_finish(g, &lr, ferr, sizeof(ferr));
+    if (frc != VC4D_OK) {
+        snprintf(err, errn, "probe raised %s", ferr);
+        return -1;
+    }
+    return 0;
+}
+
+int gpu_recover(struct gpu *g, char *err, size_t errn)
+{
+    if (!g->regs || !g->probe_ready) {
+        snprintf(err, errn, "no register mapping / probe program");
+        return -1;
+    }
+    g->recovering = 1;
+    int rc = gpu_reset(g, err, errn);
+    if (rc == 0)
+        rc = gpu_probe_launch(g, 500, err, errn);
+    g->recovering = 0;
+    if (rc == 0) {
+        g->dead = 0;
+        g->inflight = 0;
+    }
+    return rc;
 }
 
 static const struct { uint32_t off; const char *name; } wreg_allow[] = {

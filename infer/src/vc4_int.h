@@ -34,6 +34,7 @@ typedef struct {
 struct vc4_ctx {
     int      mem_fd;
     int      dmabuf_fd;
+    int      lock_fd;        /* board-wide GPU lock, direct mode only */
     volatile uint32_t *v3d;
     uint8_t *arena;
     uint32_t gpu_phys;

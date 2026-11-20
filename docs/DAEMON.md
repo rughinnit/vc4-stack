@@ -125,10 +125,13 @@ which is launch-bound.  First 128³ run after boot is colder (1.25 ms wall).
   fell back to 64 MiB and reintroduced the failure.  The final suite ran with the
   64 MiB client region and the 72 MiB daemon; `test_convgrad` was also verified
   separately against this exact unit.
-- Lock topology: in daemon mode the daemon takes `/tmp/vc4-gpu.lock` per
-  launch, so the tests must not hold it (otherwise both wait and the launch
-  fails as busy).  The engine retries `E_BUSY` for a minute, which is what let
-  it coexist with long `qrun_gemm` runs from a concurrent session.  The unit needs
+- Lock topology: the daemon takes `/tmp/vc4-gpu.lock` per launch, so the
+  tests must not hold it (otherwise both wait and the launch fails as busy).
+  The engine retries `E_BUSY` for a minute, which is what let it coexist with
+  long `qrun_gemm` runs from a concurrent session.  Since the G11 fix the direct path
+  takes the same lock for the same window, so a direct-mode run next to a live
+  daemon takes turns instead of timing out (`conv_nhwc_dil: GPU timeout`);
+  `tests/util.h` therefore never takes it in either mode.  The unit needs
   `ReadWritePaths=/tmp` to create the lock at boot.
 - No kernel needed a fallback to root.  `vc4_gemm`, `vc4_ew`, `vc4_conv`,
   `vc4_convbwd`, `vc4_train` and the softmax/pool paths all run through

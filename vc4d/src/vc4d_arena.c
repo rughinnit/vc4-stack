@@ -58,7 +58,6 @@ static void page_align_cache(void *addr, size_t bytes)
     (void)addr; (void)bytes;
 #endif
 }
-
 static uint32_t run_nonce(void)
 {
     uint32_t v = 0;
@@ -128,30 +127,24 @@ static int find_phys(uint8_t *map, size_t len, uint32_t *out, char *err, size_t 
     return rc;
 }
 
-static void freeblk_insert(struct arena *a, uint32_t off, uint32_t len)
+/* ---- page bitmap ------------------------------------------------------- */
+static inline int page_used(const struct arena *a, uint32_t p)
 {
-    int i = 0;
-    while (i < a->nfree && a->free[i].off < off)
-        ++i;
-    if (a->nfree == MAX_FREEBLK)
-        return;                       /* leak-safe: region stays unusable */
-    memmove(&a->free[i + 1], &a->free[i], (size_t)(a->nfree - i) * sizeof(a->free[0]));
-    a->free[i].off = off;
-    a->free[i].len = len;
-    a->nfree++;
-    /* coalesce with the next, then with the previous */
-    if (i + 1 < a->nfree && a->free[i].off + a->free[i].len == a->free[i + 1].off) {
-        a->free[i].len += a->free[i + 1].len;
-        memmove(&a->free[i + 1], &a->free[i + 2],
-                (size_t)(a->nfree - i - 2) * sizeof(a->free[0]));
-        a->nfree--;
-    }
-    if (i > 0 && a->free[i - 1].off + a->free[i - 1].len == a->free[i].off) {
-        a->free[i - 1].len += a->free[i].len;
-        memmove(&a->free[i], &a->free[i + 1],
-                (size_t)(a->nfree - i - 1) * sizeof(a->free[0]));
-        a->nfree--;
-    }
+    return (a->bits[p >> 5] >> (p & 31)) & 1u;
+}
+
+static inline void page_set(struct arena *a, uint32_t p)
+{
+    a->bits[p >> 5] |= 1u << (p & 31);
+}
+
+static inline int page_clear(struct arena *a, uint32_t p)
+{
+    uint32_t *w = &a->bits[p >> 5];
+    uint32_t m = 1u << (p & 31);
+    int was = (*w & m) != 0;
+    *w &= ~m;
+    return was;
 }
 
 /* Confirm the discovered physical base.  The tag scan that found it already
@@ -258,9 +251,19 @@ int arena_open(struct arena *a, size_t want, char *err, size_t errn)
         a->bus = phys | 0xC0000000u;
         a->bytes = len;
         memset(a->map, 0, A_DATA_BASE);       /* header, code and uni areas */
-        a->nfree = 1;
-        a->free[0].off = A_DATA_BASE;
-        a->free[0].len = (uint32_t)(len - A_DATA_BASE);
+        a->npages = (uint32_t)((len - A_DATA_BASE) / ARENA_PAGE);
+        a->bits = calloc((a->npages + 31u) / 32u, sizeof(uint32_t));
+        if (!a->bits) {
+            munmap(unc, len);
+            close((int)d.fd);
+            a->fd = -1;
+            a->map = NULL;
+            snprintf(err, errn, "out of memory for a %u-page arena bitmap",
+                     a->npages);
+            return -1;
+        }
+        a->hint = 0;
+        a->used = 0;
         return 0;
     }
     if (!*err)
@@ -274,42 +277,68 @@ void arena_close(struct arena *a)
         munmap(a->map, a->bytes);
     if (a->fd >= 0)
         close(a->fd);
+    free(a->bits);
     memset(a, 0, sizeof(*a));
     a->fd = -1;
 }
 
 int arena_alloc(struct arena *a, uint32_t bytes, uint32_t *off)
 {
-    if (!bytes)
+    if (!bytes || !a->bits || !a->npages)
         return -1;
-    uint32_t need = (bytes + 4095u) & ~4095u;
-    if (need < bytes)
+    uint32_t need = (bytes + ARENA_PAGE - 1u) / ARENA_PAGE;
+    if (need < 1 || need > a->npages)
         return -1;
-    for (int i = 0; i < a->nfree; ++i) {
-        if (a->free[i].len < need)
-            continue;
-        uint32_t o = a->free[i].off;
-        a->free[i].off += need;
-        a->free[i].len -= need;
-        if (!a->free[i].len) {
-            memmove(&a->free[i], &a->free[i + 1],
-                    (size_t)(a->nfree - i - 1) * sizeof(a->free[0]));
-            a->nfree--;
+
+    /* First fit from the cursor, then wrap once to page 0.  The scan is over
+       a bitmap, so it can never "lose" free space to bookkeeping. */
+    for (int pass = 0; pass < 2; ++pass) {
+        uint32_t from = pass ? 0 : a->hint;
+        uint32_t to = pass ? a->hint : a->npages;
+        uint32_t run = 0, start = 0;
+        for (uint32_t p = from; p < to; ++p) {
+            if (page_used(a, p)) {
+                run = 0;
+                continue;
+            }
+            if (!run)
+                start = p;
+            if (++run == need) {
+                for (uint32_t q = start; q < start + need; ++q)
+                    page_set(a, q);
+                a->used += (size_t)need * ARENA_PAGE;
+                a->hint = start + need;
+                if (a->hint >= a->npages)
+                    a->hint = 0;
+                *off = A_DATA_BASE + start * ARENA_PAGE;
+                return 0;
+            }
         }
-        a->used += need;
-        *off = o;
-        return 0;
+        if (!a->hint)
+            break;                    /* the second pass would repeat pass 1 */
     }
     return -1;
 }
 
 int arena_free(struct arena *a, uint32_t off, uint32_t len)
 {
-    if (!len || (off & 4095u) || (len & 4095u) || off < A_DATA_BASE ||
-        (size_t)off + len > a->bytes)
+    if (!a->bits || !len || (off & (ARENA_PAGE - 1)) ||
+        (len & (ARENA_PAGE - 1)) || off < A_DATA_BASE ||
+        (size_t)off + len > a->bytes ||
+        (size_t)off + len < A_DATA_BASE)
         return -1;
-    freeblk_insert(a, off, len);
-    a->used -= len;
+    uint32_t first = (off - A_DATA_BASE) / ARENA_PAGE;
+    uint32_t np = len / ARENA_PAGE;
+    uint32_t cleared = 0;
+    for (uint32_t i = 0; i < np; ++i)
+        if (page_clear(a, first + i))
+            cleared++;
+    /* Only pages that were actually allocated are subtracted, so the counter
+       stays exact even if a caller frees the same region twice. */
+    size_t bytes = (size_t)cleared * ARENA_PAGE;
+    a->used = a->used >= bytes ? a->used - bytes : 0;
+    if (first < a->hint)
+        a->hint = first;
     return 0;
 }
 

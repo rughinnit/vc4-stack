@@ -152,55 +152,342 @@ def _extra_handlers():
     return _EXTRA_HANDLERS
 
 
-class Pool:
-    """A bump/free allocator over one engine allocation.
+def _align(n, a=64):
+    return (int(n) + a - 1) // a * a
 
-    libvc4infer has no free(), so the runner carves every activation out of a
-    single arena buffer and recycles it by ONNX liveness.  ``Buf`` objects are
-    plain (off, bytes) pairs, so a sub-range of the pool is a perfectly good
-    engine operand.
+
+def _mib(n):
+    return "%.1f MiB" % (n / 2 ** 20)
+
+
+def _align16(n):
+    return (int(n) + 15) // 16 * 16
+
+
+def _tensor_bytes(shape, nhwc=False):
+    """Bytes the runner's pool gives a tensor of this ONNX shape.
+
+    Conv outputs are stored NHWC with the channel and width axes padded to 16
+    (the QPU kernel's grid), so they are bigger than their element count; every
+    other tensor is a plain contiguous fp32 buffer.  The +64 is the allocator's
+    per-buffer slack (see Runner._alloc).
     """
+    if not shape or any(d is None or int(d) <= 0 for d in shape):
+        return 0
+    n = 1
+    for d in shape:
+        n *= int(d)
+    if nhwc and len(shape) == 4:
+        nb, c, h, w = (int(d) for d in shape)
+        return _align(nb * h * _align16(w) * _align16(c) * 4) + 64
+    return _align(n * 4) + 64
+
+
+def _conv_attrs(node):
+    a = {x.name: x for x in node.attribute}
+    ks = list(a["kernel_shape"].ints) if "kernel_shape" in a else None
+    st = list(a["strides"].ints) if "strides" in a else [1, 1]
+    pd = list(a["pads"].ints) if "pads" in a else [0, 0, 0, 0]
+    dl = list(a["dilations"].ints) if "dilations" in a else [1, 1]
+    gp = int(a["group"].i) if "group" in a else 1
+    return ks, st, pd, dl, gp
+
+
+def _is_float_init(t):
+    import onnx
+    return t.data_type in (onnx.TensorProto.FLOAT, onnx.TensorProto.DOUBLE)
+
+
+def _numel_proto(t):
+    n = 1
+    for d in t.dims:
+        n *= int(d)
+    return n
+
+
+def _init_shape_map(graph):
+    """name -> dims for initialisers (shape inference does not cover them)."""
+    out = {}
+    for init in graph.initializer:
+        out[init.name] = [int(d) for d in init.dims]
+    return out
+
+
+def estimate_pool_bytes(model, shapes=None):
+    """The graph pool's peak demand in bytes, computed from the graph itself.
+
+    The pool holds three things at once:
+
+      * every float initialiser, uploaded once and kept for the whole run
+        (``Runner.values``);
+      * the live activations of the moment with the largest fan-out, from an
+        ONNX liveness walk (first use .. last use);
+      * the packed NHWC weight panels, built on a conv's first use and cached
+        in ``Runner._panels`` (never freed), plus the transient copy of a
+        weight while its panel is built.
+
+    It is a plan-time *estimate*: good to within a few percent on the selftest
+    models, and the pool grows by another segment if it was short (Pool.alloc),
+    so an under-estimate costs a reallocation, not a failure.  The point is
+    that the pool is sized from the model instead of from the arena with an
+    8 MiB floor (G10).
+    """
+    from . import coverage
+
+    graph = model.graph
+    if shapes is None:
+        shapes, _ = coverage._shape_map(model)
+    init = _init_shape_map(graph)
+
+    def shp(name):
+        s = shapes.get(name)
+        return s if s else init.get(name)
+
+    perma = 0
+    for init_t in graph.initializer:
+        if _is_float_init(init_t):
+            perma += _align(_numel_proto(init_t) * 4) + 64
+
+    # conv panels + the transient weight upload they need
+    panels = 0
+    transient = 0
+    for n in graph.node:
+        if n.op_type != "Conv" or len(n.input) < 2:
+            continue
+        ws = shp(n.input[1])
+        if not ws or len(ws) != 4 or any(d <= 0 for d in ws):
+            continue
+        ks, st, pd, dl, gp = _conv_attrs(n)
+        cout, cin = int(ws[0]), int(ws[1]) * gp
+        kh, kw = (int(ks[0]), int(ks[1])) if ks else (int(ws[2]), int(ws[3]))
+        cpad, opad = _align16(cin), _align16(cout)
+        panels += opad * (_align16(cpad * kh * kw) + 16) * 4
+        transient = max(transient, _align(opad * cpad * kh * kw * 4) + 64)
+
+    first, last = {}, {}
+    for idx, n in enumerate(graph.node):
+        for t in n.input:
+            if t:
+                first.setdefault(t, idx)
+        for t in n.output:
+            if t:
+                last[t] = idx
+
+    live = 0
+    peak = perma
+    sizes = {}
+    for idx, n in enumerate(graph.node):
+        for t in n.input:                       # free what dies here
+            if t and last.get(t) == idx:
+                live -= sizes.pop(t, 0)
+        extra = 0
+        for t in n.output:
+            if not t or t in init:
+                continue        # an initialiser is already in `perma`
+            b = _tensor_bytes(shapes.get(t), nhwc=(n.op_type == "Conv"))
+            if not b:
+                continue
+            sizes[t] = b
+            live += b
+        if n.op_type == "Conv" and len(n.input) > 1:
+            extra = transient
+        peak = max(peak, perma + live + extra)
+    return int(peak + panels)
+
+
+def estimate_pool_floor(model, shapes=None):
+    """The bytes the pool *cannot* do without, whatever the liveness says.
+
+    Weights + packed conv panels + the single largest tensor: a model below
+    this cannot run in the arena, and this is the number to refuse on.  The
+    full estimate (estimate_pool_bytes) is deliberately conservative - it
+    assumes every tensor the ONNX graph keeps syntactically live is resident,
+    while the runner releases some earlier - so it sizes the pool but does not
+    decide refusal on its own.
+    """
+    from . import coverage
+
+    graph = model.graph
+    if shapes is None:
+        shapes, _ = coverage._shape_map(model)
+    init = _init_shape_map(graph)
+
+    perma = 0
+    for t in graph.initializer:
+        if _is_float_init(t):
+            perma += _align(_numel_proto(t) * 4) + 64
+    panels = 0
+    biggest = 0
+    for n in graph.node:
+        out = n.output[0] if n.output else None
+        b = _tensor_bytes(shapes.get(out))
+        if b > biggest:
+            biggest = b
+        if n.op_type != "Conv" or len(n.input) < 2:
+            continue
+        ws = shapes.get(n.input[1]) or init.get(n.input[1])
+        if not ws or len(ws) != 4 or any(d <= 0 for d in ws):
+            continue
+        ks, st, pd, dl, gp = _conv_attrs(n)
+        cin = int(ws[1]) * gp
+        cout = int(ws[0])
+        kh, kw = (int(ks[0]), int(ks[1])) if ks else (int(ws[2]), int(ws[3]))
+        panels += (_align16(cout) *
+                   (_align16(_align16(cin) * kh * kw) + 16) * 4)
+    return int(perma + panels + biggest)
+
+
+def estimate_scratch_bytes(model, shapes=None):
+    """Bytes the engine needs *beside* the pool, from the largest node.
+
+    libvc4infer takes its own scratch from the arena above the pool: the NHWC
+    conv zero-pads the whole input image into scratch and builds an im2col
+    panel there (measured: ~6 MiB at 160x160, ~23 MiB at 320x320 - which is
+    where VC4_POOL_RESERVE_MB=24 came from), and an elementwise op with an
+    unaligned element count pads its operands in scratch.  Both are reset per
+    op, so the requirement is the largest single op, not a sum.
+    """
+    from . import coverage
+
+    graph = model.graph
+    if shapes is None:
+        shapes, _ = coverage._shape_map(model)
+    init = _init_shape_map(graph)
+
+    def shp(name):
+        s = shapes.get(name)
+        return s if s else init.get(name)
+
+    conv = 0
+    for n in graph.node:
+        if n.op_type != "Conv" or len(n.input) < 2:
+            continue
+        xs = shp(n.input[0])
+        ws = shp(n.input[1])
+        if not xs or not ws or len(xs) != 4 or len(ws) != 4:
+            continue
+        if any(d <= 0 for d in xs + ws):
+            continue
+        ks, st, pd, dl, gp = _conv_attrs(n)
+        nb, cin, h, w = (int(d) for d in xs)
+        cout = int(ws[0])
+        kh, kw = (int(ks[0]), int(ks[1])) if ks else (int(ws[2]), int(ws[3]))
+        cpad, opad = _align16(cin), _align16(cout)
+        ho = (h + 2 * pd[0] - (dl[0] * (kh - 1) + 1)) // st[0] + 1
+        wo = (w + 2 * pd[1] - (dl[1] * (kw - 1) + 1)) // st[1] + 1
+        if ho <= 0 or wo <= 0:
+            continue
+        pad_img = nb * cpad * (h + 2 * pd[0]) * (w + 2 * pd[1]) * 4 + 64
+        nk = _align16(cpad * kh * kw) + 16
+        panel = nb * ho * _align16(wo) * nk * 4
+        conv = max(conv, pad_img + panel)
+    # An elementwise op whose element count is not a multiple of its group
+    # rounds the operand up in scratch (up to three tensor-sized buffers), and
+    # every op resets scratch first, so the need is a per-op maximum, not a sum.
+    tail = 0
+    for n in graph.node:
+        t = n.output[0] if n.output else None
+        sh = shp(t)
+        if not sh or any(int(d) <= 0 for d in sh):
+            continue
+        n_el = 1
+        for d in sh:
+            n_el *= int(d)
+        if n_el % 256:
+            tail = max(tail, 3 * _align(((n_el + 255) // 256) * 256 * 4))
+    return int(max(conv, tail) + (256 << 10))
+
+
+class Pool:
+    """A bump/free allocator over one or more engine allocations.
+
+    libvc4infer has no free(), so the runner carves every activation out of
+    arena buffers it takes from the engine and recycles them by ONNX liveness.
+    ``Buf`` objects are plain (off, bytes) pairs, so a sub-range of the pool is
+    a perfectly good engine operand.
+
+    The pool used to be one allocation of ``max(arena - reserve, 8 MiB)``: a
+    small client arena therefore produced a fixed 8 MiB pool and then failed
+    inside the run with ``graph pool exhausted ... of 8388608 B``, which reads
+    like "model too big" (G10).  Now the first segment is sized from the graph
+    (estimate_pool_bytes), a short estimate grows by asking the engine for
+    another segment, and a request the arena cannot serve names the number
+    needed and the number available.
+    """
+
+    MIN_SEG = 1 << 20
 
     def __init__(self, eng, nbytes, reserve=0):
         self.eng = eng
         self.reserve = reserve
-        while True:
-            n = (nbytes + 63) & ~63
-            if n < (1 << 20):
-                raise UnsupportedNode("no room for a graph pool (%d B)"
-                                      % nbytes)
-            try:
-                self.buf = eng.alloc(n)
-                break
-            except vc4infer.Error:
-                nbytes //= 2
-        self.base = self.buf.off
-        self.size = n
-        self.bump = 0
-        self.free = []                  # [(off, size)], sorted, coalesced
+        self.segs = []                  # [[base, size, bump], ...]
+        self.free = []                  # [(off, size)] engine-global offsets
+        self.high = 0                   # high-water of used_bytes
+        if not self._add_segment(max(int(nbytes), self.MIN_SEG)):
+            raise self._exhausted(int(nbytes))
 
+    # -- segments ----------------------------------------------------------
+    def _add_segment(self, want):
+        """Ask the engine for another pool segment; 0 if the arena is full."""
+        n = _align(max(int(want), 1 << 16))
+        while n >= (1 << 16):
+            try:
+                b = self.eng.alloc(n)
+                self.segs.append([int(b.off), n, 0])
+                return n
+            except vc4infer.Error:
+                n //= 2
+        return 0
+
+    def _exhausted(self, n):
+        return UnsupportedNode(
+            "graph pool exhausted: one node needs %d B (%.1f MiB), the pool is "
+            "%s in %d segment(s) and the client arena is %s%s: start vc4d with "
+            "a larger --arena-mb (or set VC4INFER_ARENA_MB), or lower "
+            "VC4_POOL_RESERVE_MB"
+            % (n, n / 2 ** 20, _mib(self.size), len(self.segs),
+               _mib(self.eng.arena_bytes),
+               (" (%.1f MiB held for conv scratch)" % (self.reserve / 2 ** 20))
+               if self.reserve else ""))
+
+    def _ensure(self, n):
+        for seg in self.segs:
+            if seg[2] + n <= seg[1]:
+                return seg
+        # short estimate: grow by at least the request (halved inside
+        # _add_segment if the arena cannot give that much at once)
+        self._add_segment(max(n, 4 << 20))
+        seg = self.segs[-1]
+        if len(self.segs) and seg[1] < n:
+            raise self._exhausted(n)
+        return seg
+
+    # -- allocation --------------------------------------------------------
     def alloc(self, nbytes):
-        n = (nbytes + 63) & ~63
+        n = _align(nbytes)
         for i, (off, sz) in enumerate(self.free):
             if sz >= n:
                 if sz == n:
                     self.free.pop(i)
                 else:
                     self.free[i] = (off + n, sz - n)
-                return vc4infer.Buf(self.base + off, int(nbytes))
-        off, self.bump = self.bump, self.bump + n
-        if off + n > self.size:
-            raise UnsupportedNode("graph pool exhausted: %d B needed, %d B "
-                                  "used of %d B" % (n, off, self.size))
-        return vc4infer.Buf(self.base + off, int(nbytes))
+                return vc4infer.Buf(off, int(nbytes))
+        seg = self._ensure(n)
+        off = seg[0] + seg[2]
+        seg[2] += n
+        used = self.used_bytes
+        if used > self.high:
+            self.high = used
+        return vc4infer.Buf(off, int(nbytes))
 
     def release(self, b):
         if b is None:
             return
-        off = b.off - self.base
-        if off < 0 or off >= self.size:
+        off = int(b.off)
+        inside = any(seg[0] <= off < seg[0] + seg[1] for seg in self.segs)
+        if not inside:
             return
-        n = (int(b.bytes) + 63) & ~63
+        n = _align(int(b.bytes))
         lo, hi = off, off + n
         merged = []
         for o, sz in self.free:                 # sorted, so one pass coalesces
@@ -213,9 +500,23 @@ class Pool:
         merged.sort()
         self.free = merged
 
+    def reset(self):
+        for seg in self.segs:
+            seg[2] = 0
+        self.free = []
+        self.high = 0
+
+    @property
+    def size(self):
+        return sum(seg[1] for seg in self.segs)
+
+    @property
+    def segments(self):
+        return len(self.segs)
+
     @property
     def used_bytes(self):
-        used = self.bump
+        used = sum(seg[2] for seg in self.segs)
         return used - sum(sz for _, sz in self.free)
 
 
@@ -305,18 +606,21 @@ class Runner:
         self._panels = {}       # packed NHWC weight panels, by node name
         # One pool per engine: libvc4infer cannot free, and running several
         # Runner objects on one Engine at the same time is not supported.
-        # The pool must leave room for the per-conv scratch (the padded image
-        # plus the im2col panel): 6 MB at 160x160, 23 MB at 320x320, so a
-        # bigger model wants a bigger reserve (VC4_POOL_RESERVE_MB).
-        reserve = int(os.environ.get("VC4_POOL_RESERVE_MB", "24")) << 20
-        need = max(eng.arena_bytes - reserve, 8 << 20)
+        #
+        # The pool is sized from *this model's* peak (weights + longest-lived
+        # activations + cached conv panels), not from the arena with a fixed
+        # reserve and an 8 MiB floor: the floor produced `graph pool exhausted
+        # ... of 8388608 B` for a model that was nowhere near too big (G10).
+        # The engine's own scratch (the conv padded image + im2col panel,
+        # elementwise workspaces) still has to fit beside the pool, so it is
+        # estimated too; VC4_POOL_RESERVE_MB overrides that estimate.
+        need, self.pool_plan = self._plan_pool_bytes()
         pool = getattr(eng, "_vc4_pool", None)
         if pool is None or pool.size < need:
             pool = Pool(eng, need)
             eng._vc4_pool = pool
         else:
-            pool.bump = 0
-            pool.free = []
+            pool.reset()
         self.pool = pool
         self._garbage = []      # per-node temporaries
         self._consts = set(i.name for i in self.graph.initializer)
@@ -538,6 +842,47 @@ class Runner:
         return tier == "host-meta"
 
     # ------------------------------------------------------------- rewrites
+    def _plan_pool_bytes(self):
+        """Bytes the graph pool must be able to hold, from the graph itself.
+
+        Returns (need, plan).  `need` is the size of the first pool segment:
+        the model's estimated peak (weights + live activations + cached conv
+        panels), clamped to what the arena can give beside the engine's own
+        scratch.  A model that cannot fit at all is refused *here*, at plan
+        time, with both numbers - that is the difference between
+        "graph pool exhausted ... of 8388608 B" (which looks like a model
+        problem) and "needs 30.2 MiB, arena is 24.0 MiB".
+        """
+        from . import coverage as _cov
+        shapes, _types = _cov._shape_map(self.model)
+        peak = estimate_pool_bytes(self.model, shapes)
+        floor = estimate_pool_floor(self.model, shapes)
+        scratch = estimate_scratch_bytes(self.model, shapes)
+        env = os.environ.get("VC4_POOL_RESERVE_MB")
+        if env is not None:
+            try:
+                scratch = int(env) << 20
+            except ValueError:
+                pass
+        arena = int(self.eng.arena_bytes)
+        avail = max(arena - int(scratch), 0)
+        if floor > avail:
+            raise UnsupportedNode(
+                "graph pool needs at least %s (weights + packed conv panels + "
+                "the largest tensor) and this model's peak is about %s, but "
+                "the client arena is %s with %s reserved for conv/elementwise "
+                "scratch: start vc4d with a larger --arena-mb (or set "
+                "VC4INFER_ARENA_MB) - about %s would do - or lower "
+                "VC4_POOL_RESERVE_MB"
+                % (_mib(floor), _mib(peak), _mib(arena), _mib(scratch),
+                   _mib(floor + scratch + (8 << 20))))
+        need = min(int(peak), avail) if avail else int(peak)
+        need = max(need, 1 << 20)
+        plan = {"pool_bytes": need, "estimate_bytes": int(peak),
+                "floor_bytes": int(floor), "scratch_bytes": int(scratch),
+                "arena_bytes": arena, "clamped": need < int(peak)}
+        return need, plan
+
     def _find_silu(self):
         """Collapse ``Mul(x, Sigmoid(x))`` into one fused SiLU.
 

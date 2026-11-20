@@ -14,6 +14,7 @@ layout from [TUTORIAL.md](TUTORIAL.md): `/home/raspi/work/vc4-stack`, user
 | `HostNotAllowed: node ... may not run on the host` | 2.2 |
 | `NeedsDeviceDispatch: node ... needs device-side dispatch` | 2.3 |
 | `GPU timeout (context is dead)`, `daemon marked dead`, `TIMEOUT` | 3 |
+| `arena exhausted` while nothing is running | 3b |
 | every launch takes ~60 s, then `E_BUSY` | 4 |
 | output changes between runs, more elements over tolerance on repeats | 5 |
 | `graph pool exhausted`, `conv_nhwc: out of arena memory` | 6 |
@@ -186,48 +187,55 @@ There is no device-side dispatch in this build.
 
 ## 3. GPU wedge after a bad kernel or a killed client
 
-**Symptom.** The first failing launch prints something like:
+**Symptom.** A launch fails with a timeout:
 
 ```
 engine error: copy2d_x: GPU timeout (context is dead)
-(LAUNCH: daemon is dead (GPU timeout earlier))
+(LAUNCH: GPU timeout)
 ```
 
-or the older form:
-
-```
-TIMEOUT ... launch=1; daemon marked dead
-```
-
-`vc4top --once` then shows `ERRSTAT` with `0x40` set (e.g. `0x1040` instead of
-`0x1000 VCD-idle`), and every later launch times out even after restarting
-`vc4d`.
+`vc4top --once` may then show `ERRSTAT` with `0x40` set (e.g. `0x1040` instead
+of `0x1000 VCD-idle`), and launches may keep timing out.
 
 **Cause.** The QPU context is wedged.  The usual triggers, all measured here:
 
 * killing a client in the middle of a launch - a `SIGPIPE` from
   `vc4infer ... | head`, `timeout` expiring during a launch, Ctrl-C;
 * `sudo systemctl restart vc4d` issued while another process has a launch in
-  flight (this is how the timeout above was produced during this documentation
-  pass);
+  flight;
 * a genuinely bad kernel (the op-long-tail and two-groups-per-QPU experiments
-  both did it).
+  both did it);
+* a legitimate launch that simply outran its timeout.
 
-`vc4d` marks itself dead after the timeout, which is why the second half of the
-message says the daemon is dead.  A daemon restart resets the *daemon*; it does
-**not** reset the V3D.
+**What the daemon does now.**  Since `vc4d 1.2.2` (B9) a launch timeout no
+longer kills the daemon.  It resets the V3D context - queue, VPM base, L2/SLC,
+error latch, counters - under the board GPU lock and then **proves** the reset
+with a launch of its own 4-instruction probe program (the last code slot is
+reserved for it).  Only a probe that completes with no new error bits lets
+launches through again; the journal shows which happened:
 
-**Fix.**
+```
+vc4d: TIMEOUT uid=1000 pid=4242 launch=17
+vc4d: after a launch timeout: GPU context reset and verified with a probe
+      launch (0.1 ms); accepting launches again
+```
 
-1. If only the daemon is dead and `ERRSTAT` is still `VCD-idle`, restart it:
+If the reset cannot be verified (the QPU is really stuck, the V3D is powered
+down, the queue will not drain), the daemon does not become a zombie: it logs
+`GPU context reset FAILED` and exits 75, and `Restart=always` starts a clean
+one about two seconds later.  So:
+
+1. **Retry the command once.**  A transient timeout is recovered in-process; a
+   single failed launch is not evidence of a dead daemon any more:
 
    ```sh
-   sudo systemctl restart vc4d
-   systemctl is-active vc4d
-   vc4infer selftest
+   vc4infer run model.onnx --input img.jpg
+   # only if that still fails:
+   systemctl status vc4d --no-pager -l | tail -20
    ```
 
-2. If launches still time out, or `ERRSTAT` has `0x40`, **reboot**:
+2. If the journal shows `GPU context reset FAILED` repeatedly, or `vc4top
+   --once` shows `ERRSTAT` with `0x40` set, the QPU itself is wedged - **reboot**:
 
    ```sh
    sudo reboot
@@ -250,34 +258,66 @@ Prevention: one GPU client at a time; never pipe a GPU command through
 long runs a timeout that is comfortably longer than the expected work, and do
 not `kill -9` them mid-launch.
 
+## 3b. `arena exhausted` with nothing running
+
+**Symptom.** Every new client fails while `vc4top`/`top` show no GPU work:
+
+```
+vc4d: DENY uid=1000 pid=4242 op=ALLOC: arena exhausted
+```
+
+`vc4d` logs `clients=N` in STATS with no matching processes.
+
+**Cause.** A client's arena region was tied to its *socket*, not to the process
+that allocated it.  A client that forked (or leaked its descriptor) kept the
+connection open after the allocating process exited, and the region was pinned
+until the socket closed - forever, if the holder lived on.  This was G9.
+
+**Fix.** `vc4d 1.2.2` anchors liveness on the peer pid from `SO_PEERCRED` and
+reclaims a region when that process is gone, even if the socket is still open;
+it sweeps every poll iteration, on `HELLO`, and before refusing a connection
+for lack of a slot.  It logs what it reclaimed:
+
+```
+vc4d: reclaim pid=4242 uid=1000 (peer process is gone): releasing 1 region(s)
+```
+
+If you are on an older daemon, `sudo systemctl restart vc4d` remains the
+workaround.  A client that forks and keeps *using* the inherited connection
+after the parent exits is reaped by design: reconnect in the child instead.
+
 ## 4. `flock` deadlock
 
-**Symptom.** Every launch blocks for about a minute and then fails with
-`E_BUSY`; the GPU is idle the whole time.  If you inspect the lock, something
-other than `vc4d` holds `/tmp/vc4-gpu.lock`.
+**Symptom.** Every launch blocks and then fails with `E_BUSY` or `GPU timeout
+(context is dead)`; the GPU is idle the whole time.  If you inspect the lock,
+something other than `vc4d` holds `/tmp/vc4-gpu.lock`.
 
 **Cause.** `vc4d` takes `flock(LOCK_EX)` on `/tmp/vc4-gpu.lock` **per launch**,
-to serialise all clients.  If the client also holds that lock (a test harness
-that copied the old direct-root pattern, or a shell wrapper), the daemon waits
-for the client while the client waits for the daemon.  The engine retries
-`E_BUSY` for about 60 s, which is why it looks like a hang rather than an
-error.
+to serialise all clients.  Since `vc4d 1.2.2` / `vc4infer 1.2.5` the engine
+takes the same lock for the same window in **both** modes (that is what makes
+G11 fixed: a `--backend direct` run and a live daemon now take turns instead of
+overwriting each other's queue).  If the client also holds that lock (a test
+harness or shell wrapper that copied the old direct-root pattern), the engine
+waits for its own lock and fails after 30 s.  Older releases only hit this in
+daemon mode.
 
-**Fix.** Do not hold the lock in a client.  The daemon owns it.  Remove the
-`flock` from wrappers and test harnesses:
+**Fix.** Do not hold the lock in a client.  The engine and the daemon own it.
+Remove the `flock` from wrappers and test harnesses:
 
 ```sh
-# wrong in daemon mode:
+# wrong in direct mode and in daemon mode (both take it internally):
 flock /tmp/vc4-gpu.lock vc4infer run model.onnx --input img.jpg
 
 # right:
 vc4infer run model.onnx --input img.jpg
 ```
 
-In this repository, `tests/util.h` returns a dummy fd in daemon mode for
+In this repository, `tests/util.h` no longer takes the lock in either mode for
 exactly this reason.  If a stale process still holds the lock, find it with
 `fuser -v /tmp/vc4-gpu.lock` (or `lsof`) and stop that process; do not delete
-the lock file while the daemon is running.
+the lock file while the daemon is running.  If you must measure a single
+direct-mode launch without the ~ms lock acquisition in the number, set
+`VC4INFER_NO_GPU_LOCK=1` - but then nothing else may be using the QPUs.
 
 The daemon's own unit needs `ReadWritePaths=/tmp` to create the lock at boot;
 the shipped unit has it.
@@ -324,23 +364,25 @@ are on an older build, upgrade; the 1.2.1 `selftest` reports 0/44,100 over in
 
 ## 6. `--arena-mb` too small for 320x320
 
-**Symptom.** 320x320 fails at plan/first-conv time with exit 3:
+**Symptom.** 320x320 fails at plan time with exit 3, and the message now names
+both sides:
 
 ```
-vc4infer: unsupported: unsupported graph: graph pool exhausted:
-589888 B needed, 7845248 B used of 8388608 B
+vc4infer: unsupported: unsupported graph: graph pool needs at least 68.4 MiB
+  (weights + packed conv panels + the largest tensor) and this model's peak is
+  about 84.1 MiB, but the client arena is 64.0 MiB with 23.5 MiB reserved for
+  conv/elementwise scratch: start vc4d with a larger --arena-mb (or set
+  VC4INFER_ARENA_MB) - about 113.7 MiB would do - or lower VC4_POOL_RESERVE_MB
 ```
 
-or, on the NCHW path:
+(older releases printed `graph pool exhausted: 589888 B needed, 7845248 B used
+of 8388608 B`, because the pool was floored at 8 MiB - G10)
 
-```
-conv_nhwc: out of arena memory
-```
-
-**Cause.** The default `vc4d` unit serves 72 MiB, which leaves the client its
+**Cause.** The default `vc4d` unit serves 96 MiB, which leaves the client its
 64 MiB region.  A 320x320 YOLOv8n needs a ~68 MiB graph pool plus >=23 MiB of
-per-conv scratch; the default cannot hold it.  The 8 MiB pool in the message is
-what is left after the weights and the stem plane.
+per-conv scratch; the default cannot hold it.  Since `vc4infer 1.2.5` the pool
+is sized from the model (weights + live activations + conv panels) and the
+message above is what you get when the arena cannot supply it.
 
 **Fix.** Use the 150 MiB recipe in TUTORIAL.md section 7.2:
 

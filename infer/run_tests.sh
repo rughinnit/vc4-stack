@@ -47,6 +47,11 @@ board() {
 echo "=== backend: $BACKEND"
 clocks
 
+# Build against this tree's daemon client library and headers, not a copy.
+: "${VC4D_DIR:=../vc4d}"
+VC4D_DIR=$(cd "$VC4D_DIR" && pwd)
+export VC4D_DIR
+
 make -j4
 
 echo "=== maths (no GPU)"
@@ -54,6 +59,39 @@ make check-math
 
 echo "=== test_dispatch (no GPU)"
 ./build/test_dispatch
+
+# --- daemon regressions -----------------------------------------------------
+# G1/G9/G11 need a daemon they can provoke (timeout, departed client, lock
+# contention) without disturbing the one everything else talks to, so they run
+# against a private vc4d on its own socket.  --gpu-lock makes the two daemons
+# (and any direct-mode client) take turns on the QPUs.
+echo "=== test_daemon_recover (G1: a launch timeout must not kill the daemon)"
+echo "=== test_daemon_arena   (G9: the arena comes back with the client)"
+TMPD=${TMPDIR:-$HOME/scratch/tmp}
+mkdir -p "$TMPD"
+TSOCK=/run/vc4d-test-$$.sock
+sudo -n rm -f "$TSOCK"
+sudo -n "$VC4D_DIR/build/vc4d" --socket "$TSOCK" --arena-mb 16 \
+    --group vc4 --drop-user nobody --gpu-lock --max-timeout-ms 5000 \
+    </dev/null >"$TMPD/vc4d-test-$$.log" 2>&1 &
+TPID=$!
+trap 'sudo -n kill $TPID 2>/dev/null; sudo -n rm -f "$TSOCK"' EXIT
+for i in $(seq 1 100); do [ -S "$TSOCK" ] && break; sleep 0.05; done
+[ -S "$TSOCK" ] || { echo "FAIL: private vc4d did not start"; tail -5 "$TMPD/vc4d-test-$$.log"; exit 1; }
+./build/test_daemon_recover "$TSOCK"
+./build/test_daemon_arena "$TSOCK"
+board
+
+echo "=== test_direct_lock (G11: direct mode and vc4d share the GPU lock)"
+sudo -n ./build/test_direct_lock "$TSOCK"
+board
+sudo -n kill $TPID 2>/dev/null
+trap - EXIT
+sudo -n rm -f "$TSOCK"
+
+echo "=== test_pool_sizing (G10: pool sized from the model, no 8 MiB floor)"
+timeout -k 5 300 $RUN PYTHONPATH=python TMPDIR="$TMPD" \
+    python3 tests/test_pool_sizing.py
 
 # Evidence for the security claim: a real suite client, with a live socket and
 # an arena mapping, has no /dev/mem and no capabilities.

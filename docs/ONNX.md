@@ -70,7 +70,9 @@ VC4INFER_DAEMON=1 python infer/tools/onnx/yolo_report.py infer/tools/onnx/models
 
 The runner takes the GPU lock through vc4d; do **not** hold
 `/tmp/vc4-gpu.lock` in the calling shell in daemon mode (vc4d takes it per
-launch, and a second holder makes every launch time out).
+launch, and a second holder makes every launch time out).  The same applies to
+direct mode since vc4infer 1.2.5: the engine takes the lock itself, per launch,
+in both modes (G11).
 
 `VC4INFER_CACHE` matters: the C library's built-in cache path is the installed
 `/usr/lib/vc4infer/kcache`, which is root-owned once the `.deb` is installed, so

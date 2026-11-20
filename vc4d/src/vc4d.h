@@ -35,7 +35,11 @@
  * uploads one program per kernel shape, and a test that runs several conv
  * shapes legitimately needs ~25.  MAX_PROGS_SLOTS bounds the total. */
 #define MAX_PROGS_CLI   128
-#define MAX_FREEBLK     64
+/* The last code/uniform slot is the daemon's own: it holds the known-good
+ * probe launch that verifies a GPU context reset (see gpu_recover()). */
+#define PROBE_SLOT      (MAX_PROGS_SLOTS - 1)
+
+#define ARENA_PAGE      4096u
 
 /* V3D registers used by name */
 #define R_IDENT0    0x0000u
@@ -58,15 +62,26 @@
 #define R_ERRSTAT   0x0f20u
 
 /* ---- arena ------------------------------------------------------------- */
+/* The heap is tracked as a page bitmap, not as a free list.
+ *
+ * It used to be a sorted free list with a hard cap (MAX_FREEBLK) whose insert
+ * silently dropped a block when the list was full ("leak-safe: region stays
+ * unusable").  A daemon that served many clients therefore lost arena
+ * permanently, and once the losses added up a later ALLOC was denied with
+ * `arena exhausted` while nothing was running.  A bitmap over
+ * [A_DATA_BASE, bytes) cannot lose a block: a freed page is a cleared bit, and
+ * arena_free() can only ever make more space.  It is also exact, which is what
+ * makes `used == 0` a testable postcondition after every client has gone. */
 struct arena {
     int      fd;              /* dma-buf, kept for SCM_RIGHTS dups */
     uint8_t *map;             /* uncached /dev/mem mapping        */
     uint32_t phys;
     uint32_t bus;             /* phys | 0xC0000000                */
     size_t   bytes;
-    size_t   used;            /* bytes currently handed out       */
-    int      nfree;
-    struct { uint32_t off, len; } free[MAX_FREEBLK];
+    size_t   used;            /* bytes currently handed out (exact) */
+    uint32_t *bits;           /* one bit per page: 1 = allocated  */
+    uint32_t npages;          /* pages in [A_DATA_BASE, bytes)    */
+    uint32_t hint;            /* first-fit cursor                 */
 };
 
 int  arena_open(struct arena *a, size_t want, char *err, size_t errn);
@@ -91,6 +106,11 @@ struct gpu {
     uint64_t t0;
     uint64_t deadline;
     uint64_t gpu_ns;
+    /* context-reset support: the daemon's own known-good program */
+    int      recovering;      /* set while gpu_recover() runs a probe     */
+    int      probe_ready;
+    uint32_t probe_code_bus;
+    uint32_t probe_uni_bus;
 };
 
 int  gpu_open(struct gpu *g, char *err, size_t errn);
@@ -102,6 +122,13 @@ int  gpu_poll(struct gpu *g);
 int  gpu_finish(struct gpu *g, struct launch_result *r, char *err, size_t errn);
 void gpu_abort(struct gpu *g);
 int  gpu_wreg(struct gpu *g, uint32_t off, uint32_t val, char *err, size_t errn);
+
+/* Reset the V3D context after a timeout and prove it works with a launch of
+ * the daemon's known-good probe program.  0 = recovered and verified,
+ * non-zero = still unusable (the caller must exit and let systemd restart a
+ * clean daemon). */
+void gpu_use_probe(struct gpu *g, uint32_t code_bus, uint32_t uni_bus);
+int  gpu_recover(struct gpu *g, char *err, size_t errn);
 
 /* ---- sha256 ------------------------------------------------------------ */
 struct sha256 { uint32_t h[8]; uint64_t bytes; uint8_t buf[64]; size_t n; };

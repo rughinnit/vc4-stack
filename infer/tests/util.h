@@ -44,40 +44,27 @@ UTIL_UNUSED static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-/* One GPU user at a time: the whole board hangs if two workloads race.
- * With VC4INFER_DAEMON=1 every launch goes through vc4d, which takes this
- * same lock for the duration of each launch itself; holding it here for the
- * whole test would make the daemon's bounded flock() wait fail (E_BUSY). */
+/* Board-wide GPU lock.
+ *
+ * Since G11 the engine takes /tmp/vc4-gpu.lock itself, per launch, in *both*
+ * modes: vc4d holds it for the duration of each launch, and a direct-mode
+ * client takes the same lock around its own kick/wait.  A test that also took
+ * the lock for its whole run would hold the only copy while its launch waits
+ * for it (flock is per open-file-description: same process, different fd,
+ * still blocks) and would time out after 30 s.  So the harness no longer takes
+ * it; serialisation is per launch, which is what the hardware needs.
+ *
+ * The helpers stay so every test keeps the same shape. */
 static int gpu_lock(void)
 {
-    const char *dm = getenv("VC4INFER_DAEMON");
-    if (dm && *dm && strcmp(dm, "0") != 0) {
-        int fd = open("/dev/null", O_RDONLY);
-        return fd >= 0 ? fd : -1;
-    }
-    /* fs.protected_regular refuses O_CREAT on a /tmp file owned by another
-       user, so fall back to O_RDONLY (flock does not need write access) */
-    int fd = open("/tmp/vc4-gpu.lock", O_RDWR | O_CREAT, 0666);
-    if (fd < 0)
-        fd = open("/tmp/vc4-gpu.lock", O_RDONLY);
-    if (fd < 0) {
-        perror("open /tmp/vc4-gpu.lock");
-        return -1;
-    }
-    if (flock(fd, LOCK_EX) != 0) {
-        perror("flock");
-        close(fd);
-        return -1;
-    }
-    return fd;
+    int fd = open("/dev/null", O_RDONLY);
+    return fd >= 0 ? fd : -1;
 }
 
 static void gpu_unlock(int fd)
 {
-    if (fd >= 0) {
-        flock(fd, LOCK_UN);
+    if (fd >= 0)
         close(fd);
-    }
 }
 
 /* double-precision reference GEMM, row-major, used only for verification */

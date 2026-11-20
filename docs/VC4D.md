@@ -87,7 +87,12 @@ launch is better.
 - The unit needs `ReadWritePaths=/tmp` (with `ProtectSystem=strict`) or the
   daemon cannot create `/tmp/vc4-gpu.lock` at boot.
 - Per-client program slots must cover a whole process's kernel set (one per
-  shape): 64, not 16.
+  shape): 128, not 64 - and the last one is reserved for the daemon's recovery
+  probe, so clients get 127.
+- A launch timeout is no longer terminal (G1): the daemon resets the V3D
+  context under the GPU lock, verifies it with the probe program and resumes;
+  if the reset cannot be verified it exits 75 for `Restart=always`.  A departed
+  client's arena is reclaimed from its peer pid (G9), not from its socket.
 
 ## Remaining
 None for the engine port.  `VC4INFER_DAEMON=1` in `libvc4infer` selects the

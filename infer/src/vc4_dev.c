@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -188,15 +189,92 @@ void vc4__write(vc4_ctx *ctx, uint32_t off, const void *src, size_t bytes)
     __sync_synchronize();
 }
 
+/* --------------------------------------------------------- board GPU lock
+ *
+ * The QPU has one instruction queue, one VPM base, one error latch: two
+ * drivers that program it at the same time corrupt each other's launch.  That
+ * is what G11 was: a `--backend direct` run next to an active vc4d launched
+ * into the middle of the daemon's launch and timed out (`conv_nhwc_dil: GPU
+ * timeout`), while the daemon itself stayed healthy.
+ *
+ * vc4d takes flock(LOCK_EX) on /tmp/vc4-gpu.lock for the duration of each
+ * launch (its unit sets VC4D_GPU_LOCK=1, and handle_launch calls
+ * gpu_lock_take() before gpu_kick()).  A direct-mode client now takes the same
+ * lock for the same window, so the two drivers interleave instead of overlapping.
+ * The wait is bounded: a stale holder, or a wrapper that already holds the lock
+ * itself (flock is per open-file-description, so re-taking it in the same
+ * process blocks), must produce an error, not a hang.
+ *
+ * VC4INFER_NO_GPU_LOCK=1 disables it (single-user benchmarks that want the
+ * 30 s acquire out of the measurement), VC4INFER_GPU_LOCK_MS sets the bound.
+ */
+#define GPU_LOCK_PATH "/tmp/vc4-gpu.lock"
+
+static int gpu_lock_open(void)
+{
+    if (getenv("VC4INFER_NO_GPU_LOCK"))
+        return -1;
+    /* fs.protected_regular refuses O_CREAT on a /tmp file owned by another
+       user; flock does not need write access, so fall back to O_RDONLY */
+    int fd = open(GPU_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    if (fd < 0)
+        fd = open(GPU_LOCK_PATH, O_RDONLY | O_CLOEXEC);
+    return fd;
+}
+
+static uint64_t lock_wait_ms(void)
+{
+    const char *e = getenv("VC4INFER_GPU_LOCK_MS");
+    if (e) {
+        unsigned long v = strtoul(e, NULL, 0);
+        if (v)
+            return v;
+    }
+    return 30000;                     /* a launch is ~ms; 30 s means stuck */
+}
+
+static vc4_status gpu_lock_take(vc4_ctx *ctx)
+{
+    if (!ctx || ctx->lock_fd < 0)
+        return VC4_OK;                /* no interop requested / available */
+    uint64_t limit = now_ns() + lock_wait_ms() * 1000000ull;
+    for (;;) {
+        if (flock(ctx->lock_fd, LOCK_EX | LOCK_NB) == 0)
+            return VC4_OK;
+        if (errno != EWOULDBLOCK && errno != EINTR) {
+            vc4__set_err(ctx, "GPU lock: %s", strerror(errno));
+            return VC4_ERR_IO;
+        }
+        if (now_ns() > limit) {
+            vc4__set_err(ctx, "GPU lock %s busy for %llu ms: another client "
+                         "or vc4d holds it (if you wrapped this command in "
+                         "`flock %s`, remove that: the engine takes the lock "
+                         "itself)", GPU_LOCK_PATH,
+                         (unsigned long long)lock_wait_ms(), GPU_LOCK_PATH);
+            return VC4_ERR_TIMEOUT;
+        }
+        usleep(2000);
+    }
+}
+
+static void gpu_lock_give(vc4_ctx *ctx)
+{
+    if (ctx && ctx->lock_fd >= 0)
+        flock(ctx->lock_fd, LOCK_UN);
+}
+
 vc4_status vc4__wait_idle(vc4_ctx *ctx)
 {
     if (!ctx)
         return VC4_ERR_INVAL;
     if (ctx->remote)
         return VC4_OK;             /* one launch in flight, WAIT is synchronous */
-    if (!srq_reset(ctx))
-        return VC4_ERR_GPU;
-    return VC4_OK;
+    vc4_status lk = gpu_lock_take(ctx);
+    if (lk != VC4_OK)
+        return lk;
+    int ok = srq_reset(ctx);
+    gpu_lock_give(ctx);
+    return ok ? VC4_OK : VC4_ERR_GPU;
 }
 
 uint32_t *vc4__uni(vc4_ctx *ctx, const vc4_kernel *k, int qpu)
@@ -205,22 +283,10 @@ uint32_t *vc4__uni(vc4_ctx *ctx, const vc4_kernel *k, int qpu)
 }
 
 /* --------------------------------------------------------------- launching */
-vc4_status vc4__launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
-                       uint64_t *wall_ns)
+static vc4_status launch_locked(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
+                                uint64_t *wall_ns)
 {
     char st[96];
-    if (!ctx || !k)
-        return VC4_ERR_INVAL;
-    if (ctx->remote)
-        return vc4__remote_launch(ctx, k, nqpu, wall_ns);
-    if (ctx->dead) {
-        vc4__set_err(ctx, "context is dead after a previous timeout; reboot the board");
-        return VC4_ERR_TIMEOUT;
-    }
-    if (nqpu < 1 || nqpu > VC4_MAX_QPU || nqpu > (int)k->nqpu) {
-        vc4__set_err(ctx, "launch: nqpu=%d out of range (blob supports %u)", nqpu, k->nqpu);
-        return VC4_ERR_INVAL;
-    }
     if (!vc4__health(ctx)) {
         ctx->dead = 1;
         vc4__set_err(ctx, "V3D IDENT0=0xdeadbeef (suspended)");
@@ -301,6 +367,29 @@ vc4_status vc4__launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
             return VC4_ERR_GPU;
     }
     return VC4_OK;
+}
+
+vc4_status vc4__launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
+                       uint64_t *wall_ns)
+{
+    if (!ctx || !k)
+        return VC4_ERR_INVAL;
+    if (ctx->remote)
+        return vc4__remote_launch(ctx, k, nqpu, wall_ns);
+    if (ctx->dead) {
+        vc4__set_err(ctx, "context is dead after a previous timeout; reboot the board");
+        return VC4_ERR_TIMEOUT;
+    }
+    if (nqpu < 1 || nqpu > VC4_MAX_QPU || nqpu > (int)k->nqpu) {
+        vc4__set_err(ctx, "launch: nqpu=%d out of range (blob supports %u)", nqpu, k->nqpu);
+        return VC4_ERR_INVAL;
+    }
+    vc4_status lk = gpu_lock_take(ctx);
+    if (lk != VC4_OK)
+        return lk;
+    vc4_status st = launch_locked(ctx, k, nqpu, wall_ns);
+    gpu_lock_give(ctx);
+    return st;
 }
 
 /* ------------------------------------------------------------------ arena */
@@ -456,6 +545,11 @@ vc4_status vc4_init(vc4_ctx **out, const char *cache_dir, size_t arena_bytes)
         return st;
     }
 
+    /* Interop with a running vc4d: same lock, same window (see the block
+       above vc4__wait_idle).  A missing lock file is not fatal — a direct
+       client alone on the board does not need it. */
+    ctx->lock_fd = gpu_lock_open();
+
     ctx->v3d = map_phys(V3D_PHYS_BASE, V3D_LENGTH, PROT_READ | PROT_WRITE, &ctx->mem_fd);
     if (!ctx->v3d) {
         vc4__set_err(ctx, "map V3D registers: %s (running as root?)", strerror(errno));
@@ -501,6 +595,8 @@ void vc4_shutdown(vc4_ctx *ctx)
         close(ctx->mem_fd);
     if (ctx->dmabuf_fd >= 0)
         close(ctx->dmabuf_fd);
+    if (ctx->lock_fd >= 0)
+        close(ctx->lock_fd);
     free(ctx);
 }
 
@@ -511,10 +607,19 @@ vc4_status vc4_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out)
 {
     if (!ctx || !out || bytes == 0)
         return VC4_ERR_INVAL;
-    size_t off = (ctx->arena_top + 63u) & ~(size_t)63u;
+    /* Persistent buffers bump upwards from arena_top, but an op's scratch
+       (conv padded image + im2col panel) also bumps upwards from
+       ctx->scratch, which is above arena_top.  A second vc4_alloc() - the
+       graph pool growing past its first segment - must therefore start above
+       whatever scratch is still live, or it would hand out the panel's
+       memory. */
+    size_t base = ctx->scratch > ctx->arena_top ? ctx->scratch : ctx->arena_top;
+    size_t off = (base + 63u) & ~(size_t)63u;
     if (off + bytes > ctx->arena_bytes) {
-        vc4__set_err(ctx, "arena exhausted: need %zu B, have %zu B",
-                     bytes, ctx->arena_bytes - off);
+        vc4__set_err(ctx, "arena exhausted: need %zu B, have %zu B "
+                     "(arena %zu B, %zu B in pool, %zu B in scratch)",
+                     bytes, ctx->arena_bytes - off, ctx->arena_bytes,
+                     ctx->arena_top, ctx->scratch);
         return VC4_ERR_NOMEM;
     }
     out->off = (uint32_t)off;

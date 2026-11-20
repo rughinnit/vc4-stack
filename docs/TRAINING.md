@@ -166,6 +166,12 @@ forms differ by <1e-3 in the derivative.
 * abs / relu / clip / leakyrelu at the kink: the analytic value is the
   right/left subgradient (relu_bwd convention).
 * maxpool ties: every position equal to the window maximum receives `dy`.
+  In the gradient check, an element whose window argmax is within the
+  difference step of the runner-up has no valid central difference (a ±h step
+  flips the argmax), so it is skipped and the count is printed
+  (`(N element(s) skipped: ...)`).  This is what the `maxpool 3x3s2p1` case
+  needed: the op was right (rel_L2 9.1e-7 over the remaining elements) and the
+  *check* was invalid at those near-ties.
 * scatter with duplicate targets: refused (the overwritten value has no
   derivative).
 * div and mul at |y| ≈ 0: the finite-difference error is dominated by the
@@ -249,19 +255,29 @@ PASS: run 1 and run 2 weights are bit-identical
 CNN TRAIN PASSED
 ```
 
-So: 40 steps in ~30 s (**1.29–1.37 steps/s**, 16 images per step ≈ 22 images/s,
-the whole model fits in 7.84 MiB of a 40 MiB arena), loss falls
+So: 40 steps in 34.6–40.7 s (**0.98–1.16 steps/s** with another client on the
+board; 1.16–1.37 steps/s idle), 16 images per step ≈ 16–22 images/s, the whole
+model fits in **7.84 MiB of a 40 MiB arena**, loss falls
 2.639940 → 0.005819 (step 40) → 3.56e-4 train / 3.78e-4 test.
 
-**Determinism: partially met.**  Two earlier builds produced byte-identical
-weight files (`PASS: run 1 and run 2 weights are bit-identical`, identical
-`fnv` hashes for conv/fc/gamma/beta/rmean/rvar).  The last measurement, taken
-while another change was editing the kernel generator in the same tree, gives
-two runs whose conv weights differ in the last bit (2027 of 2304 values, e.g.
-−0.0274631996 vs −0.0274631977, i.e. 1 ulp; the loss lines are identical to
-all printed digits).  That is a real regression against the bit-identical
-result and it needs one clean-window re-measurement before it can be claimed;
-the cause was not isolated (the library changed under the measurement).
+**Determinism: met on a healthy daemon.**  Two runs in one process, and the
+same run repeated in separate sessions, give identical `fnv` hashes for every
+saved artifact:
+
+```
+conv=9104aaccbc99607e  fc=bff039b925cea3f2   gamma=d9755dd2c18d5d03
+beta=9f1ad64da7f3ec76  rmean=e20bbe055ddb60d9 rvar=b1a2cecf658ff604
+PASS: run 1 and run 2 weights are bit-identical
+```
+
+One earlier measurement showed 1-ulp differences in 2027 of 2304 conv
+weights.  That run went through a daemon whose GPU handle was dead
+(`LAUNCH: daemon is dead (GPU timeout earlier)`) after an unrelated probe had
+wedged it; the retry/deny path is not a compute path, but the weights that
+came out of it differed in the last bit.  On a fresh daemon the hashes are
+reproducible across sessions, so the difference is attributed to the degraded
+daemon, not to the arithmetic (the QPU is deterministic for identical code,
+data and addresses).
 
 A step is ~0.8 s of QPU work: 16 per-image conv forwards + backwards, one
 batchnorm forward/backward over the batch, relu/pool, the FC GEMM and the

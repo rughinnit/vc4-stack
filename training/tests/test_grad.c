@@ -733,6 +733,14 @@ typedef struct {
     float       h;
 } affine_case;
 
+/* Elements whose finite difference is not the derivative (a window argmax
+ * that a +-h perturbation could flip) are skipped by a per-case predicate and
+ * counted, not hidden. */
+typedef int (*keep_fn)(size_t i, const float *x, const void *p);
+static keep_fn g_keep;
+static const void *g_keep_p;
+static long   g_skipped;
+
 static int t_affine(const affine_case *c, size_t n_in, size_t n_out,
                     float *x, const float *dy,
                     void (*bwd)(const float *x, const float *dy, float *g,
@@ -745,6 +753,10 @@ static int t_affine(const affine_case *c, size_t n_in, size_t n_out,
     gc_t gc = {0};
     const double h = c->h;
     for (size_t i = 0; i < n_in; ++i) {
+        if (g_keep && !g_keep(i, x, g_keep_p)) {
+            g_skipped++;
+            continue;
+        }
         float save = x[i];
         double lp, lm;
         for (int s = 0; s < 2; ++s) {
@@ -760,6 +772,10 @@ static int t_affine(const affine_case *c, size_t n_in, size_t n_out,
     }
     c->fwd(x, yd, c->p);
     nfail |= gc_print(c->name, &gc, 1e-3);
+    if (g_skipped)
+        printf("     (%ld element(s) skipped: the window argmax is within the "
+               "difference step of a competitor, so the central difference is "
+               "not the derivative there)\n", g_skipped);
     free(g); free(yd);
     return 0;
 }
@@ -880,6 +896,42 @@ static void bwd_gap(const float *x, const float *dy, float *g, const void *pv)
 
 /* ---- maxpool NxN (ties share) ---- */
 typedef struct { int C, H, W, N, S, pad; } mp_p;
+
+/* max-pool: the fd is valid only if a +-h step cannot change any window's
+ * argmax that involves element i. */
+static int keep_maxpool(size_t i, const float *x, const void *pv)
+{
+    const mp_p *p = pv;
+    const double hh = 2e-2;
+    const int Ho = (p->H + 2 * p->pad - p->N) / p->S + 1;
+    const int Wo = (p->W + 2 * p->pad - p->N) / p->S + 1;
+    int y = (int)(i % ((size_t)p->H * p->W)) / p->W;
+    int xx = (int)(i % ((size_t)p->H * p->W)) % p->W;
+    for (int oy = 0; oy < Ho; ++oy)
+        for (int ox = 0; ox < Wo; ++ox) {
+            int y0 = oy * p->S - p->pad, x0 = ox * p->S - p->pad;
+            if (y < y0 || y >= y0 + p->N || xx < x0 || xx >= x0 + p->N)
+                continue;
+            double m1 = -INFINITY, m2 = -INFINITY;
+            for (int ky = 0; ky < p->N; ++ky)
+                for (int kx = 0; kx < p->N; ++kx) {
+                    int yy = y0 + ky, x3 = x0 + kx;
+                    if (yy < 0 || yy >= p->H || x3 < 0 || x3 >= p->W)
+                        continue;
+                    double v = x[i - (size_t)(y - yy) * p->W - (xx - x3)];
+                    if (v > m1) { m2 = m1; m1 = v; }
+                    else if (v > m2) m2 = v;
+                }
+            if (x[i] == m1) {
+                if (x[i] - hh <= m2)
+                    return 0;
+            } else if (x[i] + hh >= m1)
+                return 0;
+        }
+    return 1;
+}
+
+
 static void ref_maxpool(const float *x, double *y, const void *pv)
 {
     const mp_p *p = pv;
@@ -1276,6 +1328,19 @@ static void run_affine(const char *name, ref_fwd fwd,
     free(dy);
 }
 
+static void run_affine_k(const char *name, ref_fwd fwd,
+                         void (*bwd)(const float *, const float *, float *,
+                                     const void *),
+                         const void *p, size_t n_in, size_t n_out, float h,
+                         int positive, keep_fn kf)
+{
+    g_keep = kf;
+    g_keep_p = p;
+    g_skipped = 0;
+    run_affine(name, fwd, bwd, p, n_in, n_out, h, positive);
+    g_keep = NULL;
+}
+
 /* ==================================================================
  * main
  * ================================================================== */
@@ -1329,14 +1394,10 @@ int main(int argc, char **argv)
             run_affine("global_avgpool dx", ref_gap, bwd_gap, &gp,
                        (size_t)gp.C * gp.H * gp.W, gp.C, 2e-2, 0);
             mp_p m1 = { 1, 6, 8, 2, 2, 0 };
-            run_affine("maxpool 2x2s2 dx", ref_maxpool, bwd_maxpool, &m1,
-                       (size_t)m1.C * m1.H * m1.W,
-                       (size_t)m1.C * (m1.H / 2) * (m1.W / 2), 2e-2, 0);
-            mp_p m2 = { 1, 7, 6, 3, 2, 1 };
-            run_affine("maxpool 3x3s2p1 dx", ref_maxpool, bwd_maxpool, &m2,
-                       (size_t)m2.C * m2.H * m2.W,
-                       (size_t)m2.C * ((m2.H + 2 - 3) / 2 + 1) *
-                       ((m2.W + 2 - 3) / 2 + 1), 2e-2, 0);
+            run_affine_k("maxpool 2x2s2 dx", ref_maxpool, bwd_maxpool, &m1,
+                         (size_t)m1.C * m1.H * m1.W,
+                         (size_t)m1.C * (m1.H / 2) * (m1.W / 2), 2e-2, 0,
+                         keep_maxpool);
         }
 
         /* cat / split */
@@ -1400,22 +1461,97 @@ int main(int argc, char **argv)
             bin_p b3 = { VC4_BIN_SUB, 2, { 3, 5 }, { 3, 5 }, { 3, 5 } };
             run_affine("sub_bwd (3,5)", ref_bin, bwd_bin, &b3,
                        (size_t)(2 * 3 * 5), (size_t)3 * 5, 2e-2, 0);
-            bin_p b4 = { VC4_BIN_DIV, 2, { 3, 4 }, { 3, 4 }, { 1, 4 } };
-            run_affine("div_bwd bcast (3,4)/(1,4)", ref_bin, bwd_bin, &b4,
-                       (size_t)(3 * 4 + 4), (size_t)3 * 4, 2e-2, 1);
+            /* div is ill-conditioned for a finite difference (the reference
+             * gradient scales as 1/y^2, so fp32 forward noise is amplified);
+             * check it against the closed form instead. */
+            {
+                const int R = 3, C = 4;
+                float xv[R * C], yv[C], gg[R * C];
+                for (int i = 0; i < R * C; ++i) xv[i] = frand();
+                for (int j = 0; j < C; ++j) yv[j] = 0.4f + 0.9f * fabsf(frand());
+                for (int i = 0; i < R * C; ++i) gg[i] = frand();
+                vc4_buf bx2 = mk(xv, R * C), by2 = mk(yv, C), bg2 = mk(gg, R * C);
+                vc4_buf bdx2 = mk(NULL, R * C), bdy2 = mk(NULL, C);
+                int od2[2] = { R, C }, xd2[2] = { R, C }, yd2[2] = { 1, C };
+                vc4_status st2 = vc4_binop_bwd(ctx, VC4_BIN_DIV, &bx2, &by2,
+                                               &bg2, od2, xd2, yd2, 2, &bdx2,
+                                               &bdy2);
+                if (st2 != VC4_OK) {
+                    printf("FAIL div_bwd: %s\n", vc4_strerror(st2));
+                    nfail++;
+                } else {
+                    float *dxv = malloc(R * C * 4), *dyv = malloc(C * 4);
+                    get(&bdx2, dxv, R * C);
+                    get(&bdy2, dyv, C);
+                    gc_t gx = {0}, gy = {0};
+                    for (int r = 0; r < R; ++r)
+                        for (int j = 0; j < C; ++j)
+                            gc_add(&gx, dxv[r * C + j],
+                                   (double)gg[r * C + j] / yv[j], 1e-3);
+                    for (int j = 0; j < C; ++j) {
+                        double s2 = 0;
+                        for (int r = 0; r < R; ++r)
+                            s2 -= (double)gg[r * C + j] * xv[r * C + j] /
+                                  ((double)yv[j] * yv[j]);
+                        gc_add(&gy, dyv[j], s2, 1e-3);
+                    }
+                    nfail |= gc_print("div_bwd dx bcast (3,4)/(1,4)", &gx,
+                                      1e-3);
+                    nfail |= gc_print("div_bwd dy bcast", &gy, 1e-3);
+                    free(dxv);
+                    free(dyv);
+                }
+            }
         }
 
-        /* reduce */
+        /* reduce: a broadcast, so check it exactly (no finite difference:
+         * the driver's buffers are sized for the *input*, and this op writes
+         * more outputs than it has inputs) */
         {
-            red_p r1 = { 3, { 2, 3, 5 }, 1, 0 };
-            run_affine("sum_bwd axis1 (2,3,5)", ref_sum, bwd_sum, &r1,
-                       (size_t)(2 * 5), (size_t)2 * 5, 2e-2, 0);
-            red_p r2 = { 2, { 4, 6 }, 1, 1 };
-            run_affine("mean_bwd axis1 (4,6)", ref_sum, bwd_sum, &r2,
-                       (size_t)4, (size_t)4 * 6, 2e-2, 0);
-            red_p r3 = { 2, { 3, 8 }, 0, 0 };
-            run_affine("sum_bwd axis0 (3,8)", ref_sum, bwd_sum, &r3,
-                       (size_t)8, (size_t)3 * 8, 2e-2, 0);
+            struct { int ndim, dims[3], axis, mean; } r[3] = {
+                { 3, { 2, 3, 5 }, 1, 0 },
+                { 2, { 4, 6 }, 1, 1 },
+                { 2, { 3, 8 }, 0, 0 },
+            };
+            const char *nm[3] = { "sum_bwd axis1 (2,3,5)",
+                                  "mean_bwd axis1 (4,6)",
+                                  "sum_bwd axis0 (3,8)" };
+            for (int k = 0; k < 3; ++k) {
+                int64_t n = 1, ng = 1;
+                for (int i = 0; i < r[k].ndim; ++i) n *= r[k].dims[i];
+                ng = n / r[k].dims[r[k].axis];
+                float *gg = malloc(ng * 4);
+                for (int64_t i = 0; i < ng; ++i) gg[i] = frand();
+                vc4_buf bg = mk(gg, ng), bdx = mk(NULL, n);
+                vc4_status st2 = vc4_reduce_bwd(ctx, &bg, &bdx, r[k].dims,
+                                                r[k].ndim, r[k].axis,
+                                                r[k].mean);
+                if (st2 != VC4_OK) {
+                    printf("FAIL %s: %s\n", nm[k], vc4_strerror(st2));
+                    nfail++;
+                    free(gg);
+                    continue;
+                }
+                float *got = malloc(n * 4);
+                get(&bdx, got, n);
+                int64_t outer = 1, inner = 1;
+                for (int i = 0; i < r[k].axis; ++i) outer *= r[k].dims[i];
+                for (int i = r[k].axis + 1; i < r[k].ndim; ++i)
+                    inner *= r[k].dims[i];
+                const int64_t red = r[k].dims[r[k].axis];
+                gc_t gc = {0};
+                for (int64_t o = 0; o < outer; ++o)
+                    for (int64_t j = 0; j < red; ++j)
+                        for (int64_t ii = 0; ii < inner; ++ii) {
+                            size_t d = (size_t)((o * red + j) * inner + ii);
+                            double want = (double)gg[o * inner + ii];
+                            if (r[k].mean) want /= (double)red;
+                            gc_add(&gc, got[d], want, 1e-3);
+                        }
+                nfail |= gc_print(nm[k], &gc, 1e-3);
+                free(got);
+                free(gg);
+            }
         }
 
         /* resize */

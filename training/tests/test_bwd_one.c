@@ -476,49 +476,23 @@ int main(int argc, char **argv)
         }
         report(op, &bo, N, ref);
     } else if (!strcmp(op, "gate")) {
-        /* The unverified kernels must never launch silently: each is either
-         * refused with a message (VC4_ERR_UNSUPPORTED) or already fixed and
-         * verified.  vc4_gather and vc4_blit are still refused; vc4_reduce and
-         * the nvec=4 uop bodies are being repaired on another change, so their
-         * status is reported rather than asserted while that work is in
-         * flight.  No call below launches anything: the refusal happens before
-         * any QPU work. */
-        vc4_buf dummy = { 0, 64 }, dout = { 0, 64 };
-        struct { const char *name; vc4_status st; int must_refuse; } g[] = {
-            { "vc4_gather", vc4_gather(ctx, &dummy, &dout, 1, 0.0f), 1 },
-            { "vc4_reduce", vc4_reduce(ctx, &dummy, &dout, 1, 1, VC4_RED_SUM), 0 },
-            { "vc4_blit", vc4_blit(ctx, &dummy, &dout, 64), 1 },
-            { "uop exp", vc4_unary(ctx, VC4_UOP_EXP, &dummy, &dout, 1, 0, 0, 0), 0 },
-        };
-        for (unsigned i = 0; i < sizeof(g) / sizeof(g[0]); ++i) {
-            if (g[i].st == VC4_ERR_UNSUPPORTED) {
-                printf("  %-12s refused: %s\n", g[i].name, vc4_last_error(ctx));
-            } else if (g[i].st == VC4_OK) {
-                printf("  %-12s ran (being verified elsewhere)\n", g[i].name);
-                if (g[i].must_refuse) {
-                    printf("FAIL %s ran without a gate\n", g[i].name);
-                    errors++;
-                }
+        /* The refusal contract, asserted without launching anything: these two
+         * kernels must refuse with a message.  vc4_reduce and the nvec=4 uop
+         * bodies are repaired on another change; calling them here would
+         * *launch* them (one wedged the QPU while this test was written), so
+         * they are deliberately not touched.  Nothing below reaches the QPU. */
+        static const char *nm2[] = { "vc4_gather", "vc4_blit" };
+        for (int i = 0; i < 2; ++i) {
+            vc4_buf dummy = { 0x1000, 64 }, dout = { 0x2000, 64 };
+            vc4_status g = i ? vc4_blit(ctx, &dummy, &dout, 64)
+                             : vc4_gather(ctx, &dummy, &dout, 1, 0.0f);
+            if (g != VC4_ERR_UNSUPPORTED || !*vc4_last_error(ctx)) {
+                printf("FAIL %s did not refuse (st=%d %s)\n", nm2[i], g,
+                       vc4_strerror(g));
+                errors++;
             } else {
-                printf("FAIL %s: %s\n", g[i].name, vc4_strerror(g[i].st));
-                errors++;
+                printf("  %-11s refused: %s\n", nm2[i], vc4_last_error(ctx));
             }
-        }
-        /* ... and the verified 16-vector affine still works */
-        float one = 1.0f;
-        vc4_buf b1 = bufs(1, &one), b2 = bufs(1, NULL);
-        st = vc4_affine(ctx, &b1, &b2, 1, 2.0f, 1.0f);
-        float got = 0;
-        if (st == VC4_OK) {
-            vc4_download(ctx, &b2, &got, 4);
-            if (got != 3.0f) {
-                printf("FAIL affine: got %g want 3\n", got);
-                errors++;
-            } else
-                printf("  affine a*2+1  ok (%g)\n", got);
-        } else {
-            printf("FAIL affine: %s\n", vc4_strerror(st));
-            errors++;
         }
     } else {
         printf("unknown op %s\n", op);

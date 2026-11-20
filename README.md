@@ -40,6 +40,8 @@ Every measured number — GEMM, YOLOv8n, per-op vs CPU, training, builds,
 clocks, completeness — is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), and
 every bug with its cause, fix and verification is in
 [`docs/BUGS.md`](docs/BUGS.md) (the open ones are listed there too).
+Accuracy — including VC4 vs the CPU on the same image, where the detections are
+identical to 0.00 px — is in [`docs/ACCURACY.md`](docs/ACCURACY.md).
 
 Full table, the two execution paths and a "which repo do I open" guide:
 [`docs/ECOSYSTEM.md`](docs/ECOSYSTEM.md).

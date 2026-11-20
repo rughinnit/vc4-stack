@@ -88,6 +88,10 @@ Host byte movement on this model went **38,410,632 B → 17,077,040 B → 0 B**
 | modelB: stride-2, depthwise, 5×5 pool, concat, resize | 26 → 19 | 35.8 | 18.9–21.3 | max abs 4.41e-06, 0/16,384 |
 | modelC: conv/GAP/gemm 8×8 | 9 | 6.0 | 5.6–6.4 | max abs 4.06e-07, 0/4 |
 
+Accuracy is its own document: [`ACCURACY.md`](ACCURACY.md) — VC4 vs ORT CPU on
+the same image gives **identical detections (0.00 px)**, the raw tensor differing
+by 3.2e-4 relative.
+
 ## 4. `torch_vc4` vs the CPU, per op
 
 Quiet board, `torch.set_num_threads(4)`, median of 5 after 2 warm-ups, vc4 wall

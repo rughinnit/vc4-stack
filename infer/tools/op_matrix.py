@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import pickle
 import platform
@@ -236,6 +237,11 @@ class Spec:
     out_types: list | None = None
     note: str = ""
     oracle_gap: bool = False
+    # a draw from a random generator cannot be compared value-by-value with
+    # another generator's draw: those cases are compared by distribution over
+    # `reps` independent runs (see stochastic_check)
+    stochastic: bool = False
+    reps: int = 1
 
 
 def arr(rng, shape, lo=None, hi=None, dtype=np.float32):
@@ -254,11 +260,12 @@ def f32(*values):
 
 def sp(op, variant, ins, feeds, inits=None, attrs=None, *, required=True,
        edge=False, opset=None, n_out=None, out_types=None, note="",
-       oracle_gap=False):
+       oracle_gap=False, stochastic=False, reps=1):
     return Spec(op=op, variant=variant, ins=list(ins), feeds=feeds,
                 inits=inits or {}, attrs=attrs or {}, required=required,
                 edge=edge, opset=opset, n_out=n_out, out_types=out_types,
-                note=note, oracle_gap=oracle_gap)
+                note=note, oracle_gap=oracle_gap, stochastic=stochastic,
+                reps=reps)
 
 
 # --------------------------------------------------------------- model build
@@ -1021,23 +1028,30 @@ def rec_loss(op, rng, o):
 def rec_bernoulli(op, rng, o):
     return [sp(op, "p_uniform", ["input"],
                {"input": arr(rng, (2, 3), 0.0, 1.0)},
-               attrs={"dtype": TensorProto.FLOAT, "seed": 0.0})]
+               attrs={"dtype": TensorProto.FLOAT, "seed": 0.0},
+               stochastic=True, reps=64,
+               note="a Bernoulli draw: compared by distribution, not value")]
 
 
 def rec_random(op, rng, o):
     if op.endswith("Like"):
         return [sp(op, "like", ["input"], {"input": arr(rng, (2, 3), -1, 1)},
-                   attrs={"dtype": TensorProto.FLOAT, "seed": 0.0})]
+                   attrs={"dtype": TensorProto.FLOAT, "seed": 0.0},
+                   stochastic=True, reps=64,
+                   note="a random draw: compared by distribution")]
     return [sp(op, "shape_2x3", [], {},
                attrs={"shape": [2, 3], "dtype": TensorProto.FLOAT,
-                      "seed": 0.0})]
+                      "seed": 0.0},
+               stochastic=True, reps=64,
+               note="a random draw: compared by distribution")]
 
 
 def rec_multinomial(op, rng, o):
     return [sp(op, "2x4_sample3", ["input"],
                {"input": arr(rng, (2, 4), 0.0, 1.0)},
                attrs={"sample_size": 3, "seed": 0.0},
-               out_types=[TensorProto.INT64])]
+               out_types=[TensorProto.INT64], stochastic=True, reps=128,
+               note="multinomial draws: compared by class histogram")]
 
 
 def rec_ismatch(op, rng, o):
@@ -1184,6 +1198,176 @@ def _alarm(signum, frame):
     raise Timeout("case exceeded the wall-clock guard")
 
 
+# ------------------------------------------------------- reference-gap values
+# onnx.reference 1.17 crashes on these *valid* graphs because it passes 0-d
+# numpy scalars where python ints are required.  The implementation that
+# crashes is not wrong about the *maths*, so the fallback below calls the same
+# reference function with the scalars coerced -- the numbers are still the
+# reference implementation's, not this tool's.
+def _gap_oracle(spec):
+    vals = dict(spec.inits or {})
+    vals.update({k: v for k, v in (spec.feeds or {}).items()})
+    a = {k: np.asarray(v) for k, v in (spec.attrs or {}).items()}
+    try:
+        if spec.op == "DFT":
+            from onnx.reference.ops.op_dft import _cfft, _cifft
+            x = np.asarray(vals["input"])
+            axis = int(np.asarray(vals.get("axis", -2)).ravel()[0])
+            axis %= x.ndim
+            n = int(np.asarray(
+                vals.get("dft_length", x.shape[axis])).ravel()[0])
+            onesided = bool(int(a.get("onesided", 0)))
+            inv = bool(int(a.get("inverse", 0)))
+            if inv:
+                r = _cifft(x, n, axis, onesided)
+            else:
+                r = _cfft(x, n, axis, onesided, False)
+            return [np.asarray(r, np.float32)]
+        if spec.op == "STFT":
+            from onnx.reference.ops.op_stft import _stft
+            sig = np.asarray(vals["signal"])
+            step = int(np.asarray(vals["frame_step"]).ravel()[0])
+            win = np.asarray(vals["window"]) if "window" in vals else None
+            flen = int(win.shape[0]) if win is not None else sig.shape[-2]
+            if win is None:
+                win = np.ones((flen,), sig.dtype)
+            nf = 1 + (sig.shape[-2] - flen) // step
+            onesided = bool(int(a.get("onesided", 1)))
+            return [np.asarray(_stft(sig, flen, step, nf, win,
+                                     onesided=onesided), np.float32)]
+        if spec.op == "MelWeightMatrix":
+            from onnx.reference.ops.op_mel_weight_matrix import MelWeightMatrix
+            argv = []
+            for name in ("num_mel_bins", "dft_length", "sample_rate"):
+                argv.append(int(np.asarray(vals[name]).ravel()[0]))
+            for name in ("lower_edge_hertz", "upper_edge_hertz"):
+                argv.append(float(np.asarray(vals[name]).ravel()[0]))
+            obj = object.__new__(MelWeightMatrix)
+            rows = MelWeightMatrix._run(obj, *argv)      # a 1-tuple
+            return [np.asarray(rows[0], np.float32)]
+    except Exception:                                # noqa: BLE001
+        return None
+    return None
+
+
+# ---------------------------------------------------------- statistical check
+def stochastic_check(spec, ref, runs):
+    """Compare a random op by distribution, not by value.
+
+    A draw from one generator can never equal a draw from another, so the
+    case is judged as follows (all thresholds are in the stats record):
+
+      * shape and dtype identical to the reference draw, every replicate;
+      * every value inside the operator's analytic support;
+      * the pooled mean and variance of ``reps`` independent runs within
+        5 sigma of the distribution the ONNX attributes define (for
+        ``Bernoulli`` the per-run number of ones, summed over the replicates);
+      * ``Multinomial``: a chi-square over the class histogram of
+        ``reps x sample_size`` draws at p = 1e-3;
+      * the replicates are not all identical (that would be a stuck stream).
+
+    The 10^6-draw evidence for the generator itself is tests/check_rng_gpu.py.
+    """
+    ref = np.asarray(ref[0] if isinstance(ref, list) else ref)
+    got = [np.asarray(r[0] if isinstance(r, list) else r) for r in runs]
+    st = {"reps": len(got), "checks": {}}
+    for i, g in enumerate(got):
+        if tuple(g.shape) != tuple(ref.shape):
+            return False, {"reason": "run %d: shape %s != %s"
+                           % (i, tuple(g.shape), tuple(ref.shape))}
+    # a 6-element draw has few possible patterns, so "not stuck" is the test
+    # here; the distribution tests below carry the statistical weight
+    if len({g.tobytes() for g in got}) < 2:
+        st["checks"]["distinct"] = False
+        return False, st
+    st["checks"]["distinct"] = True
+    a = spec.attrs or {}
+    lo = float(a.get("low", 0.0))
+    hi = float(a.get("high", 1.0))
+    op = spec.op
+    if op == "Multinomial":
+        x = np.asarray(spec.feeds["input"], np.float64)
+        p = np.exp(x - x.max(axis=1, keepdims=True))
+        p /= p.sum(axis=1, keepdims=True)
+        for b in range(x.shape[0]):
+            draws = np.concatenate([g[b] for g in got])
+            if np.any(draws < 0) or np.any(draws >= x.shape[1]):
+                return False, {"reason": "index out of range"}
+            cnt = np.bincount(draws, minlength=x.shape[1]).astype(np.float64)
+            exp = p[b] * cnt.sum()
+            ok = exp > 5
+            stat = float(((cnt[ok] - exp[ok]) ** 2 / exp[ok]).sum())
+            df = max(1, int(ok.sum()) - 1)
+            pv = _chi2_p(stat, df)
+            st["checks"]["row%d_chi2_p" % b] = round(pv, 6)
+            st["checks"]["row%d_stat" % b] = round(stat, 3)
+            if pv < 1e-3:
+                return False, st
+        return True, st
+    if op == "Bernoulli":
+        pv = np.asarray(spec.feeds["input"], np.float64)
+        ones = sum(float(g.sum()) for g in got)
+        exp = pv.sum() * len(got)
+        sd = math.sqrt(float((pv * (1 - pv)).sum()) * len(got))
+        st["checks"]["ones"] = ones
+        st["checks"]["expected_ones"] = round(exp, 3)
+        st["checks"]["sigma"] = round((ones - exp) / max(sd, 1e-9), 3)
+        for g in got:
+            if not np.all((g == 0.0) | (g == 1.0)):
+                return False, {"reason": "Bernoulli produced a value not in "
+                                         "{0,1}"}
+        if abs(ones - exp) > 5 * max(sd, 1e-9):
+            return False, st
+        return True, st
+    # RandomUniform / RandomNormal
+    pooled = np.concatenate([g.ravel() for g in got]).astype(np.float64)
+    st["checks"]["min"] = float(pooled.min())
+    st["checks"]["max"] = float(pooled.max())
+    if op.startswith("RandomUniform"):
+        mu, var = (lo + hi) / 2.0, (hi - lo) ** 2 / 12.0
+        if pooled.min() < lo or pooled.max() >= hi + 1e-6:
+            return False, {"reason": "value outside [%g,%g)" % (lo, hi)}
+    else:
+        mu = float(a.get("mean", 0.0))
+        var = float(a.get("scale", 1.0)) ** 2
+        if not np.all(np.isfinite(pooled)):
+            return False, {"reason": "non-finite normal draw"}
+    n = pooled.size
+    m, v = float(pooled.mean()), float(pooled.var())
+    st["checks"]["mean"] = round(m, 6)
+    st["checks"]["mean_expect"] = round(mu, 6)
+    st["checks"]["mean_sigma"] = round((m - mu) / math.sqrt(var / n), 3)
+    st["checks"]["var"] = round(v, 6)
+    st["checks"]["var_expect"] = round(var, 6)
+    if abs(m - mu) > 5 * math.sqrt(var / n):
+        return False, st
+    if not (0.75 < v / var < 1.25):
+        return False, st
+    return True, st
+
+
+def _chi2_p(stat, df):
+    """Wilson-Hilferty chi-square tail (adequate for df >= 3)."""
+    if df <= 0:
+        return 1.0
+    z = ((stat / df) ** (1.0 / 3.0) - (1.0 - 2.0 / (9 * df))) / \
+        math.sqrt(2.0 / (9 * df))
+    return 0.5 * math.erfc(z / math.sqrt(2.0))
+
+
+def _dummy_ref(spec, feeds):
+    """The declared output shape/dtype when no oracle can produce values.
+
+    Only ``Multinomial`` needs this (onnx.reference 1.17 has no
+    implementation at all); the value check for it is the class histogram in
+    :func:`stochastic_check`.
+    """
+    a = spec.attrs or {}
+    if spec.op == "Multinomial":
+        x = np.asarray(feeds[spec.ins[0]])
+        return np.zeros((x.shape[0], int(a.get("sample_size", 1))), np.int64)
+    return np.zeros((1,), np.float32)
+
 def compare(ref, got, tol_abs=TOL_ABS, tol_rel=TOL_REL):
     """Return (ok, stats) for one output tensor."""
     ref = np.asarray(ref)
@@ -1316,6 +1500,15 @@ def run_case(spec, schema, default_opset, workdir, eng, do_engine=True,
         msg = str(e)
         if _reference_limitation(e) or spec.oracle_gap:
             oracle = "unavailable"
+            fb = _gap_oracle(spec)
+            if fb is not None:
+                ref_vals = fb
+                oracle = "ok"
+                rec["oracle_fallback"] = ("onnx.reference %s crashes on this "
+                                          "graph; the value oracle is the same "
+                                          "reference implementation called "
+                                          "with python scalars" %
+                                          onnx.__version__)
             rec["oracle_error"] = "%s: %s" % (type(e).__name__, msg)
             rec["oracle_note"] = ("onnx.reference %s cannot evaluate this "
                                   "checker-valid graph (%s)" %
@@ -1370,10 +1563,12 @@ def _daemon_dead(e):
     """The daemon itself is gone.  That is *not* an operator result: the case
     and every case after it must be recorded as unmeasured."""
     msg = str(e).lower()
+    # A *refusal* can mention vc4d too ("which vc4d refuses as a possible GPU
+    # bus address"); only an I/O/connection failure means the daemon is gone.
     return any(k in msg for k in (
         "daemon is dead", "daemon not running", "daemon is not running",
-        "vc4d", "connect to", "connection refused", "broken pipe",
-        "socket", "no such device", "device lost"))
+        "vc4d socket", "is vc4d running", "connect to", "connection refused",
+        "broken pipe", "no such device", "device lost"))
 
 
 def _wedge(e):
@@ -1483,6 +1678,29 @@ def _engine_phase(spec, rec, feeds, ref_vals, oracle, eng, path, do_engine):
     # no QPU work.  That is not a vc4 run and must not be scored as one.
     folded = bool(prof) and all(p.get("backend") == "folded" for p in prof)
     rec["got"] = [_summary(v) for v in out]
+
+    if spec.stochastic:
+        feed = {k: np.ascontiguousarray(v, np.float32)
+                for k, v in feeds.items()}
+        runs = [out]
+        for _ in range(max(0, int(spec.reps) - 1)):
+            runs.append(runner.run(feed, profile=False))
+        ref = ref_vals
+        if ref is None:
+            ref = [_dummy_ref(spec, feeds)]
+            rec["oracle_note"] = ("no reference implementation exists for "
+                                  "this operator; the case is judged by "
+                                  "distribution and shape")
+        ok, st = stochastic_check(spec, ref, runs)
+        rec["compare"] = [st]
+        rec["reps"] = len(runs)
+        if folded:
+            rec["status"] = "folded"
+        elif ok:
+            rec["status"] = "vc4"
+        else:
+            rec["status"] = "mismatch"
+        return rec
 
     if oracle != "ok":
         rec["status"] = "folded" if folded else "vc4-unverified"
@@ -1897,6 +2115,11 @@ def write_markdown(path, payload):
     add("|---|---|")
     add("| Generated | %s |" % payload["generated"])
     add("| Engine | vc4infer %s |" % payload["versions"]["vc4infer"])
+    pg = payload["versions"].get("vc4infer_file")
+    if pg:
+        add("| Python package | `%s` |" % pg)
+    add("| Engine library | `%s` |"
+        % (os.environ.get("VC4INFER_LIB") or "(installed default)"))
     add("| Runner | `mode=%s`, `host_policy=%s` |" %
         (payload["runner"]["mode"], payload["runner"]["host_policy"]))
     add("| ONNX / opset | onnx %s, default domain opset **%s** |" %
@@ -1947,10 +2170,10 @@ def write_markdown(path, payload):
     add("same number as `pct_complete` and is never presented as it.")
     add("")
     if payload.get("daemon_dead"):
-        add("> **The sweep stopped early: vc4d died.**  `%s`  Every case")
+        add("> **The sweep stopped early: vc4d died.**  `%s`  Every case"
+            % _esc(str(payload["daemon_dead"])))
         add("> after that point is `unmeasured`, never `refused` or `hang`;")
-        add("> a dead daemon is not an engine result." %
-            _esc(str(payload["daemon_dead"])))
+        add("> a dead daemon is not an engine result.")
         add("")
     add("Structural exclusions from the second denominator: **%d** operators "
         "(%s).  They are listed with their exact reason in "

@@ -143,6 +143,10 @@ static const vc4_op_info OPS[] = {
       "additive scatter; a target hit more than 64 times is refused", 1 },
     { "scatter_bwd", "qpu gather table", 1, "out[idx[i]] = x[i] -> dx[i] = g[idx[i]]", 1 },
     { "affine", "qpu uop(affine)", 1, "a*p0 + p1 (the scalar scale/offset)", 0 },
+    { "rng", "-", 0,
+      "counter-based uniform [0,1) from an integer key (kops.b_rng, "
+      "docs/OPS-RNN.md); a primitive for the Random*/Bernoulli operators, "
+      "not an ONNX operator of its own", 0 },
     { "cmp/eq", "qpu ew bit-compare", 1,
       "a==b; exact for every fp32, NaN gives 0, -0.0==+0.0", 1 },
     { "cmp/gt", "qpu ew bit-compare", 1, "a>b; exact, NaN gives 0", 1 },

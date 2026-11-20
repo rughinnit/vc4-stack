@@ -119,6 +119,10 @@ echo "=== test_onnx_norm (17 ops through the runner)"
 PYTHONPATH=$PYTHONPATH:. timeout -k 5 600 python3 tests/test_onnx_norm.py
 board
 
+echo "=== test_onnx_gaps (variadic/conversion/gather family through the runner)"
+PYTHONPATH=$PYTHONPATH:. timeout -k 5 900 python3 tests/test_onnx_gaps.py
+board
+
 echo "=== test_copyops (layout copy kernels, byte-exact)"
 timeout -k 5 300 $RUN ./build/test_copyops
 board

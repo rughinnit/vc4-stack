@@ -80,7 +80,7 @@ and `transpose` (including the operand transposes a `dot_general` needs) are
 index gathers through a table computed at compile time, and the reduced
 result is compacted the same way.  This is the same division of labour as the
 engine's ONNX executor (the ARM moves and pads bytes, the QPU does MACs), and
-it is forced by the state of two engine kernels, below.
+it is forced by the state of three engine kernels, below.
 
 ## 4. Op subset
 
@@ -92,7 +92,7 @@ message.  There is no CPU arithmetic fallback anywhere.
 | `add_v1`, `multiply_v1` | `vc4_elementwise(ADD/MUL)` | 1 |
 | `subtract_v1` | `vc4_unary(NEG)` + `vc4_elementwise(ADD)` | 2 |
 | `negate_v1` | `vc4_unary(NEG)` | 1 |
-| `relu_v1` | `vc4_relu` | 1 |
+| `relu_v1` (accepted; JAX emits `maximum` instead) | `vc4_relu` | 1 |
 | `maximum_v1` | `0.5*(a+b+|a-b|)` = NEG, ADD, ABS, ADD, ADD, AFFINE | 6 |
 | `compare_v1` (GT/GE/LT/LE/EQ) | `vc4_elementwise(CMP_*)` | 1 |
 | `select_v1` | `b + p*(a-b)` = NEG, ADD, MUL, ADD | 4 |
@@ -105,7 +105,9 @@ message.  There is no CPU arithmetic fallback anywhere.
 | `constant_v1` | uploaded once at compile | 0 |
 | `call_v1`, `return_v1`, `func_v1`, builtin `module` | inlined / structural | — |
 
-`maximum` and `select` are arithmetic sequences because the engine's
+Eighteen VHLO operation names are accepted (the rows above, counting
+`func_v1`, `call_v1` and `return_v1`, and not counting `relu_v1`, which no
+producer emits).  `maximum` and `select` are arithmetic sequences because the engine's
 `vc4_select3` and `vc4_gather` are currently refused by
 `VC4_ALLOW_UNVERIFIED_KERNELS` gating (`infer/src/vc4_guard.c`,
 `docs/KERNELS.md`), and `vc4_reduce` likewise; `vc4_matmul` and the unary

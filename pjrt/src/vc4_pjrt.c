@@ -1279,7 +1279,7 @@ static PJRT_Error *h_Executable_OutputDimensions(
     }
     args->dims = flat;
     args->dim_sizes = sizes;
-    args->num_outputs = e->num_outputs;
+    args->num_outputs = e->num_outputs < 64 ? e->num_outputs : 64;
     return NULL;
 }
 

@@ -1096,6 +1096,26 @@ static PJRT_Error *build_program(PJRT_Executable *e, VC4PjrtClient *c) {
             return make_error(PJRT_Error_Code_INTERNAL,
                               "constant upload: %s", vc4_strerror(st));
     }
+    /* vc4_gather wants arena byte offsets; the lowering stored element
+       indices, and both the table and the source slots are now fixed. */
+    for (int i = 0; i < e->prog.num_insns; i++) {
+        vc4sl_insn *in = &e->prog.insns[i];
+        if (in->table < 0 || in->table_slot < 0) continue;
+        int n = e->prog.tables[in->table].n;
+        int32_t *bytes = malloc(n ? (size_t)n * 4 : 4);
+        if (!bytes)
+            return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "table");
+        uint32_t base = e->slab.off + (uint32_t)e->offs[in->a];
+        for (int k = 0; k < n; k++)
+            bytes[k] = (int32_t)(base +
+                                 (uint32_t)e->prog.tables[in->table].idx[k] * 4);
+        vc4_buf tb = slot_buf(e, in->table_slot);
+        st = vc4_upload(ctx, &tb, bytes, (size_t)n * 4);
+        free(bytes);
+        if (st != VC4_OK)
+            return make_error(PJRT_Error_Code_INTERNAL,
+                              "layout table upload: %s", vc4_strerror(st));
+    }
 
     e->num_outputs = (size_t)e->prog.num_outputs;
     e->num_parameters = (size_t)e->prog.num_params;
@@ -1443,38 +1463,22 @@ static PJRT_Error *run_insn(VC4PjrtClient *c, PJRT_Executable *e,
         st = vc4_matmul_bt(ctx, &A, &B, &D, (uint32_t)in->aux[0],
                            (uint32_t)in->aux[1], (uint32_t)in->aux[2]);
         break;
-    case VC4SL_GATHER_HOST: {
-        if (in->table < 0 || in->table >= e->prog.num_tables)
+    case VC4SL_GATHER: {
+        if (in->table < 0 || in->table_slot < 0)
             return make_error(PJRT_Error_Code_INTERNAL, "missing layout table");
-        size_t src_n = vc4sl_num_elements(&e->prog, in->a);
-        float *stage_in = malloc(src_n ? src_n * 4 : 4);
-        float *stage_out = malloc(n ? n * 4 : 4);
-        if (!stage_in || !stage_out) {
-            free(stage_in);
-            free(stage_out);
-            return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED,
-                              "layout staging");
-        }
-        vc4_status s1 = vc4_download(ctx, &A, stage_in, src_n * 4);
-        if (s1 == VC4_OK) {
-            const int32_t *tab = e->prog.tables[in->table].idx;
-            for (size_t i = 0; i < n; i++) {
-                int32_t idx = tab[i];
-                if (idx < 0 || (size_t)idx >= src_n) {
-                    free(stage_in);
-                    free(stage_out);
-                    return make_error(PJRT_Error_Code_INTERNAL,
-                                      "layout index out of range");
-                }
-                stage_out[i] = stage_in[idx];
-            }
-            s1 = vc4_upload(ctx, &D, stage_out, n * 4);
-        }
-        free(stage_in);
-        free(stage_out);
-        st = s1;
+        vc4_buf T = slot_buf(e, in->table_slot);
+        st = vc4_gather(ctx, &T, &D, n, 0.0f);
         break;
     }
+    case VC4SL_SELECT: {
+        vc4_buf C = slot_buf(e, in->c);
+        st = vc4_select3(ctx, VC4_SEL_WHERE, &A, &B, &C, &D, n);
+        break;
+    }
+    case VC4SL_REDUCE_SUM:
+        st = vc4_reduce(ctx, &A, &D, (uint32_t)in->aux[0],
+                        (uint32_t)in->aux[1], VC4_RED_SUM);
+        break;
     case VC4SL_CONSTANT:
         return NULL;
     default:

@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
         printf("]\n");
     }
     static const char *ops[] = {"add", "sub", "mul", "maximum", "abs",
-                                "affine", "host_gather", "negate", "relu",
+                                "affine", "gather", "negate", "relu",
                                 "compare", "select", "dot", "dot_bt",
                                 "bcast", "transpose", "reduce_sum",
                                 "constant"};

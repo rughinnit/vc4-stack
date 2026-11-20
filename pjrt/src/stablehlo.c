@@ -1508,8 +1508,6 @@ static int cmp_code(int64_t dir) {
 static int compile_region(comp *c, sregion *reg, const int *args, int nargs,
                           int *outs, int *nouts, int depth, const char *fname);
 
-static int align16(int n) { return (n + 15) & ~15; }
-
 static int emit_simple(comp *c, vc4sl_opcode op, int a, int b, int dst,
                        vc4sl_shape sh, const char *name) {
     vc4sl_insn in;
@@ -1678,21 +1676,23 @@ static int compile_region(comp *c, sregion *reg, const int *args, int nargs,
             int a = phys(c->p, vals[n->operands[0]]);
             int b = phys(c->p, vals[n->operands[1]]);
             vc4sl_shape sh = c->p->tensors[rslots[0]].shape;
-            int t1 = new_tensor(c, sh, "maximum");
-            int t2 = new_tensor(c, sh, "maximum");
-            int t3 = new_tensor(c, sh, "maximum");
-            int t4 = new_tensor(c, sh, "maximum");
-            int t5 = new_tensor(c, sh, "maximum");
-            if (t1 < 0 || t2 < 0 || t3 < 0 || t4 < 0 || t5 < 0) return -1;
-            /* maximum(a,b) = 0.5 * (a + b + |a - b|), with a - b as a + (-b)
-               and no select kernel (vc4_select3 is refused by the engine). */
-            if (emit_simple(c, VC4SL_NEGATE, b, 0, t1, sh, name) ||
-                emit_simple(c, VC4SL_ADD, a, t1, t2, sh, name) ||
-                emit_simple(c, VC4SL_ABS, t2, 0, t3, sh, name) ||
-                emit_simple(c, VC4SL_ADD, a, b, t4, sh, name) ||
-                emit_simple(c, VC4SL_ADD, t4, t3, t5, sh, name) ||
-                emit_simple(c, VC4SL_AFFINE, t5, 0, rslots[0], sh, name))
+            int pred = new_tensor(c, sh, "maximum");
+            if (pred < 0) return -1;
+            /* cond = a >= b; out = where(cond, a, b).  Both kernels are
+               verified on silicon after the VPM store fix. */
+            if (emit_simple(c, VC4SL_COMPARE, a, b, pred, sh, name))
                 return -1;
+            vc4sl_insn in2;
+            memset(&in2, 0, sizeof(in2));
+            in2.op = VC4SL_SELECT;
+            in2.a = pred;
+            in2.b = a;
+            in2.c = b;
+            in2.dst = rslots[0];
+            in2.shape = sh;
+            in2.table = -1;
+            in2.name = name;
+            if (emit(c, in2)) return -1;
         } else if (!strcmp(name, "negate_v1")) {
             if (n->noperands != 1 || nres != 1)
                 return cfail(c, "negate_v1: unexpected arity");
@@ -1725,20 +1725,17 @@ static int compile_region(comp *c, sregion *reg, const int *args, int nargs,
         } else if (!strcmp(name, "select_v1")) {
             if (n->noperands != 3 || nres != 1)
                 return cfail(c, "select_v1: unexpected arity");
-            int pred = phys(c->p, vals[n->operands[0]]);
-            int tv = phys(c->p, vals[n->operands[1]]);
-            int fv = phys(c->p, vals[n->operands[2]]);
-            vc4sl_shape sh = c->p->tensors[rslots[0]].shape;
-            int t1 = new_tensor(c, sh, "select");
-            int t2 = new_tensor(c, sh, "select");
-            int t3 = new_tensor(c, sh, "select");
-            if (t1 < 0 || t2 < 0 || t3 < 0) return -1;
-            /* select(p,a,b) = b + p*(a - b), p is 0.0/1.0 fp32. */
-            if (emit_simple(c, VC4SL_NEGATE, fv, 0, t1, sh, name) ||
-                emit_simple(c, VC4SL_ADD, tv, t1, t2, sh, name) ||
-                emit_simple(c, VC4SL_MUL, pred, t2, t3, sh, name) ||
-                emit_simple(c, VC4SL_ADD, t3, fv, rslots[0], sh, name))
-                return -1;
+            vc4sl_insn in2;
+            memset(&in2, 0, sizeof(in2));
+            in2.op = VC4SL_SELECT;
+            in2.a = phys(c->p, vals[n->operands[0]]);
+            in2.b = phys(c->p, vals[n->operands[1]]);
+            in2.c = phys(c->p, vals[n->operands[2]]);
+            in2.dst = rslots[0];
+            in2.shape = c->p->tensors[in2.dst].shape;
+            in2.table = -1;
+            in2.name = name;
+            if (emit(c, in2)) return -1;
         } else if (!strcmp(name, "broadcast_in_dim_v1")) {
             if (n->noperands != 1 || nres != 1 || n->nprops < 1)
                 return cfail(c, "broadcast_in_dim_v1: malformed");
@@ -1761,7 +1758,7 @@ static int compile_region(comp *c, sregion *reg, const int *args, int nargs,
                     return cfail(c, "broadcast_in_dim_v1: bad dimension");
             size_t nout = shape_elems(&dst);
             int32_t *tab = NULL;
-            in.op = VC4SL_GATHER_HOST;
+            in.op = VC4SL_GATHER;
             in.a = phys(c->p, vals[n->operands[0]]);
             in.dst = rslots[0];
             in.shape = dst;
@@ -1799,7 +1796,7 @@ static int compile_region(comp *c, sregion *reg, const int *args, int nargs,
             }
             size_t nout = shape_elems(&dst);
             int32_t *tab = NULL;
-            in.op = VC4SL_GATHER_HOST;
+            in.op = VC4SL_GATHER;
             in.a = phys(c->p, vals[n->operands[0]]);
             in.dst = rslots[0];
             in.shape = dst;
@@ -1866,7 +1863,7 @@ static int compile_region(comp *c, sregion *reg, const int *args, int nargs,
                 if (tmp < 0) return -1;
                 vc4sl_insn t;
                 memset(&t, 0, sizeof(t));
-                t.op = VC4SL_GATHER_HOST;
+                t.op = VC4SL_GATHER;
                 t.name = name;
                 t.a = phys(c->p, lhs);
                 t.dst = tmp;
@@ -1889,7 +1886,7 @@ static int compile_region(comp *c, sregion *reg, const int *args, int nargs,
                 if (tmpb < 0) return -1;
                 vc4sl_insn t;
                 memset(&t, 0, sizeof(t));
-                t.op = VC4SL_GATHER_HOST;
+                t.op = VC4SL_GATHER;
                 t.name = name;
                 t.a = phys(c->p, rhs);
                 t.dst = tmpb;
@@ -1942,41 +1939,17 @@ static int compile_region(comp *c, sregion *reg, const int *args, int nargs,
                     outer *= (size_t)src.dims[i];
                 }
             }
-            /* sum over the reduced axes = [outer][red] x ones[red][16]. */
-            vc4sl_shape osh = {2, {(int64_t)red, 16}, VC4SL_DT_F32};
-            int ones = new_tensor(c, osh, "reduce ones");
-            if (ones < 0) return -1;
-            size_t obytes = (size_t)red * 16 * 4;
-            c->p->tensors[ones].is_constant = 1;
-            c->p->tensors[ones].const_len = obytes;
-            c->p->tensors[ones].const_data = malloc(obytes);
-            if (!c->p->tensors[ones].const_data) return cfail(c, "out of memory");
-            for (size_t i = 0; i < (size_t)red * 16; i++)
-                ((float *)c->p->tensors[ones].const_data)[i] = 1.0f;
-            vc4sl_shape tsh = {2, {align16((int)outer), 16}, VC4SL_DT_F32};
-            int tmp = new_tensor(c, tsh, "reduce output");
-            if (tmp < 0) return -1;
-            in.op = VC4SL_DOT;
-            in.a = phys(c->p, vals[n->operands[0]]);
-            in.b = ones;
-            in.dst = tmp;
-            in.shape = tsh;
-            in.aux[0] = (int64_t)outer;
-            in.aux[1] = 16;
-            in.aux[2] = (int64_t)red;
-            if (emit(c, in)) return -1;
-            vc4sl_insn g;
-            memset(&g, 0, sizeof(g));
-            g.op = VC4SL_GATHER_HOST;
-            g.a = tmp;
-            g.dst = rslots[0];
-            g.shape = c->p->tensors[rslots[0]].shape;
-            g.table = -1;
-            g.name = name;
-            int32_t *tab = NULL;
-            if (new_table(c, (int)outer, &g, &tab)) return -1;
-            for (size_t o = 0; o < outer; o++) tab[o] = (int32_t)(o * 16);
-            if (emit(c, g)) return -1;
+            vc4sl_insn in2;
+            memset(&in2, 0, sizeof(in2));
+            in2.op = VC4SL_REDUCE_SUM;
+            in2.a = phys(c->p, vals[n->operands[0]]);
+            in2.dst = rslots[0];
+            in2.shape = c->p->tensors[in2.dst].shape;
+            in2.aux[0] = (int64_t)outer;
+            in2.aux[1] = (int64_t)red;
+            in2.table = -1;
+            in2.name = name;
+            if (emit(c, in2)) return -1;
         } else if (!strcmp(name, "constant_v1")) {
             if (nres != 1 || n->nprops < 1)
                 return cfail(c, "constant_v1: malformed");

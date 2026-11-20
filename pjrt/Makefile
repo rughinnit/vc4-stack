@@ -3,9 +3,15 @@ CFLAGS  ?= -O2 -g -Wall -Wextra -std=gnu11 -fPIC
 # The PJRT C API header is vendored: the jaxlib wheel ships only xla/ffi.
 PJRT_INC ?= third_party
 CPPFLAGS = -I$(PJRT_INC)
-# The installed engine (vc4infer 1.2.x).  VC4INFER_LIB may point at a
-# source-tree build instead.
+# Prefer the engine built from this checkout (infer/build), which carries the
+# ungated gather/reduce/select3 kernels the lowering uses; fall back to the
+# installed libvc4infer.  Override VC4INFER_LIB for a packaged build.
+ENGINE_DIR := $(abspath $(CURDIR)/../infer/build)
+ifeq ($(wildcard $(ENGINE_DIR)/libvc4infer.so),)
 VC4INFER_LIB ?= -lvc4infer
+else
+VC4INFER_LIB ?= -L$(ENGINE_DIR) -lvc4infer -Wl,-rpath,$(ENGINE_DIR)
+endif
 LDLIBS  = $(VC4INFER_LIB) -lm
 
 BUILD = build

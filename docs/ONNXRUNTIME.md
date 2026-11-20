@@ -78,7 +78,7 @@ than fall back.
 The report is per node, with measured time where it exists:
 
 ```
-vc4infer.ort 1.2.1 -- yolov8n_160.onnx (263 nodes, 1 partitions)
+vc4infer.ort 1.2.2 -- yolov8n_160.onnx (263 nodes, 1 partition)
   providers requested: vc4
   backend       nodes   %nodes        MACs    %MACs
   vc4             233    88.6%      273.2M   100.0%
@@ -121,7 +121,7 @@ session creation instead, naming the node.
 The provider is part of the `vc4infer` package; only ONNX Runtime is extra:
 
 ```sh
-sudo apt install ./vc4infer_1.2.1_arm64.deb      # engine + vc4infer package
+sudo apt install ./vc4infer_1.2.2_arm64.deb      # engine + vc4infer package
 sudo systemctl enable --now vc4d                 # unprivileged GPU access
 pip install onnxruntime                          # 1.32.0 on cp313/aarch64
 ```

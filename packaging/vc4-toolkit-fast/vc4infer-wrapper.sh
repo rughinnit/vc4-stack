@@ -8,8 +8,8 @@
 # without JIT (no python3 kgen.py spawn) while a non-bundled model can still
 # JIT into the user's own directory.
 #
-# VC4INFER_CACHE set explicitly disables the seeding: setting it explicitly is the supported way to disable it
-# directory, so it is left alone.
+# VC4INFER_CACHE set explicitly disables the seeding, so the system cache
+# directory is then left alone.
 set -u
 
 sys=/usr/lib/vc4infer/kcache

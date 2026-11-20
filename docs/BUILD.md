@@ -57,7 +57,7 @@ in these runs, but MemAvailable reached 47-54 MiB, which is the territory where
 the OOM killer starts picking victims on a shared board.
 
 The same applies to any other LLVM-weight build on this machine.  During a
-sustained mixed-load run, a concurrent job's `pip install -e .` of `torch_vc4`
+sustained mixed-load run, a concurrent `pip install -e .` of `torch_vc4`
 (one `cc1plus` at 490 MiB) pushed swap to 731 MiB and MemAvailable to 60 MiB
 while the engine was being rebuilt at -j4.  Two big C++ builds never belong on
 this board at the same time.

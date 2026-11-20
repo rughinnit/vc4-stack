@@ -16,7 +16,7 @@ The asm10 **packer port works** and is byte-identical to asm10's proven blob,
 and the asm10 **GEMM's k loop, prime and store are byte-identical** to asm10's
 proven kernel - but the *generalised tile addressing* I wrote for the engine
 (arbitrary M, N, K instead of asm10's square N) produces wrong results, and I
-could not isolate the cause inside this run.  Details, evidence and the
+could not isolate the cause within this run.  Details, evidence and the
 ruled-out list are below so a follow-up can start where this stopped.
 
 ## 1. What was built (kept in `attempt-asm10/`)

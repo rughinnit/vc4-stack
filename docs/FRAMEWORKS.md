@@ -262,7 +262,7 @@ it is `large (months)` even though the ABI is clean.
 
 All package checks were run on the board (throwaway venvs under
 `~/scratch/tmp/fw`); PyPI metadata was read from `https://pypi.org/pypi/<pkg>/json`.
-No GPU workload was started by this survey; a concurrent job held the GPU.
+No GPU workload was started by this survey; the GPU was busy.
 
 ### 11.1 Platform
 

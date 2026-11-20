@@ -13,7 +13,7 @@ measurements during this work and are now controlled:
    voltage change). `docs/CLOCK-VARIANCE.md`.
 2. **Backend.** `managed` (vc4d, ~0.1 ms/launch) vs `direct` (root, no
    per-launch cost) differ by **7 % on a GEMM and 16 % on YOLO**. `docs/BACKENDS.md`.
-3. **Board load.** a concurrent build moves ARM numbers by 6–25 %. Every row
+3. **Board load.** A concurrent build moves ARM numbers by 6–25 %. Every row
    below states the state it was taken in.
 4. **Temperature — since 2026-11-20 the board is fanless.** Idle ~56 C, and a
    sustained QPU load reaches **73 C in under two minutes**; the soft limit is

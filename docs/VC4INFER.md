@@ -332,7 +332,7 @@ and `GlobalAveragePool` are batch 1 and raise otherwise.
 ## Measured performance
 
 Stock clocks, `VC4INFER_DAEMON=1`, one image per run, warm kernel cache, same
-boot.  The board is shared; a session measured while a concurrent build was
+boot.  The board is shared; a run measured while a concurrent build was
 running came out slower, so the range is honest rather than a best case.
 
 | model | input | runs | mean | FPS | launches/img | GPU (pack+kernel) | over 5e-4 |

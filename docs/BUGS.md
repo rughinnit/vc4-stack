@@ -82,7 +82,7 @@ be re-taken under `tools/thermal-guard.sh` before being quoted as a measurement.
 | D3 | `sum_bwd axis1` failed intermittently | the check wrote 30 outputs into a 10-element buffer (heap corruption) | exact broadcast check | `rel_L2 0` |
 | D4 | `maxpool 3x3s2p1 dx` failed | **the check was wrong**: with `h=2e-2` the finite difference flips the argmax when a window's top two values are within `h`; the op matched an fp64 scatter reference on all 42 elements | the check skips near-ties and **reports the count** | `rel_L2 9.1e-07, over_tol 0` |
 | D5 | `div_bwd` "passed" a bad check | validated by a difference of `1/y`, ill-conditioned by `1/y²` | closed-form check | `9.3e-8` |
-| D6 | `mm 256³` reported "vc4 faster than CPU" | the CPU figure (6.17 ms) was taken while a concurrent job was running; the real value is 3.632 ms | protocol added: pinned threads, quiet board, median of 5 after 2 warm-ups | CPU 3.632 vs vc4 5.090 ms |
+| D6 | `mm 256³` reported "vc4 faster than CPU" | the CPU figure (6.17 ms) was taken while another job was running; the real value is 3.632 ms | protocol added: pinned threads, quiet board, median of 5 after 2 warm-ups | CPU 3.632 vs vc4 5.090 ms |
 | D7 | "The engine's NHWC conv hangs the board" | a name-keyed blob cache was being rebuilt concurrently; the call verifies | claim withdrawn, call re-verified (`1.9e-05`), native path enabled | torch-vc4 `COMPLETENESS.md` |
 | D8 | "same binary, half the speed" (twice) | the firmware's DVFS cannot see QPU work through `vc4d` and drops the core **400 → 250 MHz**; the second time, the boot config had no `core_freq` at all | sampled during load; pinned `core_freq=400` + `core_freq_min=400` (stock, no voltage change) | 400 MHz in 5/5 samples under load; 3.73 → 8.47 GFLOP/s |
 | D9 | 250 MHz looked like a droop during an 18 s "slow" run | **250 MHz is also the idle clock**; a dead GPU process had left the board idle | sample only while work is in flight; trust cycle counts over one clock reading | `docs/CLOCK-VARIANCE.md` |
@@ -106,7 +106,7 @@ be re-taken under `tools/thermal-guard.sh` before being quoted as a measurement.
 
 | # | failure | what happened | rule adopted |
 |---|---|---|---|
-| F1 | `flock /tmp/vc4-gpu.lock` around a client | the daemon takes the same lock per launch, so the client never got it: `GPU lock wait timed out`, launches denied, a concurrent job's training run blocked for 4.5 minutes. **Deadlocked the board three times.** | never hold that lock; the daemon serialises; check `ps` and wait |
+| F1 | `flock /tmp/vc4-gpu.lock` around a client | the daemon takes the same lock per launch, so the client never got it: `GPU lock wait timed out`, launches denied, a concurrent training run blocked for 4.5 minutes. **Deadlocked the board three times.** | never hold that lock; the daemon serialises; check `ps` and wait |
 | F2 | A resurrected probe on a dead daemon | `LAUNCH: daemon is dead (GPU timeout earlier)` — every later test failed for the wrong reason | check `systemctl is-active vc4d` before blaming code; `systemctl restart vc4d` |
 | F3 | Two daemons on one V3D | a private `vc4d-tv` alongside the installed one produced a spurious `V3D_ERR_STAT=0x1000` | one daemon; stale sockets removed |
 | F4 | Purge during a concurrent test | a suite run was invalidated mid-flight by `apt-get purge` | announce purges; sequence the board |

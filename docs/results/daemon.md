@@ -128,7 +128,7 @@ which is launch-bound.  First 128³ run after boot is colder (1.25 ms wall).
 - Lock topology: in daemon mode the daemon takes `/tmp/vc4-gpu.lock` per
   launch, so the tests must not hold it (otherwise both wait and the launch
   fails as busy).  The engine retries `E_BUSY` for a minute, which is what let
-  it coexist with long `qrun_gemm` runs from a concurrent session.  The unit needs
+  it coexist with concurrent `qrun_gemm` runs.  The unit needs
   `ReadWritePaths=/tmp` to create the lock at boot.
 - No kernel needed a fallback to root.  `vc4_gemm`, `vc4_ew`, `vc4_conv`,
   `vc4_convbwd`, `vc4_train` and the softmax/pool paths all run through

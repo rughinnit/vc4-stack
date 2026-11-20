@@ -227,6 +227,10 @@ pub   rsa4096 2026-11-19 [SC]
 uid                      vc4top archive <rughinnit@users.noreply.github.com>
 ```
 
+*(The source line was already applied on the reference board; the key was
+re-fetched and its fingerprint checked.  The `echo ... | tee` line itself was
+not re-run.)*
+
 The dependency resolution was checked on the board; `vc4infer` brings
 `python3-numpy`, `python3-onnx`, `python3-pil`, and the DKMS module builds for
 the running kernel:
@@ -623,6 +627,10 @@ the same.
    ```python
    vu.register(patch_warmup=False)
    ```
+
+   *(On this board `patch_warmup=False` would hit the torchvision bug, so that
+   path was not exercised; the default `patch_warmup=True` path was, and is
+   what the verified output above uses.)*
 
 The adapter's `VC4Backend` is glue: torch tensor in, numpy through
 `Engine.run`, numpy out.  `.pt`, `.engine` and other formats keep their normal

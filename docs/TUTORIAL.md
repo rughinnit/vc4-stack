@@ -1034,14 +1034,20 @@ pool ~4x.  That is well past the 256 MiB CMA on this board (and past what the
 here; the honest statement is "320 is the largest measured size, and 640 is out
 of the board's memory budget."
 
-The default 72 MiB daemon / 64 MiB client fails 320 at plan time with:
+The default 96 MiB daemon / 64 MiB client fails 320 at plan time with a
+message that names both sides:
 
 ```
-vc4infer: unsupported: unsupported graph: graph pool exhausted:
-589888 B needed, 7845248 B used of 8388608 B
+vc4infer: unsupported: unsupported graph: graph pool needs at least N MiB
+  (weights + packed conv panels + the largest tensor) and this model's peak is
+  about P MiB, but the client arena is A MiB with S MiB reserved for
+  conv/elementwise scratch: start vc4d with a larger --arena-mb (or set
+  VC4INFER_ARENA_MB) ...
 ```
 
-(exit 3).  That is the arena, not a kernel bug; see section 9.6.
+(exit 3; N/P/A/S are that model's numbers - older releases instead printed
+`graph pool exhausted: ... of 8388608 B`, which read like a model-size
+problem).  That is the arena, not a kernel bug; see section 9.6.
 
 ### 7.3 GEMM ceilings: engine vs hand-written asm10
 

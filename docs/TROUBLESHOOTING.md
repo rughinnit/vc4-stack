@@ -368,15 +368,17 @@ are on an older build, upgrade; the 1.2.1 `selftest` reports 0/44,100 over in
 both sides:
 
 ```
-vc4infer: unsupported: unsupported graph: graph pool needs at least 68.4 MiB
+vc4infer: unsupported: unsupported graph: graph pool needs at least 24.8 MiB
   (weights + packed conv panels + the largest tensor) and this model's peak is
-  about 84.1 MiB, but the client arena is 64.0 MiB with 23.5 MiB reserved for
+  about 41.6 MiB, but the client arena is 16.0 MiB with 5.8 MiB reserved for
   conv/elementwise scratch: start vc4d with a larger --arena-mb (or set
-  VC4INFER_ARENA_MB) - about 113.7 MiB would do - or lower VC4_POOL_RESERVE_MB
+  VC4INFER_ARENA_MB) - about 38.5 MiB would do - or lower VC4_POOL_RESERVE_MB
 ```
 
-(older releases printed `graph pool exhausted: 589888 B needed, 7845248 B used
-of 8388608 B`, because the pool was floored at 8 MiB - G10)
+(those are the YOLOv8n-160 numbers against a 16 MiB client region; a 320x320
+model reports its own.  Older releases printed `graph pool exhausted: 589888 B
+needed, 7845248 B used of 8388608 B` instead, because the pool was floored at
+8 MiB - G10)
 
 **Cause.** The default `vc4d` unit serves 96 MiB, which leaves the client its
 64 MiB region.  A 320x320 YOLOv8n needs a ~68 MiB graph pool plus >=23 MiB of

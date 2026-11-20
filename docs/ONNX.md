@@ -559,7 +559,10 @@ Measured on the `bilinear` graph (Conv 8->16 3x3 then a 2x linear resize of a
 12x12 map): **5 runs, 0/9216 mismatches, max abs 5.25e-6**, 16.2 ms mean
 wall, 1.9 ms GPU, 23 launches.  The working set is about 6x the output (four
 taps + four weights + temporaries), so a large resize can exhaust the graph
-pool; `Pool.alloc` raises `graph pool exhausted` with the exact byte count.
+pool; since `vc4infer` 1.2.5 the pool is sized from the graph's own peak, a
+short estimate grows by another arena segment, and a model that cannot fit is
+refused at plan time with the bytes needed, the scratch reserve and the arena
+size instead of a mid-run `graph pool exhausted ... of N B`.
 A dedicated bilinear kernel would cut both the launches and the memory; it is
 the obvious next step.
 

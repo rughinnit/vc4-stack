@@ -60,3 +60,58 @@ engine ~8 % (8.50 -> 7.80 GFLOP/s).  With four pure ARM spinners the engine's
 polling path loses 32 % (3.95 -> 5.23 ms/rep).  So compare performance numbers
 between runs with the same background load -- but the "same binary, half the
 speed" clock effect is no longer part of that variance.
+
+## It came back, and the cause was firmware DVFS (2026-11-20, second occurrence)
+
+A "same binary, half the speed" effect reappeared: `mm 256^3` measured
+**3.73 GFLOP/s** where the recorded best is 8.40, with `throttled=0x0`,
+1.3125 V and 43-45 C.  Sampling the clock *during* the load explained it:
+
+```
+core=400000000 thr=0x0 temp=43.5
+core=400000000 thr=0x0 temp=44.0
+core=400000000 thr=0x0 temp=43.5
+core=250000000 thr=0x0 temp=42.9   <- after ~4 s of QPU load
+core=250000000 thr=0x0 temp=42.9
+```
+
+The core drops **400 -> 250 MHz** mid-benchmark, at a die temperature that is
+not the cause.  On this board the firmware's DVFS decides the core clock from
+the V3D's activity, and **our QPU work goes through `vc4d`, which the firmware
+cannot see**: the V3D is idle while the QPUs are saturated, so the core is
+downclocked to its minimum.  The Python/VC4CL paths show the same thing
+whenever their GL/V3D component is idle.
+
+`/boot/firmware/config.txt` had **no** `core_freq` line, so the clock was
+firmware-managed.  It now pins the **stock** frequency:
+
+```
+# Pin the core (QPU) clock to its stock 400 MHz. The firmware DVFS cannot
+# see QPU work issued through vc4d, so it drops the core to 250 MHz in the
+# middle of a benchmark. This is the stock maximum, not an overclock.
+core_freq=400
+core_freq_min=400
+```
+
+`core_freq_min` is the line that matters: `core_freq` alone still allowed the
+drop after ~4 s.  Neither value is above the board's stock 400 MHz and no
+voltage was changed -- this is a *floor* at the stock maximum, not
+overclocking.
+
+Verified after a reboot:
+
+| check | before | after |
+|---|---:|---:|
+| core clock, sustained 400-rep load | 250 MHz after ~4 s | **400 MHz in 5/5 samples** |
+| `mm 256^3` | 3.73 GFLOP/s (8.99 ms) | **8.47 GFLOP/s (3.96 ms)** |
+| YOLOv8n 160 | 767 ms / 1.30 FPS | **487 ms / 2.05 FPS** |
+| temperature under load | 42.9 C | 44.5-46.2 C |
+| `throttled` | 0x0 | 0x0 |
+
+**Consequence for the record:** any measurement taken on this board between
+the previous reboot and this fix may have been at 250 MHz without saying so.
+The numbers in `docs/COMPLETENESS.md`, `docs/ONNX.md` and the release notes
+should be read with the clock check in mind; `vc4infer util` and `vc4-smi`
+print the clock for exactly this reason.  The lesson is the same as the first
+occurrence: **record the clock with every number, and pin it before comparing
+two runs.**

@@ -173,6 +173,21 @@ class Engine:
                                       ctypes.c_uint32, ctypes.c_uint32,
                                       ctypes.POINTER(Buf)]
         L.vc4_softmax_fwd.restype = ctypes.c_int
+        # last-axis softmax, any class count (fused kernel <= 16 classes)
+        L.vc4_softmax.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
+                                  ctypes.c_uint32, ctypes.c_uint32,
+                                  ctypes.POINTER(Buf)]
+        L.vc4_softmax.restype = ctypes.c_int
+        # ctx, x, gamma, beta, running_mean, running_var, out, N, C, HW, eps
+        L.vc4_batchnorm_infer.argtypes = \
+            [ctypes.c_void_p] + [ctypes.POINTER(Buf)] * 6 + \
+            [ctypes.c_uint32] * 3 + [ctypes.c_float]
+        L.vc4_batchnorm_infer.restype = ctypes.c_int
+        # ctx, x, gamma, beta, out, save_mean, save_invstd, rows, cols, eps
+        L.vc4_layernorm_fwd.argtypes = \
+            [ctypes.c_void_p] + [ctypes.POINTER(Buf)] * 6 + \
+            [ctypes.c_uint32] * 2 + [ctypes.c_float]
+        L.vc4_layernorm_fwd.restype = ctypes.c_int
         L.vc4_conv_nhwc_wpanel_bytes.argtypes = [ctypes.c_int] * 5
         L.vc4_conv_nhwc_wpanel_bytes.restype = ctypes.c_size_t
         L.vc4_conv_nhwc_pack_w.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
@@ -380,6 +395,27 @@ class Engine:
         self._check(self.lib.vc4_softmax_fwd(
             self.ctx, ctypes.byref(x), rows, cols, ctypes.byref(out)),
             "softmax_fwd")
+
+    def softmax(self, x, out, rows, cols):
+        """Last-axis softmax, any class count (stable only up to |x| < 80)."""
+        self._check(self.lib.vc4_softmax(
+            self.ctx, ctypes.byref(x), rows, cols, ctypes.byref(out)),
+            "softmax")
+
+    def batchnorm_infer(self, x, gamma, beta, mean, var, out, N, C, HW, eps):
+        """y = (x - mean)/sqrt(var + eps)*gamma + beta (fixed operand order)."""
+        self._check(self.lib.vc4_batchnorm_infer(
+            self.ctx, ctypes.byref(x), ctypes.byref(gamma),
+            ctypes.byref(beta), ctypes.byref(mean), ctypes.byref(var),
+            ctypes.byref(out), N, C, HW, float(eps)), "batchnorm_infer")
+
+    def layernorm_fwd(self, x, gamma, beta, out, save_mean, save_invstd,
+                      rows, cols, eps):
+        """Standardise each row over cols columns, then *gamma + beta."""
+        self._check(self.lib.vc4_layernorm_fwd(
+            self.ctx, ctypes.byref(x), ctypes.byref(gamma),
+            ctypes.byref(beta), ctypes.byref(out), ctypes.byref(save_mean),
+            ctypes.byref(save_invstd), rows, cols, float(eps)), "layernorm")
 
     # ---- generic kernels (vc4_gen.c)
     def unary(self, op, a, out, n, p0=0.0, p1=0.0, p2=0.0):

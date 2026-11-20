@@ -5,6 +5,26 @@ clocks** (core 400 MHz / V3D 300 MHz).  Everything that computes runs on the
 VC4 QPUs.  The ARM cores run the control plane only (allocation, I/O, byte
 movement); there is no CPU arithmetic fallback anywhere in this stack.
 
+## This is the main repository
+
+The whole VideoCore IV project is organised around this repo: the engine, the
+kernels, the training core, the measurements and the documentation are here, and
+issues belong here. The other repositories are either components or the package
+channel.
+
+| repository | role |
+|---|---|
+| **`vc4-stack`** (this repo) | **main**: inference engine, QPU kernels, training, docs, measurements |
+| `vc4-apt` | the only install source: signed apt repo + pip index (`apt install vc4-toolkit`) |
+| `torch-vc4` | PyTorch `PrivateUse1` backend (`torch_vc4 0.3.0`) |
+| `vc4top` | GPU monitor TUI + the `vc4mon` DKMS module |
+| `VC4C` | OpenCL C → QPU compiler (fork; performance branches) |
+| `VC4CL` | OpenCL runtime (fork; Debian 13 + unprivileged fixes) |
+| `VC4CLStdLib` | GPU-side OpenCL standard library (fork) |
+
+Full table, the two execution paths and a "which repo do I open" guide:
+[`docs/ECOSYSTEM.md`](docs/ECOSYSTEM.md).
+
 ## Start here
 
 New to the stack?  Follow the tutorial, in this order:

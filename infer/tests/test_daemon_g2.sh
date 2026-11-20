@@ -207,6 +207,13 @@ LOG=$LOGD-b.log
 say "-- B. degrade: holding CMA down to ${leave} MiB free across startup"
 hold_until_free "$leave" || say "   (could only reach $(free_mb) MiB free)"
 say "   CmaFree $(free_mb) MiB"
+# If the hold could not reach the target, the premise of this phase (a daemon
+# that has to degrade) does not exist -- skip, do not fail.  On this board with
+# 256 MiB of CMA the hold often stops at ~20 MiB, and the daemon then starts
+# fine, which used to read as a failure of the fix rather than of the setup.
+if [ "$(free_mb)" -gt "$leave" ]; then
+    skip "phase B skipped: could not drive CMA to ${leave} MiB (reached $(free_mb) MiB), so the daemon has no reason to degrade"
+fi
 launch_daemon
 if ! wait_ready; then
     if [ "$(free_mb)" -lt 14 ]; then

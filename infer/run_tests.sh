@@ -89,6 +89,12 @@ echo "=== test_daemon_recover (G1: a launch timeout must not kill the daemon)"
 echo "=== test_daemon_arena   (G9: the arena comes back with the client)"
 TMPD=${TMPDIR:-$HOME/scratch/tmp}
 mkdir -p "$TMPD"
+# The private daemon must be built from the current sources.  Starting a stale
+# binary here is how G1 once reported dead=99: the daemon's stats struct had
+# gained fields and the client read a neighbouring one.  Same class as B12.
+make -C "$VC4D_DIR" -s build/vc4d || {
+	echo "FAIL: could not build the tree's vc4d" >&2; exit 1; }
+
 TSOCK=/run/vc4d-test-$$.sock
 sudo -n rm -f "$TSOCK"
 sudo -n "$VC4D_DIR/build/vc4d" --socket "$TSOCK" --arena-mb 16 \

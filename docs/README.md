@@ -36,6 +36,7 @@ and every path below is relative to the repository root unless it starts with
 | `BUILD.md` | build parallelism on 1 GB: engine -j4 safe, VC4C -j2/-j1, ccache, `tools/build-fast.sh` |
 | `CLOCK-VARIANCE.md` | core clock drooped 400->250 MHz under load *before* the fan; 89/89 samples at 400 MHz with it |
 | [`OPS-UNARY.md`](OPS-UNARY.md) | the inverse/hyperbolic unary family (asin/acos/atan/atanh/asinh/acosh/sinh/cosh/tan): per-op method, enforced domain, measured accuracy, the refusals and their exact limits |
+| [`OPS-NORM.md`](OPS-NORM.md) | the pooling / normalisation / softmax-variant / loss family (AveragePool, GlobalMaxPool, LpPool, GlobalLpPool, MaxUnpool, BatchNormalization, InstanceNormalization, GroupNormalization, LayerNormalization, MeanVarianceNormalization, LRN, Hardmax, LogSoftmax, Softmax, SoftmaxCrossEntropyLoss, NegativeLogLikelihoodLoss, Dropout): per-op method, the enforced epsilon placement and channel-axis layout, measured accuracy, every refusal with its exact reason, the five onnx.reference divergences, and two engine limits worked around |
 | `ONNX.md` | ONNX graph path: supported nodes, runner usage, measured modelA/B/C numbers, stride-2/depthwise decompositions, YOLOv8n coverage, the device byte invariant |
 | `VC4INFER.md` | the packaged product: install, `run`/`bench`/`nodes`/`selftest`, guarantees, measured performance, package layout |
 | `PYTHON-API.md` | the earlier `Engine`, `Device`, `Detector`, threading, error and Ultralytics reference (kept for history; `API.md` is current) |

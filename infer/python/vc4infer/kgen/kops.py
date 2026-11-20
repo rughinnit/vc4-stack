@@ -23,7 +23,8 @@ Kernel ABI (one 64 B uniform block per QPU; all offsets are arena bytes)
             u5 red, u6 op, u7 in offset, u8 in gap, u9 in step,
             u10 out offset, u11 out step, u12 out gap, u13 1/red,
             u14 lanestride (red*4)
-    cumsum  u0 a bus, u1 out bus, u2 groups, u3 qid, u4 nqpu, u5 cols
+    cumsum  u0 a bus, u1 out bus, u2 groups, u3 qid, u4 nqpu, u5 cols,
+            u6 carry seed address (one float: the total so far)
 
 A "group" is NVEC vectors of 16 lanes; QPU q runs groups q, q+nqpu, ...
 Each vector produces 16 consecutive output floats.  The QPU FPU truncates
@@ -1414,7 +1415,15 @@ def _prologue(k, b, nvec, vpmq16, consts):
     b.e(k.add_(k.ADD_ADD, A_T2, k.areg(A_NQ), k.breg(B_NEG1)))
     b.e(k.add_(k.ADD_SHL, B_GAP, k.areg(A_T2), k.imm(shift), ws=1))
     if vpmq16:
-        b.e(k.add_(k.ADD_SHL, A_VPMQ, k.areg(A_QID), k.imm(2)))
+        # The VPM row (write) and the VDW read row must be this QPU's own
+        # 4-row sector, selected by the *hardware* QPU number, exactly as
+        # build_ew/emit_store16 do.  The uniform group index is not the same
+        # thing: a launch can place a group on a physical QPU other than the
+        # one the uniform names, and a store aimed at another QPU's sector
+        # never reaches memory (the kernel completes, the caller keeps the
+        # previous launch's bytes).
+        b.e(k.add_or(A_VPMQ, k.breg(k.R_QPU_NUM), k.breg(k.R_QPU_NUM)))
+        b.e(k.add_(k.ADD_SHL, A_VPMQ, k.areg(A_VPMQ), k.imm(2)))
         b.e(k.add_(k.ADD_SHL, B_VPMQ7, k.areg(A_VPMQ), k.imm(7), ws=1))
     else:
         b.e(k.add_(k.ADD_SHL, B_V4, k.areg(A_QID), k.imm(2), ws=1))
@@ -1441,12 +1450,27 @@ def _aw(reg):
     return reg
 
 
-def _stream_base(k, b, bus_reg, ptr_reg):
+def _stream_base(k, b, bus_reg, ptr_reg, lane=True):
+    """ptr_reg = bus + q*gb [+ lane*4].
+
+    `lane` is for the TMU streams: a gather/scan address is per-lane, so the
+    lane byte offset is part of it.  The VPM->DMA *store* address is a scalar
+    -- every lane must present the same value.  Adding lane*4 there made the
+    store write nothing at all on silicon (measured: a marker that stores 42.0
+    with a per-lane address returns the previous launch's bytes no matter how
+    long the program then runs, while the same marker with a uniform address
+    works); the four kernels below shared the gather helper, so their output
+    stream carried the lane offset too.  The DMA address is therefore built
+    without it.
+    """
     b.e(k.add_(k.ADD_OR, _aw(ACC3), k.areg(bus_reg), k.areg(bus_reg)))
     b.e(k.nop(), k.nop())
     b.e(k.add_(k.ADD_ADD, _aw(ACC3), k.acc(3), k.areg(A_T1)))
     b.e(k.nop(), k.nop())
-    b.e(k.add_(k.ADD_ADD, ptr_reg, k.acc(3), k.areg(A_T0)))
+    if lane:
+        b.e(k.add_(k.ADD_ADD, ptr_reg, k.acc(3), k.areg(A_T0)))
+    else:
+        b.e(k.add_(k.ADD_OR, ptr_reg, k.acc(3), k.acc(3)))
     b.e(k.nop(), k.nop())
 
 
@@ -1455,6 +1479,18 @@ def _store(k, b, nvec, vpmq16):
     b.check = False
     if vpmq16:
         k.emit_store16(p, 0)
+        # emit_store16 arms each chunk's DMA and reads vpm_st_wait on the very
+        # next word.  The read can reach the status register before the DMA has
+        # started, so it reports "idle" and returns without waiting; the last
+        # chunk is then still in flight when the program reaches `end`, and the
+        # output keeps the previous launch's bytes (nondeterministically --
+        # sometimes the DMA wins the race and the result is correct).  Give the
+        # last transfer a couple of words to start, then wait for it to drain.
+        # This is the whole difference between the marker that stores 42.0 and
+        # the same marker with a long nop tail.
+        b.e(k.nop(), k.nop())
+        b.e(k.add_or(k.W_NOP, k.breg(k.R_VPW_WAIT), k.breg(k.R_VPW_WAIT)))
+        b.e(k.nop(), k.nop())
     else:
         k._store4(b, B_V4, B_V9, A_CADR, 0)
         if nvec == 8:
@@ -1470,8 +1506,14 @@ def _load(k, b, addr_reg, acc=0, tmu=0):
     b.e(k.add_or(w, k.areg(addr_reg), k.areg(addr_reg), ws=1))
     b.e(k.nop(), k.nop(), k.nop(), k.nop())
     b.e(k.nop(), k.nop(), k.nop(), k.nop())
-    b.e(k.alu(sig=sig, cond_add=k.COND_NEVER, cond_mul=k.COND_NEVER))
-    b.e(k.add_or(32 + acc, k.acc(4), k.acc(4)))
+    # The TMU response lands in accumulator 4 on the SIG_LOAD word; the QPU
+    # has no forwarding, so a read of acc4 in the very next word sees the
+    # previous response (in a loop, the previous vector; on the first vector,
+    # the previous launch).  build_ew's verified pipeline puts one nop between
+    # the load and the pop, and one after it before the body reads the staging
+    # accumulator; the same two gaps are required here.
+    b.e(k.alu(sig=sig, cond_add=k.COND_NEVER, cond_mul=k.COND_NEVER), k.nop())
+    b.e(k.add_or(32 + acc, k.acc(4), k.acc(4)), k.nop())
 
 
 def _consts_load(k, b, consts):
@@ -2005,7 +2047,7 @@ def build_sel3(k, op):
     _consts_load(k, b, consts)
     _prologue(k, b, nvec, True, consts)
     _stream_base(k, b, A_AB, A_IB)
-    _stream_base(k, b, A_OB, A_OB2)
+    _stream_base(k, b, A_OB, A_OB2, lane=False)
     A_BP, A_CP = A_P0, A_P1
     for reg, bus in ((A_BP, A_BP), (A_CP, A_CP)):
         b.e(k.add_(k.ADD_OR, _aw(ACC1), k.areg(bus), k.areg(bus)))
@@ -2078,7 +2120,7 @@ def build_gather(k):
     _consts_load(k, b, consts)
     _prologue(k, b, nvec, True, consts)
     _stream_base(k, b, A_AB, A_IB)
-    _stream_base(k, b, A_OB, A_OB2)
+    _stream_base(k, b, A_OB, A_OB2, lane=False)
     p.label('grp')
     b.e(k.add_or(A_CADR, k.areg(A_OB2), k.areg(A_OB2)))
     for j in range(nvec):
@@ -2193,8 +2235,14 @@ def build_reduce(k, op):
     b.read_uni(b_ls, ws=1)
     _consts_load(k, b, consts)
     b.e(k.ldi(256, B_CSTEP, ws=1))
-    b.e(k.add_(k.ADD_SHL, A_VPMQ, k.areg(A_QID), k.imm(2)))
-    b.e(k.add_(k.ADD_SHL, B_VPMQ7, k.areg(A_QID), k.imm(7), ws=1))
+    # VDM read row = 4*qpu (row field is bits 7..12), i.e. the same row the
+    # vpw_generic write setup selects.  This used to shift A_QID by 7, which
+    # puts `qid` in the row field: QPU 1 wrote rows 4..7 and DMA-read row 1,
+    # so every group after the first returned another QPU's VPM contents
+    # (measured: outer=512, red=1, out[256] = a[16]).
+    b.e(k.add_or(A_VPMQ, k.breg(k.R_QPU_NUM), k.breg(k.R_QPU_NUM)))
+    b.e(k.add_(k.ADD_SHL, A_VPMQ, k.areg(A_VPMQ), k.imm(2)))
+    b.e(k.add_(k.ADD_SHL, B_VPMQ7, k.areg(A_VPMQ), k.imm(7), ws=1))
     # lane * lane_stride  and  lane * 4
     b.e(k.add_(k.ADD_OR, _aw(ACC0), k.areg(k.R_ELEM_NUM),
                k.areg(k.R_ELEM_NUM)))
@@ -2214,7 +2262,8 @@ def build_reduce(k, op):
     b.e(k.nop(), k.nop())
     b.e(k.add_(k.ADD_ADD, _aw(ACC3), k.acc(3), k.areg(A_OUTBASE)))
     b.e(k.nop(), k.nop())
-    b.e(k.add_(k.ADD_ADD, A_OB2, k.acc(3), k.acc(2)))
+    # uniform DMA address: no lane*4 (see _stream_base)
+    b.e(k.add_(k.ADD_OR, A_OB2, k.acc(3), k.acc(3)))
     b.e(k.nop(), k.nop())
     p.label('grp')
     b.e(k.add_or(A_CADR, k.areg(A_OB2), k.areg(A_OB2)))
@@ -2297,12 +2346,12 @@ def build_cumsum(k):
     b.read_uni(A_QID)
     b.read_uni(A_NQ)
     b.read_uni(A_P0)
-    b.read_uni(A_P1)
+    b.read_uni(A_P1)          # carry seed address (u6)
     b.read_uni(A_P2)
     _consts_load(k, b, consts)
     _prologue(k, b, nvec, True, consts)
     _stream_base(k, b, A_AB, A_IB)
-    _stream_base(k, b, A_OB, A_OB2)
+    _stream_base(k, b, A_OB, A_OB2, lane=False)
     # mask_s = all ones iff lane >= s
     for s, reg in ((1, b_m1), (2, b_m2), (4, b_m4), (8, b_m8)):
         b.e(k.add_(k.ADD_SUB, _aw(ACC0), k.areg(k.R_ELEM_NUM), k.imm(s)))
@@ -2313,8 +2362,13 @@ def build_cumsum(k):
         b.e(k.nop(), k.nop())
     p.label('grp')
     b.e(k.add_or(A_CADR, k.areg(A_OB2), k.areg(A_OB2)))
-    b.e(k.add_(k.ADD_OR, b_carry, k.breg(consts['ZERO'][1]),
-               k.breg(consts['ZERO'][1]), ws=1))
+    # Seed the running total from u6.  For the first 256-column chunk of a row
+    # this points at a zero word; for a later chunk it points at the previous
+    # chunk's last output word, so the scan continues instead of restarting.
+    # Every lane reads the same address, so the broadcast is immediate.
+    _load(k, b, A_P1, 0)
+    b.e(k.nop(), k.nop())
+    b.e(k.add_or(b_carry, k.acc(0), k.acc(0), ws=1))
     b.e(k.nop(), k.nop())
     for j in range(nvec):
         _load(k, b, A_IB, 0)
@@ -2383,9 +2437,16 @@ A_SB, A_DB, A_S, A_D, A_VCNT, A_BCNT = 19, 20, 21, 22, 23, 24
 # temp pool also uses -- the store address was the sign mask.
 A_TA2, A_CD2 = 26, 27
 A_MASK, A_NMASK, A_FILLN, A_STRCO = 28, 29, 30, 31
-B_SVEC, B_DVEC, B_SLANE, B_SSTEP, B_DSTEP = 0, 1, 2, 3, 4
-B_C4D, B_STRIDE, B_VPMQ, B_VPMQ7, B_FILL, B_C64, B_VPR = 5, 6, 7, 8, 9, 10, 11
-B_NLANE, B_NBLK, B_SBSTEP, B_DBSTEP, B_LV = 12, 13, 14, 15, 16
+C2_SVEC, C2_DVEC, C2_SLANE, C2_SSTEP, C2_DSTEP = 0, 1, 2, 3, 4
+# copy2d-only names.  This block used to reuse B_VPMQ7 (the module's
+# DMA read-row register, B23) and B_C64 (the per-vector table/source
+# advance, B21): because it is at module scope it rebound both, so
+# gather/sel3/cumsum loaded B_C64 into B10 (clobbered by the body's
+# temp pool) and wrote the VDW read row into B8 while emit_store16
+# read B23.  The store then pointed at a VPM row the QPU had not
+# written, and the caller kept the previous launch's bytes.
+C2_C4D, C2_STRIDE, C2_VPMQ, C2_VPMQ7, C2_FILL, C2_C64, C2_VPR = 5, 6, 7, 8, 9, 10, 11
+C2_NLANE, C2_NBLK, C2_SBSTEP, C2_DBSTEP, C2_LV = 12, 13, 14, 15, 16
 
 
 def _ushift(units):
@@ -2426,48 +2487,48 @@ def build_copy2d(k, fill=0, units=4, depth=16):
     b.read_uni(A_SRC)                    # u0
     b.read_uni(A_DST)                    # u1
     b.read_uni(A_ROWS)                   # u2
-    b.read_uni(B_SSTEP, ws=1)            # u3
-    b.read_uni(B_DSTEP, ws=1)            # u4
-    b.read_uni(B_VPR, ws=1)              # u5
-    b.read_uni(B_SVEC, ws=1)             # u6
-    b.read_uni(B_DVEC, ws=1)             # u7
-    b.read_uni(B_SLANE, ws=1)            # u8
-    b.read_uni(B_VPMQ, ws=1)             # u9
-    b.read_uni(B_VPMQ7, ws=1)            # u10
-    b.read_uni(B_NLANE, ws=1)            # u11
-    b.read_uni(B_NBLK, ws=1)             # u12
-    b.read_uni(B_SBSTEP, ws=1)           # u13
-    b.read_uni(B_DBSTEP, ws=1)           # u14
-    b.read_uni(B_STRIDE, ws=1)           # u15
+    b.read_uni(C2_SSTEP, ws=1)            # u3
+    b.read_uni(C2_DSTEP, ws=1)            # u4
+    b.read_uni(C2_VPR, ws=1)              # u5
+    b.read_uni(C2_SVEC, ws=1)             # u6
+    b.read_uni(C2_DVEC, ws=1)             # u7
+    b.read_uni(C2_SLANE, ws=1)            # u8
+    b.read_uni(C2_VPMQ, ws=1)             # u9
+    b.read_uni(C2_VPMQ7, ws=1)            # u10
+    b.read_uni(C2_NLANE, ws=1)            # u11
+    b.read_uni(C2_NBLK, ws=1)             # u12
+    b.read_uni(C2_SBSTEP, ws=1)           # u13
+    b.read_uni(C2_DBSTEP, ws=1)           # u14
+    b.read_uni(C2_STRIDE, ws=1)           # u15
     # ACC2 = dvec, reused for the derived words (chunk step, store stride)
-    b.e(k.ldi(fill & M32, B_FILL, ws=1))
+    b.e(k.ldi(fill & M32, C2_FILL, ws=1))
     b.e(k.ldi(0xC0010000, A_STRCO))
-    b.e(k.add_or(34, k.breg(B_DVEC), k.breg(B_DVEC)))
-    b.e(k.add_(k.ADD_SHL, B_C4D, k.acc(2), k.imm(_ushift(units)), ws=1))
+    b.e(k.add_or(34, k.breg(C2_DVEC), k.breg(C2_DVEC)))
+    b.e(k.add_(k.ADD_SHL, C2_C4D, k.acc(2), k.imm(_ushift(units)), ws=1))
     # lane mask: mask = -1 for lane < nlane, 0 otherwise
-    b.e(k.add_(k.ADD_SUB, A_TA2, k.areg(k.R_ELEM_NUM), k.breg(B_NLANE)))
+    b.e(k.add_(k.ADD_SUB, A_TA2, k.areg(k.R_ELEM_NUM), k.breg(C2_NLANE)))
     b.e(k.add_(k.ADD_ASR, A_MASK, k.areg(A_TA2), k.imm(31)))
     b.e(k.add_(k.ADD_NOT, A_NMASK, k.areg(A_MASK), k.areg(A_MASK)))
-    b.e(k.add_(k.ADD_AND, A_FILLN, k.breg(B_FILL), k.areg(A_NMASK)))
+    b.e(k.add_(k.ADD_AND, A_FILLN, k.breg(C2_FILL), k.areg(A_NMASK)))
     # lane * slane, in the B file so a vector address is one A + one B read
     b.e(k.add_(k.ADD_OR, 33, k.areg(k.R_ELEM_NUM),
                k.areg(k.R_ELEM_NUM)))                          # ACC1 = lane
     b.e(dict(mul_op=k.MUL_MUL24, mul_out=32 + 2, mul_a=k.acc(1),
-             mul_b=k.breg(B_SLANE), ws=0, sig=k.SIG_NONE))
-    b.e(k.add_or(B_LV, k.acc(2), k.acc(2), ws=1))
+             mul_b=k.breg(C2_SLANE), ws=0, sig=k.SIG_NONE))
+    b.e(k.add_or(C2_LV, k.acc(2), k.acc(2), ws=1))
     p.label('row')
     b.e(k.add_or(A_SB, k.areg(A_SRC), k.areg(A_SRC)))
     b.e(k.add_or(A_DB, k.areg(A_DST), k.areg(A_DST)))
-    b.e(k.add_or(A_BCNT, k.breg(B_NBLK), k.breg(B_NBLK)))
+    b.e(k.add_or(A_BCNT, k.breg(C2_NBLK), k.breg(C2_NBLK)))
     p.label('blk')
     b.e(k.add_or(A_S, k.areg(A_SB), k.areg(A_SB)))
     b.e(k.add_or(A_D, k.areg(A_DB), k.areg(A_DB)))
-    b.e(k.add_or(A_VCNT, k.breg(B_VPR), k.breg(B_VPR)))
+    b.e(k.add_or(A_VCNT, k.breg(C2_VPR), k.breg(C2_VPR)))
     p.label('chunk')
     b.e(k.add_or(A_CD2, k.areg(A_D), k.areg(A_D)))
     for r in range(units):
         # lanes >= nlane read at the vector base instead of past the source
-        b.e(k.add_(k.ADD_AND, 33, k.breg(B_LV), k.areg(A_MASK)))
+        b.e(k.add_(k.ADD_AND, 33, k.breg(C2_LV), k.areg(A_MASK)))
         b.e(k.add_(k.ADD_ADD, A_TA2, k.acc(1), k.areg(A_S)))
         b.e(k.add_or(k.W_TMU0_S, k.areg(A_TA2), k.areg(A_TA2), ws=1))
         b.e(k.nop(), k.nop(), k.nop(), k.nop())
@@ -2478,20 +2539,20 @@ def build_copy2d(k, fill=0, units=4, depth=16):
         b.e(k.add_(k.ADD_AND, 33, k.acc(0), k.areg(A_MASK)))
         b.e(k.add_or(35, k.acc(1), k.areg(A_FILLN)))
         b.e(k.add_or(r, k.acc(3), k.acc(3)))           # store row r
-        b.e(k.add_(k.ADD_ADD, A_S, k.areg(A_S), k.breg(B_SVEC)))
-    _store_var(b, k, A_CD2, B_VPMQ, B_VPMQ7, A_STRCO, B_STRIDE,
+        b.e(k.add_(k.ADD_ADD, A_S, k.areg(A_S), k.breg(C2_SVEC)))
+    _store_var(b, k, A_CD2, C2_VPMQ, C2_VPMQ7, A_STRCO, C2_STRIDE,
                units, depth)
-    b.e(k.add_(k.ADD_ADD, A_D, k.areg(A_D), k.breg(B_C4D)))
+    b.e(k.add_(k.ADD_ADD, A_D, k.areg(A_D), k.breg(C2_C4D)))
     b.e(k.add_(k.ADD_SUB, A_VCNT, k.areg(A_VCNT), k.imm(units), sf=1))
     p.branch_to('chunk', cond=k.BR_ALL_Z_CLEAR)
     b.e(k.nop(), k.nop(), k.nop())
-    b.e(k.add_(k.ADD_ADD, A_SB, k.areg(A_SB), k.breg(B_SBSTEP)))
-    b.e(k.add_(k.ADD_ADD, A_DB, k.areg(A_DB), k.breg(B_DBSTEP)))
+    b.e(k.add_(k.ADD_ADD, A_SB, k.areg(A_SB), k.breg(C2_SBSTEP)))
+    b.e(k.add_(k.ADD_ADD, A_DB, k.areg(A_DB), k.breg(C2_DBSTEP)))
     b.e(k.add_(k.ADD_SUB, A_BCNT, k.areg(A_BCNT), k.imm(1), sf=1))
     p.branch_to('blk', cond=k.BR_ALL_Z_CLEAR)
     b.e(k.nop(), k.nop(), k.nop())
-    b.e(k.add_(k.ADD_ADD, A_SRC, k.areg(A_SRC), k.breg(B_SSTEP)))
-    b.e(k.add_(k.ADD_ADD, A_DST, k.areg(A_DST), k.breg(B_DSTEP)))
+    b.e(k.add_(k.ADD_ADD, A_SRC, k.areg(A_SRC), k.breg(C2_SSTEP)))
+    b.e(k.add_(k.ADD_ADD, A_DST, k.areg(A_DST), k.breg(C2_DSTEP)))
     b.e(k.add_(k.ADD_SUB, A_ROWS, k.areg(A_ROWS), k.imm(1), sf=1))
     p.branch_to('row', cond=k.BR_ALL_Z_CLEAR)
     b.e(k.nop(), k.nop(), k.nop())

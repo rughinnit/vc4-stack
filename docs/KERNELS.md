@@ -1,4 +1,4 @@
-# The five gated kernels, and the exact erf-form GELU derivative
+# The five kernels that were gated, and the exact erf-form GELU derivative
 
 This file records the engine-level work on the kernels that `vc4_guard.c`
 refused: `vc4_gather`, `vc4_blit`, `vc4_reduce`, `vc4_cumsum`, `vc4_select3`,
@@ -9,16 +9,15 @@ Status at the end of this run:
 | entry point | status | evidence |
 |---|---|---|
 | `vc4_blit` | **fixed, ungated** | byte-exact on silicon: 0/1600 B and 0/208 B, `tests/test_gated blit` |
-| `vc4_gather` | gated, defects fixed | exact in the ALU/TMU model; silicon still returns another launch's bytes |
-| `vc4_reduce` | gated, defects fixed | exact in the ALU/TMU model (6 ops); silicon still returns another launch's bytes |
-| `vc4_cumsum` | gated, defects fixed | exact in the ALU/TMU model; silicon still returns another launch's bytes |
-| `vc4_select3` | gated, defects fixed | exact in the ALU/TMU model (3 ops); silicon still returns another launch's bytes |
+| `vc4_gather` | **fixed, ungated** | 0 bad at n = 1, 16, 17, 255, 256, 257, 1000, `tests/test_gated gather` |
+| `vc4_reduce` | **fixed, ungated** | 0 bad for all 6 ops, outer 1..1024, red 1..64 |
+| `vc4_cumsum` | **fixed, ungated** | 0 bad for 1x256, 2x256, 3x512, 5x1024 (max\\|err\\| 7.6e-05) |
+| `vc4_select3` | **fixed, ungated** | 0 bad for where/clip3/prelu at n = 1..1000 |
 | `VC4_BW_GELU_ERF` | **implemented** | one 1967-word kernel at 4 vectors/group; gradcheck rel_L2 2.45e-07, over_tol 0 |
 
-The four remaining gates are honest about what they are: each names the
-defects that were found and fixed *and* the measured silicon symptom.  The
-element checks in `infer/tests/test_gated.c` are the test that turns green the
-moment the last defect is closed; today they print `GATED`.
+All five entry points are element-verified on silicon.  The gate has no call
+sites left; `vc4__refuse_unverified` stays as the fast-fail for a future blob
+that has not been through `test_gated`.
 
 ## 1. The model that found the defects
 
@@ -152,28 +151,76 @@ kernel, so a 6400 B copy is **one launch**; the old per-group kernel needed
 one group per 64 B (`bytes/64` groups, 12 per launch).  That is the shape the
 `bytes % 64` contract promises and the shape callers get.
 
-## 4. What the four remaining gates are waiting for
+## 4. Why the four kernels returned another launch's bytes
 
-The model says the emitted code computes the right thing, including the store
-address.  On silicon, with the same uniforms, the output is not the kernel's
-own result:
+The output was not a stale copy that some CPU path failed to invalidate: the
+VPM->DMA store did not land.  The store sequence itself was already identical
+to `build_ew`'s verified four-chunk store (confirmed word for word against a
+working blob), so the defect had to be in the state the store was given.
+Bisecting a marker that writes 42.0 to all 16 lanes found five independent
+faults.
 
-* a marker body that stores `42.0` in every lane returns a *previous launch's*
-  bytes, and the same value appears from the emulator's point of view only if
-  the address arithmetic is right;
-* `vc4_gather` at `n=1` (one 16-lane vector, one QPU) is wrong on the very
-  first element, so this is not tail or multi-group arithmetic;
-* `emu_kernel.run_kernel('tanh', nvec=4)` (the same harness that carries
-  `VC4_BW_GELU_ERF`, which *is* exact on silicon) works, so the harness and
-  the nv4 store are not the difference.
+### 4.1 `build_copy2d`'s register block sat at module scope
 
-The remaining difference between those kernels and `build_ew`'s harness is in
-`kops._prologue`/`_stream_base`/`emit_store16` as a whole: the nv16 store's
-VPM row (`A_VPMQ`) and DMA row (`B_VPMQ7`) are both derived from the *uniform*
-group index rather than the physical QPU, and the group's stream base is
-staged through an accumulator.  The next step is to rebuild one of them
-(`vc4_cumsum` is the smallest) directly on `build_ew`'s prologue and store,
-which are element-verified on silicon, and then re-apply the algorithm.
+`B_C4D, B_STRIDE, B_VPMQ, B_VPMQ7, B_FILL, B_C64, B_VPR = 5, ...` is
+*module-level* code above `build_copy2d`, so importing `kops` rebound
+
+* `B_VPMQ7` from 23 to **8**, and
+* `B_C64` from 21 to **10**.
+
+`_prologue` therefore loaded the per-vector table/source advance (64) into
+B10, which the per-vector temp pool hands out and clobbers, and wrote the VDW
+read row (`(4*qpu) << 7`) into B8 while `emit_store16` read B23 -- which
+nothing had written.  The DMA read a VPM row the QPU had not stored, the
+kernel finished normally, and the caller kept the previous launch's bytes.
+This is the same failure mode as A16's `A_CADR` rebinding.  The copy2d
+registers are `C2_*` now.
+
+### 4.2 `vc4_reduce` put the group index in the VDW row field
+
+`build_reduce` builds its prologue inline and computed
+`B_VPMQ7 = A_QID << 7`.  The VDW row field is bits 7..12, so that selects row
+`qid`, while the matching `vpw_generic` write setup selects row `4*qid`.
+Every QPU after the first DMA-read another QPU's sector; measured with
+`outer=512, red=1`, `out[256]` held `a[16]`, i.e. QPU 0's second store chunk,
+not `a[256]`.  Both rows are `4*qpu` now, taken from the hardware QPU number
+(`R_QPU_NUM`) rather than the uniform group index.
+
+### 4.3 The TMU pop was read one word too early
+
+`kops._load` issued `SIG_LOAD_TMU0/1` and read accumulator 4 on the very next
+word.  The response lands in acc4 *on* the load word, and the QPU does not
+forward, so the staging accumulator received the previous response -- the
+previous vector inside a loop, the previous launch on the first vector.
+`build_ew`'s verified pipeline keeps a nop between the load and the pop and
+one after it; `_load` does the same now.
+
+### 4.4 The DMA store address carried the lane offset
+
+`_stream_base` is shared by the TMU streams, where the address is per-lane,
+and by the output stream.  The VPM DMA address is a scalar: every lane
+presents the same value.  `build_ew` and `copy2d` both build it without a
+lane term; the four kernels carried `lane*4` into it.  The output stream is
+built with `lane=False` now.
+
+### 4.5 `vc4_cumsum`'s carry stopped at every 256 columns
+
+The scan kernel covers one 256-word chunk per group and restarted its carry
+at the group label, while the host spread a row's chunks over different
+QPUs.  No shape with `cols > 256` could be right.  The kernel now takes a
+carry-seed address (uniform 6), and the host walks the chunk positions in
+order, passing the previous chunk's last output word as the seed (a zero word
+in scratch for the first chunk).  Rows stay parallel: one row per QPU, so
+`5x1024` is four launches.
+
+### 4.6 What the model cannot see
+
+`emu_alu` executes the register/ALU/TMU behaviour and checks the per-lane DMA
+address, but it has no register-file forwarding model, no per-physical-QPU VPM
+sector, and it cannot observe a module-scope Python rebinding at all, because
+`emu_gated.py` calls the same `build_*` functions.  Each of 4.1-4.4 was exact
+in the model and wrong on silicon, which is why the element checks in
+`infer/tests/test_gated.c` are the verification that counts.
 
 ## 5. `Gelu`-erf backward
 
@@ -213,7 +260,7 @@ entry point returned `VC4_ERR_UNSUPPORTED`), and the registry row that already
 advertised the op is now true.  `VC4_BW_GELU_ERF`'s old "use the tanh form"
 refusal is gone.
 
-## 6. Cost of the compositions that the gated kernels still serve
+## 6. What the ungated kernels replace
 
 Measured launch counts of the compositions, from `docs/OPS-GEOMETRY.md` and
 `docs/OPS-GAPS.md` (same board, same clock pin):

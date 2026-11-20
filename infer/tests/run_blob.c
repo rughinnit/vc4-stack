@@ -11,6 +11,7 @@
 
 int main(int argc, char **argv)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 10) {
         fprintf(stderr, "usage: %s blob nqpu n u0..u5 [nout]\n", argv[0]);
         return 2;
@@ -98,7 +99,8 @@ int main(int argc, char **argv)
     }
     usleep(200000);            /* let an asynchronous VPM DMA drain */
     vc4__l2_flush(ctx);
-    printf("errors after settle: 0x%08x\n", ctx->v3d[0x0F20/4]);
+    if (ctx->v3d)
+        printf("errors after settle: 0x%08x\n", ctx->v3d[0x0F20/4]);
     if (getenv("DUMP_A")) {
         printf("a:");
         for (size_t i = 0; i < 16; ++i) printf(" %08x(%.5g)", *(uint32_t *)&a[i], (double)a[i]);

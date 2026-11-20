@@ -1,34 +1,28 @@
-/*
- * The unverified kernel gate.
+/* The unverified-kernel gate.
  *
- * These kernels are reachable from the public API, have never been exercised
- * by a test, and are confirmed to break the board.  Each one either hangs the
- * QPU (which kills the vc4d context for every later client on the machine) or
- * silently returns wrong results:
+ * This used to refuse six entry points.  All of them are now verified on
+ * silicon, so no call site uses it: vc4_blit rides copy2d, and
+ * vc4_gather/vc4_reduce/vc4_cumsum/vc4_select3 pass their element oracles
+ * (tests/test_gated.c).  What they all had in common was a broken VPM store:
  *
- *   vc4_gather   hands the TMU1 setup word an address taken from an
- *                accumulator (areg(100) encodes a different register) and its
- *                per-iteration load/pop does not match build_ew's 2-deep
- *                pipeline.  Both candidate fixes still hang the QPU.
- *   vc4_reduce   walks a fixed 256-output group, so it reads and writes past
- *                the caller's `outer` elements (a TMU read past the end of the
- *                arena hangs the board), and it seeds register 36 (r4) instead
- *                of r0.  Measured 2026-11-20, one launch per process: every
- *                shape, including outer=256 red=16, kills the context.
- *   vc4_cumsum   uses the same TMU setup as vc4_gather; every shape kills the
- *                context (measured 2026-11-20, one launch per process).
- *   vc4_select3  WHERE returns VC4_OK with every element wrong (the
- *                pad_stream/TMU lane pattern it shares with vc4_reduce).
- *   vc4_blit     returns VC4_OK and copies nothing; the 4-vector store path it
- *                uses (build_ew with nvec != 16) writes no output either.
- *   the ewb nvec=4 store path
- *                the unary (uop) path was fixed and verified on 2026-11-20
- *                (docs/NUMERICS.md: 4q write row, B8 constant exclusion); the
- *                backward bodies still need the same verification.
+ *   - build_copy2d's register block sat at module scope and rebound the
+ *     shared B_VPMQ7 (23 -> 8) and B_C64 (21 -> 10), so the four kernels
+ *     loaded their per-vector advance into B10 and wrote the VDW read row to
+ *     B8 while emit_store16 read B23.  The store then read a VPM row the QPU
+ *     had not written, and the caller kept the previous launch's bytes.
+ *   - vc4_reduce's manual prologue put the group index in the VDW row field
+ *     (qid<<7 is row qid, not row 4*qid), so every QPU after the first read
+ *     another QPU's VPM sector.
+ *   - the TMU pop was read on the word right after SIG_LOAD, before the
+ *     response had landed in accumulator 4.
+ *   - the DMA store address carried the per-lane offset; the address is a
+ *     scalar and every lane must present the same value.
+ *   - vc4_cumsum restarted its carry every 256 columns; the host now chains
+ *     the chunks with the previous chunk's last output word.
  *
- * Until each one is fixed it fails fast here, so no caller can launch it by
- * accident.  VC4_ALLOW_UNVERIFIED_KERNELS=1 re-enables them for the person
- * fixing them (they can then hang the board - that is the point of the gate).
+ * VC4_ALLOW_UNVERIFIED_KERNELS=1 still overrides the gate, which is kept for
+ * future kernels: a new QPU blob that has not been element-verified should
+ * fail fast here rather than wedge the board.
  */
 #include "vc4_int.h"
 

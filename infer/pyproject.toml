@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vc4infer"
-version = "1.2.7"
+version = "1.2.8"
 description = "ONNX inference engine for the Raspberry Pi VideoCore IV (V3D) QPUs"
 readme = "README.md"
 requires-python = ">=3.9"

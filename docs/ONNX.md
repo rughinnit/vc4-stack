@@ -1106,3 +1106,231 @@ and a broadcast `ADD`.  Four GPU launches, no host arithmetic, no new kernel:
 Against `onnx.reference.ReferenceEvaluator`, tolerance `1e-4 + 1e-4*max(|ref|,1)`.
 `genops_onnx.py` now covers 8 ops / 28 graphs / 4670 elements, 0 mismatches.
 `vc4infer nodes` reports `Tanh` as a vc4 node.
+
+
+## 12. The unary family: what runs, what is refused, and why
+
+`vc4_unary` (one kernel per op, range reduction + polynomial + integer
+scaling) is now wired into the ONNX executor for the ops whose kernels are
+element-verified on this board at **nvec=16**.  Each was checked at five
+shapes: `1`, `16`, `17` (tail), `256` (exact 4-vector group), `4096`
+(multi-launch), over random data plus a 16-value boundary vector, against a
+float64 reference at `1e-4 + 1e-4*max(|ref|,1)`.
+
+| op | method | measured worst | status |
+|---|---|---|---|
+| `Identity` | view, no copy | bit-exact | **runs** |
+| `Abs` | bits AND `0x7FFFFFFF` | bit-exact | **runs** |
+| `Neg` | bits XOR `0x80000000` | bit-exact | **runs** |
+| `Sign` | `|x|>0` integer test + sign bit (both zeros -> +0) | bit-exact | **runs** |
+| `Clip` | `fmax/fmin` with scalar uniforms | bit-exact | **runs** |
+| `LeakyRelu` | `max(x,0) + alpha*min(x,0)` | bit-exact for alpha=0.5; 1.2e-7 | **runs** |
+| `HardSigmoid` | `clip(alpha*x+beta,0,1)` | 8.0e-8 | **runs** |
+| `HardSwish` | `x*clip(x/6+0.5,0,1)` | 2.4e-7 | **runs** |
+| `Floor` | `ftoi(|x|)`, fraction/g masks, `|x|>=2^23` passes through | bit-exact | **runs** |
+| `Ceil` | same, ceiling branch | bit-exact | **runs** |
+| `Softsign` | `x * rcp(1+|x|)` (Newton reciprocal) | 1.6e-7 | **runs** |
+| `Tanh` | `2*sigmoid(2x)-1` (verified sigmoid, MUL, ADD) | 1.6e-6 | **runs (composed)** |
+| `Exp` | `2^(x*log2e)` degree-5 + exact exponent scaling | 6e-6 offline | **runs** |
+| `Log` | exponent/mantissa split + `(m-1)/(m+1)` atanh series | 4.8e-7 offline | **runs** |
+| `Sqrt` | Newton `1/sqrt`, `x*y` | 1.1e-7 offline | **runs** |
+| `Reciprocal` | sign-split Newton core, `|x|<2^-126 -> inf` | 5.7e-8 offline | **runs** |
+| `Erf` | A&S 7.1.26 + exp core | 4.1e-7 offline | **runs** |
+| `Round` | truncate + half-to-even masks | bit-exact offline | **runs** |
+| `Softplus` | `max(x,0) + 2*atanh(u)`, `u=t/(2+t)`, `t=e^{-|x|}` | 1.3e-6 offline | **runs** |
+| `Elu` / `Selu` | `exp(min(x,0))-1` branch | 5.9e-7 / 8.7e-7 offline | **runs** |
+| `Gelu` (erf) | `0.5x(1+erf(x/sqrt2))` | 5.0e-7 offline | **runs** |
+| `Gelu` (tanh) | `0.5x(1+tanh(...))` + saturation select | bit-exact offline | **runs** |
+| `Mish` | `x*tanh(softplus(x))` | 4.1e-7 offline | **runs** |
+| `Sin` / `Cos` | 3-part Cody-Waite, degree-7/8 polynomials | 4.8e-6 for |x|<=1e5 | **runs** |
+
+"offline" means the **bit-exact ALU emulator** (`infer/tests/emu_alu.py`,
+which models truncation and denormal flushing) against float64; it is not a
+board number.  The full offline table is produced by
+`infer/tests/check_uops_emu.py`.
+
+### 12.1 Why these were briefly refused (historical; fixed in 12.3)
+
+Their bodies do not fit the 16 KiB QPU code slot at nvec=16, so they need the
+4-vector group path.  That path is now correct for the address/store
+(`_store4` writes rows 0..3 when given `4q`/`q<<9`; the `probe_seq store` and
+`pipe4` instruments are exact), but a **long body** at nvec=4 still returns an
+input-independent 64-word pattern on silicon, while the same body at nvec=16
+is exact (Softsign: 0/4096 mismatches at every shape).  The engine therefore
+raises `Unsupported` for these ops rather than launch a kernel it cannot
+stand behind:
+
+    unary: exp is not verified on this board: its body is generated with
+    4 vectors per group and that store path (build_ew nvec != 16) writes no
+    output.  It is refused rather than launched
+    (set VC4_ALLOW_UNVERIFIED_KERNELS=1 to override while fixing it).
+
+`vc4infer nodes` now reports them as vc4; the guard on the 4-vector path was
+relaxed for the unary family after the fixes in 12.3.
+
+### 12.2 Domain handling that is implemented and emulator-verified
+
+Even though the kernels are blocked by the nv4 issue, their special cases are
+written and checked offline, so fixing the group path should not require
+touching them again:
+
+* `Log`: `+-0 -> -inf`, `x<0 -> nan`, `+inf -> +inf` (masks after the main
+  polynomial); normal inputs use the exact exponent split.
+* `Sqrt`: `x<0 -> nan`, `+inf -> +inf`, `+-0 -> +-0`.
+* `Reciprocal`: sign is restored after the positive Newton core; `|x|<2^-126`
+  (zero/denormal, which the FPU flushes) maps to `+-inf`, matching float32;
+  results below 2^-126 (|x|>2^126) flush to zero - the one documented range
+  limit.
+* `Floor`/`Ceil`/`Round`: `|x|>=2^23` is already an integer and passes through
+  (also keeps `inf` from overflowing the int32 `ftoi`).
+* `Gelu` (tanh): `|u|>44` selects the saturated half explicitly, because the
+  truncating tanh core settles at `1-2^-24` and `x*(2^-24)` is a real error
+  for large x (x=-1e10 gave -298 before the select).
+* `Sin`/`Cos`: the 3-part Cody-Waite reduction is accurate to 4.8e-6 for
+  `|x|<=1e5`; the dispatcher raises outside that range rather than return a
+  number the reduction cannot support.
+* Denormals: the FPU flushes them.  `Exp`, `Tanh`, `Erf` and the sigmoid
+  family are unaffected within tolerance; `Log` of a denormal is outside its
+  claimed range and the kernel's exponent split would be wrong there.
+
+
+### 12.3 Final status (2026-11-20, after the nv4 fixes)
+
+The 4-vector defect had three independent causes, all now fixed and measured:
+
+1. the store passed `q<<9` as the VPM **write** row (needs `4q`) and the DMA
+   **read** row (`q<<9`) - every QPU but 0 wrote VPM row 0;
+2. `B8` (the b operand) was used as a constant by `Exp` (`ONE`) and as a body
+   temp by `Log` (`ee`);
+3. `Log`'s mantissa normalisation destroyed the mantissa before using it.
+
+`infer/tests/check_uops_gpu.py`, five shapes per op (`1, 16, 17, 256, 4096`),
+random plus boundary data: **0 mismatches over 105,264 elements / 120 runs**
+for identity, abs, neg, sign, floor, ceil, round, clip, leakyrelu,
+hardsigmoid, hardswish, exp, log, sqrt, reciprocal, tanh, erf, softplus,
+softsign, elu, selu, gelu (tanh form), sin, cos.  `Gelu` (erf form) and
+`Mish` use verified compositions and are covered individually at graph level
+by `infer/tests/check_onnx_unary.py`.
+
+Measured accuracy (worst observed at those shapes / domain):
+
+| op | method | accuracy |
+|---|---|---|
+| `Exp` | `2^(x*log2e)`, degree-5, exact exponent scale | max rel 5.7e-6 |
+| `Log` | exponent/mantissa split, `(m-1)/(m+1)` atanh series | max rel 4.8e-7 |
+| `Sqrt` | Newton `1/sqrt`, `x*y` | max rel 1.1e-7 |
+| `Reciprocal` | sign-split Newton reciprocal | max rel 5.7e-8 |
+| `Tanh` | `sign*(1-t)/(1+t)`, `t=e^{-2|x|}` | max abs 1.2e-7 |
+| `Erf` | A&S 7.1.26 + exp core | max abs 4.1e-7 |
+| `Softplus` | `max(x,0)+2*atanh(t/(2+t))` | max abs 1.3e-6 |
+| `Softsign` | `x*rcp(1+|x|)` | max abs 1.6e-7 |
+| `Elu` / `Selu` | `exp(min(x,0))-1` select | 5.9e-7 / 8.7e-7 |
+| `Gelu` tanh | `0.5x(1+tanh(u))` + saturation | exact to tolerance |
+| `Gelu` erf | composed: scale, Erf, add, halve, MUL | max abs 5.0e-7 |
+| `Mish` | composed: Softplus, Tanh, MUL | max abs 4.1e-7 |
+| `Sin` / `Cos` | 3-part Cody-Waite, degree-7/8 | max abs 4.8e-6, `|x|<=1e5` |
+| `Floor/Ceil/Round` | `ftoi` + integer masks, `|x|>=2^23` passthrough | bit-exact |
+
+Domain contracts still enforced (refused, not wrongly answered): `Log`
+requires `2^-126 <= x < inf`, `Sqrt` `0 <= x < inf`, `Sin`/`Cos` `|x| <= 1e5`.
+`vc4infer nodes` reports every op in the table as vc4.
+
+
+### 12.4 Staged state and the clean GPU window (2026-11-20, superseded by 12.5)
+
+The kernels are emulator-clean but the **clean, sequenced GPU re-run** has not
+happened yet, so the family is deliberately staged behind the existing
+refusal:
+
+* the C `vc4_unary` refuses every `nvec != 16` kernel with
+  "the non-16 group path is fixed but not yet re-verified in the clean
+  window"; `VC4_ALLOW_UNVERIFIED_KERNELS=1` overrides for the operator only;
+* the executor's dispatch table and `coverage.py` include the 13 ops only
+  when `VC4_UNARY_VERIFIED=1` (default `0`).  So `vc4infer nodes` reports
+  them **unsupported** in the default state, exactly what the executor does,
+  and enabling both variables is the whole "one commit away" switch.
+
+Offline evidence for the candidate (no GPU):
+
+| check | result |
+|---|---|
+| `infer/tests/emu_kernel.py 4` (whole harness + long bodies) | 0 mismatches for exp, log, sqrt, reciprocal, tanh, erf, softplus, elu, selu, gelu, sin, cos, round, softsign |
+| `infer/tests/check_uops_emu.py` (body-level) | 0 mismatches for every shipped body |
+| `infer/tests/emu_kernel.py 16 exp` | 0 mismatches (the B8 fix) |
+| `infer/tests/emu_kernel.py 8 round/exp/log` | 0 mismatches |
+
+`Exp`'s nv16 failure is fully explained: with 12 constants, `ew_consts`
+assigned `ONE` to B8, and the harness writes the b operand (`x`) into B8
+immediately before every vector body, so the final Horner step added `x`
+instead of 1.  Excluding B8 from both the constant pool and the body temp
+allocator makes the same nv16 body exact in the emulator.
+
+`Round` does not fit nv16 (2183 words / 17,464 B > 16,384 B), so it now uses
+**nvec=8** with a two-chunk 4-row store (rows 8q..8q+3 then 8q+4..8q+7, the
+second chunk at +256 B): 1117 words / 8936 B, emulator-exact.  `Exp` and
+`Log` also fit nv8 (949 / 1863 words) and use it; the rest stay at nv4.
+
+Clean window procedure (no `flock`; `vc4d` serialises launches itself):
+
+    systemctl is-active vc4d
+    ps -eo pid,cmd | grep -E 'test_|bench_|check_' | grep -v grep   # wait if busy
+    cd ~/work/vc4-stack
+    env VC4_UNARY_VERIFIED=1 VC4_ALLOW_UNVERIFIED_KERNELS=1 \
+        VC4INFER_CACHE=$HOME/scratch/tmp/clean1 \
+        VC4INFER_KGEN=$PWD/infer/python/vc4infer/kgen/kgen.py \
+        VC4INFER_LIB=$PWD/infer/build/libvc4infer.so \
+        TMPDIR=$HOME/scratch/tmp \
+        python3 infer/tests/check_uops_gpu.py
+    env VC4_UNARY_VERIFIED=1 VC4_ALLOW_UNVERIFIED_KERNELS=1 ... \
+        python3 infer/tests/check_onnx_unary.py
+
+When both are green, flip the defaults (remove the two env gates) and run
+`REPS=1 ./run_tests.sh` plus the YOLOv8n 5e-4 check.
+
+
+### 12.5 Clean-window result (2026-11-20): live
+
+Executed in the sequenced window with `vc4d` alone on `/run/vc4d.sock`,
+no `flock`, fresh cache:
+
+    check_uops_gpu.py   -> 0 mismatches over 105,264 elements / 120 runs
+                           (24 kernel ops x 5 shapes: 1,16,17,256,4096)
+    check_onnx_unary.py -> 0 mismatches over 10,478 elements / 78 graphs
+                           (26 ops incl. composed Gelu-erf and Mish x 3 shapes)
+
+Two defects were found and fixed during that run:
+
+* **Erf saturation**: the A&S residual is below 2^-24, but the truncating FPU
+  rounds `1-eps` down to `1-2^-24`.  The composed Gelu-erf then returned
+  `x*(2^-24)/2` (-298 at x=-1e10).  `Erf` now selects exactly +-1 for
+  `|x| >= 6` (the `SIX` clamp constant), which is the true fp32 value; the
+  graph test went from 2 bad elements to 0.
+* **nv8 is not used**: the two-chunk store first raised V3D_ERR_STAT bit 5
+  (a QPU's VPM slice is four rows; the second chunk must reuse rows
+  `4q..4q+3`, which is now implemented), but the results were then scaled by
+  a constant 2^92.  That second fault is unexplained, so `Exp`, `Log` and
+  `Round` use the verified **nv4** path (Round is 641 words there; the nv16
+  split is unnecessary).  The nv8 code remains in `build_ew` but
+  `uop_nvec` does not select it.
+
+The two default gates are now **on**: `_dispatch`/`coverage.py` register all
+13 ops without `VC4_UNARY_VERIFIED`, and `vc4_unary` launches non-16 kernels
+without `VC4_ALLOW_UNVERIFIED_KERNELS`.  `VC4_UNARY_VERIFIED=0` stages the
+Python side out again; the C gate can be restored from git history if a
+regression appears.
+
+Per-op accuracy from the clean window (worst over the five shapes):
+
+| op | max abs / rel |
+|---|---|
+| Exp | 0 (rel 5.7e-6 at x=80, within 1e-4 rel) |
+| Log | 0 (rel 4.8e-7) |
+| Sqrt | 0 (rel 1.1e-7) |
+| Reciprocal | 0 (rel 5.7e-8) |
+| Erf | 0 (abs 4.1e-7, exact +-1 beyond 6) |
+| Tanh | 0 (abs 1.2e-7) |
+| Sin / Cos | 0 (abs 4.8e-6 for |x|<=1e5) |
+| Softplus | 0 (abs 1.3e-6) |
+| Elu / Selu | 0 (5.9e-7 / 8.7e-7) |
+| Gelu / Gelu-erf / Mish | 0 at graph level |
+| Round / Floor / Ceil | bit-exact |

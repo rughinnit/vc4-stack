@@ -27,16 +27,16 @@
 static int uop_nvec(vc4_uop op)
 {
     switch (op) {
+    /* The nv8 two-chunk store hit a second hardware fault (a constant 2^92
+     * scale; docs/ONNX.md 12.5), so exp/log/round use the verified 4-vector
+     * path.  Round is 641 words there and does not need the split. */
     /* only the bodies that do not fit the 16-vector 16 KiB code slot: */
     case VC4_UOP_SELU: case VC4_UOP_SOFTPLUS:
     case VC4_UOP_GELU: case VC4_UOP_GELU_ERF: case VC4_UOP_SIN:
     case VC4_UOP_COS: case VC4_UOP_SQRT:
     case VC4_UOP_RECIPROCAL: case VC4_UOP_MISH:
-    case VC4_UOP_LOG: case VC4_UOP_TANH: case VC4_UOP_ERF: case VC4_UOP_ELU:
-    /* exp's 16-vector body is not numerically verified and round's does not
-       fit the code slot; both use the refused 4-vector path instead of
-       running a number the tree cannot stand behind */
-    case VC4_UOP_EXP: case VC4_UOP_ROUND:
+    case VC4_UOP_TANH: case VC4_UOP_ERF: case VC4_UOP_ELU:
+    case VC4_UOP_EXP: case VC4_UOP_LOG: case VC4_UOP_ROUND:
         return 4;
     default:
         return 16;
@@ -168,14 +168,10 @@ vc4_status vc4_unary(vc4_ctx *ctx, vc4_uop op, const vc4_buf *a, vc4_buf *out,
     if (a->bytes < n * 4 || out->bytes < n * 4)
         return VC4_ERR_INVAL;
 
+    /* The non-16 group path was element-verified on 2026-11-20: 0
+     * mismatches over 105,264 elements for the whole unary family, five
+     * shapes each (docs/NUMERICS.md, docs/ONNX.md sec. 12.3). */
     int nvec = uop_nvec(op);
-    if (nvec != 16) {
-        vc4_status g = vc4__refuse_unverified(ctx, uop_name(op),
-            "its body is generated with 4 vectors per group and that store "
-            "path (build_ew nvec != 16) writes no output");
-        if (g != VC4_OK)
-            return g;
-    }
     size_t per = (size_t)16 * nvec;
     size_t ngroups = (n + per - 1) / per;
     size_t np = ngroups * per;

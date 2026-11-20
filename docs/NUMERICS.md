@@ -130,3 +130,123 @@ integer/control flow on lane 0 and reconstructs every VDR/TMU/store address).
 - Verification: every NHWC op 0 mismatches over 5 runs against a float64
   oracle (conv max rel 5.2e-5 at k=576, pool/concat/upsample byte-exact); the
   160x160 synthetic forward is 0 mismatches on 13 stages, max rel 2.3e-7.
+
+
+## Hand-written unary kernels: the three measured hazards (2026-11-20)
+
+These are the reasons the `kops.py` unary bodies failed on the board while a
+word-level emulator said they were right.  All three are now encoded in the
+generator, not worked around per op.
+
+### 1. A small immediate is legal only in the *second* ALU operand slot
+
+`add imm, reg` (the immediate in `raddr_b`, reached through the A-slot mux)
+assembles and disassembles, but on silicon the QPU does not return: the launch
+times out with `SRQCS` done=0 and the board is left unresponsive until a
+reboot.  Measured with `floor`, whose `-n` step was first emitted as
+`sub n, imm(0), n`.
+
+Rule: encode small immediates only in the b-slot (`e.opi`, `add_b=imm(...)`).
+To subtract from zero, use a register constant (`ZERO = 0x00000000`) as the
+left operand: `e.op(ADD_SUB, n, ZERO, n)`.
+
+The same experiment also produced the only reliable "the QPU is wedged"
+signal: `SRQCS` requests/completed stop advancing while `STATE` still reads
+LIVE.  A warm reboot did not always clear it; a power cycle did.
+
+### 2. An add-ALU accumulator result needs three words before a *multiply* reads it
+
+Measured with `probe_seq` (16 lanes, bit-for-bit):
+
+| sequence | nops | result |
+|---|---:|---|
+| `fmul acc0 = x*2; fmul acc1 = acc0*3` | 0..5 | **exact** at every spacing (0 nops is fine: mul -> mul forwards) |
+| `fmul acc0; add-mov B = acc0; fmul B*3` | 0..5 | **exact** at every spacing |
+| `fmul acc0; fadd acc1 = acc0+1` | 0 | exact (mul -> add) |
+| `fmul acc0; N nops; packed fmul(acc0*3)+fadd(acc0+1)` | 0 | exact |
+| `mov acc2 = Bx; fmul acc3 = acc2 * By` | **1** | **stale acc2** |
+
+So the failing direction is **add ALU -> multiply ALU**: a value written to an
+accumulator by the add ALU is not visible to the multiply ALU in the next
+word.  `feed a MUL result into a later MUL` was the visible symptom because
+the emitter's bank-conflict staging (`_fit`) writes `ACC2` with an add-ALU
+`mov` and the multiply then read it in the very next word.  Every
+transcendental body stages two same-file operands that way; Abs/Neg/Sign/Clip
+never do, which is exactly the working/failing split that was observed.
+
+Rule: after a staging `mov` into an accumulator, leave **three words**
+(write + 2 nops) before a multiply reads it.  `kops.E.mul`/`mul24` do this;
+`kops.E.op` (add ALU) may read it immediately.  `NUMERICS.md`'s older
+"3 words between an add-ALU result and the mul ALU" note stands; the probe
+table above is the bit-exact confirmation.
+
+### 3. The 4-vector group store needs `4*q` (VPM write row) and `q<<9` (DMA read row)
+
+`_store4` takes two different offsets:
+
+* `vpmq4` is added to `vpw_generic(row=0)`: the **write** row, `4*q`, in the
+  low six bits;
+* `vpmq9` is added to `vdw_basic(row=0)`: the **DMA read** row, `q*4` encoded
+  at bit 7, i.e. `q<<9`.
+
+`build_ew` passed `q<<9` for both, so every QPU but 0 wrote VPM row 0 while
+the DMA read rows 4q..4q+3 (unwritten): the output was zeros/garbage and
+`V3D_ERRORS` bit 5 (VPM read range) fired at 12 QPUs.  A diagnostic
+`probe_seq store` that writes rows 1,2,3,4 through `_store4` is exact, and
+`build_ew` now passes `4*q` (`B23`) and `q<<9` (`B24`) separately.
+
+With that fixed, one QPU and the serial TMU load are exact at nvec=4
+(`probe_seq pipe4` copies 0..63 correctly).  The long *body* at nvec=4 still
+does not produce its own result on silicon: every body tested (softsign, exp,
+round, tanh) returns the same input-independent 64-word pattern, so the
+engine currently **refuses** nvec=4 unary kernels instead of launching them
+(`vc4_unary`: "not verified on this board", override
+`VC4_ALLOW_UNVERIFIED_KERNELS=1`).  The same bodies at nvec=16 are exact
+(Softsign 0/4096 mismatches at all five shapes) or exceed the 16 KiB code
+slot.  This is the one open defect; the section above is what has been ruled
+out, not a claim that the path works.
+
+
+### 4. B8 is the harness's b operand: never a constant, never a body temp
+
+`build_ew` runs `or rb8, r4, r4` immediately before every vector body, so
+**B8 always holds the second TMU operand (x, for a unary op)** at the start of
+the body.  Two separate failures came from ignoring that:
+
+* `Exp` has 12 constants and `ew_consts` assigned `ONE` to B8.  The final
+  Horner step `p*f + 1.0` therefore added **x**: exp(1) was right only because
+  x happened to be 1 in that test.
+* `ew_body`'s temporary allocator also included B8.  `Log`'s `ee` (the
+  exponent) landed there, so the final `ee*ln2 + p` used **x*ln2**.
+
+Fix: `ew_consts` and `ew_body` both exclude B8.  The B-register pool is
+`0..7, 9..21, 26` plus B30/B31 when the op has fewer than two parameters
+(B21 is free because the group counter now uses an immediate subtract).
+
+### 5. A body must not write a register it still needs
+
+`b_log`'s mantissa normalisation did
+
+    d = m - sqrt2;  mask = d > 0;  m = m*0.5
+    m = ~mask            <-- destroys the mantissa
+    m = m & m            <-- was meant to be ~mask & mantissa
+    m = m | (mask & m*0.5)
+
+which is `NaN` for every power of two (m == 1).  It is now a `keep_sel`
+(`m = mask ? m/2 : m`).  The emulator caught this only in the *full* kernel
+(with the harness's register init), not in a raw body with zeroed registers -
+a reminder to run the harness-level model, not just the body.
+
+## Verified unary family (2026-11-20, stock clocks)
+
+`infer/tests/check_uops_gpu.py` ran every unary kernel at five shapes
+(`1, 16, 17, 256, 4096`) with random data plus a boundary vector:
+
+    identity abs neg sign floor ceil round clip leakyrelu hardsigmoid
+    hardswish exp log sqrt reciprocal tanh erf softplus softsign elu selu
+    gelu sin cos
+
+**0 mismatches over 105,264 elements / 120 runs** at
+`1e-4 + 1e-4*max(|ref|,1)`.  `Gelu` (erf form) and `Mish` are composed from
+the verified Erf / Softplus / Tanh kernels and are checked at the graph level
+by `infer/tests/check_onnx_unary.py`.

@@ -35,6 +35,7 @@ Every node is also classified into exactly one execution tier:
 host-control | host-unwritten | unsupported-graph`` report used by
 ``Engine.node_backends`` and ``vc4infer nodes``.
 """
+import os
 import onnx
 import numpy as np
 from onnx import TensorProto, numpy_helper
@@ -50,6 +51,9 @@ OPS = {
     "LeakyRelu": "QPU unary (UOP_LEAKYRELU, alpha in a uniform)",
     "HardSigmoid": "QPU unary (UOP_HARDSIGMOID, alpha/beta)",
     "HardSwish": "QPU unary (UOP_HARDSWISH)",
+    "Floor": "QPU unary (UOP_FLOOR, exact; |x| >= 2^23 passes through)",
+    "Ceil": "QPU unary (UOP_CEIL, exact; |x| >= 2^23 passes through)",
+    "Softsign": "QPU unary (UOP_SOFTSIGN, x/(1+|x|), max err 1.6e-7)",
     "Sigmoid": "QPU elementwise",
     "Tanh": "QPU sigmoid composition: 2*sigmoid(2x)-1",
     "Silu": "QPU elementwise (fused)",
@@ -76,7 +80,27 @@ OPS = {
     "Constant": "initialiser",
     "Shape": "folded at plan time (no runtime work)",
     "Gather": "folded at plan time when it indexes shapes",
+    "Exp": "QPU unary (UOP_EXP, |x|<=88, max rel 5.7e-6)",
+    "Log": "QPU unary (UOP_LOG, 2^-126<=x<inf, max rel 4.8e-7; refused outside)",
+    "Sqrt": "QPU unary (UOP_SQRT, 0<=x<inf, max rel 1.1e-7; refused outside)",
+    "Reciprocal": "QPU unary (UOP_RECIPROCAL, sign-split, max rel 5.7e-8)",
+    "Erf": "QPU unary (UOP_ERF, A&S 7.1.26, max abs 4.1e-7)",
+    "Sin": "QPU unary (UOP_SIN, Cody-Waite, |x|<=1e5, max abs 4.8e-6; refused outside)",
+    "Cos": "QPU unary (UOP_COS, Cody-Waite, |x|<=1e5, max abs 4.8e-6; refused outside)",
+    "Round": "QPU unary (UOP_ROUND, half-to-even, exact)",
+    "Softplus": "QPU unary (UOP_SOFTPLUS, |x|<inf, max abs 1.3e-6)",
+    "Elu": "QPU unary (UOP_ELU, alpha uniform, max abs 5.9e-7)",
+    "Selu": "QPU unary (UOP_SELU, alpha/gamma uniforms, max abs 8.7e-7)",
+    "Gelu": "QPU unary (UOP_GELU tanh / composed erf, max abs 5.0e-7)",
+    "Mish": "QPU Softplus+Tanh+MUL composition (max abs 4.1e-7)",
 }
+
+# Registered after the 2026-11-20 clean-window verification.  Set
+# VC4_UNARY_VERIFIED=0 to stage the 13 ops out again (matching the C gate).
+if os.environ.get("VC4_UNARY_VERIFIED", "1") == "0":
+    for _op in ("Exp", "Log", "Sqrt", "Reciprocal", "Erf", "Sin", "Cos",
+                "Round", "Softplus", "Elu", "Selu", "Gelu", "Mish"):
+        OPS.pop(_op, None)
 
 # tiers ---------------------------------------------------------------------
 META_OPS = frozenset(("Shape", "Size", "Constant", "ConstantOfShape"))

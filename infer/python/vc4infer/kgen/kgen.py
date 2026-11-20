@@ -1765,17 +1765,20 @@ def _tmu_load(b, tmu, addr_reg, dst):
         b.e(add_or(dst, acc(4), acc(4)))
 
 
-def _store4(b, vpmq4, vpmq9, dst_reg, stride):
+def _store4(b, vpmq4, vpmq9, dst_reg, stride, base=0):
     """The verified 4-row VPM->DMA store (emit_store16, one chunk).
 
-    Writes VPM rows [4q..4q+3] (already filled) to four consecutive 64 B rows
-    at dst_reg, `stride` bytes between rows (0 = contiguous).
+    Writes four A-file vectors A[base..base+3] into VPM rows [4q..4q+3]
+    (already filled) and DMA-stores them to four consecutive 64 B rows at
+    dst_reg, `stride` bytes between rows (0 = contiguous).  A QPU's VPM
+    slice is only four rows wide, so a second chunk (nvec=8) reuses the same
+    rows with base=4, exactly like emit_store16's four chunks.
     """
     b.e(ldi(0x1A00, R5, ws=1))
     b.e(dict(add_op=ADD_ADD, add_out=W_VPW_SETUP, ws=1,
              add_a=acc(5), add_b=breg(vpmq4)))
     for r in range(4):
-        b.e(add_or(W_VPM, areg(r), areg(r)))
+        b.e(add_or(W_VPM, areg(base + r), areg(base + r)))
     b.e(ldi((2 << 30) | (4 << 23) | (16 << 16) | (1 << 14), R5, ws=1))
     b.e(dict(add_op=ADD_ADD, add_out=W_VPW_SETUP, ws=1,
              add_a=acc(5), add_b=breg(vpmq9)))
@@ -2320,6 +2323,25 @@ def build_probe_seq(seq):
     _tmu_load_a(b, 0, A_ADDR, A_IN)
 
     b.check = False
+    if head == 'exp2':
+        # diagnostic: the 16 input lanes are t; out = core_exp2(t)
+        import kops
+        mod = sys.modules[__name__]
+        mod._kops_consts = {}
+        code = kops.UOP_ORDER.index('exp')
+        kops.ew_consts(mod, b, code)
+        ctx = kops.Ctx(mod._kops_consts[code])
+        e = kops.E(mod, b, ctx)
+        kops.core_exp2(e, A_IN, 0, ctx.tb(), ctx.tb())
+        # B3/B4 were the store offsets, but ew_consts just overwrote them with
+        # exp constants; use B30/B31 (free for a zero-parameter op)
+        b.e(ldi(0, 30, ws=1))
+        b.e(ldi(0, 31, ws=1))
+        b.e(nop(), nop(), nop(), nop())
+        _store4(b, 30, 31, A_OUT, 0)
+        b.e(end_program())
+        b.e(nop(), nop(), nop())
+        return p
     if head == 'store':
         # diagnostic: four known rows through the verified _store4, no math
         for i, val in enumerate((0x3F800000, 0x40000000, 0x40400000,
@@ -2327,6 +2349,22 @@ def build_probe_seq(seq):
             b.e(ldi(val, 5 + i, ws=1))
             b.e(nop(), nop(), nop())
             b.e(add_or(i, breg(5 + i), breg(5 + i)), nop(), nop())
+        _store4(b, B_V4, B_V9, A_OUT, 0)
+        b.e(end_program())
+        b.e(nop(), nop(), nop())
+        return p
+    if head == 'storeacc':
+        # four rows produced through the E.mul path (mul -> ACC3 -> mov A_i)
+        b.e(ldi(0x3F800000, 5, ws=0))     # A5 = 1.0
+        b.e(nop(), nop(), nop())
+        for i, val in enumerate((0x3F800000, 0x40000000, 0x40400000,
+                                 0x40800000)):
+            b.e(ldi(val, 7, ws=1))
+            b.e(nop(), nop(), nop())
+            b.e(dict(mul_op=MUL_FMUL, mul_out=32 + 3, ws=0,
+                     mul_a=breg(7), mul_b=areg(5)))
+            b.e(nop(), nop())
+            b.e(add_or(i, acc(3), acc(3)), nop(), nop())
         _store4(b, B_V4, B_V9, A_OUT, 0)
         b.e(end_program())
         b.e(nop(), nop(), nop())
@@ -2858,12 +2896,12 @@ def build_ew(op, depth=2, nvec=16):
     # a group is nvec vectors of 64 B: 16 (1024 B) for the cheap ops, 4
     # (256 B) for the long transcendental bodies that would not fit the 16 KiB
     # code slot.
-    _gshift = 10 if nvec == 16 else 8
+    _gshift = {16: 10, 8: 9, 4: 8}[nvec]
     b.e(add_(ADD_SHL, B_K['STEP'], ws=1, a=areg(E_T9), b=imm(_gshift)))
     # per-iteration gap: after the nvec vectors of a group have advanced the
     # TMU address by nvec*64, QPU i's next group is i+nqpu, so add
     # (nqpu-1)*nvec*64.
-    b.e(add_(ADD_ADD, E_T8, areg(E_T9), (REGB, B_K['C4INT'])))
+    b.e(add_(ADD_SUB, E_T8, areg(E_T9), imm(1)))
     b.e(add_(ADD_SHL, B_K['GAP'], ws=1, a=areg(E_T8), b=imm(_gshift)))
     if nvec != 16:
         # the 4-vector store (_store4) needs q<<9 (the DMA/VPM read row) in B
@@ -2873,9 +2911,11 @@ def build_ew(op, depth=2, nvec=16):
     b.e(add_(ADD_SHL, E_VPMQ, areg(E_VPMQ), imm(2)), nop())            # 4*qpu
     if nvec == 16:
         b.e(add_(ADD_SHL, B_K['VPMQ7'], ws=1, a=areg(E_VPMQ), b=imm(7)))
+    elif nvec == 8:
+        # 8 rows per QPU: write row 8q, DMA read row 8q<<7 = 4q<<8
+        b.e(add_(ADD_SHL, B_K['VPMQ7'], ws=1, a=areg(E_VPMQ), b=imm(1)), nop())
+        b.e(add_(ADD_SHL, B_K['CSTEP'], ws=1, a=areg(E_VPMQ), b=imm(8)), nop())
     else:
-        # _store4's first argument is the VPM *write* row: 4q, in the low
-        # bits of vpw_generic (the 16-vector path wants q<<9 for emit_store16)
         b.e(add_or(B_K['VPMQ7'], ws=1, a=areg(E_VPMQ), b=areg(E_VPMQ)), nop())
     # per-QPU stream offset within a group: 16 vectors for the cheap ops,
     # 4 for the long bodies (which is also the VPM-row and store step)
@@ -2889,7 +2929,6 @@ def build_ew(op, depth=2, nvec=16):
     b.e(add_(ADD_ADD, E_AB2, areg(E_AB2), (REGB, B_K['LOFF'])))
     b.e(nop(), nop())
 
-    b.e(ldi(0xFFFFFFFF, B_K['C4INT'], ws=1))
     if nvec == 16:
         # emit_store16's chunk step is 4 rows x 64 B; the 4-vector path keeps
         # CSTEP = q<<9 (the VPM source row of this QPU's 4 rows), set above
@@ -2931,31 +2970,59 @@ def build_ew(op, depth=2, nvec=16):
     p._builder = b
     p.label('grp_top')
     b.e(add_or(E_CADR, areg(E_AO), areg(E_AO)), nop())
-    # prime the TMU pipeline (issue/pop never share a word: the asm3 rule)
-    for _ in range(depth):
-        b.e(add_or(W_TMU0_S, areg(E_AA), areg(E_AA), ws=1))
-        b.e(add_or(W_TMU1_S, areg(E_AB2), areg(E_AB2), ws=1))
-        b.e(nop(), nop())
-        b.e(add_(ADD_ADD, E_AA, areg(E_AA), (REGB, B_K['C16'])))
-        b.e(add_(ADD_ADD, E_AB2, areg(E_AB2), (REGB, B_K['C16'])))
-        b.e(nop(), nop())
-    for j in range(nvec):
-        if j + depth < nvec:
+    if nvec == 4:
+        # The pipelined sequence (2 issued ahead, the next issued before the
+        # pop) puts three requests in flight with a long body.  The TMU keeps
+        # two: a body that runs long enough lets the third response overwrite
+        # the oldest, and the later vectors silently get the wrong 64 B - the
+        # measured nvec=4 failure.  The 4-vector path therefore loads each
+        # vector serially (issue, wait, pop), the sequence probes 1/3 used.
+        for j in range(nvec):
+            _tmu_load_a(b, 0, E_AA, E_AV)
+            _tmu_load_b(b, 1, E_AB2, B_VB)
+            b.e(add_(ADD_ADD, E_AA, areg(E_AA), (REGB, B_K['C16'])))
+            b.e(add_(ADD_ADD, E_AB2, areg(E_AB2), (REGB, B_K['C16'])), nop())
+            _ew_compute(b, op, j)
+    else:
+        # prime the TMU pipeline (issue/pop never share a word: the asm3 rule)
+        for _ in range(depth):
             b.e(add_or(W_TMU0_S, areg(E_AA), areg(E_AA), ws=1))
             b.e(add_or(W_TMU1_S, areg(E_AB2), areg(E_AB2), ws=1))
             b.e(nop(), nop())
             b.e(add_(ADD_ADD, E_AA, areg(E_AA), (REGB, B_K['C16'])))
             b.e(add_(ADD_ADD, E_AB2, areg(E_AB2), (REGB, B_K['C16'])))
             b.e(nop(), nop())
-        b.e(alu(sig=SIG_LOAD_TMU0, cond_add=COND_NEVER, cond_mul=COND_NEVER), nop())
-        b.e(add_or(E_AV, acc(4), acc(4)), nop())
-        b.e(alu(sig=SIG_LOAD_TMU1, cond_add=COND_NEVER, cond_mul=COND_NEVER), nop())
-        b.e(add_or(B_VB, ws=1, a=acc(4), b=acc(4)), nop())
-        _ew_compute(b, op, j)
+        for j in range(nvec):
+            if j + depth < nvec:
+                b.e(add_or(W_TMU0_S, areg(E_AA), areg(E_AA), ws=1))
+                b.e(add_or(W_TMU1_S, areg(E_AB2), areg(E_AB2), ws=1))
+                b.e(nop(), nop())
+                b.e(add_(ADD_ADD, E_AA, areg(E_AA), (REGB, B_K['C16'])))
+                b.e(add_(ADD_ADD, E_AB2, areg(E_AB2), (REGB, B_K['C16'])))
+                b.e(nop(), nop())
+            b.e(alu(sig=SIG_LOAD_TMU0, cond_add=COND_NEVER, cond_mul=COND_NEVER), nop())
+            b.e(add_or(E_AV, acc(4), acc(4)), nop())
+            b.e(alu(sig=SIG_LOAD_TMU1, cond_add=COND_NEVER, cond_mul=COND_NEVER), nop())
+            b.e(add_or(B_VB, ws=1, a=acc(4), b=acc(4)), nop())
+            _ew_compute(b, op, j)
     b.check = False
     if nvec == 16:
         emit_store16(p, 0)
+    elif nvec == 8:
+        # Two 4-row chunks in the QPU's same 4-row VPM slice: chunk 0 from
+        # A0..A3, chunk 1 from A4..A7 (the slice cannot hold 8 rows).
+        b.e(add_or(B_K['VPMQ7'], ws=1, a=areg(E_VPMQ), b=areg(E_VPMQ)),
+            nop(), nop())
+        b.e(add_(ADD_SHL, B_K['CSTEP'], ws=1, a=areg(E_VPMQ), b=imm(7)),
+            nop(), nop())
+        _store4(b, B_K['VPMQ7'], B_K['CSTEP'], E_CADR, 0, base=0)
+        b.e(add_(ADD_ADD, E_CADR, areg(E_CADR), imm(256)), nop(), nop())
+        _store4(b, B_K['VPMQ7'], B_K['CSTEP'], E_CADR, 0, base=4)
     else:
+        b.e(add_or(B_K['VPMQ7'], ws=1, a=areg(E_VPMQ), b=areg(E_VPMQ)),
+            nop(), nop())
+        b.e(add_(ADD_SHL, B_K['CSTEP'], ws=1, a=areg(E_VPMQ), b=imm(7)),
+            nop(), nop())
         # _store4 takes the VPM *write* row (4q, low bits of vpw_generic) and
         # the VPM *read* row for the DMA word (q<<9, the vdw row field)
         _store4(b, B_K['VPMQ7'], B_K['CSTEP'], E_CADR, 0)
@@ -2963,7 +3030,7 @@ def build_ew(op, depth=2, nvec=16):
     b.e(add_(ADD_ADD, E_AO, areg(E_AO), (REGB, B_K['STEP'])))
     b.e(add_(ADD_ADD, E_AA, areg(E_AA), (REGB, B_K['GAP'])))
     b.e(add_(ADD_ADD, E_AB2, areg(E_AB2), (REGB, B_K['GAP'])))
-    b.e(add_(ADD_ADD, E_CNT, (REGB, B_K['C4INT']), areg(E_CNT), sf=1))
+    b.e(add_(ADD_SUB, E_CNT, areg(E_CNT), imm(1), sf=1))
     p.branch_to('grp_top', cond=BR_ALL_Z_CLEAR)
     b.e(nop(), nop(), nop())
     b.e(end_program())

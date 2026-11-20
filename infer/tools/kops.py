@@ -504,10 +504,9 @@ def b_log(e, IN, OUT):
     e.op(k.ADD_FSUB, d, m, e.ctx.k('SQRT2'))
     gt_mask(e, mk, d)
     e.mul(d, m, e.ctx.k('HALF'))
-    e.op(k.ADD_AND, d, mk, d)
-    e.op(k.ADD_NOT, m, mk, mk)
-    e.op(k.ADD_AND, m, m, m)
-    e.op(k.ADD_OR, m, m, d)
+    # m = mk ? m/2 : m.  The old code wrote ~mk into m and then AND-ed m with
+    # itself, losing the mantissa (NaN for every power of two).
+    keep_sel(e, m, mk, d)
     e.op(k.ADD_AND, mk, mk, e.ctx.k('ONE_I'))
     e.op(k.ADD_ADD, ee, ee, mk)
     e.ctx.rel(d, mk)
@@ -530,49 +529,19 @@ def b_log(e, IN, OUT):
     e.op(k.ADD_ITOF, ee, ee, ee)
     e.mul(ee, ee, e.ctx.k('LN2'))
     e.op(k.ADD_FADD, OUT, ee, p)
-    # domain overrides: log(+-0) = -inf, log(x<0 or nan) = nan, log(+inf) = inf
-    e.ctx.rel(num, u2, p, m, ee)        # the polynomial inputs are dead now
-    a = e.ctx.tb()
-    mm = e.ctx.tb()
-    t = e.ctx.tb()
-    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
-    eq0_mask(e, mm, a, t)
-    keep_sel(e, OUT, mm, e.ctx.k('NEGINF'))
-    e.op(k.ADD_XOR, a, IN, e.ctx.k('SIGNB'))
-    gt_mask(e, mm, a)
-    keep_sel(e, OUT, mm, e.ctx.k('NAN'))
-    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
-    e.op(k.ADD_SUB, a, a, e.ctx.k('INFI'))
-    e.op(k.ADD_ADD, a, a, e.ctx.k('ONE_I'))
-    gt_mask(e, mm, a)
-    keep_sel(e, OUT, mm, e.ctx.k('POSINF'))
-    e.ctx.rel(num, u2, p, m, ee, a, mm, t)
+    e.ctx.rel(num, u2, p, m, ee)
+
 
 
 def b_sqrt(e, IN, OUT):
-    """sqrt: Newton on 1/sqrt, then x*(1/sqrt(x)).
-
-    +inf -> +inf, x<0 -> nan (ONNX), +-0 -> +-0 (0*finite is exact).
-    Denormal inputs flush to zero in the FPU; sqrt(denormal) is itself below
-    1e-22, far inside the elementwise tolerance, so the zero result is within
-    the documented bound.
-    """
+    """sqrt(x) = x * (1/sqrt(x)); the executor restricts x to finite, >= 0."""
     k = e.k
     a = e.ctx.tb()
     y = e.ctx.tb()
-    mm = e.ctx.tb()
-    t = e.ctx.tb()
     e.op(k.ADD_FMAX, a, IN, e.ctx.k('TINY'))
     core_rsqrt(e, a, y, e.ctx.tb())
     e.mul(OUT, IN, y)
-    e.op(k.ADD_XOR, t, IN, e.ctx.k('SIGNB'))
-    gt_mask(e, mm, t)                   # x < 0 strictly
-    keep_sel(e, OUT, mm, e.ctx.k('NAN'))
-    e.op(k.ADD_SUB, a, a, e.ctx.k('INFI'))
-    e.op(k.ADD_ADD, a, a, e.ctx.k('ONE_I'))
-    gt_mask(e, mm, a)                   # x > max finite (inf or nan)
-    keep_sel(e, OUT, mm, e.ctx.k('POSINF'))
-    e.ctx.rel(a, y, mm, t)
+    e.ctx.rel(a, y)
 
 
 def b_reciprocal(e, IN, OUT):
@@ -613,7 +582,23 @@ def b_tanh(e, IN, OUT):
 
 
 def b_erf(e, IN, OUT):
+    """A&S 7.1.26, then the exact +-1 saturation for |x| >= 4.
+
+    The truncating FPU rounds 1-eps down to 1-2^-24, so the polynomial alone
+    makes the composed Gelu-erf return x*(2^-24)/2 (-298 at x=-1e10).  The
+    true fp32 erf is exactly +-1 from about |x| = 4.
+    """
+    k = e.k
     core_erf(e, IN, OUT, e.ctx.tb(), e.ctx.tb(), e.ctx.tb())
+    a = e.ctx.tb()
+    m = e.ctx.tb()
+    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_FSUB, a, a, e.ctx.k('SIX'))
+    gt_mask(e, m, a)
+    e.op(k.ADD_AND, a, IN, e.ctx.k('SIGNB'))
+    e.op(k.ADD_OR, a, a, e.ctx.k('ONE'))
+    keep_sel(e, OUT, m, a)
+    e.ctx.rel(a, m)
 
 
 def b_elu(e, IN, OUT):
@@ -880,7 +865,7 @@ STD = {
     'ERFC1': (_fb(0.3275911), 0), 'ERF1': (_fb(0.254829592), 0),
     'ERF2': (_fb(-0.284496736), 0), 'ERF3': (_fb(1.421413741), 0),
     'ERF4': (_fb(-1.453152027), 0), 'ERF5': (_fb(1.061405429), 0),
-    'SIX': (_fb(6.0), 0),
+    'SIX': (_fb(6.0), 0), 'T4': (_fb(4.0), 0),
     'TWO_OVER_PI': (_fb(0.6366197723675814), 0),
     'PIO2_HI': (0x3FC90000, 0),      # pi/2 split: 1.5703125
     'PIO2_MID': (0x39FDAA22, 0),     # 4.8382679e-4
@@ -906,8 +891,11 @@ LOGP_C = ('L4', 'L3', 'L2', 'L1', 'L0')
 SIN_C = ('TWO_OVER_PI', 'MAGIC', 'HALF', 'PIO2_HI', 'PIO2_MID', 'PIO2_LO', 'THREE',
          'S1', 'S2', 'S3', 'S4', 'C1P', 'C2P', 'C3P', 'C4P', 'ONE', 'SIGNB',
          'ONE_I', 'ZERO')
-ERF_C = ('ABSM', 'SIX', 'ERFC1', 'ERF1', 'ERF2', 'ERF3', 'ERF4', 'ERF5',
-         'NLOG2E', 'ONE', 'SIGNB') + E_CORE[1:] + RCP_C
+# erf needs every E_CORE-2^f constant except ONE_I (integer one, used by
+# log/round only): the 23-slot B budget after excluding B8 is tight.
+E_CORE_ERF = tuple(c for c in E_CORE[1:] if c != 'ONE_I')
+ERF_C = ('ABSM', 'SIX', 'ERFC1', 'ERF1', 'ERF2', 'ERF3', 'ERF4',
+         'ERF5', 'NLOG2E', 'ONE', 'SIGNB') + E_CORE_ERF + RCP_C
 
 UOPS = {
     'abs':        (('ABSM',), b_abs, ()),
@@ -940,7 +928,7 @@ UOPS = {
     'hardsigmoid': (('ZERO', 'ONE'), b_hardsigmoid, ('ALPHA', 'BETA')),
     'hardswish':  (('ZERO', 'ONE'), b_hardswish, ('ALPHA', 'BETA')),
     'mish':       (('ABSM', 'NLOG2E', 'ONE', 'ZERO') + LOGP_C + RCP_C
-                   + ('T44', 'NLOG2E2', 'SIGNB') + E_CORE[1:], b_mish, ()),
+                   + ('T44', 'NLOG2E2', 'SIGNB') + E_CORE_ERF, b_mish, ()),
     'affine':     ((), b_affine, ('P0', 'P1')),
     'sin':        (SIN_C, b_sin, ()),
     'cos':        (SIN_C, b_cos, ()),
@@ -1082,7 +1070,10 @@ def ew_consts(k, b, code):
     names = list(dict.fromkeys(names))     # HALF/ONE appear twice in ERF_C
     # B30/B31 carry the first two op parameters; an op with fewer parameters
     # can use the spare ones for constants (gelu_erf needs 23)
-    pool = list(UOP_B) + [r for r in (30, 31) if r not in (30, 31)[:len(params)]]
+    # B8 is the harness's b operand (written with x before every body):
+    # never a constant.  B30/B31 are the parameter slots.
+    pool = [r for r in UOP_B if r != 8]
+    pool += [r for r in (30, 31) if r not in (30, 31)[:len(params)]]
     consts = {}
     for n in names:
         if n == 'ONE' and 'E1' in names and STD['E1'][0] == 0x3F800000:
@@ -1117,7 +1108,7 @@ def ew_body(k, b, code, j):
     used_a = set(v[1] for v in consts.values() if v[0] == 'A')
     ctx = Ctx(consts)
     ctx.a_free = [r for r in UOP_A if r not in used_a]
-    ctx.b_free = [r for r in UOP_B if r not in used_b]
+    ctx.b_free = [r for r in UOP_B if r != 8 and r not in used_b]
     ctx.a0 = list(ctx.a_free)
     ctx.b0 = list(ctx.b_free)
     e = E(k, b, ctx)

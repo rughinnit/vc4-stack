@@ -103,6 +103,14 @@ from . import coverage
 from . import _binding as vc4infer                      # noqa: E402
 from ._errors import (HostNodeError, HostNotAllowed, NeedsDeviceDispatch,
                       UnsupportedNode)                    # noqa: E402
+
+# The 13 nv4 ops were element-verified on 2026-11-20: 0 mismatches over
+# 105,264 kernels elements (five shapes each) and 0 over 10,478 graph
+# elements (docs/ONNX.md sec. 12.3).  VC4_UNARY_VERIFIED=0 stages them out
+# again (the C non-16 refusal is the matching hard gate).
+_UNARY_NV4_VERIFIED = os.environ.get("VC4_UNARY_VERIFIED", "1") != "0"
+_UNARY_NV4_STAGED = ("Exp", "Log", "Sqrt", "Reciprocal", "Erf", "Sin", "Cos",
+                     "Round", "Softplus", "Elu", "Selu", "Gelu", "Mish")
 from ._hybrid import HostEvaluator, outer_refs             # noqa: E402
 
 # Kept for the scripts that print the engine directory.
@@ -1127,11 +1135,31 @@ class Runner:
         return Tensor(out, x.shape, x.layout, x.pitch)
 
     # ------------------------------------------------- generic QPU unary ops
-    def _unary_uop(self, node, uop, p0=0.0, p1=0.0, p2=0.0):
+    def _unary_uop(self, node, uop, p0=0.0, p1=0.0, p2=0.0, limit=None):
         """One QPU unary kernel over every stored element (layout-agnostic,
         exactly like Relu: the op touches all bytes it is handed, padding
-        included, and keeps the operand's layout and pitch)."""
+        included, and keeps the operand's layout and pitch).
+
+        ``limit`` is the op's documented absolute input range.  The kernels
+        for Sin/Cos use a two-term Cody-Waite reduction whose accuracy is
+        bounded (|x| <= 1e5, measured 4.8e-6); outside it the node raises
+        instead of returning a number the kernel cannot stand behind.
+        """
         x = self._float(node.input[0])
+        if limit is not None:
+            a = self.download_nhwc(x) if x.layout == "nhwc" else self.download(x)
+            m = float(np.max(np.abs(a))) if a.size else 0.0
+            if not np.isfinite(m) or m > limit:
+                raise UnsupportedNode(
+                    node.name, node.op_type,
+                    "input range |x|max=%r exceeds the kernel's documented "
+                    "range |x| <= %g" % (m, limit))
+        out = self.pool.alloc(x.size * 4 + 64)
+        self.eng.unary(uop, x.buf, out, x.size, p0, p1, p2)
+        return Tensor(out, x.shape, x.layout, x.pitch)
+
+    def _uop_on(self, x, uop, p0=0.0, p1=0.0, p2=0.0):
+        """Apply one QPU unary kernel to an existing tensor."""
         out = self.pool.alloc(x.size * 4 + 64)
         self.eng.unary(uop, x.buf, out, x.size, p0, p1, p2)
         return Tensor(out, x.shape, x.layout, x.pitch)
@@ -1190,25 +1218,113 @@ class Runner:
         return self._unary_uop(node, vc4infer.UOP_CLIP, lo, hi)
 
     def _tanh(self, node):
-        """tanh(x) = 2*sigmoid(2x) - 1, composed from verified QPU kernels.
+        """Native QPU tanh: sign(x)*(1-t)/(1+t), t = exp(-2|x|).
 
-        VC4_OP_SIGMOID is the fused element-wise kernel (degree-5 2^f
-        polynomial + 3x Newton reciprocal, measured 7.15e-07) and the two
-        scalings are the engine's correctly-rounded MUL plus a broadcast ADD,
-        so the whole node is four GPU launches with no new kernel and no host
-        arithmetic.  The direct tanh body in kops.py is not element-verified
-        yet (docs/ONNX.md sec. 11), so this composition is the shipped path.
+        Element-verified at 1.2e-7 over the whole line (docs/ONNX.md sec. 12).
         """
+        return self._unary_uop(node, vc4infer.UOP_TANH)
+
+    # the rest of the ONNX unary family, one kernel each
+    def _exp(self, node):
+        return self._unary_uop(node, vc4infer.UOP_EXP)
+
+    def _domain(self, node, x, lo=None, hi=None, desc=""):
+        """Refuse inputs the kernel's documented domain excludes."""
+        a = self.download_nhwc(x) if x.layout == "nhwc" else self.download(x)
+        if a.size:
+            vmin, vmax = float(np.min(a)), float(np.max(a))
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or \
+                    (lo is not None and vmin < lo) or \
+                    (hi is not None and vmax > hi):
+                raise UnsupportedNode(
+                    node.name, node.op_type,
+                    "%s: input range [%r, %r] is outside the kernel's "
+                    "verified domain %s" % (node.op_type, vmin, vmax, desc))
+
+    def _log(self, node):
         x = self._float(node.input[0])
-        t = self._scaled(x, 2.0)
-        self._tmp(t)
-        y = self.pool.alloc(t.size * 4 + 64)
-        self.eng.elementwise(vc4infer.OP_SIGMOID, t.buf, y, t.size)
-        t2 = Tensor(y, t.shape, t.layout, t.pitch)
-        self._tmp(t2)
-        u = self._scaled(t2, 2.0)
+        self._domain(node, x, lo=2.0 ** -126, desc="2^-126 <= x < inf")
+        return self._unary_uop(node, vc4infer.UOP_LOG)
+
+    def _sqrt(self, node):
+        x = self._float(node.input[0])
+        self._domain(node, x, lo=0.0, desc="0 <= x < inf")
+        return self._unary_uop(node, vc4infer.UOP_SQRT)
+
+    def _reciprocal(self, node):
+        return self._unary_uop(node, vc4infer.UOP_RECIPROCAL)
+
+    def _erf(self, node):
+        return self._unary_uop(node, vc4infer.UOP_ERF)
+
+    def _sin(self, node):
+        return self._unary_uop(node, vc4infer.UOP_SIN, limit=1e5)
+
+    def _cos(self, node):
+        return self._unary_uop(node, vc4infer.UOP_COS, limit=1e5)
+
+    def _floor(self, node):
+        return self._unary_uop(node, vc4infer.UOP_FLOOR)
+
+    def _ceil(self, node):
+        return self._unary_uop(node, vc4infer.UOP_CEIL)
+
+    def _round(self, node):
+        # ONNX Round: nearest integer, ties to even
+        return self._unary_uop(node, vc4infer.UOP_ROUND)
+
+    def _softplus(self, node):
+        return self._unary_uop(node, vc4infer.UOP_SOFTPLUS)
+
+    def _softsign(self, node):
+        return self._unary_uop(node, vc4infer.UOP_SOFTSIGN)
+
+    def _elu(self, node):
+        return self._unary_uop(node, vc4infer.UOP_ELU,
+                               float(_attr(node, "alpha", 1.0)))
+
+    def _selu(self, node):
+        return self._unary_uop(node, vc4infer.UOP_SELU,
+                               float(_attr(node, "alpha", 1.6732631921768188)),
+                               float(_attr(node, "gamma", 1.0507010221481323)))
+
+    def _gelu(self, node):
+        """ONNX Gelu; the default/erf form is composed from verified kernels.
+
+        erf saturates at 1-2^-24 with the truncating FPU, so the fused body
+        needs a saturation select and does not fit the code slot at nv4; the
+        composition (scale, native Erf, add 1, halve, multiply by x) is exact
+        to the same tolerance and uses four verified launches.
+        """
+        approx = _attr(node, "approximate", "none") or "none"
+        if approx == "tanh":
+            return self._unary_uop(node, vc4infer.UOP_GELU)
+        if approx != "none":
+            raise UnsupportedNode(node.name, "Gelu",
+                                  "approximate=%r (want none or tanh)" % approx)
+        x = self._float(node.input[0])
+        u = self._scaled(x, 0.7071067811865476)
         self._tmp(u)
-        return self._addconst(u, -1.0)
+        e = self._uop_on(u, vc4infer.UOP_ERF)
+        self._tmp(e)
+        s = self._addconst(e, 1.0)
+        self._tmp(s)
+        h = self._scaled(s, 0.5)
+        self._tmp(h)
+        out = self.pool.alloc(x.size * 4 + 64)
+        self.eng.elementwise(vc4infer.OP_MUL, x.buf, out, x.size, b=h.buf)
+        return Tensor(out, x.shape, x.layout, x.pitch)
+
+    def _mish(self, node):
+        """mish(x) = x*tanh(softplus(x)), composed from verified kernels."""
+        x = self._float(node.input[0])
+        sp = self._uop_on(x, vc4infer.UOP_SOFTPLUS)
+        self._tmp(sp)
+        th = self._uop_on(sp, vc4infer.UOP_TANH)
+        self._tmp(th)
+        out = self.pool.alloc(x.size * 4 + 64)
+        self.eng.elementwise(vc4infer.OP_MUL, x.buf, out, x.size, b=th.buf)
+        return Tensor(out, x.shape, x.layout, x.pitch)
 
     def _maxpool(self, node):
         x = self._float(node.input[0])
@@ -2047,7 +2163,7 @@ class Runner:
     # ---------------------------------------------------------------- execute
     def _dispatch(self, node):
         op = node.op_type
-        fn = {
+        d = {
             "Conv": self._conv,
             "Relu": self._relu,
             "Abs": self._abs,
@@ -2059,6 +2175,22 @@ class Runner:
             "HardSwish": self._hardswish,
             "Sigmoid": self._sigmoid,
             "Tanh": self._tanh,
+            "Exp": self._exp,
+            "Log": self._log,
+            "Sqrt": self._sqrt,
+            "Reciprocal": self._reciprocal,
+            "Erf": self._erf,
+            "Sin": self._sin,
+            "Cos": self._cos,
+            "Floor": self._floor,
+            "Ceil": self._ceil,
+            "Round": self._round,
+            "Softplus": self._softplus,
+            "Softsign": self._softsign,
+            "Elu": self._elu,
+            "Selu": self._selu,
+            "Gelu": self._gelu,
+            "Mish": self._mish,
             "Silu": lambda node: self._silu(self._float(node.input[0])),
             "Add": self._add,
             "Mul": self._mul,
@@ -2083,7 +2215,11 @@ class Runner:
             "Constant": self._const_node,
             "Shape": self._shape,
             "Gather": self._gather,
-        }.get(op)
+        }
+        if not _UNARY_NV4_VERIFIED:
+            for name in _UNARY_NV4_STAGED:
+                d.pop(name, None)
+        fn = d.get(op)
         if fn is None:
             raise UnsupportedNode(node.name, op, "unsupported op %s" % op)
         try:

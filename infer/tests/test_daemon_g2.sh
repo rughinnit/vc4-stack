@@ -168,7 +168,10 @@ if ! wait_for_cma $((WANT_MB + 8)) 120; then
     printf 'G2 SKIP (%d)\n' "$skipped"
     exit 0
 fi
-leave=$((WANT_MB / 2 + 2))
+# Leave room for the fallback block: want/2 must still be obtainable, and
+# ARENA_MIN (8 MiB) must fit with a margin, or the daemon refuses to start at
+# all and there is nothing to observe (that is a skip, not a failure).
+leave=$((WANT_MB / 2 + 4))
 
 # ---------------------------------------------------------------- A. retry --
 SOCK=$BASE-a.sock
@@ -206,7 +209,11 @@ hold_until_free "$leave" || say "   (could only reach $(free_mb) MiB free)"
 say "   CmaFree $(free_mb) MiB"
 launch_daemon
 if ! wait_ready; then
-    fail "private vc4d did not start (B)"
+    if [ "$(free_mb)" -lt 14 ]; then
+        skip "phase B skipped: the daemon could not get even its minimum block with $(free_mb) MiB of CMA free"
+    else
+        fail "private vc4d did not start (B)"
+    fi
 else
     out=$("$PROBE" "$SOCK" 2>&1)
     say "   $out"

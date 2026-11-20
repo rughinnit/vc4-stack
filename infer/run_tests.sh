@@ -187,6 +187,11 @@ PYTHONPATH=$PYTHONPATH:. timeout -k 5 900 python3 tests/test_onnx_gaps.py
 board
 cool
 
+echo "=== test_onnx_geom (geometry/detection family through the runner)"
+PYTHONPATH=$PYTHONPATH:. timeout -k 5 1200 python3 tests/test_onnx_geom.py
+board
+cool
+
 echo "=== test_copyops (layout copy kernels, byte-exact)"
 timeout -k 5 300 $RUN ./build/test_copyops
 board

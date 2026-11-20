@@ -182,6 +182,18 @@ OPS = {
     "Unique": "QPU pairwise equality/order matrices + QPU row gather",
     "ReverseSequence": "QPU copy2d laned gather over the time axis",
     "CenterCropPad": "QPU fill2d + copy2d laned gather (crop/pad map)",
+    # the geometry / detection family (_dispatch_geom.py,
+    # docs/OPS-GEOMETRY.md).  Each entry names the kernels the handler composes.
+    "ConvTranspose": "QPU gemm (W^T @ X) + QPU tap scatter (col2im), bias QPU",
+    "Col2Im": "QPU k^2 tap scatter (copy2d lane stride) + QPU vector add",
+    "AffineGrid": "QPU affine x/y planes + one-word strided store interleave",
+    "GridSample": "QPU denormalise/reflect/floor, index read-back, 4 copy2d taps, QPU bilinear weights",
+    "RoiAlign": "QPU ROI sample coordinates, 4 copy2d taps per sample, QPU GEMM avg / max chain",
+    "MaxRoiPool": "QPU integer ROI bins, window row copies + QPU max chain",
+    "NonMaxSuppression": "QPU IoU matrix + pairwise score rank (GEMM), QPU triangular suppression predicate",
+    "Det": "QPU permutation gathers + QPU mul/add chain (Leibniz expansion)",
+    "Einsum": "QPU copy2d permutations + QPU gemm contraction (lowered, not a kernel)",
+    "DeformConv": "QPU offset coordinates + 4-tap bilinear im2col + QPU gemm",
 }
 
 # Registered after the 2026-11-20 clean-window verification.  Set

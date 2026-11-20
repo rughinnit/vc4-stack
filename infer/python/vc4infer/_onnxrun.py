@@ -145,12 +145,14 @@ def _extra_handlers():
     """
     global _EXTRA_HANDLERS, _EXTRA_OVERRIDES
     if _EXTRA_HANDLERS is None:
-        from . import _dispatch_extra, _dispatch_norm
+        from . import _dispatch_extra, _dispatch_norm, _dispatch_geom
         _EXTRA_HANDLERS = dict(_dispatch_extra.HANDLERS)
         _EXTRA_HANDLERS.update(_dispatch_norm.HANDLERS)
+        _EXTRA_HANDLERS.update(_dispatch_geom.HANDLERS)
         _EXTRA_OVERRIDES = (
             frozenset(getattr(_dispatch_norm, "OVERRIDES", ()))
-            | frozenset(getattr(_dispatch_extra, "OVERRIDES", ())))
+            | frozenset(getattr(_dispatch_extra, "OVERRIDES", ()))
+            | frozenset(getattr(_dispatch_geom, "OVERRIDES", ())))
     return _EXTRA_HANDLERS
 
 

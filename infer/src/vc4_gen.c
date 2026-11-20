@@ -87,6 +87,7 @@ static const char *uop_name(vc4_uop op)
     case VC4_UOP_TAN: return "tan";
     case VC4_UOP_SINH: return "sinh";
     case VC4_UOP_COSH: return "cosh";
+    case VC4_UOP_RNG: return "rng";
     default: return NULL;
     }
 }

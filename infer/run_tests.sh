@@ -187,6 +187,21 @@ PYTHONPATH=$PYTHONPATH:. timeout -k 5 900 python3 tests/test_onnx_gaps.py
 board
 cool
 
+echo "=== test_onnx_rnn (RNN/GRU/LSTM attribute matrix through the runner)"
+PYTHONPATH=$PYTHONPATH:. timeout -k 5 900 python3 tests/test_onnx_rnn.py
+board
+cool
+
+echo "=== test_onnx_sig (signal/quantise/random attribute matrix)"
+PYTHONPATH=$PYTHONPATH:. timeout -k 5 900 python3 tests/test_onnx_sig.py
+board
+cool
+
+echo "=== check_rng_gpu (the counter-based QPU RNG, 10^6 draws)"
+PYTHONPATH=$PYTHONPATH:. timeout -k 5 600 python3 tests/check_rng_gpu.py
+board
+cool
+
 echo "=== test_copyops (layout copy kernels, byte-exact)"
 timeout -k 5 300 $RUN ./build/test_copyops
 board

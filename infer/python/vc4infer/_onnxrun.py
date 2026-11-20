@@ -148,7 +148,9 @@ def _extra_handlers():
         from . import _dispatch_extra, _dispatch_norm
         _EXTRA_HANDLERS = dict(_dispatch_extra.HANDLERS)
         _EXTRA_HANDLERS.update(_dispatch_norm.HANDLERS)
-        _EXTRA_OVERRIDES = frozenset(getattr(_dispatch_norm, "OVERRIDES", ()))
+        _EXTRA_OVERRIDES = (
+            frozenset(getattr(_dispatch_norm, "OVERRIDES", ()))
+            | frozenset(getattr(_dispatch_extra, "OVERRIDES", ())))
     return _EXTRA_HANDLERS
 
 

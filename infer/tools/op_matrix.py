@@ -508,6 +508,33 @@ def rec_pool(op, rng, o):
     return out
 
 
+def rec_variadic(op, rng, o):
+    """Sum / Mean / Max / Min: variadic element-wise.
+
+    The generic recipe fills one feed per schema input, and a variadic
+    operator's schema has a *single* variadic parameter, so it synthesises a
+    one-operand node -- for Sum/Max/Min/Mean that is an identity, which a
+    composition can pass with no element-wise pass at all.  These are the
+    forms that exercise the operator: two operands, and three with numpy
+    broadcasting (Mean stays same-shape because the 1.17 reference adds in
+    place into its first operand and cannot evaluate a broadcast form).
+    """
+    shp = (2, 3, 4)
+    same = [sp(op, "two_operands", ["A", "B"],
+               {"A": arr(rng, shp, -1.0, 1.5), "B": arr(rng, shp, -1.0, 1.5)})]
+    three = {"A": arr(rng, (2, 1, 4), -1.0, 1.5),
+             "B": arr(rng, (3, 4), -1.0, 1.5)}
+    if op == "Mean":
+        three = {"A": arr(rng, shp, -1.0, 1.5),
+                 "B": arr(rng, shp, -1.0, 1.5)}
+        three["C"] = arr(rng, shp, -1.0, 1.5)
+    else:
+        three["C"] = arr(rng, (1,), 0.5, 1.5)
+    same.append(sp(op, "three_operands", ["A", "B", "C"], three,
+                   note="numpy broadcasting" if op != "Mean" else ""))
+    return same
+
+
 def rec_norm(op, rng, o):
     if op == "LRN":
         return [sp(op, "size3", ["X"], {"X": arr(rng, (1, 16, 5, 5), -1, 1)},
@@ -1040,6 +1067,8 @@ RECIPES = {
     "InstanceNormalization": rec_norm, "GroupNormalization": rec_norm,
     "LayerNormalization": rec_norm, "MeanVarianceNormalization": rec_norm,
     "LpNormalization": rec_norm,
+    "Sum": rec_variadic, "Mean": rec_variadic, "Max": rec_variadic,
+    "Min": rec_variadic,
     "ReduceL1": rec_reduce, "ReduceL2": rec_reduce,
     "ReduceLogSum": rec_reduce, "ReduceLogSumExp": rec_reduce,
     "ReduceMax": rec_reduce, "ReduceMean": rec_reduce,

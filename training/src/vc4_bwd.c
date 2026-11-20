@@ -179,8 +179,12 @@ static vc4_buf ws_get(bw_ws *w, size_t bytes)
     vc4_buf b = { 0, 0 };
     if (!w->ok)
         return b;
-    if (!vc4__ws_alloc(w->ctx, bytes, &b))
+    if (!vc4__ws_alloc(w->ctx, bytes, &b)) {
+        if (getenv("VC4_BWD_DEBUG"))
+            fprintf(stderr, "[bwd] ws_get %zu B failed, free %zu, used %zu\n",
+                    bytes, vc4__ws_free(w->ctx), vc4_arena_used(w->ctx));
         w->ok = 0;
+    }
     return b;
 }
 
@@ -332,6 +336,22 @@ static vc4_status ones_row(bw_ws *w, uint32_t n, vc4_buf *b)
     return VC4_OK;
 }
 
+/* out[r*block + k] = src[r] for every block of `block` floats: the affine
+ * copy2d with a zero lane stride.  No table, one launch, no memory. */
+static vc4_status bcast_blocks(vc4_ctx *ctx, const vc4_buf *src, uint32_t nblk,
+                               uint32_t block, vc4_buf *out, uint32_t srow)
+{
+    if (block == 0 || nblk == 0)
+        return VC4_ERR_INVAL;
+    if (block <= 16)
+        return vc4_copy2d_n(ctx, src, out, nblk, 1, srow, block * 4, 0,
+                            block * 4u, 0, 16, 1, block);
+    if (block % 16)
+        return VC4_ERR_UNSUPPORTED;
+    return vc4_copy2d_n(ctx, src, out, nblk, block / 16, srow, block * 4, 0,
+                        64, 0, 16, 1, 16);
+}
+
 /* ======================================================================
  * generic broadcast and single-axis reduction
  * ====================================================================== */
@@ -349,6 +369,49 @@ static vc4_status bcast_gen(vc4_ctx *ctx, const vc4_buf *src, const int *sdims,
         for (int i = 0; i < ndim - 1; ++i) rows *= odims[i];
         return bcast_rows(ctx, src, (uint32_t)rows, (uint32_t)odims[ndim - 1],
                           out);
+    }
+    /* A per-channel vector expanded over BOTH a leading (batch) and a
+     * trailing (spatial) axis: two affine passes instead of a table.
+     *   step 1  [1][C][1] -> [1][C][HW]   (repeat each element over the tail)
+     *   step 2  [1][C][HW] -> [N][C][HW]  (repeat the whole block N times)
+     */
+    if (sdims[ndim - 1] == 1 && odims[ndim - 1] > 1) {
+        /* every differing axis must be the leading one or the trailing one */
+        int ok = 1;
+        for (int i = 1; i < ndim - 1; ++i)
+            if (sdims[i] != odims[i])
+                ok = 0;
+        if (sdims[0] != 1 && odims[0] > 1)
+            ok = 0;
+        const int64_t nblk1 = prod_dims(sdims, ndim - 1);
+        const uint32_t run1 = (uint32_t)odims[ndim - 1];
+        if (ok && (run1 % 16 == 0 || run1 <= 16)) {
+            bw_ws w;
+            ws_on(&w, ctx);
+            vc4_buf t1 = ws_get(&w, al64((size_t)nblk1 * run1 * 4));
+            vc4_status st = w.ok ? VC4_OK : VC4_ERR_NOMEM;
+            if (st == VC4_OK)
+                st = bcast_blocks(ctx, src, (uint32_t)nblk1, run1, &t1, 4);
+            if (st == VC4_OK) {
+                /* the block to repeat is nblk1*run1 floats, odims[0] times */
+                const uint32_t blk = (uint32_t)(nblk1 * run1);
+                if (blk <= 16)
+                    st = vc4_copy2d_n(ctx, &t1, out, (uint32_t)odims[0], 1, 0,
+                                      blk * 4, 0, blk * 4u, 0, 16, 1, blk);
+                else if (blk % 16 == 0)
+                    st = vc4_copy2d_n(ctx, &t1, out, (uint32_t)odims[0],
+                                      blk / 16, 0, blk * 4, 0, 64, 0, 16, 1,
+                                      16);
+                else
+                    st = VC4_ERR_UNSUPPORTED;
+            }
+            ws_off(&w);
+            if (st == VC4_OK) {
+                ctx->st.flops += (uint64_t)n_out;
+                return st;
+            }
+            /* fall through to the table on an unsupported shape */
+        }
     }
     /* general: build the 0/1 map and do one matvec */
     bw_ws w;

@@ -122,7 +122,7 @@ for op in softmax_bwd softmax_ce_bwd batchnorm_bwd layernorm_bwd \
           avgpool_bwd adaptive_avgpool_bwd global_avgpool_bwd maxpooln_bwd \
           binop_bwd cat_bwd split_bwd pad_bwd transpose_bwd reduce_bwd \
           resize_nearest_bwd resize_bilinear_bwd gather_bwd scatter_bwd \
-          bwop_run; do
+          bwop_run gate; do
     timeout -k 2 120 $RUN ./build/test_bwd_one $op || {
         echo "FAIL: test_bwd_one $op"; exit 1; }
 done

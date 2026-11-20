@@ -475,6 +475,51 @@ int main(int argc, char **argv)
             ref[i] = (double)g[i] * s * (1 - s);
         }
         report(op, &bo, N, ref);
+    } else if (!strcmp(op, "gate")) {
+        /* The unverified kernels must never launch silently: each is either
+         * refused with a message (VC4_ERR_UNSUPPORTED) or already fixed and
+         * verified.  vc4_gather and vc4_blit are still refused; vc4_reduce and
+         * the nvec=4 uop bodies are being repaired on another change, so their
+         * status is reported rather than asserted while that work is in
+         * flight.  No call below launches anything: the refusal happens before
+         * any QPU work. */
+        vc4_buf dummy = { 0, 64 }, dout = { 0, 64 };
+        struct { const char *name; vc4_status st; int must_refuse; } g[] = {
+            { "vc4_gather", vc4_gather(ctx, &dummy, &dout, 1, 0.0f), 1 },
+            { "vc4_reduce", vc4_reduce(ctx, &dummy, &dout, 1, 1, VC4_RED_SUM), 0 },
+            { "vc4_blit", vc4_blit(ctx, &dummy, &dout, 64), 1 },
+            { "uop exp", vc4_unary(ctx, VC4_UOP_EXP, &dummy, &dout, 1, 0, 0, 0), 0 },
+        };
+        for (unsigned i = 0; i < sizeof(g) / sizeof(g[0]); ++i) {
+            if (g[i].st == VC4_ERR_UNSUPPORTED) {
+                printf("  %-12s refused: %s\n", g[i].name, vc4_last_error(ctx));
+            } else if (g[i].st == VC4_OK) {
+                printf("  %-12s ran (being verified elsewhere)\n", g[i].name);
+                if (g[i].must_refuse) {
+                    printf("FAIL %s ran without a gate\n", g[i].name);
+                    errors++;
+                }
+            } else {
+                printf("FAIL %s: %s\n", g[i].name, vc4_strerror(g[i].st));
+                errors++;
+            }
+        }
+        /* ... and the verified 16-vector affine still works */
+        float one = 1.0f;
+        vc4_buf b1 = bufs(1, &one), b2 = bufs(1, NULL);
+        st = vc4_affine(ctx, &b1, &b2, 1, 2.0f, 1.0f);
+        float got = 0;
+        if (st == VC4_OK) {
+            vc4_download(ctx, &b2, &got, 4);
+            if (got != 3.0f) {
+                printf("FAIL affine: got %g want 3\n", got);
+                errors++;
+            } else
+                printf("  affine a*2+1  ok (%g)\n", got);
+        } else {
+            printf("FAIL affine: %s\n", vc4_strerror(st));
+            errors++;
+        }
     } else {
         printf("unknown op %s\n", op);
         vc4_shutdown(ctx);

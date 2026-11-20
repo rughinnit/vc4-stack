@@ -25,6 +25,7 @@
  *                      [--reps R] [--save FILE]
  */
 #include "vc4infer.h"
+#include "vc4_int.h"
 #include "util.h"
 #include <math.h>
 
@@ -205,7 +206,11 @@ static uint64_t fnv(const void *p, size_t n)
 /* ------------------------------------------------------------------ macros */
 #define CK(x) do { st = (x); if (st != VC4_OK) { \
         printf("FAIL line %d: %s <- %s (%s)\n", __LINE__, vc4_strerror(st), \
-               #x, vc4_last_error(ctx)); rc = 1; goto out; } } while (0)
+               #x, vc4_last_error(ctx)); \
+        printf("     arena=%zu used=%zu ws_free=%zu\n", \
+               vc4_arena_bytes(ctx), vc4_arena_used(ctx), \
+               vc4__ws_free(ctx)); \
+        rc = 1; goto out; } } while (0)
 
 /* one optimizer step on a tensor of n floats from gradient G */
 #define OPT_W(Wv, G, M, V, n) do { \
@@ -272,6 +277,7 @@ int main(int argc, char **argv)
     const char *opt = "sgd";
     const char *savepath = "vc4_cnntrain.weights";
     int steps = 120, reps = 1;
+    float lr_opt = 0.0f;
     uint32_t seed = 12345, B = 8;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--opt") && i + 1 < argc) opt = argv[++i];
@@ -279,6 +285,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--batch") && i + 1 < argc) B = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--lr") && i + 1 < argc) lr_opt = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--save") && i + 1 < argc) savepath = argv[++i];
     }
     int use_adam = strcmp(opt, "adam") == 0;
@@ -299,9 +306,8 @@ int main(int argc, char **argv)
            "opt=%s seed=%u batch=%u arena %.1f MiB\n", VC4INFER_VERSION_STRING,
            opt, seed, B, (double)vc4_arena_bytes(ctx) / (1 << 20));
 
-    bt_t tr, te;
-    if (bt_alloc(ctx, &tr, NTRAIN, B) != VC4_OK ||
-        bt_alloc(ctx, &te, NTEST, B) != VC4_OK)
+    bt_t tr;   /* one arena layout: images [0,NTRAIN) train, then test */
+    if (bt_alloc(ctx, &tr, NTRAIN + NTEST, B) != VC4_OK)
         return 2;
 
     rng_t r = { seed };
@@ -311,18 +317,19 @@ int main(int argc, char **argv)
     make_dataset(&r, Xtr, Ltr, NTRAIN);
     make_dataset(&r, Xte, Lte, NTEST);
 
-    float *xp = calloc((size_t)NTRAIN * NIMG, 4);
+    float *xp = calloc((size_t)(NTRAIN + NTEST) * NIMG, 4);
     for (int i = 0; i < NTRAIN; ++i)
         memcpy(xp + (size_t)i * NIMG, Xtr + (size_t)i * IMG * IMG, IMG * IMG * 4);
-    vc4_upload(ctx, &tr.X, xp, (size_t)NTRAIN * NIMG * 4);
-    free(xp);
-    xp = calloc((size_t)NTEST * NIMG, 4);
     for (int i = 0; i < NTEST; ++i)
-        memcpy(xp + (size_t)i * NIMG, Xte + (size_t)i * IMG * IMG, IMG * IMG * 4);
-    vc4_upload(ctx, &te.X, xp, (size_t)NTEST * NIMG * 4);
+        memcpy(xp + (size_t)(NTRAIN + i) * NIMG,
+               Xte + (size_t)i * IMG * IMG, IMG * IMG * 4);
+    vc4_upload(ctx, &tr.X, xp, (size_t)(NTRAIN + NTEST) * NIMG * 4);
     free(xp);
-    vc4_upload(ctx, &tr.lab, Ltr, NTRAIN * 4);
-    vc4_upload(ctx, &te.lab, Lte, NTEST * 4);
+    int32_t *lall = malloc((size_t)(NTRAIN + NTEST) * 4);
+    memcpy(lall, Ltr, NTRAIN * 4);
+    memcpy(lall + NTRAIN, Lte, NTEST * 4);
+    vc4_upload(ctx, &tr.lab, lall, (size_t)(NTRAIN + NTEST) * 4);
+    free(lall);
 
     float *w0 = malloc((size_t)NW * 4), *wfc0 = malloc((size_t)KFC * CPAD * 4);
     float *gam0 = malloc(64), *bet0 = malloc(64);
@@ -333,7 +340,7 @@ int main(int argc, char **argv)
     vc4_alloc(ctx, (size_t)KFC * CPAD * 4, &Wfc);
 
     const size_t NFW = (size_t)KFC * CPAD;
-    const float lr = use_adam ? 0.01f : 0.25f;
+    const float lr = lr_opt > 0.0f ? lr_opt : (use_adam ? 0.01f : 0.25f);
     const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
     fill_scalar(ctx, &tr.s_b1, NFW, b1);
     fill_scalar(ctx, &tr.s_ib1, NFW, 1.0f - b1);
@@ -434,6 +441,9 @@ int main(int argc, char **argv)
         }
         uint64_t t1 = now_ns();
         last_loss = tot;
+        printf("rep %d arena: %.2f MiB of %.2f MiB used after %d steps\n", rep,
+               (double)vc4_arena_used(ctx) / (1 << 20),
+               (double)vc4_arena_bytes(ctx) / (1 << 20), steps);
 
         /* final losses over the whole train and test sets */
         double ltr = 0, lte = 0;
@@ -443,8 +453,8 @@ int main(int argc, char **argv)
             ltr += tot;
         }
         for (uint32_t base = 0; base < NTEST; base += B) {
-            FORWARD(te, base, B, W, Wfc);
-            vc4_download(ctx, &te.loss, &tot, 4);
+            FORWARD(tr, NTRAIN + base, B, W, Wfc);
+            vc4_download(ctx, &tr.loss, &tot, 4);
             lte += tot;
         }
         ltr /= NTRAIN;

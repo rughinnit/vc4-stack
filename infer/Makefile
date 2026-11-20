@@ -16,7 +16,7 @@ LIB   = $(BUILD)/libvc4infer.a
 # same library: the op registry dispatches to them.
 SRC   = src/vc4_gen.c src/vc4_dev.c src/vc4_dev_remote.c src/vc4_kern.c src/vc4_gemm.c \
         src/vc4_ew.c src/vc4_conv.c src/vc4_nhwc.c src/vc4_api.c \
-        ../training/src/vc4_convbwd.c ../training/src/vc4_train.c
+        ../training/src/vc4_convbwd.c ../training/src/vc4_train.c ../training/src/vc4_bwd.c
 OBJ   = $(addprefix $(BUILD)/,$(notdir $(SRC:.c=.o)))
 
 TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_onnxops $(BUILD)/test_nhwc $(BUILD)/bench_matmul

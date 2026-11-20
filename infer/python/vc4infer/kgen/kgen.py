@@ -2276,6 +2276,101 @@ def build_im2col_nhwc(Cin, KH, KW, stride=1, vpitch=1, dilation=1):
     return p
 
 
+def build_probe_seq(seq):
+    """Diagnostic: one 16-lane vector in, the raw 16-lane result out.
+
+    ``seq`` is ``<kind>_<nops>`` and names a minimal dependency sequence:
+    one product, then a controllable number of nops, then the second
+    operation.  It exists to measure the QPU write->read hazard for the
+    multiply ALU without any other instruction in the way (docs/NUMERICS.md).
+
+        acc_N      t = fmul(x,2) -> accumulator, N nops, y = fmul(t,3)
+        bmov_N     t -> acc, 2 nops, add-mov -> B register, N nops, fmul(B,3)
+        bmul_N     t = fmul(x,2) -> B register, N nops, fmul(B,3)
+        amul_N     t = fmul(x,2) -> A register, N nops, fmul(A,3)
+        add_N      t -> acc, N nops, y = fadd(t,1)
+        packmul_N  first word packs fmul(x,2) with an independent fadd, N
+                   nops, y = fmul(t,3)
+        packfadd_N t -> acc, N nops, then one word packs fmul(t,3) with
+                   fadd(t,1): both ALUs consume the product at the same time
+
+    The result is replicated into all four store rows (the verified 4-row
+    VPM->DMA store); the first 16 words are the answer.
+    ABI: u0 a bus, u1 unused, u2 out bus.  One QPU.
+    """
+    A_IN, A_OUT, A_ADDR, A_T = 26, 27, 28, 16
+    B_C2, B_C3, B_L4, B_V4, B_V9 = 0, 1, 2, 3, 4
+
+    head, _, tail = seq.partition('_')
+    n = int(tail) if tail else 0
+
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))
+    b.read_uni(A_IN)                       # u0: source
+    b.read_uni(A_T)                        # u1: unused (ABI stability)
+    b.read_uni(A_OUT)                      # u2: destination
+    b.e(ldi(0x40000000, B_C2, ws=1))       # 2.0
+    b.e(ldi(0x40400000, B_C3, ws=1))       # 3.0
+    b.e(ldi(0, B_V4, ws=1))
+    b.e(ldi(0, B_V9, ws=1))
+    b.e(add_(ADD_SHL, B_L4, ws=1, a=areg(R_ELEM_NUM), b=imm(2)))
+    b.e(add_(ADD_ADD, A_ADDR, areg(A_IN), breg(B_L4)), nop())
+    b.e(nop(), nop())
+    _tmu_load_a(b, 0, A_ADDR, A_IN)
+
+    b.check = False
+    if head in ('acc', 'bmov', 'add', 'packfadd'):
+        b.e(dict(mul_op=MUL_FMUL, mul_out=32 + 0, ws=0,
+                 mul_a=areg(A_IN), mul_b=breg(B_C2)))
+    elif head == 'packmul':
+        # producer word: fmul plus an unrelated fadd, like the GEMM's packed
+        # fmul+fadd (the add reads only the source, not the product)
+        b.e(dict(mul_op=MUL_FMUL, mul_out=32 + 0, ws=0,
+                 add_op=ADD_FADD, add_out=32 + 1,
+                 mul_a=areg(A_IN), mul_b=breg(B_C2),
+                 add_a=areg(A_IN), add_b=imm(1)))
+    elif head == 'bmul':
+        b.e(dict(mul_op=MUL_FMUL, mul_out=16, ws=0,
+                 mul_a=areg(A_IN), mul_b=breg(B_C2)))
+    elif head == 'amul':
+        b.e(dict(mul_op=MUL_FMUL, mul_out=16, ws=1,
+                 mul_a=areg(A_IN), mul_b=breg(B_C2)))
+    else:
+        raise ValueError('bad probe sequence %r' % seq)
+
+    if head == 'bmov':
+        b.e(nop(), nop())                  # the emitter's staging gap
+        b.e(add_or(16, acc(0), acc(0), ws=1))   # acc -> B16
+    for _ in range(n):
+        b.e(nop())
+
+    if head == 'add':
+        b.e(dict(add_op=ADD_FADD, add_out=32 + 1,
+                 add_a=acc(0), add_b=imm(1)))
+    elif head == 'packfadd':
+        b.e(dict(mul_op=MUL_FMUL, mul_out=32 + 1, ws=0,
+                 add_op=ADD_FADD, add_out=32 + 2,
+                 mul_a=acc(0), mul_b=breg(B_C3),
+                 add_a=acc(0), add_b=imm(1)))
+    elif head in ('bmul', 'amul'):
+        b.e(dict(mul_op=MUL_FMUL, mul_out=32 + 1, ws=0,
+                 mul_a=breg(16) if head == 'bmul' else areg(16),
+                 mul_b=breg(B_C3)))
+    else:
+        b.e(dict(mul_op=MUL_FMUL, mul_out=32 + 1, ws=0,
+                 mul_a=acc(0), mul_b=breg(B_C3)))
+
+    b.check = True
+    b.e(add_or(0, acc(1), acc(1)))
+    b.e(add_or(1, areg(0), areg(0)), nop(), nop())
+    b.e(add_or(2, areg(0), areg(0)), nop(), nop())
+    b.e(add_or(3, areg(0), areg(0)), nop(), nop())
+    _store4(b, B_V4, B_V9, A_OUT, 0)
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
 def build_probe_lane():
     """Diagnostic: one TMU gather of 16 4-byte words at src + lane*4.
 
@@ -2729,14 +2824,20 @@ def build_ew(op, depth=2, nvec=16):
     b.e(add_(ADD_ADD, E_T8, areg(E_T9), (REGB, B_K['C4INT'])))
     b.e(add_(ADD_SHL, B_K['GAP'], ws=1, a=areg(E_T8), b=imm(_gshift)))
     if nvec != 16:
-        # the 4-vector store (_store4) needs 4*q and q<<9 in the B file
-        b.e(add_(ADD_OR, B_K['VPMQ7'], ws=1, a=areg(E_VPMQ), b=areg(E_VPMQ)))
+        # the 4-vector store (_store4) needs q<<9 (the DMA/VPM read row) in B
         b.e(add_(ADD_SHL, B_K['CSTEP'], ws=1, a=areg(E_TMP), b=imm(9)))
     b.e(add_or(E_LANE, areg(R_ELEM_NUM), areg(R_ELEM_NUM)), nop())
     b.e(add_or(E_VPMQ, breg(R_QPU_NUM), breg(R_QPU_NUM)), nop())
     b.e(add_(ADD_SHL, E_VPMQ, areg(E_VPMQ), imm(2)), nop())            # 4*qpu
-    b.e(add_(ADD_SHL, B_K['VPMQ7'], ws=1, a=areg(E_VPMQ), b=imm(7)))
-    b.e(add_(ADD_SHL, B_K['QOFF'], ws=1, a=areg(E_TMP), b=imm(10)))   # q*1024
+    if nvec == 16:
+        b.e(add_(ADD_SHL, B_K['VPMQ7'], ws=1, a=areg(E_VPMQ), b=imm(7)))
+    else:
+        # _store4's first argument is the VPM *write* row: 4q, in the low
+        # bits of vpw_generic (the 16-vector path wants q<<9 for emit_store16)
+        b.e(add_or(B_K['VPMQ7'], ws=1, a=areg(E_VPMQ), b=areg(E_VPMQ)), nop())
+    # per-QPU stream offset within a group: 16 vectors for the cheap ops,
+    # 4 for the long bodies (which is also the VPM-row and store step)
+    b.e(add_(ADD_SHL, B_K['QOFF'], ws=1, a=areg(E_TMP), b=imm(_gshift)))
     b.e(add_(ADD_SHL, B_K['LOFF'], ws=1, a=areg(E_LANE), b=imm(2)))   # lane*4
     b.e(nop(), nop())
     b.e(add_(ADD_ADD, E_AA, areg(E_AB), (REGB, B_K['QOFF'])))
@@ -2747,7 +2848,10 @@ def build_ew(op, depth=2, nvec=16):
     b.e(nop(), nop())
 
     b.e(ldi(0xFFFFFFFF, B_K['C4INT'], ws=1))
-    b.e(ldi(256, B_K['CSTEP'], ws=1))
+    if nvec == 16:
+        # emit_store16's chunk step is 4 rows x 64 B; the 4-vector path keeps
+        # CSTEP = q<<9 (the VPM source row of this QPU's 4 rows), set above
+        b.e(ldi(256, B_K['CSTEP'], ws=1))
     b.e(ldi(64, B_K['C16'], ws=1))     # one group vector = 16 floats = 64 B
     if op == OP_MUL:
         # constants for the correctly-rounded product (see _ew_compute):
@@ -2761,7 +2865,11 @@ def build_ew(op, depth=2, nvec=16):
         b.e(ldi(0x3FC00000, 1, ws=1))      # B1: 1.5
         b.e(ldi(0x3F000000, 2, ws=1))      # B2: 0.5
         b.e(nop(), nop())
-    if op >= 100:
+    if op >= 200:
+        # generic binary / backward op from kops.py (op-200 indexes EWB)
+        import kops
+        kops.ewb_consts(sys.modules[__name__], b, op - 200)
+    elif op >= 100:
         # generic unary from kops.py: the op loads its own constants and its
         # body replaces _ew_compute below; the harness stays byte-identical to
         # the verified elementwise kernel.
@@ -2806,6 +2914,8 @@ def build_ew(op, depth=2, nvec=16):
     if nvec == 16:
         emit_store16(p, 0)
     else:
+        # _store4 takes the VPM *write* row (4q, low bits of vpw_generic) and
+        # the VPM *read* row for the DMA word (q<<9, the vdw row field)
         _store4(b, B_K['VPMQ7'], B_K['CSTEP'], E_CADR, 0)
     b.check = True
     b.e(add_(ADD_ADD, E_AO, areg(E_AO), (REGB, B_K['STEP'])))
@@ -2821,6 +2931,10 @@ def build_ew(op, depth=2, nvec=16):
 
 def _ew_compute(b, op, j):
     """Vector j -> r(j).  Operands: r26 (a) and b8 (b)."""
+    if op >= 200:
+        import kops
+        kops.ewb_body(sys.modules[__name__], b, op - 200, j)
+        return
     if op >= 100:
         import kops
         kops.ew_body(sys.modules[__name__], b, op - 100, j)
@@ -3375,6 +3489,9 @@ def main(argv):
         p = build_probe_lane_b()
     elif kind == 'probe_pool':
         p = build_probe_pool(g('cin'))
+    elif kind == 'probe_seq':
+        p = build_probe_seq(_opt('seq'))
+        used.update(('seq',))
     elif kind == 'depthwise':
         p = build_depthwise_nhwc(g('cin'))
     elif kind == 'pool_nhwc':
@@ -3385,7 +3502,7 @@ def main(argv):
         p = build_copy_nhwc(g('cin'), g('cout'))
     elif kind == 'ew':
         p = build_ew(g('op'))
-    elif kind in ('uop', 'sel3', 'gather', 'blit', 'reduce', 'cumsum',
+    elif kind in ('uop', 'ewb', 'sel3', 'gather', 'blit', 'reduce', 'cumsum',
                   'copy2d'):
         # generic kernels for the numeric op long tail (kops.py): they reuse
         # build_ew's verified harness and only replace the body.

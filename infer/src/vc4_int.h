@@ -41,6 +41,8 @@ struct vc4_ctx {
     size_t   arena_bytes;
     size_t   arena_top;      /* persistent bump cursor                 */
     size_t   scratch;        /* scratch bump cursor, reset per op      */
+    size_t   ws_top;         /* workspace cursor, carved *down* from the
+                              * end of the arena by a bwd composition    */
     size_t   dirty_top;      /* remote: high-water of CPU-written bytes */
     int      dead;
     void    *remote;         /* struct vc4_remote * when VC4INFER_DAEMON=1 */
@@ -110,6 +112,46 @@ vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
 /* ---- vc4_ew.c ----------------------------------------------------------- */
 vc4_status vc4__ew_run(vc4_ctx *ctx, vc4_op op, uint64_t n,
                        uint32_t a_bus, uint32_t b_bus, uint32_t o_bus);
+
+/* ---- vc4_ew.c: generic binary/backward elementwise ---------------------- */
+/* A kernel from kops' EWB family: out = f(a, b) with p0/p1 as attributes.
+ * `heavy` selects the 4-vector group the long bodies are generated with. */
+vc4_status vc4__ewb(vc4_ctx *ctx, const char *opname, int heavy,
+                    const vc4_buf *a, const vc4_buf *b, vc4_buf *out,
+                    size_t n, float p0, float p1);
+
+/* ---- workspace: temporaries that outlive nested per-op scratch resets ---- */
+/*
+ * Every op resets the scratch cursor (which bumps *up* from arena_top) before
+ * and after it runs, so a backward composition cannot keep its intermediates
+ * there.  The workspace carves *down* from the end of the arena instead:
+ * nothing else allocates from that direction, and ws_end restores the cursor.
+ * Both nest.
+ */
+size_t vc4__ws_begin(vc4_ctx *ctx);
+void   vc4__ws_end(vc4_ctx *ctx, size_t top);
+/* Carve `bytes` from the workspace; NULL (VC4_ERR_NOMEM) when it is full. */
+void  *vc4__ws_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out);
+/* How much workspace is left. */
+size_t vc4__ws_free(const vc4_ctx *ctx);
+
+
+/* A kernel from kops' EWB family: out = f(a, b) with p0/p1 as attributes.
+ * `heavy` selects the 4-vector group the long bodies are generated with. */
+vc4_status vc4__ewb(vc4_ctx *ctx, const char *opname, int heavy,
+                    const vc4_buf *a, const vc4_buf *b, vc4_buf *out,
+                    size_t n, float p0, float p1);
+
+/* ---- workspace: temporaries that outlive nested per-op scratch resets ---- */
+/*
+ * Every op resets the scratch cursor before and after it runs, so a backward
+ * composition cannot keep its intermediates in scratch naively.  ws_begin
+ * raises the scratch *base* above whatever is live and returns the previous
+ * base; every nested reset then rewinds to the raised base instead of 0.
+ * ws_end restores.  Both are cheap and nest.
+ */
+size_t vc4__ws_begin(vc4_ctx *ctx);
+void   vc4__ws_end(vc4_ctx *ctx, size_t base);
 
 /* ---- helpers ------------------------------------------------------------ */
 static inline uint32_t vc4__align8(uint32_t v)  { return (v + 7u) & ~7u; }

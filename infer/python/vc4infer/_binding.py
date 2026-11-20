@@ -82,7 +82,8 @@ LAYOUT_ROW_MAJOR = 0
 (UOP_ABS, UOP_NEG, UOP_IDENTITY, UOP_CLIP, UOP_LEAKYRELU, UOP_FLOOR,
  UOP_CEIL, UOP_ROUND, UOP_SIGN, UOP_EXP, UOP_LOG, UOP_SQRT, UOP_RECIPROCAL,
  UOP_TANH, UOP_ERF, UOP_ELU, UOP_SELU, UOP_SOFTPLUS, UOP_SOFTSIGN, UOP_GELU,
- UOP_GELU_ERF, UOP_HARDSIGMOID, UOP_HARDSWISH, UOP_SIN, UOP_COS) = range(25)
+ UOP_GELU_ERF, UOP_HARDSIGMOID, UOP_HARDSWISH, UOP_SIN, UOP_COS,
+ UOP_AFFINE, UOP_MISH) = range(27)
 SEL_WHERE, SEL_CLIP3, SEL_PRELU = range(3)
 RED_SUM, RED_MEAN, RED_MAX, RED_MIN, RED_ARGMAX, RED_ARGMIN = range(6)
 
@@ -200,6 +201,10 @@ class Engine:
                                   ctypes.POINTER(ctypes.c_int),
                                   ctypes.POINTER(ctypes.c_int)]
         L.vc4_upsample2x_nhwc.restype = ctypes.c_int
+        L.vc4_probe.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                ctypes.POINTER(Buf), ctypes.POINTER(Buf),
+                                ctypes.c_size_t]
+        L.vc4_probe.restype = ctypes.c_int
         L.vc4_unary.argtypes = [ctypes.c_void_p, ctypes.c_int,
                                 ctypes.POINTER(Buf), ctypes.POINTER(Buf),
                                 ctypes.c_size_t] + [ctypes.c_float] * 3
@@ -376,6 +381,11 @@ class Engine:
                                        ctypes.byref(out), int(n),
                                        float(p0), float(p1), float(p2)),
                     "unary")
+
+    def probe(self, seq, a, out, n=16):
+        """Diagnostic: one 16-lane vector in, raw 16 lanes out."""
+        self._check(self.lib.vc4_probe(self.ctx, seq.encode(), ctypes.byref(a),
+                                       ctypes.byref(out), int(n)), "probe")
 
     def select3(self, op, a, b, c, out, n):
         self._check(self.lib.vc4_select3(self.ctx, int(op), ctypes.byref(a),

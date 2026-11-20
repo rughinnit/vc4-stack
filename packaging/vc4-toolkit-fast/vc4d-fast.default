@@ -1,8 +1,0 @@
-# vc4-toolkit-fast: vc4d arguments for the speed-tuned recipe.
-#
-# Installed to /etc/vc4/vc4d-fast.default by the package postinst, selected by
-# /etc/systemd/system/vc4d.service.d/10-fast.conf, toggled by `vc4fast`.
-#
-# No clock, governor or voltage setting appears here.  The board runs at the
-# stock core 400 MHz / V3D 300 MHz.
-VC4D_ARGS="--socket /run/vc4d.sock --arena-mb 150 --group vc4 --drop-user nobody --max-timeout-ms 60000"

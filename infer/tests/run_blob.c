@@ -40,6 +40,16 @@ int main(int argc, char **argv)
     vc4_alloc(ctx, bytes, &bo);
     float *a = vc4_host_ptr(ctx, &ba), *b = vc4_host_ptr(ctx, &bb), *o = vc4_host_ptr(ctx, &bo);
     for (size_t i = 0; i < bytes / 4; ++i) { a[i] = 0.5f + frand(); b[i] = 2.0f * frand(); }
+    /* PROBE_IN: a binary file whose first 16 words replace a[0..15], so a
+       diagnostic kernel can be fed an exact bit pattern and compared with a
+       model.  Nothing else about the harness changes. */
+    const char *pin = getenv("PROBE_IN");
+    if (pin) {
+        FILE *pf = fopen(pin, "rb");
+        if (!pf) { perror(pin); return 2; }
+        if (fread(a, 4, 16, pf) != 16) { perror(pin); fclose(pf); return 2; }
+        fclose(pf);
+    }
     memset(o, 0xCD, bytes);
     vc4__l2_flush(ctx);
 
@@ -89,6 +99,11 @@ int main(int argc, char **argv)
     usleep(200000);            /* let an asynchronous VPM DMA drain */
     vc4__l2_flush(ctx);
     printf("errors after settle: 0x%08x\n", ctx->v3d[0x0F20/4]);
+    if (getenv("DUMP_A")) {
+        printf("a:");
+        for (size_t i = 0; i < 16; ++i) printf(" %08x(%.5g)", *(uint32_t *)&a[i], (double)a[i]);
+        printf("\n");
+    }
     if (nout) {
         printf("out:");
         for (size_t i = 0; i < nout; ++i)

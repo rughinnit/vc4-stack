@@ -27,11 +27,11 @@
 static int uop_nvec(vc4_uop op)
 {
     switch (op) {
-    case VC4_UOP_LOG: case VC4_UOP_TANH: case VC4_UOP_ERF: case VC4_UOP_ELU:
+    case VC4_UOP_ABS: case VC4_UOP_LOG: case VC4_UOP_TANH: case VC4_UOP_ERF: case VC4_UOP_ELU:
     case VC4_UOP_SELU: case VC4_UOP_SOFTPLUS: case VC4_UOP_SOFTSIGN:
     case VC4_UOP_GELU: case VC4_UOP_GELU_ERF: case VC4_UOP_SIN:
     case VC4_UOP_COS: case VC4_UOP_ROUND: case VC4_UOP_SQRT:
-    case VC4_UOP_RECIPROCAL: case VC4_UOP_EXP:
+    case VC4_UOP_RECIPROCAL: case VC4_UOP_EXP: case VC4_UOP_MISH:
         return 4;
     default:
         return 16;
@@ -66,6 +66,8 @@ static const char *uop_name(vc4_uop op)
     case VC4_UOP_HARDSWISH: return "hardswish";
     case VC4_UOP_SIN: return "sin";
     case VC4_UOP_COS: return "cos";
+    case VC4_UOP_AFFINE: return "affine";
+    case VC4_UOP_MISH: return "mish";
     default: return NULL;
     }
 }
@@ -206,6 +208,39 @@ vc4_status vc4_unary(vc4_ctx *ctx, vc4_uop op, const vc4_buf *a, vc4_buf *out,
     }
     vc4__scratch_reset(ctx);
     return st;
+}
+
+/* ------------------------------------------------------------------- probe */
+struct probe_base {
+    uint32_t a, o;
+};
+
+static void probe_fill(uint32_t *u, uint32_t g, uint32_t nq, const uint32_t *b)
+{
+    const struct probe_base *x = (const struct probe_base *)b;
+    u[0] = x->a;
+    u[1] = x->a;                  /* unused stream: alias, never load from 0 */
+    u[2] = x->o;
+    u[3] = 1;
+    u[4] = g;
+    u[5] = nq;
+}
+
+vc4_status vc4_probe(vc4_ctx *ctx, const char *seq, const vc4_buf *a,
+                     vc4_buf *out, size_t n)
+{
+    if (!ctx || !seq || !a || !out || n != 16)
+        return VC4_ERR_INVAL;
+    if (a->bytes < 16 * 4 || out->bytes < 4 * 16 * 4)
+        return VC4_ERR_INVAL;
+    if (ctx->dead)
+        return VC4_ERR_TIMEOUT;
+    struct probe_base x = { vc4_bus_addr(ctx, a), vc4_bus_addr(ctx, out) };
+    char name[96];
+    snprintf(name, sizeof(name), "probe_%s_q1", seq);
+    char *argv[] = { (char *)"probe_seq", (char *)"--seq", (char *)seq, NULL };
+    return launch_groups(ctx, name, argv, 1, probe_fill,
+                         (const uint32_t *)&x);
 }
 
 /* -------------------------------------------------------------------- sel3 */
@@ -630,6 +665,25 @@ vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
     vc4__scratch_reset(ctx);
     x.o = vc4_bus_addr(ctx, out);
     if (np != outer) {
+        /* The kernel walks a full 256-output group, so it reads
+         * np*red floats even when only `outer` outputs are real.  Reading
+         * past the end of the caller's buffer can leave the arena (the last
+         * buffer is usually at the top) and a TMU read of an unmapped
+         * physical address wedges the QPU.  Pad the tail in scratch; the
+         * padding outputs are discarded, so their values do not matter. */
+        float *ap = vc4__scratch_alloc(ctx, np * (size_t)red * 4, NULL);
+        if (!ap) {
+            vc4__scratch_reset(ctx);
+            return VC4_ERR_NOMEM;
+        }
+        vc4__invalidate_off(ctx, a->off, (size_t)outer * red * 4);
+        vc4__write(ctx, (uint32_t)((uint8_t *)ap - ctx->arena),
+                   ctx->arena + a->off, (size_t)outer * red * 4);
+        memset((uint8_t *)ap + (size_t)outer * red * 4, 0,
+               (np - outer) * (size_t)red * 4);
+        vc4__mark_dirty(ctx, (uint32_t)((uint8_t *)ap - ctx->arena),
+                        np * (size_t)red * 4);
+        x.a = ctx->gpu_bus + (uint32_t)((uint8_t *)ap - ctx->arena);
         o_tmp = vc4__scratch_alloc(ctx, np * 4, NULL);
         if (!o_tmp) {
             vc4__scratch_reset(ctx);

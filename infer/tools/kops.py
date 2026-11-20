@@ -209,9 +209,38 @@ def sel(e, out, mask, a_true, b_false, t):
     e.op(k.ADD_OR, out, out, t)
 
 
-def core_exp2(e, t, out, z, sc):
-    """out = 2^t for t in [-126,128]; t,out,z,sc distinct accs."""
+def keep_sel(e, out, mask, a_true):
+    """out = mask ? a_true : out, safe when the false operand is `out`.
+
+    `sel` writes `out` before reading the false operand, so passing `out` as
+    b_false makes the padded read see the new ~mask instead of the old value.
+    Here the AND with the old value comes first: a same-word read returns the
+    pre-write register (the one forwarding rule the QPU does have).  Only one
+    scratch register is needed, which matters because the long bodies are at
+    the B-register budget already.
+    """
     k = e.k
+    t = e.ctx.tb()
+    e.op(k.ADD_NOT, t, mask, mask)
+    e.op(k.ADD_AND, out, out, t)        # old out & ~mask (same-word read)
+    e.op(k.ADD_AND, t, mask, a_true)
+    e.op(k.ADD_OR, out, out, t)
+    e.ctx.rel(t)
+
+
+def core_exp2(e, t, out, z, sc):
+    """out = 2^t for t in [-126,128]; t,out,z,sc distinct registers.
+
+    If a caller aliases t and out (the natural "exp in place" call) the
+    fraction is copied first: the seed `out = E5` below would otherwise
+    destroy the argument before the Horner loop reads it.
+    """
+    k = e.k
+    copied = False
+    if t == out:
+        t = e.ctx.ta() if _bank(out) == 'A' else e.ctx.tb()
+        e.mov(t, out)
+        copied = True
     e.op(k.ADD_FMAX, t, t, e.ctx.k('EXP_LO'))
     e.op(k.ADD_FMIN, t, t, e.ctx.k('EXP_HI'))
     e.op(k.ADD_FADD, z, t, e.ctx.k('HALF'))
@@ -229,15 +258,26 @@ def core_exp2(e, t, out, z, sc):
     e.mul(out, out, t)
     e.op(k.ADD_FADD, out, out, e.ctx.k('ONE'))
     e.mul(out, out, sc)
+    if copied:
+        e.ctx.rel(t)
 
 
 def core_rcp(e, d, out, q):
     k = e.k
+    copied = False
+    if d == out:
+        # the seed below overwrites , so an in-place call must keep the
+        # denominator somewhere else first
+        d = e.ctx.ta() if _bank(out) == 'A' else e.ctx.tb()
+        e.mov(d, out)
+        copied = True
     e.op(k.ADD_SUB, out, e.ctx.k('RCPM'), d)
     for _ in range(4):
         e.mul(q, out, d)
         e.op(k.ADD_FSUB, q, e.ctx.k('TWO'), q)
         e.mul(out, out, q)
+    if copied:
+        e.ctx.rel(d)
 
 
 def core_rsqrt(e, a, out, q):
@@ -346,9 +386,15 @@ def b_floor(e, IN, OUT):
     fl = e.ctx.tb()
     e.op(k.ADD_ADD, fl, n, g)
     t = e.ctx.tb()
-    e.op(k.ADD_SUB, n, k.imm(0), n)
+    e.op(k.ADD_SUB, n, e.ctx.k('ZERO'), n)
     sel(e, OUT, sg, n, fl, t)
     e.op(k.ADD_ITOF, OUT, OUT, OUT)
+    # |x| >= 2^23 is already an integer: return x.  This also passes inf
+    # through instead of overflowing the int32 FTOI (floor(-1e10) was wrong).
+    e.op(k.ADD_AND, n, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_FSUB, n, n, e.ctx.k('T23'))
+    gt_mask(e, sg, n)
+    keep_sel(e, OUT, sg, IN)
     e.ctx.rel(n, g, sg, fl, t)
 
 
@@ -358,9 +404,13 @@ def b_ceil(e, IN, OUT):
     fl = e.ctx.tb()
     e.op(k.ADD_ADD, fl, n, g)
     t = e.ctx.tb()
-    e.op(k.ADD_SUB, fl, k.imm(0), fl)
+    e.op(k.ADD_SUB, fl, e.ctx.k('ZERO'), fl)
     sel(e, OUT, sg, fl, n, t)
     e.op(k.ADD_ITOF, OUT, OUT, OUT)
+    e.op(k.ADD_AND, n, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_FSUB, n, n, e.ctx.k('T23'))
+    gt_mask(e, sg, n)
+    keep_sel(e, OUT, sg, IN)
     e.ctx.rel(n, g, sg, fl, t)
 
 
@@ -390,21 +440,32 @@ def b_round(e, IN, OUT):
     e.op(k.ADD_AND, mk, mk, lsb)
     e.op(k.ADD_SUB, n, n, mk)
     e.op(k.ADD_ITOF, OUT, n, n)
-    e.ctx.rel(n, nf, fr, d, mk, lsb)
+    m = e.ctx.tb()
+    e.op(k.ADD_AND, m, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_FSUB, m, m, e.ctx.k('T23'))
+    gt_mask(e, mk, m)
+    keep_sel(e, OUT, mk, IN)
+    e.ctx.rel(n, nf, fr, d, mk, lsb, m)
 
 
 def b_sign(e, IN, OUT):
+    """ONNX Sign: -1, 0, +1; both zeros map to +0.
+
+    The integer "float bits > 0" test is used on |x| (so the sign bit cannot
+    turn -0.0 into a wrapped positive) and then split by the sign bit.
+    """
     k = e.k
-    m1 = e.ctx.tb()
-    m2 = e.ctx.tb()
-    t = e.ctx.tb()
-    gt_mask(e, m1, IN)
-    e.op(k.ADD_XOR, t, IN, e.ctx.k('SIGNB'))
-    gt_mask(e, m2, t)
-    e.op(k.ADD_AND, m1, m1, e.ctx.k('ONE'))
-    e.op(k.ADD_AND, m2, m2, e.ctx.k('NEGONE'))
-    e.op(k.ADD_OR, OUT, m1, m2)
-    e.ctx.rel(m1, m2, t)
+    a = e.ctx.tb()
+    m = e.ctx.tb()
+    sg = e.ctx.tb()
+    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    gt_mask(e, m, a)                       # all-ones iff |x| != 0
+    e.opi(k.ADD_ASR, sg, IN, 31)           # all-ones iff sign bit set
+    e.op(k.ADD_AND, a, m, e.ctx.k('ONE'))  # +1 (or 0)
+    e.op(k.ADD_AND, sg, sg, m)
+    e.op(k.ADD_AND, sg, sg, e.ctx.k('NEGONE'))
+    e.op(k.ADD_OR, OUT, a, sg)
+    e.ctx.rel(a, m, sg)
 
 
 def b_exp(e, IN, OUT):
@@ -455,26 +516,82 @@ def b_log(e, IN, OUT):
     e.op(k.ADD_ITOF, ee, ee, ee)
     e.mul(ee, ee, e.ctx.k('LN2'))
     e.op(k.ADD_FADD, OUT, ee, p)
-    e.ctx.rel(num, u2, p, m, ee)
+    # domain overrides: log(+-0) = -inf, log(x<0 or nan) = nan, log(+inf) = inf
+    e.ctx.rel(num, u2, p, m, ee)        # the polynomial inputs are dead now
+    a = e.ctx.tb()
+    mm = e.ctx.tb()
+    t = e.ctx.tb()
+    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    eq0_mask(e, mm, a, t)
+    keep_sel(e, OUT, mm, e.ctx.k('NEGINF'))
+    e.op(k.ADD_XOR, a, IN, e.ctx.k('SIGNB'))
+    gt_mask(e, mm, a)
+    keep_sel(e, OUT, mm, e.ctx.k('NAN'))
+    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_SUB, a, a, e.ctx.k('INFI'))
+    e.op(k.ADD_ADD, a, a, e.ctx.k('ONE_I'))
+    gt_mask(e, mm, a)
+    keep_sel(e, OUT, mm, e.ctx.k('POSINF'))
+    e.ctx.rel(num, u2, p, m, ee, a, mm, t)
 
 
 def b_sqrt(e, IN, OUT):
+    """sqrt: Newton on 1/sqrt, then x*(1/sqrt(x)).
+
+    +inf -> +inf, x<0 -> nan (ONNX), +-0 -> +-0 (0*finite is exact).
+    Denormal inputs flush to zero in the FPU; sqrt(denormal) is itself below
+    1e-22, far inside the elementwise tolerance, so the zero result is within
+    the documented bound.
+    """
     k = e.k
     a = e.ctx.tb()
     y = e.ctx.tb()
+    mm = e.ctx.tb()
+    t = e.ctx.tb()
     e.op(k.ADD_FMAX, a, IN, e.ctx.k('TINY'))
     core_rsqrt(e, a, y, e.ctx.tb())
     e.mul(OUT, IN, y)
-    e.ctx.rel(a, y)
+    e.op(k.ADD_XOR, t, IN, e.ctx.k('SIGNB'))
+    gt_mask(e, mm, t)                   # x < 0 strictly
+    keep_sel(e, OUT, mm, e.ctx.k('NAN'))
+    e.op(k.ADD_SUB, a, a, e.ctx.k('INFI'))
+    e.op(k.ADD_ADD, a, a, e.ctx.k('ONE_I'))
+    gt_mask(e, mm, a)                   # x > max finite (inf or nan)
+    keep_sel(e, OUT, mm, e.ctx.k('POSINF'))
+    e.ctx.rel(a, y, mm, t)
 
 
 def b_reciprocal(e, IN, OUT):
+    """1/x for every fp32 x the datapath can represent.
+
+    The Newton core works on a positive normal magnitude.  |x| < 2^-126
+    (zero and denormals, which the FPU flushes) maps to +-inf, which is also
+    what a float32 reference produces: 1/1.4e-45 overflows.  The sign bit is
+    restored at the end, so negative inputs (a case the old max(x,TINY) clamp
+    destroyed) are correct.  The result is a denormal - and therefore 0 - for
+    |x| > 2^126; that is the one documented range limit.
+    """
     k = e.k
     a = e.ctx.tb()
-    e.op(k.ADD_FMAX, a, IN, e.ctx.k('TINY'))
+    r = e.ctx.tb()
+    sg = e.ctx.tb()
+    d = e.ctx.tb()
+    m = e.ctx.tb()
+    t = e.ctx.tb()
+    e.op(k.ADD_AND, a, IN, e.ctx.k('ABSM'))
+    e.op(k.ADD_AND, sg, IN, e.ctx.k('SIGNB'))
+    # m = all-ones iff |x| >= 2^-126 (the smallest normal); both zeros and
+    # denormals take the inf path
+    e.op(k.ADD_SUB, d, a, e.ctx.k('TINYI'))
+    e.op(k.ADD_ADD, d, d, e.ctx.k('ONE_I'))
+    gt_mask(e, m, d)
+    e.op(k.ADD_FMAX, a, a, e.ctx.k('TINY'))    # no-op for normals
     e.op(k.ADD_FMIN, a, a, e.ctx.k('BIG'))
-    core_rcp(e, a, OUT, e.ctx.tb())
-    e.ctx.rel(a)
+    core_rcp(e, a, r, e.ctx.tb())
+    e.op(k.ADD_OR, r, r, sg)
+    e.op(k.ADD_OR, t, sg, e.ctx.k('POSINF'))
+    sel(e, OUT, m, r, t, d)
+    e.ctx.rel(a, r, sg, d, m, t)
 
 
 def b_tanh(e, IN, OUT):
@@ -516,19 +633,30 @@ def b_selu(e, IN, OUT):
     e.ctx.rel(m, t, u)
 
 
-def b_softplus(e, IN, OUT):
+def core_softplus(e, IN, out):
+    """softplus(x) = max(x,0) + log1p(exp(-|x|)).
+
+    t = exp(-|x|); u = t/(2+t) = tanh(log(1+t)/2); log1p(t) is the atanh
+    series 2*(u + u^3/3 + u^5/5 + ...).  The |x| form never exponentiates a
+    positive argument, so it cannot overflow.
+    """
     k = e.k
     ax = e.ctx.tb()
     a = e.ctx.tb()
     e.op(k.ADD_AND, ax, IN, e.ctx.k('ABSM'))
     e.mul(a, ax, e.ctx.k('NLOG2E'))
-    core_exp2(e, a, a, e.ctx.tb(), e.ctx.tb())
+    z = e.ctx.tb()
+    sc = e.ctx.tb()
+    core_exp2(e, a, a, z, sc)
+    e.ctx.rel(z, sc)
     e.op(k.ADD_FADD, a, a, e.ctx.k('ONE'))
     u = e.ctx.tb()
     den = e.ctx.tb()
+    q = e.ctx.tb()
     e.op(k.ADD_FSUB, u, a, e.ctx.k('ONE'))
     e.op(k.ADD_FADD, den, a, e.ctx.k('ONE'))
-    core_rcp(e, den, den, e.ctx.tb())
+    core_rcp(e, den, den, q)
+    e.ctx.rel(q)
     e.mul(u, u, den)
     u2 = e.ctx.tb()
     p = e.ctx.tb()
@@ -540,8 +668,22 @@ def b_softplus(e, IN, OUT):
     e.mul(p, p, u)
     e.op(k.ADD_FADD, p, p, p)
     e.op(k.ADD_FMAX, ax, IN, e.ctx.k('ZERO'))
-    e.op(k.ADD_FADD, OUT, ax, p)
+    e.op(k.ADD_FADD, out, ax, p)
     e.ctx.rel(ax, a, u, den, u2, p)
+
+
+def b_softplus(e, IN, OUT):
+    core_softplus(e, IN, OUT)
+
+
+def b_mish(e, IN, OUT):
+    """mish(x) = x * tanh(softplus(x))."""
+    k = e.k
+    sp = e.ctx.tb()
+    core_softplus(e, IN, sp)
+    core_tanh(e, sp, OUT, e.ctx.tb(), e.ctx.tb(), e.ctx.tb())
+    e.mul(OUT, OUT, IN)
+    e.ctx.rel(sp)
 
 
 def b_softsign(e, IN, OUT):
@@ -556,9 +698,18 @@ def b_softsign(e, IN, OUT):
 
 
 def b_gelu(e, IN, OUT):
+    """ONNX Gelu, tanh approximation: 0.5*x*(1+tanh(0.79788456*(x+0.044715x^3))).
+
+    The tanh core is a truncating 1 - 2t/(1+t) form, so it saturates at
+    1-2^-24 rather than 1.  At |u| > 44 the true tanh is exactly +-1 in fp32,
+    and multiplying that 2^-24 residue by a large x would be a real error
+    (x=-1e10 produced -298), so the saturated half is selected explicitly.
+    """
     k = e.k
     x3 = e.ctx.tb()
     u = e.ctx.tb()
+    m = e.ctx.tb()
+    t = e.ctx.tb()
     e.mul(x3, IN, IN)
     e.mul(x3, x3, IN)
     e.mul(x3, x3, e.ctx.k('GELU_C'))
@@ -568,7 +719,15 @@ def b_gelu(e, IN, OUT):
     e.op(k.ADD_FADD, OUT, OUT, e.ctx.k('ONE'))
     e.mul(OUT, OUT, IN)
     e.mul(OUT, OUT, e.ctx.k('HALF'))
-    e.ctx.rel(x3, u)
+    # u > 44 -> x ; u < -44 -> 0
+    e.op(k.ADD_FADD, t, u, e.ctx.k('T44'))
+    e.op(k.ADD_XOR, t, t, e.ctx.k('SIGNB'))
+    gt_mask(e, m, t)
+    keep_sel(e, OUT, m, e.ctx.k('ZERO'))
+    e.op(k.ADD_FSUB, t, u, e.ctx.k('T44'))
+    gt_mask(e, m, t)
+    keep_sel(e, OUT, m, IN)
+    e.ctx.rel(x3, u, m, t)
 
 
 def b_gelu_erf(e, IN, OUT):
@@ -588,6 +747,13 @@ def b_hardsigmoid(e, IN, OUT):
     e.op(k.ADD_FADD, OUT, OUT, e.ctx.k('BETA'))
     e.op(k.ADD_FMAX, OUT, OUT, e.ctx.k('ZERO'))
     e.op(k.ADD_FMIN, OUT, OUT, e.ctx.k('ONE'))
+
+
+def b_affine(e, IN, OUT):
+    """out = a * p0 + p1 (two scalar uniforms; the gradient-broadcast scale)."""
+    k = e.k
+    e.mul(OUT, IN, e.ctx.k('P0'))
+    e.op(k.ADD_FADD, OUT, OUT, e.ctx.k('P1'))
 
 
 def b_hardswish(e, IN, OUT):
@@ -617,6 +783,8 @@ def _sincos(e, IN):
     e.mul(r, t, e.ctx.k('PIO2_HI'))
     e.op(k.ADD_FSUB, r, IN, r)
     h = e.ctx.tb()
+    e.mul(h, t, e.ctx.k('PIO2_MID'))
+    e.op(k.ADD_FSUB, r, r, h)
     e.mul(h, t, e.ctx.k('PIO2_LO'))
     e.op(k.ADD_FSUB, r, r, h)
     r2 = e.ctx.tb()
@@ -645,36 +813,30 @@ def _sincos(e, IN):
 
 
 def b_sin(e, IN, OUT):
+    """sin with quadrant q = round(x*2/pi): q&1 picks cos, q>>1 the sign."""
     k = e.k
     sp, cp, b0, b1 = _sincos(e, IN)
     m = e.ctx.tb()
-    e.opi(k.ADD_SUB, m, b0, 1)
-    e.opi(k.ADD_ASR, m, m, 31)
-    e.op(k.ADD_NOT, m, m, m)
-    e.op(k.ADD_AND, sp, m, cp)
-    e.op(k.ADD_NOT, m, m, m)
-    e.op(k.ADD_AND, cp, m, cp)
-    e.op(k.ADD_OR, sp, sp, cp)
+    t = e.ctx.tb()
+    e.op(k.ADD_SUB, m, e.ctx.k('ZERO'), b0)   # -1 iff b0 (q odd)
+    sel(e, OUT, m, cp, sp, t)           # odd -> cos(r), even -> sin(r)
     e.opi(k.ADD_SHL, b1, b1, 31)
-    e.op(k.ADD_XOR, OUT, sp, b1)
-    e.ctx.rel(sp, cp, b0, b1, m)
+    e.op(k.ADD_XOR, OUT, OUT, b1)
+    e.ctx.rel(sp, cp, b0, b1, m, t)
 
 
 def b_cos(e, IN, OUT):
+    """cos with quadrant q = round(x*2/pi): q&1 picks -sin, q>>1 the sign."""
     k = e.k
     sp, cp, b0, b1 = _sincos(e, IN)
     m = e.ctx.tb()
-    e.opi(k.ADD_SUB, m, b0, 1)
-    e.opi(k.ADD_ASR, m, m, 31)          # -1 iff b0 == 0
-    e.op(k.ADD_NOT, m, m, m)            # select -sin when b0 == 0
+    t = e.ctx.tb()
     e.op(k.ADD_XOR, sp, sp, e.ctx.k('SIGNB'))
-    e.op(k.ADD_AND, sp, m, sp)
-    e.op(k.ADD_NOT, m, m, m)
-    e.op(k.ADD_AND, cp, m, cp)
-    e.op(k.ADD_OR, sp, sp, cp)
+    e.op(k.ADD_SUB, m, e.ctx.k('ZERO'), b0)   # -1 iff b0 (q odd)
+    sel(e, OUT, m, sp, cp, t)           # odd -> -sin(r), even -> cos(r)
     e.opi(k.ADD_SHL, b1, b1, 31)
-    e.op(k.ADD_XOR, OUT, sp, b1)
-    e.ctx.rel(sp, cp, b0, b1, m)
+    e.op(k.ADD_XOR, OUT, OUT, b1)
+    e.ctx.rel(sp, cp, b0, b1, m, t)
 
 
 # ---------------------------------------------------------------- constants
@@ -683,7 +845,9 @@ STD = {
     'ONE': (0x3F800000, 0), 'TWO': (0x40000000, 0),
     'HALF': (0x3F000000, 0), 'MAGIC': (0x4B400000, 0),
     'RCPM': (0x7EF311C3, 0), 'ONE_I': (1, 1), 'NEG1': (M32, 0),
-    'TINY': (0x00800000, 0), 'C127': (127, 1), 'MANT': (0x007FFFFF, 0),
+    'T23': (_fb(8388608.0), 0),   # every float this large is integral
+    'TINY': (0x00800000, 0), 'TINYI': (0x00800000, 1),
+    'C127': (127, 1), 'MANT': (0x007FFFFF, 0),
     'ZERO': (0, 0), 'THREE': (3, 1),
     'EXP_LO': (_fb(-126.0), 0), 'EXP_HI': (_fb(128.0), 0),
     'E5': (0x3AAEC3FF, 0), 'E4': (0x3C1D955B, 0),
@@ -704,15 +868,20 @@ STD = {
     'ERF4': (_fb(-1.453152027), 0), 'ERF5': (_fb(1.061405429), 0),
     'SIX': (_fb(6.0), 0),
     'TWO_OVER_PI': (_fb(0.6366197723675814), 0),
-    'PIO2_HI': (_fb(1.5707963705062866), 0),
-    'PIO2_LO': (_fb(-4.37113883e-8), 0),
+    'PIO2_HI': (0x3FC90000, 0),      # pi/2 split: 1.5703125
+    'PIO2_MID': (0x39FDAA22, 0),     # 4.8382679e-4
+    'PIO2_LO': (0x2C346000, 0),      # 2.5632829e-12
     'S1': (_fb(-1.0 / 6), 0), 'S2': (_fb(1.0 / 120), 0),
     'S3': (_fb(-1.0 / 5040), 0), 'S4': (_fb(1.0 / 362880), 0),
     'C1P': (_fb(-0.5), 0), 'C2P': (_fb(1.0 / 24), 0),
     'C3P': (_fb(-1.0 / 720), 0), 'C4P': (_fb(1.0 / 40320), 0),
     'GELU_C': (_fb(0.044715), 0), 'GELU_S': (_fb(0.7978845608028654), 0),
     'INV_SQRT2': (_fb(0.7071067811865476), 0),
+    'NONE': (_fb(-1.0), 0), 'NHALF': (_fb(-0.5), 0),
+    'TWO_OVER_SQRTPI': (_fb(2.0 / 1.77245385090551602729), 0),
+    'INV_SQRT2PI': (_fb(0.39894228040143267794), 0),
     'NEGINF': (0xFF800000, 0), 'POSINF': (0x7F800000, 0),
+    'NAN': (0x7FC00000, 0), 'INFI': (0x7F800000, 1),
 }
 
 E_CORE = ('LOG2E', 'E5', 'E4', 'E3', 'E2', 'E1', 'MAGIC', 'HALF', 'ONE',
@@ -720,9 +889,9 @@ E_CORE = ('LOG2E', 'E5', 'E4', 'E3', 'E2', 'E1', 'MAGIC', 'HALF', 'ONE',
 RCP_C = ('RCPM', 'TWO')
 LOG_C = ('SQRT2', 'MANT', 'C127', 'ONE', 'LN2', 'TINY')
 LOGP_C = ('L4', 'L3', 'L2', 'L1', 'L0')
-SIN_C = ('TWO_OVER_PI', 'MAGIC', 'HALF', 'PIO2_HI', 'PIO2_LO', 'THREE',
+SIN_C = ('TWO_OVER_PI', 'MAGIC', 'HALF', 'PIO2_HI', 'PIO2_MID', 'PIO2_LO', 'THREE',
          'S1', 'S2', 'S3', 'S4', 'C1P', 'C2P', 'C3P', 'C4P', 'ONE', 'SIGNB',
-         'ONE_I')
+         'ONE_I', 'ZERO')
 ERF_C = ('ABSM', 'SIX', 'ERFC1', 'ERF1', 'ERF2', 'ERF3', 'ERF4', 'ERF5',
          'NLOG2E', 'ONE', 'SIGNB') + E_CORE[1:] + RCP_C
 
@@ -732,14 +901,17 @@ UOPS = {
     'identity':   ((), b_identity, ()),
     'clip':       ((), b_clip, ('P_LO', 'P_HI')),
     'leakyrelu':  (('ZERO',), b_leakyrelu, ('ALPHA',)),
-    'floor':      (('ABSM', 'SIGNB'), b_floor, ()),
-    'ceil':       (('ABSM', 'SIGNB'), b_ceil, ()),
-    'round':      (('ONE_I', 'HALF'), b_round, ()),
-    'sign':       (('ONE', 'NEGONE', 'SIGNB'), b_sign, ()),
+    'floor':      (('ABSM', 'SIGNB', 'ZERO', 'T23'), b_floor, ()),
+    'ceil':       (('ABSM', 'SIGNB', 'ZERO', 'T23'), b_ceil, ()),
+    'round':      (('ONE_I', 'HALF', 'ABSM', 'T23'), b_round, ()),
+    'sign':       (('ONE', 'NEGONE', 'SIGNB', 'ABSM'), b_sign, ()),
     'exp':        (E_CORE, b_exp, ()),
-    'log':        (LOG_C + LOGP_C + RCP_C + ('HALF', 'ONE_I'), b_log, ()),
-    'sqrt':       (('TINY', 'RSQRTC', 'HALF', 'THREEH'), b_sqrt, ()),
-    'reciprocal': (('TINY', 'BIG') + RCP_C, b_reciprocal, ()),
+    'log':        (LOG_C + LOGP_C + RCP_C + ('HALF', 'ONE_I', 'ABSM',
+                    'SIGNB', 'NEGINF', 'POSINF', 'NAN', 'INFI'), b_log, ()),
+    'sqrt':       (('TINY', 'RSQRTC', 'HALF', 'THREEH', 'SIGNB', 'NAN',
+                    'POSINF', 'INFI', 'ONE_I'), b_sqrt, ()),
+    'reciprocal': (('TINY', 'BIG', 'ABSM', 'SIGNB', 'POSINF',
+                    'TINYI', 'ONE_I') + RCP_C, b_reciprocal, ()),
     'tanh':       (('ABSM', 'T44', 'NLOG2E2', 'SIGNB', 'ONE') + E_CORE[1:]
                    + RCP_C, b_tanh, ()),
     'erf':        (ERF_C, b_erf, ()),
@@ -749,15 +921,18 @@ UOPS = {
                    + E_CORE[1:], b_softplus, ()),
     'softsign':   (('ABSM', 'ONE') + RCP_C, b_softsign, ()),
     'gelu':       (('GELU_C', 'GELU_S', 'ABSM', 'T44', 'NLOG2E2', 'SIGNB',
-                    'ONE', 'HALF') + E_CORE[1:] + RCP_C, b_gelu, ()),
+                    'ONE', 'HALF', 'ZERO') + E_CORE[1:] + RCP_C, b_gelu, ()),
     'gelu_erf':   (('INV_SQRT2', 'HALF', 'ONE') + ERF_C, b_gelu_erf, ()),
     'hardsigmoid': (('ZERO', 'ONE'), b_hardsigmoid, ('ALPHA', 'BETA')),
     'hardswish':  (('ZERO', 'ONE'), b_hardswish, ('ALPHA', 'BETA')),
+    'mish':       (('ABSM', 'NLOG2E', 'ONE', 'ZERO') + LOGP_C + RCP_C
+                   + ('T44', 'NLOG2E2', 'SIGNB') + E_CORE[1:], b_mish, ()),
+    'affine':     ((), b_affine, ('P0', 'P1')),
     'sin':        (SIN_C, b_sin, ()),
     'cos':        (SIN_C, b_cos, ()),
 }
 
-HEAVY = {'log', 'tanh', 'erf', 'elu', 'selu', 'softplus', 'softsign', 'gelu',
+HEAVY = {'log', 'tanh', 'erf', 'elu', 'selu', 'softplus', 'softsign', 'gelu', 'mish',
          'gelu_erf', 'sin', 'cos', 'round', 'sqrt', 'reciprocal'}
 
 
@@ -870,7 +1045,7 @@ def _group_tail(k, b, nvec, gap_regs=()):
 UOP_ORDER = ['abs', 'neg', 'identity', 'clip', 'leakyrelu', 'floor', 'ceil',
              'round', 'sign', 'exp', 'log', 'sqrt', 'reciprocal', 'tanh',
              'erf', 'elu', 'selu', 'softplus', 'softsign', 'gelu', 'gelu_erf',
-             'hardsigmoid', 'hardswish', 'sin', 'cos']
+             'hardsigmoid', 'hardswish', 'sin', 'cos', 'affine', 'mish']
 
 # The unary ops ride on kgen.build_ew's *verified* harness (TMU priming, the
 # 16-vector group, the VPM->DMA store, the counter branch).  Only the body is
@@ -890,7 +1065,10 @@ def _uop_info(code):
 def ew_consts(k, b, code):
     """Load this op's constants (called from build_ew's prologue)."""
     names, body, params = _uop_info(code)
-    pool = list(UOP_B)
+    names = list(dict.fromkeys(names))     # HALF/ONE appear twice in ERF_C
+    # B30/B31 carry the first two op parameters; an op with fewer parameters
+    # can use the spare ones for constants (gelu_erf needs 23)
+    pool = list(UOP_B) + [r for r in (30, 31) if r not in (30, 31)[:len(params)]]
     consts = {}
     for n in names:
         if n == 'ONE' and 'E1' in names and STD['E1'][0] == 0x3F800000:
@@ -937,8 +1115,361 @@ def build_uop(k, op, nvec=None):
         raise ValueError("kops: unknown uop %r" % (op,))
     if not hasattr(k, '_kops_consts'):
         k._kops_consts = {}
-    nv = 4 if any(op in names for names in [HEAVY]) else 16
+    # --nvec is authoritative: vc4_gen.c's uop_nvec() and the group size the
+    # host pads/launches with must agree with what was generated
+    nv = nvec if nvec else (4 if any(op in names for names in [HEAVY]) else 16)
     return k.build_ew(100 + UOP_ORDER.index(op), nvec=nv)
+
+
+# ------------------------------------------------------- binary / backward ops
+# These ride on the same verified build_ew harness.  Operands: A26 = a (the
+# forward input, or the left operand), B8 = b (the incoming gradient, or the
+# right operand).  B8 is the harness's second TMU stream, so these ops must
+# not use it for constants: UOP_B2 is the unary pool minus B8.
+#
+# Every derivative body is written against the *same* primitives the forward
+# op uses (core_exp2 / core_rcp / core_tanh / core_erf), so the analytic
+# gradient is the derivative of the kernel that actually ran, not of an ideal
+# formula.
+UOP_B2 = [r for r in UOP_B if r != 8]
+
+SIG_C = ('NLOG2E',) + E_CORE[1:] + ('RCPM', 'TWO')
+RCP_C2 = ('TINY', 'BIG', 'RCPM', 'TWO')
+TANH_C2 = UOPS['tanh'][0]
+ERF_C2 = UOPS['erf'][0]
+EXP_C2 = UOPS['exp'][0]
+
+
+def k_sigmoid(e, IN, OUT):
+    """OUT = 1/(1+2^(-x*log2 e)) with the forward kernels' own primitives."""
+    k = e.k
+    t = e.ctx.tb()
+    d = e.ctx.tb()
+    e.mul(t, IN, e.ctx.k('NLOG2E'))
+    core_exp2(e, t, d, e.ctx.tb(), e.ctx.tb())
+    e.op(k.ADD_FADD, d, d, e.ctx.k('ONE'))
+    core_rcp(e, d, OUT, e.ctx.tb())
+
+
+def k_recip(e, IN, OUT):
+    k = e.k
+    a = e.ctx.tb()
+    e.op(k.ADD_FMAX, a, IN, e.ctx.k('TINY'))
+    e.op(k.ADD_FMIN, a, a, e.ctx.k('BIG'))
+    core_rcp(e, a, OUT, e.ctx.tb())
+
+
+def k_gt(e, x):
+    """-1 where bits(x) > 0 (i.e. x > +0), else 0.  Integer, exact."""
+    m = e.ctx.tb()
+    gt_mask(e, m, x)
+    return m
+
+
+def b2_sub(e, IN, G, OUT):
+    e.op(e.k.ADD_FSUB, OUT, IN, G)
+
+
+def _uni(body):
+    """Adapt a UOPS body (e, IN, OUT) to the binary ewb signature."""
+    def f(e, IN, G, OUT):
+        _ = G
+        body(e, IN, OUT)
+    return f
+
+
+def b2_max(e, IN, G, OUT):
+    e.op(e.k.ADD_FMAX, OUT, IN, G)
+
+
+def b2_min(e, IN, G, OUT):
+    e.op(e.k.ADD_FMIN, OUT, IN, G)
+
+
+def b2_div(e, IN, G, OUT):
+    t = e.ctx.tb()
+    k_recip(e, G, t)
+    e.mul(OUT, IN, t)
+
+
+def b2_eqmask(e, IN, G, OUT):
+    """OUT = 1.0 iff the *bit patterns* of a and b are equal, else 0.0.
+
+    Used for max-pool argmax routing: the forward max is a bit-selected
+    operand, so bit equality is exactly "this element produced the maximum".
+    """
+    k = e.k
+    t = e.ctx.tb()
+    u = e.ctx.tb()
+    e.op(k.ADD_SUB, t, IN, G)
+    eq0_mask(e, u, t, e.ctx.tb())
+    e.op(k.ADD_AND, OUT, u, e.ctx.k('ONE'))
+
+
+def b2_sigmoid_bwd(e, IN, G, OUT):
+    k = e.k
+    s = e.ctx.tb()
+    u = e.ctx.tb()
+    k_sigmoid(e, IN, s)
+    e.op(k.ADD_FSUB, u, e.ctx.k('ONE'), s)
+    e.mul(s, s, u)
+    e.mul(OUT, G, s)
+
+
+def b2_silu_bwd(e, IN, G, OUT):
+    """d/dx [x*s] = s + x*s*(1-s) = s + y*(1-s)."""
+    k = e.k
+    s = e.ctx.tb()
+    y = e.ctx.tb()
+    u = e.ctx.tb()
+    k_sigmoid(e, IN, s)
+    e.mul(y, IN, s)
+    e.op(k.ADD_FSUB, u, e.ctx.k('ONE'), s)
+    e.mul(u, u, y)
+    e.op(k.ADD_FADD, s, s, u)
+    e.mul(OUT, G, s)
+
+
+def b2_tanh_bwd(e, IN, G, OUT):
+    k = e.k
+    t = e.ctx.tb()
+    u = e.ctx.tb()
+    _uni(UOPS['tanh'][1])(e, IN, None, t)
+    e.mul(u, t, t)
+    e.op(k.ADD_FSUB, u, e.ctx.k('ONE'), u)
+    e.mul(OUT, G, u)
+
+
+def b2_exp_bwd(e, IN, G, OUT):
+    y = e.ctx.tb()
+    _uni(UOPS['exp'][1])(e, IN, None, y)
+    e.mul(OUT, G, y)
+
+
+def b2_log_bwd(e, IN, G, OUT):
+    t = e.ctx.tb()
+    k_recip(e, IN, t)
+    e.mul(OUT, G, t)
+
+
+def b2_sqrt_bwd(e, IN, G, OUT):
+    """d/dx sqrt = 1/(2 sqrt x) = 0.5 * rsqrt(x)."""
+    k = e.k
+    r = e.ctx.tb()
+    core_rsqrt(e, IN, r, e.ctx.tb())
+    e.mul(r, r, e.ctx.k('HALF'))
+    e.mul(OUT, G, r)
+
+
+def b2_abs_bwd(e, IN, G, OUT):
+    """d|x|/dx = sign(x): a bit copy of g with x's sign bit (exact)."""
+    k = e.k
+    t = e.ctx.tb()
+    e.op(k.ADD_AND, t, IN, e.ctx.k('SIGNB'))
+    e.op(k.ADD_XOR, OUT, G, t)
+
+
+def b2_clip_bwd(e, IN, G, OUT):
+    """g inside [lo, hi], 0 outside.  The endpoints count as inside (the
+    subgradient ONNX's Clip uses)."""
+    k = e.k
+    t = e.ctx.tb()
+    u = e.ctx.tb()
+    e.op(k.ADD_FMAX, t, IN, e.ctx.k('P_LO'))
+    e.op(k.ADD_FMIN, t, t, e.ctx.k('P_HI'))
+    e.op(k.ADD_SUB, u, t, IN)                 # 0 iff the value was clipped
+    eq0_mask(e, u, u, e.ctx.tb())
+    e.op(k.ADD_AND, u, u, e.ctx.k('ONE'))
+    e.mul(OUT, G, u)
+
+
+def b2_leakyrelu_bwd(e, IN, G, OUT):
+    k = e.k
+    m = k_gt(e, IN)
+    t = e.ctx.tb()
+    sel(e, t, m, e.ctx.k('ONE'), e.ctx.k('ALPHA'), e.ctx.tb())
+    e.mul(OUT, G, t)
+
+
+def b2_hardsigmoid_bwd(e, IN, G, OUT):
+    """d/dx clip(alpha*x+beta,0,1) = alpha inside, 0 in the saturated tails."""
+    k = e.k
+    t = e.ctx.tb()
+    u = e.ctx.tb()
+    e.mul(t, IN, e.ctx.k('ALPHA'))
+    e.op(k.ADD_FADD, t, t, e.ctx.k('BETA'))
+    e.op(k.ADD_FMAX, t, t, e.ctx.k('ZERO'))
+    e.op(k.ADD_FMIN, t, t, e.ctx.k('ONE'))
+    e.op(k.ADD_FSUB, u, e.ctx.k('ONE'), t)
+    m = k_gt(e, t)
+    m2 = k_gt(e, u)
+    e.op(k.ADD_AND, m, m, m2)
+    e.op(k.ADD_AND, m, m, e.ctx.k('ALPHA'))
+    e.mul(OUT, G, m)
+
+
+def b2_hardswish_bwd(e, IN, G, OUT):
+    """d/dx [x*s] = s + x*s'(x), s = clip(alpha*x+beta,0,1)."""
+    k = e.k
+    s = e.ctx.tb()
+    t = e.ctx.tb()
+    u = e.ctx.tb()
+    e.mul(t, IN, e.ctx.k('ALPHA'))
+    e.op(k.ADD_FADD, t, t, e.ctx.k('BETA'))
+    e.op(k.ADD_FMAX, s, t, e.ctx.k('ZERO'))
+    e.op(k.ADD_FMIN, s, s, e.ctx.k('ONE'))
+    e.op(k.ADD_FSUB, u, e.ctx.k('ONE'), s)
+    m = k_gt(e, s)
+    m2 = k_gt(e, u)
+    e.op(k.ADD_AND, m, m, m2)
+    e.op(k.ADD_AND, m, m, e.ctx.k('ALPHA'))
+    e.mul(t, IN, m)
+    e.op(k.ADD_FADD, s, s, t)
+    e.mul(OUT, G, s)
+
+
+def b2_gelu_bwd(e, IN, G, OUT):
+    """tanh approximation: 0.5(1+t) + 0.5*x*(1-t^2)*GELU_S*(1+3*GELU_C*x^2)."""
+    k = e.k
+    x2 = e.ctx.tb()
+    u = e.ctx.tb()
+    t = e.ctx.tb()
+    d = e.ctx.tb()
+    e.mul(x2, IN, IN)
+    e.mul(u, x2, e.ctx.k('GELU_C'))
+    e.op(k.ADD_FADD, u, u, e.ctx.k('ONE'))
+    e.mul(u, u, e.ctx.k('THREE'))             # 1 + 3c x^2
+    e.mul(d, x2, IN)
+    e.mul(d, d, e.ctx.k('GELU_C'))
+    e.op(k.ADD_FADD, d, d, IN)                # x + c x^3
+    e.mul(d, d, e.ctx.k('GELU_S'))
+    b_tanh(e, d, t)
+    e.mul(d, u, e.ctx.k('GELU_S'))            # dt/dx
+    e.mul(x2, t, t)
+    e.op(k.ADD_FSUB, x2, e.ctx.k('ONE'), x2)  # 1 - t^2
+    e.mul(d, d, x2)                           # (1-t^2) * GELU_S*(1+3cx^2)
+    e.mul(d, d, IN)
+    e.op(k.ADD_FADD, d, d, t)
+    e.op(k.ADD_FADD, d, d, e.ctx.k('ONE'))
+    e.mul(d, d, e.ctx.k('HALF'))
+    e.mul(OUT, G, d)
+
+
+def b2_gelu_erf_bwd(e, IN, G, OUT):
+    """0.5(1+erf(x/sqrt2)) + x*exp(-x^2/2)/sqrt(2 pi)."""
+    k = e.k
+    u = e.ctx.tb()
+    t = e.ctx.tb()
+    e.mul(u, IN, e.ctx.k('INV_SQRT2'))
+    _uni(UOPS['erf'][1])(e, u, None, t)
+    e.op(k.ADD_FADD, t, t, e.ctx.k('ONE'))
+    e.mul(t, t, e.ctx.k('HALF'))              # 0.5(1+erf)
+    e.mul(u, IN, IN)
+    e.mul(u, u, e.ctx.k('NHALF'))             # -x^2/2
+    _uni(UOPS['exp'][1])(e, u, None, u)
+    e.mul(u, u, IN)
+    e.mul(u, u, e.ctx.k('INV_SQRT2PI'))
+    e.op(k.ADD_FADD, t, t, u)
+    e.mul(OUT, G, t)
+
+
+def b2_erf_bwd(e, IN, G, OUT):
+    k = e.k
+    u = e.ctx.tb()
+    t = e.ctx.tb()
+    e.mul(u, IN, IN)
+    e.mul(u, u, e.ctx.k('NONE'))              # -x^2
+    _uni(UOPS['exp'][1])(e, u, None, t)
+    e.mul(t, t, e.ctx.k('TWO_OVER_SQRTPI'))
+    e.mul(OUT, G, t)
+
+
+EWB = {
+    'sub':            ((), b2_sub, ()),
+    'max':            ((), b2_max, ()),
+    'min':            ((), b2_min, ()),
+    'div':            (RCP_C2, b2_div, ()),
+    'eqmask':         (('ONE',), b2_eqmask, ()),
+    'sigmoid_bwd':    (SIG_C, b2_sigmoid_bwd, ()),
+    'silu_bwd':       (SIG_C, b2_silu_bwd, ()),
+    'tanh_bwd':       (TANH_C2, b2_tanh_bwd, ()),
+    'exp_bwd':        (EXP_C2, b2_exp_bwd, ()),
+    'log_bwd':        (RCP_C2, b2_log_bwd, ()),
+    'sqrt_bwd':       (('RSQRTC', 'HALF', 'THREEH'), b2_sqrt_bwd, ()),
+    'abs_bwd':        (('SIGNB',), b2_abs_bwd, ()),
+    'clip_bwd':       (('ONE',), b2_clip_bwd, ('P_LO', 'P_HI')),
+    'leakyrelu_bwd':  (('ONE',), b2_leakyrelu_bwd, ('ALPHA',)),
+    'hardsigmoid_bwd': (('ZERO', 'ONE'), b2_hardsigmoid_bwd, ('ALPHA', 'BETA')),
+    'hardswish_bwd':  (('ZERO', 'ONE'), b2_hardswish_bwd, ('ALPHA', 'BETA')),
+    'erf_bwd':        (EXP_C2 + ('NONE', 'TWO_OVER_SQRTPI'), b2_erf_bwd, ()),
+    # unary helpers on the same (verified) 16-vector store path; the body is
+    # the one UOPS pinned, together with the constant list it was written for
+    'exp':            (UOPS['exp'][0], _uni(UOPS['exp'][1]), ()),
+    'log':            (UOPS['log'][0], _uni(UOPS['log'][1]), ()),
+    'sqrt':           (UOPS['sqrt'][0], _uni(UOPS['sqrt'][1]), ()),
+    'rcp':            (UOPS['reciprocal'][0], _uni(UOPS['reciprocal'][1]), ()),
+    'tanh':           (UOPS['tanh'][0], _uni(UOPS['tanh'][1]), ()),
+}
+
+EWB_ORDER = list(EWB.keys())
+
+# Bodies that do not fit the 16 KiB code slot at 16 vectors per group.
+# The 4-vector store (_store4 via build_ew's nvec!=16 arm) does not write its
+# result on this board and the blit kernel built on it wedges the QPU, so no
+# op here may select it: every body below is generated with 16 vectors per
+# group and must fit the 16 KiB code slot.  b_gelu (the tanh-form GELU
+# derivative) does not, so that one is composed in C from the ops that do.
+EWB_HEAVY = set()
+
+
+def ewb_consts(k, b, code):
+    names, body, params = EWB[EWB_ORDER[code]]
+    pool = list(UOP_B2)
+    apool = list(UOP_A)
+    consts = {}
+    for n in dict.fromkeys(names):
+        if n not in STD:
+            raise KeyError("kops: no such constant %r" % (n,))
+        if pool:
+            consts[n] = ('B', pool.pop(0))
+        elif apool:
+            # The B file is exhausted: a constant can live in the A file
+            # (ws=0 selects it).  E._fit stages the A+A bank conflict.
+            consts[n] = ('A', apool.pop(0))
+        else:
+            raise RuntimeError("kops: too many constants for the ew harness")
+    for i, name in enumerate(params):
+        consts[name] = ('B', 30 + i)
+        b.read_uni(30 + i, ws=1)
+    for n, (bank, reg) in consts.items():
+        if n in params:
+            continue
+        val = STD[n]
+        b.e(k.ldi(val[0] & M32, reg, ws=1 if bank == 'B' else 0), k.nop())
+    k._kops_consts[code] = consts
+
+
+def ewb_body(k, b, code, j):
+    names, body, params = EWB[EWB_ORDER[code]]
+    consts = k._kops_consts[code]
+    used_b = set(v[1] for v in consts.values() if v[0] == 'B')
+    used_a = set(v[1] for v in consts.values() if v[0] == 'A')
+    ctx = Ctx(consts)
+    ctx.a_free = [r for r in UOP_A if r not in used_a]
+    ctx.b_free = [r for r in UOP_B2 if r not in used_b]
+    ctx.a0 = list(ctx.a_free)
+    ctx.b0 = list(ctx.b_free)
+    e = E(k, b, ctx)
+    body(e, 26, 8, j)          # a = A26 (E_AV), b/g = B8 (B_VB)
+
+
+def build_ewb(k, op):
+    if op not in EWB:
+        raise ValueError("kops: unknown binary/backward ew op %r" % (op,))
+    if not hasattr(k, '_kops_consts'):
+        k._kops_consts = {}
+    nv = 4 if op in EWB_HEAVY else 16
+    return k.build_ew(200 + EWB_ORDER.index(op), nvec=nv)
 
 
 def build_sel3(k, op):
@@ -1034,7 +1565,17 @@ def build_gather(k):
         e.op(k.ADD_NOT, ACC0, m, m)
         e.op(k.ADD_AND, ACC0, tg, ACC0)         # 0 for negative entries
         e.op(k.ADD_ADD, ACC0, ACC0, A_P0)       # absolute bus address
-        _load(k, b, ACC0, 0, tmu=1)             # per-lane gather
+        # The TMU setup word takes its address from an *A-file* register, not
+        # from an accumulator (`areg(100)` encodes a different register, and a
+        # TMU read of that value wedges the QPU).  Stage the per-lane address
+        # in A30, which is dead once the group loop starts.  The builder's
+        # no-forwarding check does not see accumulator reads (the `acc(n)`
+        # descriptor carries NOP_ADDR, not the accumulator index), so the gap
+        # has to be explicit: two words between the write of r0 and the read.
+        b.e(k.nop(), k.nop())
+        b.e(k.add_or(30, k.acc(0), k.acc(0)))
+        b.e(k.nop(), k.nop())
+        _load(k, b, 30, 0, tmu=1)               # per-lane gather
         e.op(k.ADD_AND, m, m, A_P1)             # fill where negative
         e.op(k.ADD_NOT, ACC1, m, m)
         e.op(k.ADD_AND, ACC1, ACC1, ACC0)
@@ -1398,6 +1939,8 @@ def build(k, kind, opts):
         return build_copy2d(k, int(opts.get('fill', 0)),
                             int(opts.get('units', 4)),
                             int(opts.get('depth', 16)))
+    if kind == 'ewb':
+        return build_ewb(k, opts.get('op'))
     if kind == 'uop':
         nv = opts.get('nvec')
         return build_uop(k, opts.get('op'), int(nv) if nv else None)

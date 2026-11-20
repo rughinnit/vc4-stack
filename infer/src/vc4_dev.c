@@ -553,6 +553,55 @@ void vc4__scratch_reset(vc4_ctx *ctx)
     }
 }
 
+/* ------------------------------------------------------------- workspace */
+size_t vc4__ws_begin(vc4_ctx *ctx)
+{
+    if (!ctx)
+        return 0;
+    if (!ctx->ws_top)
+        ctx->ws_top = ctx->arena_bytes;
+    return ctx->ws_top;
+}
+
+void vc4__ws_end(vc4_ctx *ctx, size_t top)
+{
+    if (ctx)
+        ctx->ws_top = top;
+}
+
+size_t vc4__ws_free(const vc4_ctx *ctx)
+{
+    size_t floor = ctx->arena_top > ctx->scratch ? ctx->arena_top
+                                                 : ctx->scratch;
+    size_t top = ctx->ws_top ? ctx->ws_top : ctx->arena_bytes;
+    return top > floor ? top - floor : 0;
+}
+
+void *vc4__ws_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out)
+{
+    if (!ctx || !bytes)
+        return NULL;
+    if (!ctx->ws_top)
+        ctx->ws_top = ctx->arena_bytes;
+    size_t floor = ctx->arena_top > ctx->scratch ? ctx->arena_top
+                                                 : ctx->scratch;
+    size_t need = (bytes + 63u) & ~(size_t)63u;
+    if (ctx->ws_top < floor + need) {
+        vc4__set_err(ctx, "workspace exhausted: need %zu B, have %zu B "
+                     "(arena %zu B, %zu B in use)", need,
+                     ctx->ws_top > floor ? ctx->ws_top - floor : 0,
+                     ctx->arena_bytes, ctx->arena_top);
+        return NULL;
+    }
+    size_t off = (ctx->ws_top - need) & ~(size_t)63u;
+    ctx->ws_top = off;
+    if (out) {
+        out->off = (uint32_t)off;
+        out->bytes = bytes;
+    }
+    return ctx->arena + off;
+}
+
 vc4_status vc4_upload(vc4_ctx *ctx, vc4_buf *b, const void *src, size_t bytes)
 {
     if (!ctx || !b || (!src && bytes))

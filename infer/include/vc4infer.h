@@ -29,7 +29,7 @@ extern "C" {
 
 #define VC4INFER_VERSION_MAJOR 0
 #define VC4INFER_VERSION_MINOR 1
-#define VC4INFER_VERSION_STRING "0.1.0"
+#define VC4INFER_VERSION_STRING "1.2.2"
 
 /* Default arena capacity.  One dma-buf, persistent user buffers + scratch. */
 #define VC4_ARENA_DEFAULT (64u << 20)
@@ -70,6 +70,38 @@ typedef enum {
     VC4_OP_IM2COL,          /* row-major im2col matrix                        */
     VC4_OP_MAXPOOL,         /* 2x2 stride-2 max                              */
     VC4_OP_MAXPOOL_BWD,     /* 2x2 stride-2 argmax-mask backward             */
+    /* the training op set: forward and backward (see docs/TRAINING.md) */
+    VC4_OP_SUB,             /* a - b (broadcast)                             */
+    VC4_OP_DIV,             /* a / b (broadcast)                             */
+    VC4_OP_SOFTMAX,         /* last-axis softmax, any class count            */
+    VC4_OP_SOFTMAX_BWD,     /* y*(g - sum(g*y))                              */
+    VC4_OP_SOFTMAX_CE_BWD,  /* softmax + cross-entropy backward, any classes */
+    VC4_OP_BATCHNORM,       /* train-mode batch stats + running update       */
+    VC4_OP_BATCHNORM_BWD,   /* dx, dgamma, dbeta                             */
+    VC4_OP_LAYERNORM,       /* last-axis normalisation                       */
+    VC4_OP_LAYERNORM_BWD,   /* dx, dgamma, dbeta                             */
+    VC4_OP_AVGPOOL,         /* NxN / stride-S average pool                   */
+    VC4_OP_AVGPOOL_BWD,     /* uniform scatter                               */
+    VC4_OP_ADAPTIVE_AVGPOOL,     /* adaptive average pool to (outH,outW)     */
+    VC4_OP_ADAPTIVE_AVGPOOL_BWD, /* window-area scatter                      */
+    VC4_OP_MAXPOOLN_BWD,    /* NxN/stride-S argmax routing                   */
+    VC4_OP_BWOP,            /* the elementwise-derivative family             */
+    VC4_OP_BINOP_BWD,       /* add/sub/mul/div with broadcasting             */
+    VC4_OP_CAT,             /* concat along one axis                         */
+    VC4_OP_SPLIT,           /* split along one axis                          */
+    VC4_OP_RESIZE_NEAREST,  /* nearest resize (asymmetric mapping)           */
+    VC4_OP_RESIZE_BILINEAR, /* bilinear resize                               */
+    VC4_OP_TRANSPOSE_BWD,   /* = transpose                                   */
+    VC4_OP_PAD,             /* zero pad                                       */
+    VC4_OP_PAD_BWD,         /* = crop                                         */
+    VC4_OP_SUM,             /* reduce over an axis                           */
+    VC4_OP_MEAN,            /* mean over an axis                             */
+    VC4_OP_SUM_BWD,         /* broadcast the gradient                        */
+    VC4_OP_GATHER,          /* table gather                                   */
+    VC4_OP_GATHER_BWD,      /* additive scatter                               */
+    VC4_OP_SCATTER_BWD,     /* = gather                                       */
+    VC4_OP_GLOBAL_AVGPOOL,  /* mean over H,W                                  */
+    VC4_OP_GLOBAL_AVGPOOL_BWD, /* uniform scatter over H,W                   */
     VC4_OP_COUNT
 } vc4_op;
 
@@ -323,6 +355,8 @@ typedef enum {
     VC4_UOP_SELU, VC4_UOP_SOFTPLUS, VC4_UOP_SOFTSIGN, VC4_UOP_GELU,
     VC4_UOP_GELU_ERF, VC4_UOP_HARDSIGMOID, VC4_UOP_HARDSWISH,
     VC4_UOP_SIN, VC4_UOP_COS,
+    VC4_UOP_AFFINE,          /* out = a*p0 + p1 (gradient broadcast scale)   */
+    VC4_UOP_MISH,            /* x*tanh(softplus(x))                          */
     VC4_UOP_COUNT
 } vc4_uop;
 
@@ -336,6 +370,15 @@ typedef enum {
 /* out[i] = uop(a[i]) for i < n; p0..p2 are the op attributes. */
 vc4_status vc4_unary(vc4_ctx *ctx, vc4_uop op, const vc4_buf *a,
                      vc4_buf *out, size_t n, float p0, float p1, float p2);
+/*
+ * Diagnostic instrument: one 16-lane vector in, the raw 16-lane result out.
+ * `seq` names a minimal ALU dependency chain (see kgen.build_probe_seq and
+ * docs/NUMERICS.md): the caller compares the words bit-for-bit with a model
+ * of the truncating FPU.  `a` must hold 16 floats, `out` 256 bytes (the
+ * verified 4-row store).  Not part of the inference path.
+ */
+vc4_status vc4_probe(vc4_ctx *ctx, const char *seq, const vc4_buf *a,
+                     vc4_buf *out, size_t n);
 vc4_status vc4_select3(vc4_ctx *ctx, vc4_selop op, const vc4_buf *a,
                        const vc4_buf *b, const vc4_buf *c, vc4_buf *out,
                        size_t n);
@@ -405,16 +448,232 @@ vc4_status vc4_reduce(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
 vc4_status vc4_cumsum(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
                       uint32_t rows, uint32_t cols);
 
+/* ======================================================================
+ * training: forward + backward
+ *
+ * Every entry point here runs *all* its arithmetic on the QPUs.  The CPU only
+ *   - builds integer index tables / geometry (byte offsets, window bounds),
+ *   - writes scalar hyperparameters (eps, momentum, inv_batch),
+ *   - pads tails to a 256-float group (byte copy).
+ * The compositions call the already element-verified kernels (gather, reduce,
+ * elementwise, unary, copy2d); no new CPU math exists.  Where a weight table
+ * is needed (bilinear resize, adaptive pooling) it is derived from *geometry
+ * only* -- no activation value ever reaches the ARM.
+ *
+ * Layouts are fp32 row-major.  "NCHW" tensors are [N][C][H][W] contiguous:
+ * a single (C,H,W) image with N == 1 is the same thing.
+ * ====================================================================== */
+
+/* ------------------------------------------------- elementwise derivatives */
+typedef enum {
+    VC4_BW_SIGMOID = 0,   /* g * s * (1-s)                                  */
+    VC4_BW_SILU,          /* g * (s + x*s*(1-s))                            */
+    VC4_BW_TANH,          /* g * (1 - tanh(x)^2)                            */
+    VC4_BW_EXP,           /* g * exp(x)                                     */
+    VC4_BW_LOG,           /* g / x                                          */
+    VC4_BW_SQRT,          /* g / (2 sqrt(x))                                */
+    VC4_BW_ABS,           /* g * sign(x)                                    */
+    VC4_BW_CLIP,          /* g inside [p0,p1], 0 outside                    */
+    VC4_BW_LEAKYRELU,     /* g * (x>0 ? 1 : p0)                             */
+    VC4_BW_HARDSWISH,     /* g * d/dx [x*clip(ax+b,0,1)]                    */
+    VC4_BW_HARDSIGMOID,   /* g * (inside the linear band ? a : 0)           */
+    VC4_BW_GELU,          /* g * d/dx gelu (tanh approximation)             */
+    VC4_BW_GELU_ERF,      /* g * d/dx gelu (exact erf form)                 */
+    VC4_BW_ERF,           /* g * 2/sqrt(pi) * exp(-x^2)                     */
+    VC4_BW_COUNT
+} vc4_bwop;
+/* p0/p1 are the op attributes: clip lo/hi, leakyrelu alpha, hard* alpha/beta. */
+vc4_status vc4_bwop_run(vc4_ctx *ctx, vc4_bwop op, const vc4_buf *x,
+                        const vc4_buf *g, vc4_buf *out, size_t n, float p0,
+                        float p1);
+/* out = a*p0 + p1 (the scale an upstream reduction needs). */
+vc4_status vc4_affine(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out, size_t n,
+                      float p0, float p1);
+
+/* ------------------------------------------------------------- softmax/CE */
+/* Last-axis softmax over any class count: x, y are [rows][cols]. */
+vc4_status vc4_softmax(vc4_ctx *ctx, const vc4_buf *x, uint32_t rows,
+                       uint32_t cols, vc4_buf *y);
+/* dx = y * (g - sum_c g*y), the row sum broadcast back over the columns. */
+vc4_status vc4_softmax_bwd(vc4_ctx *ctx, const vc4_buf *y, const vc4_buf *g,
+                           vc4_buf *dx, uint32_t rows, uint32_t cols);
+/*
+ * Fused softmax + cross-entropy backward for any class count.
+ *   logits [rows][cols]  ->  dlogits = (softmax(logits) - onehot(label))/B
+ *   loss (1 float, arena) = sum_row -log p[label] / B
+ * y_scratch is optional (>= rows*cols*4 B) and reused for the probabilities;
+ * pass NULL to let the library carve it from the arena's per-op scratch.
+ * labels are int32, one per row.
+ */
+vc4_status vc4_softmax_ce_bwd(vc4_ctx *ctx, const vc4_buf *logits,
+                              const vc4_buf *labels, vc4_buf *dlogits,
+                              vc4_buf *loss, vc4_buf *y_scratch,
+                              uint32_t rows, uint32_t cols, float inv_batch);
+
+/* -------------------------------------------------------------- batchnorm */
+/*
+ * Train-mode batch normalisation over the N*H*W elements of each channel.
+ *   x        [N][C][HW]
+ *   y        [N][C][HW]           save_mean/save_invstd  [C]
+ *   running_mean/running_var [C]  updated when update_running != 0:
+ *      running = (1-momentum)*running + momentum*batch_stat   (on the QPU)
+ * The batch variance is the biased one (as PyTorch's training pass uses);
+ * running_var is updated with the *unbiased* estimate, like PyTorch.
+ */
+vc4_status vc4_batchnorm_fwd(vc4_ctx *ctx, const vc4_buf *x,
+                             const vc4_buf *gamma, const vc4_buf *beta,
+                             vc4_buf *y, vc4_buf *save_mean,
+                             vc4_buf *save_invstd, vc4_buf *running_mean,
+                             vc4_buf *running_var, uint32_t N, uint32_t C,
+                             uint32_t HW, float momentum, float eps,
+                             int update_running);
+/* Inference: y = (x - running_mean)/sqrt(running_var+eps)*gamma + beta. */
+vc4_status vc4_batchnorm_infer(vc4_ctx *ctx, const vc4_buf *x,
+                               const vc4_buf *gamma, const vc4_buf *beta,
+                               const vc4_buf *running_mean,
+                               const vc4_buf *running_var, vc4_buf *y,
+                               uint32_t N, uint32_t C, uint32_t HW, float eps);
+/* dgamma/dbeta need no saved stats; dx does. */
+vc4_status vc4_batchnorm_bwd(vc4_ctx *ctx, const vc4_buf *x,
+                             const vc4_buf *gamma, const vc4_buf *dy,
+                             const vc4_buf *save_mean,
+                             const vc4_buf *save_invstd, vc4_buf *dx,
+                             vc4_buf *dgamma, vc4_buf *dbeta, uint32_t N,
+                             uint32_t C, uint32_t HW);
+
+/* -------------------------------------------------------------- layernorm */
+vc4_status vc4_layernorm_fwd(vc4_ctx *ctx, const vc4_buf *x,
+                             const vc4_buf *gamma, const vc4_buf *beta,
+                             vc4_buf *y, vc4_buf *save_mean,
+                             vc4_buf *save_invstd, uint32_t rows,
+                             uint32_t cols, float eps);
+vc4_status vc4_layernorm_bwd(vc4_ctx *ctx, const vc4_buf *x,
+                             const vc4_buf *gamma, const vc4_buf *dy,
+                             const vc4_buf *save_mean,
+                             const vc4_buf *save_invstd, vc4_buf *dx,
+                             vc4_buf *dgamma, vc4_buf *dbeta, uint32_t rows,
+                             uint32_t cols);
+
+/* ----------------------------------------------------------------- pooling */
+/*
+ * Average pool over [C][H][W], N x N window, stride S, zero padding `pad`.
+ * dx is [C][H][W]; dy is [C][Ho][Wo] *packed* (Ho = (H+2pad-N)/S+1).
+ * count_include_pad != 0 divides by N*N, else by the number of in-bounds
+ * samples in the window (ONNX default).
+ */
+vc4_status vc4_avgpool_bwd(vc4_ctx *ctx, const vc4_buf *dy, vc4_buf *dx,
+                           int C, int H, int W, int N, int S, int pad,
+                           int count_include_pad);
+/* Global average pool: d/dx of (1/(H*W)) * sum over the plane. */
+vc4_status vc4_global_avgpool_bwd(vc4_ctx *ctx, const vc4_buf *dy,
+                                  vc4_buf *dx, int C, int H, int W);
+/* Adaptive average pool to (outH,outW) (ONNX window bounds). */
+vc4_status vc4_adaptive_avgpool_bwd(vc4_ctx *ctx, const vc4_buf *dy,
+                                    vc4_buf *dx, int C, int H, int W,
+                                    int outH, int outW);
+/*
+ * Max-pool backward with argmax routing, any N/stride/pad (ties share the
+ * gradient, as vc4_maxpool2x2_backward does).  dy uses the *same padded
+ * layout vc4_maxpooln produces*: align16(Wo) floats per row, align4(Ho)
+ * rows per channel.  dx is [C][H][W].
+ */
+vc4_status vc4_maxpooln_bwd(vc4_ctx *ctx, const vc4_buf *x,
+                            const vc4_buf *dy, vc4_buf *dx, int C, int H,
+                            int W, int N, int S, int pad);
+
+/* ------------------------------------------------ broadcasting binary ops */
+typedef enum { VC4_BIN_ADD = 0, VC4_BIN_SUB, VC4_BIN_MUL, VC4_BIN_DIV }
+    vc4_binop;
+/*
+ * Backward of a broadcasting binary op.  Shapes are given as dimension
+ * vectors of length ndim (right aligned, like numpy): a dimension of 1 in an
+ * operand is broadcast to the output's extent.  dx/dy may be NULL when that
+ * input does not need a gradient.
+ */
+vc4_status vc4_binop_bwd(vc4_ctx *ctx, vc4_binop op, const vc4_buf *x,
+                         const vc4_buf *y, const vc4_buf *g, const int *odims,
+                         const int *xdims, const int *ydims, int ndim,
+                         vc4_buf *dx, vc4_buf *dy);
+
+/* ------------------------------------------------------- concat / split */
+/*
+ * Forward concat: out is [outer][sum(axisdim)][inner], part i is
+ * [outer][axisdim[i]][inner].  vc4_cat_bwd writes each part's slice of dy;
+ * vc4_split_bwd is its transpose (concatenate the gradients).
+ */
+vc4_status vc4_cat_bwd(vc4_ctx *ctx, const vc4_buf *dy,
+                       vc4_buf *const *dx, const int *axisdim, int nsrc,
+                       int outer, int inner);
+vc4_status vc4_split_bwd(vc4_ctx *ctx, const vc4_buf *const *dy,
+                         vc4_buf *dx, const int *axisdim, int nsrc,
+                         int outer, int inner);
+
+/* ------------------------------------------------------------- resize/pad */
+/*
+ * Nearest resize with the asymmetric mapping in = floor(out * in/out_size)
+ * (the ONNX "asymmetric" mode, and what vc4_upsample2x_nhwc does).
+ * Tensors are [planes][H][W].
+ */
+vc4_status vc4_resize_nearest(vc4_ctx *ctx, const vc4_buf *x, vc4_buf *y,
+                              int planes, int H, int W, int Ho, int Wo);
+/* dx[q] += dy[p] for every output pixel p that maps to q (scatter-add). */
+vc4_status vc4_resize_nearest_bwd(vc4_ctx *ctx, const vc4_buf *dy,
+                                  vc4_buf *dx, int planes, int H, int W,
+                                  int Ho, int Wo);
+/*
+ * Bilinear resize, half-pixel centres, edge clamp: the mapping ONNX calls
+ * "half_pixel" with "nearest" border, which is what torch's
+ * F.interpolate(mode='bilinear', align_corners=False) does.
+ */
+vc4_status vc4_resize_bilinear(vc4_ctx *ctx, const vc4_buf *x, vc4_buf *y,
+                               int planes, int H, int W, int Ho, int Wo);
+/* The adjoint (scatter-add of the four corner weights). */
+vc4_status vc4_resize_bilinear_bwd(vc4_ctx *ctx, const vc4_buf *dy,
+                                   vc4_buf *dx, int planes, int H, int W,
+                                   int Ho, int Wo);
+/* Zero pad [N][C][H][W] -> [N][C][H+pt+pb][W+pl+pr]; bwd is the crop. */
+vc4_status vc4_pad_bwd(vc4_ctx *ctx, const vc4_buf *dy, vc4_buf *dx, int N,
+                       int C, int H, int W, int pt, int pl);
+
+/* ---------------------------------------------------- transpose / reduce */
+/* dy is [cols][rows] -> dx is [rows][cols] (the same QPU 16x16 transpose). */
+vc4_status vc4_transpose_bwd(vc4_ctx *ctx, const vc4_buf *dy, vc4_buf *dx,
+                             uint32_t rows, uint32_t cols);
+/*
+ * bwd of a reduction over one axis of a dense [dims] tensor: broadcast g
+ * (which has `axis` removed) back over it.  mean divides by the extent.
+ */
+vc4_status vc4_reduce_bwd(vc4_ctx *ctx, const vc4_buf *g, vc4_buf *dx,
+                          const int *dims, int ndim, int axis, int mean);
+
+/* ------------------------------------------------------ gather / scatter */
+/*
+ * Forward: out[o] = in[idx[o]] (a table of element indices into the *first*
+ * dimension, i.e. in is [n_in] contiguous).  The backward is an additive
+ * scatter; a target hit more than VC4_GATHER_BWD_MAX times is reported as
+ * unsupported (the regular broadcast cases have dedicated backwards above).
+ */
+#define VC4_GATHER_BWD_MAX 64
+vc4_status vc4_gather_bwd(vc4_ctx *ctx, const vc4_buf *g, vc4_buf *dx,
+                          const int32_t *idx, size_t n_out, size_t n_in);
+/* Forward: out[idx[i]] = x[i].  Backward: dx[i] = g[idx[i]]. */
+vc4_status vc4_scatter_bwd(vc4_ctx *ctx, const vc4_buf *g, vc4_buf *dx,
+                           const int32_t *idx, size_t n, size_t n_out);
+
 /* ---------------------------------------------------------------- registry */
 typedef struct {
     const char *name;       /* "matmul", "conv2d/3x3", "sigmoid", ...        */
     const char *backend;    /* which GPU path implements it                  */
     int         supported;  /* 1 = dispatchable, 0 = VC4_ERR_UNSUPPORTED     */
     const char *note;       /* constraints, or why it is unsupported         */
+    int         differentiable; /* 1 = a vc4_*_bwd entry point exists       */
 } vc4_op_info;
 
 const vc4_op_info *vc4_supported_ops(size_t *count);   /* static table        */
 int  vc4_op_supported(vc4_op op);
+/* 1 when the op has a backward entry point in this library.  An op can be
+ * supported (forward runs on the QPU) and still not differentiable here. */
+int  vc4_op_differentiable(vc4_op op);
 void vc4_print_supported_ops(FILE *f);
 const char *vc4_op_name(vc4_op op);
 

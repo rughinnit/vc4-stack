@@ -1,5 +1,4 @@
 import sys
-sys.path.insert(0, '/opt/vc4-asm/tools'); sys.path.insert(0, '/opt/vc4-asm/asm3')
 import kgen
 import importlib.util
 spec = importlib.util.spec_from_file_location("gemm6", os.path.join(BASE, "asm9_gemm6.py"))
@@ -20,5 +19,5 @@ probe = [
 ]
 w[idx+1:idx+1] = probe
 a.labels = {k: (v + 7 if v > idx else v) for k, v in a.labels.items()}
-a.write('/opt/vc4-asm/g6probe_64.bin')
+a.write(os.path.join(os.environ.get('TMPDIR', '/tmp'), 'g6probe_64.bin'))
 print("wrote", len(w), "words")

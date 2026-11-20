@@ -67,7 +67,7 @@ OPS = {
     "Slice": "QPU copy2d last-axis runs",
     "Resize": "QPU nearest (2x exact) / Mul+Add (bilinear)",
     "Transpose": "QPU copy2d ([0,2,1,3] only)",
-    "Softmax": "QPU softmax_fwd (<=16 classes)",
+    "Softmax": "QPU softmax_fwd (fused <=16 classes) / QPU reduce+exp+div (any class count)",
     "MatMul": "QPU gemm",
     "Gemm": "QPU gemm + Add",
     "GlobalAveragePool": "QPU gemm over 1/HW column",
@@ -131,7 +131,24 @@ OPS = {
     "ThresholdedRelu": "QPU affine + ReluBwd",
     "Celu": "QPU Relu/Exp/Affine composition",
     "Hardmax": "QPU reduce (argmax) + host-built mask + copy2d",
-    "LogSoftmax": "QPU Exp + reduce + Log (|x| <= 88)",
+    "LogSoftmax": "QPU Exp + reduce + Log (stable shift when |x| > 80)",
+    # the pooling / normalisation / softmax-variant / loss family
+    # (_dispatch_norm.py, docs/OPS-NORM.md).  Each entry names the kernels the
+    # handler composes.
+    "AveragePool": "QPU copy2d window taps + QPU Add/Mul (integer divisor map)",
+    "LpPool": "QPU copy2d window taps + QPU Abs/Mul/Sqrt",
+    "GlobalMaxPool": "QPU max chain over the plane (copy2d slice columns)",
+    "GlobalLpPool": "QPU Abs/Mul + QPU GEMM sum + QPU Sqrt (p=1, 2)",
+    "MaxUnpool": "int64 index map + QPU copy2d single-word scatter",
+    "BatchNormalization": "QPU batchnorm_infer (eps inside the sqrt), inference",
+    "InstanceNormalization": "QPU layernorm_fwd per channel plane + QPU channel affine",
+    "GroupNormalization": "QPU layernorm_fwd per group + QPU channel affine",
+    "LayerNormalization": "QPU layernorm_fwd over the normalised axes",
+    "MeanVarianceNormalization": "QPU GEMM mean/E[x^2] + QPU Sqrt + Affine",
+    "LRN": "QPU GEMM channel band sum + QPU Log/Exp",
+    "Dropout": "identity (ONNX inference; training mode refused)",
+    "SoftmaxCrossEntropyLoss": "QPU LogSoftmax + one-hot GEMM sum + reduction",
+    "NegativeLogLikelihoodLoss": "QPU one-hot GEMM sum + reduction",
     "Pow": "QPU Log/Exp/Reciprocal chain (small integer exponents are exact "
            "multiply chains)",
     "Mod": "QPU Reciprocal/Floor/Sign + Mul/Sub (fmod and floor semantics)",
@@ -344,9 +361,9 @@ def _check_softmax(node, shapes, inits):
     if not xs or len(xs) <= axis or xs[axis] <= 0:
         return "unknown", "axis %d extent unknown" % axis
     c = xs[axis]
-    if c > 16:
-        return "unsupported", "%d classes along axis %d (max 16)" % (c, axis)
-    return "supported", "%d classes" % c
+    # the fused kernel covers <= 16 classes; any other class count and any
+    # other axis run through the reduce/exp/div composition
+    return "supported", "%d classes along axis %d" % (c, axis)
 
 
 def _check_resize(node, shapes, inits):

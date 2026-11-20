@@ -126,18 +126,29 @@ def _align16(v):
 
 
 _EXTRA_HANDLERS = None
+_EXTRA_OVERRIDES = frozenset()
 
 
 def _extra_handlers():
-    """The lazy second dispatch table (imported once, on first use).
+    """The lazy family dispatch tables (imported once, on first use).
 
-    It is imported lazily because it is built on this module's ``Tensor`` and
-    ``Runner`` helpers; a module-level import would be circular.
+    ``_dispatch_extra`` is the reduction / comparison / shape-and-arith family
+    (docs/OPS-REDUCE.md), ``_dispatch_norm`` the pooling / normalisation /
+    softmax-variant / loss family (docs/OPS-NORM.md).  They are imported
+    lazily because they are built on this module's ``Tensor`` and ``Runner``
+    helpers; a module-level import would be circular.
+
+    A family module may also *own* an operator the main table can dispatch
+    (``OVERRIDES``): ``Softmax`` moved to ``_dispatch_norm`` because the main
+    table's handler refused more than 16 classes, and the family handler calls
+    the old fast paths for the shapes they cover.
     """
-    global _EXTRA_HANDLERS
+    global _EXTRA_HANDLERS, _EXTRA_OVERRIDES
     if _EXTRA_HANDLERS is None:
-        from . import _dispatch_extra
-        _EXTRA_HANDLERS = _dispatch_extra.HANDLERS
+        from . import _dispatch_extra, _dispatch_norm
+        _EXTRA_HANDLERS = dict(_dispatch_extra.HANDLERS)
+        _EXTRA_HANDLERS.update(_dispatch_norm.HANDLERS)
+        _EXTRA_OVERRIDES = frozenset(getattr(_dispatch_norm, "OVERRIDES", ()))
     return _EXTRA_HANDLERS
 
 
@@ -2348,12 +2359,11 @@ class Runner:
             for name in _UNARY_NV4_STAGED:
                 d.pop(name, None)
         fn = d.get(op)
-        if fn is None:
-            # the reduction / comparison / shape-and-arith family lives in its
-            # own dispatch module (docs/OPS-REDUCE.md)
-            h = _extra_handlers().get(op)
-            if h is not None:
-                fn = functools.partial(h, self)
+        # the family tables also own a few operators of the main table
+        # (docs/OPS-NORM.md: Softmax > 16 classes)
+        h = _extra_handlers().get(op)
+        if h is not None and (fn is None or op in _EXTRA_OVERRIDES):
+            fn = functools.partial(h, self)
         if fn is None:
             raise UnsupportedNode(node.name, op, "unsupported op %s" % op)
         try:

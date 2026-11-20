@@ -23,7 +23,7 @@ The ARM never touches an activation value.  It only
   * builds integer index maps and geometry (broadcast/repeat/pad/tril maps),
   * uploads *constants* (a triangle mask, an eye matrix, a range, a one-hot
     pattern, the ones/triangular reduction matrices),
-  * reads the arg-scan indices back for ``ArgMax``/``ArgMin``/``Hardmax`` and
+  * reads the arg-scan indices back for ``ArgMax``/``ArgMin`` and
     converts them to int64 (the class of work ``Shape`` and ``Gather`` already
     do), and
   * converts a 0.0/1.0 mask tensor to the bool dtype ONNX declares, which is
@@ -1207,57 +1207,6 @@ class PRelu(_Base):
         return self.mul(x, keep)
 
 
-class Hardmax(_Base):
-
-    def run(self):
-        node = self.node
-        x = self.ten(node.input[0])
-        rank = len(x.shape)
-        axis = int(_attr(node, "axis", -1))
-        if axis < 0:
-            axis += rank
-        if axis < 0 or axis >= rank:
-            self.fail("axis %d for rank %d" % (axis, rank))
-        arg = ArgReduction(self.r, node)
-        T, P, D, I = self.ax_last(x, axis)
-        self.tmp(T)
-        outer = P * I
-        idx = arg._scan_impl(T, outer, D, True, False)
-        mask = np.zeros((outer, D), np.float32)
-        mask[np.arange(outer), idx.reshape(-1)] = 1.0
-        m = self.upload_const(mask)
-        return self.ax_back(m, P, D, I, x.shape)
-
-
-class LogSoftmax(_Base, _ReduceMixin):
-
-    def run(self):
-        node = self.node
-        x = self.ten(node.input[0])
-        rank = len(x.shape)
-        axis = int(_attr(node, "axis", -1))
-        if axis < 0:
-            axis += rank
-        if axis < 0 or axis >= rank:
-            self.fail("axis %d for rank %d" % (axis, rank))
-        self.download_check(
-            x, lambda a: bool(np.isfinite(a).all()
-                              and np.max(np.abs(a)) <= 88.0),
-            "LogSoftmax: exp is outside the kernel's documented range "
-            "|x| <= 88")
-        e = self.unary(x, vc4infer.UOP_EXP)
-        T, P, D, I = self.ax_last(e, axis)
-        self.tmp(T)
-        s = self.sum_last(T, P * I, D)
-        self.download_check(s, lambda a: bool(np.min(a) > 0),
-                            "LogSoftmax: sum of exp is not positive")
-        lg = self.unary(s, vc4infer.UOP_LOG)
-        shape = tuple(1 if i == axis else int(d)
-                      for i, d in enumerate(x.shape))
-        b = self.bcast_t(self.tag(lg, shape), x.shape)
-        return self.add(x, self.affine(b, -1.0, 0.0))
-
-
 # =====================================================================
 # dispatch table
 # =====================================================================
@@ -1301,6 +1250,4 @@ HANDLERS.update({
     "ThresholdedRelu": _mk(ThresholdedRelu),
     "Celu": _mk(Celu),
     "PRelu": _mk(PRelu),
-    "Hardmax": _mk(Hardmax),
-    "LogSoftmax": _mk(LogSoftmax),
 })

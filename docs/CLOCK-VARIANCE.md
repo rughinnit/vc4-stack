@@ -115,3 +115,41 @@ should be read with the clock check in mind; `vc4infer util` and `vc4-smi`
 print the clock for exactly this reason.  The lesson is the same as the first
 occurrence: **record the clock with every number, and pin it before comparing
 two runs.**
+
+## The fan is gone (2026-11-20) — the thermal envelope is now a measurement condition
+
+The fan was removed when the board was physically moved.  It was not decoration:
+it is what kept the QPU at 400 MHz for minutes at a time.  Measured on the
+fanless board, idle then under a sustained 256-cubed GEMM loop:
+
+| elapsed | temp | core | `throttled` |
+|---:|---:|---:|---|
+| idle | **56.4 C** | 400 MHz | 0x0 |
+| 24 s | 61.2 | 400 | 0x0 |
+| 56 s | 69.3 | 400 | 0x0 |
+| 104 s | 72.0 | 400 | 0x0 |
+| 112 s | **73.1** | 400 | 0x0 |
+
+So the board reaches 73 C in under two minutes of QPU load; the firmware's soft
+limit is **80 C** (hard 85), and past it the clock is reduced — which is the same
+"same binary, half the speed" failure as the DVFS bug, but thermal and therefore
+correlated with how long the run has been going.
+
+**Rules from now on:**
+
+1. Record the temperature with every benchmark, next to the clock.  A run that
+   started at 56 C and ended at 78 C is not one measurement.
+2. Keep a single sustained run under ~90 s, or put cooldowns between reps.  The
+   suite's long tests (`test_convnet`, `test_train`, a full `op_matrix` sweep)
+   need splitting or a pause between sections.
+3. Wrap anything long in `tools/thermal-guard.sh --max 72 -- <command>`: it
+   samples every 2 s, kills the command at the limit, prints peak/end/core/
+   throttle, and exits **99** so a script cannot mistake a thermally cut run for
+   a result.
+4. Re-fit a fan before any long measurement campaign.  Without one, the honest
+   statement is "these numbers hold for runs under ~90 s from a ~56 C start".
+
+The clock pin (`core_freq=400`, `core_freq_min=400`) stays: it removed the DVFS
+artefact.  It also removes the firmware's ability to save power by dropping to
+250 MHz, so the fan's absence is now visible as heat rather than as a clock
+change — which is why the temperature has to be recorded.

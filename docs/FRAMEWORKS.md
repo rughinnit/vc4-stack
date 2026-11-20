@@ -57,7 +57,7 @@ Ranked by value delivered per unit of effort on *this* board.
 | 3 | **ONNX Runtime** | EP C API: `OrtEpFactory`/`OrtEp`/`OrtNodeComputeInfo`, entry points `CreateEpFactories`/`ReleaseEpFactory`; Python `register_execution_provider_library` | **medium (weeks)** for a real EP; the Python provider was **small (days)** | ORT 1.32.0 cp313/aarch64 installs; no VC4 EP exists; wheel ships **no headers** | **in progress** — `vc4infer.ort` graph-partitioning provider + `infer/onnxruntime_ep/tests` | today: `import vc4infer.ort`<br>`InferenceSession(m, providers=["vc4"]).run(None, {"x": a})`<br>EP: `register_execution_provider_library("vc4", "libvc4_ep.so")` | the widest inference ecosystem: every ORT consumer (Python/C/C++/Java/JS) and its quantisation tooling |
 | 4 | **ggml / gguf** | `ggml_backend_i` + `ggml_backend_reg_i` + `GGML_BACKEND_DL_IMPL`/`ggml_backend_score`; loaded by `ggml_backend_load_all` | **medium (weeks)** | no board build; headers read from llama.cpp vendored in `llama-cpp-python` 0.3.37 | **not started** | drop `libggml-vc4.so` in the backend search path;<br>`ggml_backend_load_all()` then lists the device;<br>llama.cpp runs with it | LLM/transformer graphs with the smallest plugin ABI (no compiler), plus `ggml-opt` training |
 | 5 | **TFLite / LiteRT** | external delegate `.so`: `tflite_plugin_create_delegate` / `tflite_plugin_destroy_delegate`; internal `TfLiteDelegate` hooks and LiteRT dispatch (`LiteRtSetDelegateFunction`, `LiteRtDispatchDelegateGetHooks`) | **medium (weeks)** | yes — `ai-edge-litert` 2.3.0 cp313/aarch64; `Interpreter` + `load_delegate` import | **not started** | `i = Interpreter("m.tflite")`<br>`i.load_delegate("libvc4_delegate.so")`<br>`i.allocate_tensors(); i.invoke()` | the edge/Android model zoo and int8-quantised footprints (not int8 speed — see §6) |
-| 6 | **Apache TVM** | Relax BYOC: pattern table + `FuseOpsByPattern` + `relax.ext.<name>` codegen + JSON runtime. **`relay.ext` does not exist in the 0.27 wheel — Relay is not shipped.** | **large (months)** — a codegen is a compiler backend | yes — `apache-tvm` 0.27.0.post1 aarch64 imports; `relax.ext.example_npu` is a template, not built in | **not started** | nothing today;<br>when done: `relax.ext.vc4` codegen + PassContext config | one codegen for TF/Keras/MXNet/PyTorch frontends via Relax importers; `relax.training` autodiff |
+| 6 | **Apache TVM** | Relax BYOC: pattern table + `FuseOpsByPattern` + `relax.ext.<name>` codegen + JSON runtime. **the 0.27 wheel has no `tvm/relay` package, so `relay.ext` is not available.** | **large (months)** — a codegen is a compiler backend | yes — `apache-tvm` 0.27.0.post1 aarch64 imports; `relax.ext.example_npu` is a template, not built in | **not started** | nothing today;<br>when done: `relax.ext.vc4` codegen + PassContext config | one codegen for TF/Keras/MXNet/PyTorch frontends via Relax importers; `relax.training` autodiff |
 | 7 | **JAX** | PJRT C API: `PJRT_Client_Create`, `PJRT_Api` table, `PJRT_LoadedExecutable_Execute`, `PJRT_Buffer_ToHostBuffer`; discovery via `jax_plugins` namespace/entry point → `register_plugin(name, priority=, library_path=, options=)` | **large (months)** — PJRT is a compiler backend in disguise (a StableHLO executor) | yes — jax/jaxlib 0.12.1 cp313/aarch64; `jit` and `grad` run on CPU | **not started** | `JAX_PLATFORMS=vc4` plus a `jax_plugins.vc4` package that calls `register_plugin("vc4", library_path="libpjrt_vc4.so")` | the only real JAX path; `grad`/`vmap`/`jit` come free once the primitives execute |
 | 8 | **TensorFlow** | PluggableDevice via StreamExecutor C API: `SE_InitPlugin`, `SE_PlatformRegistrationParams`, device/stream/allocator/event fns, plus kernel registration | **large (months)** — a platform plus every kernel | wheel yes (2.21.0 cp313/aarch64, ships `stream_executor.h` and `pjrt_c_api.h`); **runtime import unverified** (§8.4) | **not started** | `tf.load_pluggable_device_library("libvc4_plugin.so")`<br>`with tf.device("/device:VC4:0"): …` | the Keras/TF ecosystem and its host autodiff; the only in-graph TF path |
 | 9 | **OpenVINO** | device plugin loaded with `Core::register_plugin(path, "VC4")`; remote tensors via `RemoteContext::create_tensor`; **the plugin ABI header is not in the wheel** | **large (months)** — needs the OpenVINO source tree for the plugin ABI | yes — 2026.4.1 cp313/aarch64, `available_devices == ["CPU"]` | **not started** | `core.register_plugin("libvc4_plugin.so", "VC4")`<br>`core.compile_model(m, "VC4")` | model-server ecosystem; its ONNX/Paddle/PyTorch/TF/TFLite/JAX/GGUF frontends are already in the wheel |
@@ -104,9 +104,9 @@ Training state is `params + grads + optimizer`:
 
 | optimizer | bytes/param | 0.25 M params | 1 M params | 3.15 M (YOLOv8n) |
 |---|---:|---:|---:|---:|
-| SGD | 8 | 2.0 MiB | 7.6 MiB | 24.0 MiB |
-| SGD + momentum | 12 | 3.0 MiB | 11.4 MiB | 36.1 MiB |
-| Adam | 16 | 4.0 MiB | 15.3 MiB | 48.1 MiB |
+| SGD | 8 | 1.9 MiB | 7.6 MiB | 24.0 MiB |
+| SGD + momentum | 12 | 2.9 MiB | 11.4 MiB | 36.1 MiB |
+| Adam | 16 | 3.8 MiB | 15.3 MiB | 48.1 MiB |
 
 Add activations.  One fp32 activation tensor is `batch × C × H × W × 4`
 bytes: at 32×32, batch 8, 64 channels that is **2.0 MiB**; at 64×64 it is
@@ -115,7 +115,7 @@ bytes: at 32×32, batch 8, 64 channels that is **2.0 MiB**; at 64×64 it is
 Worked budgets against the real arena sizes:
 
 * **Default client (64 MiB, daemon `--arena-mb 72`).**  A 0.25 M-parameter
-  CNN with Adam = 4.0 MiB of state, leaving ~60 MiB for ~10–20 saved
+  CNN with Adam = 3.8 MiB of state, leaving ~60 MiB for ~10–20 saved
   activation tensors at 32×32/batch 8 (2 MiB each).  This fits.  A 1 M-param
   model (15.3 MiB state) also fits at 32×32/batch 8, with ~48 MiB left.
   At 64×64 the activation set (8 MiB/tensor) eats the budget at ~1 M params.
@@ -148,7 +148,7 @@ These are properties of the V3D and the board, not of an adapter.
 
 | capability | why it is impossible here | measured reason |
 |---|---|---|
-| **fp16 / bf16 arithmetic** | the QPU FPU is fp32; there is no half-precision datapath or instruction | the engine's dtype surface is fp32 only; `matmul/f16` is an explicitly unsupported op; torch rejects `Double`/`Half` tensors (`only float32 tensors are supported`) |
+| **fp16 / bf16 arithmetic** | the QPU FPU is fp32; there is no half-precision datapath or instruction | the engine's dtype surface is fp32 only; `matmul/f16` is an explicitly unsupported op; torch rejects `Double` (`only float32 tensors are supported`) and has no half kernels |
 | **int8 speed** | the ISA has no packed byte MAC; `v8muld` is a normalised `round(a*b/255)` | measured int8 and fp32 MAC rates agree to **within 0.5%** (`docs/int8-RESULTS.md`); int8 buys footprint, never MAC/s |
 | **fp64 at speed** | no fp64 ALU; the FPU is fp32 and truncates (round toward zero) | `docs/NUMERICS.md` §1: both `fadd` and `fmul` round toward zero; there is no fp64 path to measure — it would have to be emulated on fp32/integer pairs |
 | **dynamic shapes at scale** | kernels are JIT-compiled per shape, the VDR pitch is 8191 B, and the plan resolves shapes at plan time; `If`/`Loop`/`Scan` are `host-control` and are refused under the device invariant | 263-node YOLOv8n needs ~100 distinct QPU blobs; `Shape`/`Gather` are folded at plan time; `If` raises `NeedsDeviceDispatch` under `host_policy="device"` |

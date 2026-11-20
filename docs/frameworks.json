@@ -6,7 +6,7 @@
     "wheel_ok": true,
     "runs_here": true,
     "extension_point": "none needed: native executor over the strict engine op table (infer/python/vc4infer/_onnxrun.py)",
-    "effort": "available now — shipped executor with a 263-node YOLOv8n run end to end",
+    "effort": "available now \u2014 shipped executor with a 263-node YOLOv8n run end to end",
     "status": "implemented",
     "testable_here": "yes: onnx 1.23.2 installs and imports on cp313/aarch64",
     "user_entry": [
@@ -34,7 +34,7 @@
     "wheel_ok": true,
     "runs_here": true,
     "extension_point": "PrivateUse1 + PrivateUse1HooksInterface + AutogradPrivateUse1 (TORCH_LIBRARY_IMPL(aten, PrivateUse1, m), C10_REGISTER_GUARD_IMPL)",
-    "effort": "available now — built PrivateUse1 backend, 46 gradient checks, subset op table (everything else raises)",
+    "effort": "available now \u2014 built PrivateUse1 backend, 46 gradient checks, subset op table (everything else raises)",
     "status": "implemented",
     "testable_here": "yes: torch 2.15.0+cpu installed; torch_vc4 extension built for cp313; the PyPI aarch64 torch wheel is the CUDA build and does not import (libcudart.so.13)",
     "user_entry": [
@@ -87,17 +87,17 @@
   {
     "rank": 4,
     "name": "ggml / gguf",
-    "version_tested": "llama.cpp vendored in llama-cpp-python 0.3.37 sdist (ggml-backend.h, ggml-backend-impl.h, ggml-opt.h); gguf 0.19.0 is a pure-Python file-format reader only",
+    "version_tested": "llama.cpp vendored in llama-cpp-python 0.3.37 sdist, commit a956a852c9c8bc1fb07206364838ddef299178c0 (2026-11-14), ggml 1.0.0, GGML_BACKEND_API_VERSION 3; built CPU-only with -DGGML_NATIVE=ON",
     "wheel_ok": false,
-    "runs_here": false,
+    "runs_here": true,
     "extension_point": "ggml_backend_i + ggml_backend_reg_i + ggml_backend_device_i + ggml_backend_buffer_type_i; dynamic plugin via GGML_BACKEND_DL_IMPL/ggml_backend_score, loaded by ggml_backend_load_all",
     "effort": "medium (weeks): implement the backend vtable and map ggml ops to the engine; no compiler",
-    "status": "not started",
-    "testable_here": "no aarch64 llama.cpp build attempted (building it on a 905 MiB board is a separate large job); API read from the sdist, not from memory",
+    "status": "backend shipped in this tree (docs/GGML.md): fp32 op subset, dynamic (GGML_BACKEND_PATH) and static registration",
+    "testable_here": "yes: ggml/ builds libggml-vc4.so against the vendored headers; test_dl_load loads it through GGML_BACKEND_PATH; tiny graph, MUL_MAT 64/128/256 and a 0.28 MiB llama-family block verify 0 mismatches against CPU",
     "user_entry": [
-      "drop libggml-vc4.so (exports ggml_backend_score) in the backend search path",
-      "ggml_backend_load_all()",
-      "llama.cpp then lists the VC4 device"
+      "drop libggml-vc4.so (exports ggml_backend_init + ggml_backend_score) in the backend search path",
+      "export GGML_BACKEND_PATH=/path/libggml-vc4.so; ggml_backend_load_all()",
+      "llama.cpp then lists the VC4 device and offloads the ops it supports"
     ],
     "buys": "LLM/transformer graphs with the smallest plugin ABI (no compiler), plus ggml-opt training",
     "training": {
@@ -106,11 +106,14 @@
       "feasibility": "training after N backward ops (ggml-opt is already the trainer)",
       "memory": "16 B/param (Adam) in the arena; same 64/150 MiB ceilings"
     },
-    "notes": "ggml_backend_reg_i has get_proc_address; GGML_BACKEND_DL_IMPL(reg_fn) exports ggml_backend_score and a reg getter. Ops are elementwise/matmul/rope/attention-shaped, so the mapping to the engine is direct but the LLM working set will not fit at useful sizes: a 1B-param fp32 model is 4 GB. int8/quantised ggml types reduce footprint only (int8 MAC/s == fp32 on this ISA).",
+    "notes": "ggml_backend_reg_i has get_proc_address; GGML_BACKEND_DL_IMPL(reg_fn) exports ggml_backend_init/ggml_backend_score. The backend lowers ADD/SUB/MUL/DIV/SQR, unary ABS/NEG/RELU/SIGMOID/SILU/TANH/GELU/GELU_ERF, MUL_MAT (both layouts), RMS_NORM/NORM, SOFT_MAX, GET_ROWS and CPY/CONT/DUP; everything else is a CPU fallback selected by ggml_backend_sched. Measured 5.9 GFLOP/s at 256^3 (CPU 5.15); the working set does not fit at useful sizes: a 1B-param fp32 model is 4 GB and the ggml tensor pool is 30 MiB, so no real LLM was run.",
     "evidence": [
       "llama_cpp_python-0.3.37/vendor/llama.cpp/ggml/include/ggml-backend.h:248,272,276",
       "ggml/src/ggml-backend-impl.h:130,185,239,263,267",
-      "ggml/include/ggml-opt.h:39,138,219"
+      "ggml/include/ggml-opt.h:39,138,219",
+      "ggml/src/ggml-vc4.cpp",
+      "ggml/tests/ggml_vc4_tests.cpp",
+      "docs/GGML.md"
     ]
   },
   {

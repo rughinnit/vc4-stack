@@ -1596,6 +1596,9 @@ class Runner:
 
     def _resize(self, node):
         x = self._float(node.input[0])
+        if len(x.shape) != 4:
+            raise UnsupportedNode("Resize %s: rank %d (4-D only)"
+                                  % (node.name, len(x.shape)))
         mode = _attr(node, "mode", "nearest")
         coord = _attr(node, "coordinate_transformation_mode", "half_pixel")
         nmode = _attr(node, "nearest_mode", "round_prefer_floor")

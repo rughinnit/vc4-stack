@@ -20,9 +20,9 @@ OVERRIDES` buys in `_onnxrun.py`.
 
 **No C kernel was added.**  Every operator here is a composition of the
 element-verified kernels the engine already ships (`vc4_elementwise`,
-`vc4_unary`, `vc4_matmul`, `vc4_copy2d*`, `vc4_fill2d`), so `infer/src/` is
-untouched and `vc4_gather` stays gated (section 4.1 says why that is not a
-loss).
+`vc4_unary`, `vc4_matmul`, `vc4_copy2d*`, `vc4_fill2d`), so `infer/src/` was untouched
+by this block.  `vc4_gather` was still gated when the block was written and is
+ungated now (section 4.1).
 
 ## 1. Result
 
@@ -205,21 +205,36 @@ That is true of the *destination*; read backwards it is a source-side stride of
 from the definition (so DCR and CRD both work, and blocksize 2 and 3 are
 tested), and an output row costs O(1) launches.
 
-## 4. Why no new kernel (and what `vc4_gather` would buy)
+## 4. Why no new kernel (and what `vc4_gather` buys)
 
-### 4.1 `vc4_gather` stays gated
+### 4.1 `vc4_gather` was gated, and what the repair was
 
-The gate (`infer/src/vc4_guard.c`) refuses it because its TMU1 setup word
-takes its address from an accumulator and its load/pop order does not match
-`build_ew`'s two-deep pipeline; two candidate fixes still wedged the QPU.  A
-wedge here is not a failed test: it kills the vc4d context and, from the
+The gate (`infer/src/vc4_guard.c`) refused it on three counts: the TMU1 setup
+word took its address from an accumulator, the 256-float store wrote only its
+first 64 B, and the fill select kept the gathered word's exponent bits.
+Repairing those exposed a fourth fault with a different cause.  `build_copy2d`
+keeps its register block at module scope, so importing it rebound `B_VPMQ7`
+23 to 8 and `B_C64` 21 to 10; the VPM-to-DMA store then read a row register
+the body never wrote, and the table/source advance landed in a register the
+per-vector temporary pool reuses.
+
+The same class of fault put `qid` in `vc4_reduce`'s VDW row while the write
+used `4*qid`, and made `_load` read an accumulator on the word its response
+lands on.  With the VPM rows taken from the hardware QPU number, the copy2d
+registers renamed and the two-nop gap restored, the bodies pass their
+element-wise oracles on silicon: `gather` 0 bad for n = 1...1000, `reduce`
+0 bad over six operations and outer 1...1024, `cumsum` 0 bad to 5x1024
+(max |err| 7.6e-05), `select3` 0 bad for n = 1...1000.  All four are ungated;
+`emu_gated.py` agrees with the ALU/TMU model as well.
+
+A wedge here is not a failed test: it kills the vc4d context and, from the
 earlier record, sometimes needs a power cycle, which on a shared board takes
 every concurrent change with it.
 
-What it would buy is launch *count*, not capability: a `Gather` of `n` rows is
-`n` launches here and one there.  The correctness path above needs no part of
-it, so it was left gated.  Anyone fixing it should prove it with
-`tests/test_gate.c` plus an element-wise oracle, as the gate contract states.
+What it buys is launch *count*, not capability: a `Gather` of `n` rows is `n`
+launches here and one there.  The correctness path above needs no part of it,
+so the block is unchanged; the kernel is used where the count matters
+(`GridSample`, `MaxRoiPool`).
 
 ### 4.2 The launch counts this costs
 

@@ -7,9 +7,12 @@
  *                   a host-visible allocator carved out of the engine's
  *                   dma-buf arena, a synchronous stream, events, and the
  *                   H2D / D2H / D2D memcpy paths.
- *   TF_InitKernel   the op kernels, registered for this device type.  One op
- *                   runs today: Add / AddV2, fp32, elementwise, executed by
- *                   libvc4infer's QPU elementwise kernel.
+ *   TF_InitKernel   the op kernels, registered for this device type:
+ *                   Add/AddV2, Mul, Sub, Div/RealDiv, Maximum, Minimum,
+ *                   Relu, Relu6, Sigmoid, Tanh, Neg, Exp, Log and Sqrt, all
+ *                   fp32.  Every kernel hands the arithmetic to a libvc4infer
+ *                   QPU kernel and refuses (rather than computing on the
+ *                   host) when the engine cannot take it.
  *
  * The device type is "VC" by default.  TensorFlow 2.21 validates a
  * StreamExecutor platform name and type against [A-Z][A-Z_]*, so a digit is
@@ -28,6 +31,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -949,132 +953,327 @@ void SE_InitPlugin(SE_PlatformRegistrationParams *params, TF_Status *status)
 }
 
 /* ---------------------------------------------------------------- kernels */
-
-/* Add / AddV2, fp32, same-shape elementwise.
+/*
+ * One path for every kernel: fetch the inputs, refuse anything the engine
+ * cannot represent, allocate the output, translate the tensor pointers into
+ * arena offsets, and call the engine under the single mutex.
  *
- * The inputs are device tensors, so TF_TensorData() is the host mapping of
- * the arena (the allocator hands out vc4_host_ptr()); the kernel only
- * translates the two pointers into arena offsets and calls the engine.  The
- * QPU kernel is elementwise with exact IEEE fp32 adds; n need not be a
- * multiple of 256 (the engine pads the tail in its own scratch). */
-static void vc4_add_compute(void *user, TF_OpKernelContext *ctx)
+ * No kernel computes on the host.  The arena mapping *is* the device memory,
+ * so a tensor pointer either resolves to an arena range - and then the QPUs do
+ * the arithmetic - or the kernel refuses: a pointer outside the arena, the
+ * host-arena diagnostic, and an engine that did not come up are all named
+ * refusals, never a quiet CPU result.
+ *
+ * The elementwise and unary ops share one table.  TensorFlow's C kernel API
+ * gives create_func no cookie (TF_NewKernelBuilder takes only the function
+ * pointers), so each op gets its own construction callback, expanded from the
+ * table below; the descriptor that callback returns is compute's `user`.
+ */
+
+typedef enum {
+    VC4_TF_EW = 0,      /* vc4_elementwise: same-shape binary or unary  */
+    VC4_TF_UOP          /* vc4_unary: one input, polynomial body        */
+} vc4_tf_sel;
+
+typedef struct {
+    const char *op;     /* TensorFlow op name, used in every refusal     */
+    int         inputs; /* 1 or 2                                        */
+    vc4_tf_sel  sel;
+    vc4_op      ew;     /* sel == VC4_TF_EW: elementwise selector        */
+    vc4_uop     uop;    /* sel == VC4_TF_UOP: unary selector             */
+    float       p0, p1; /* unary attributes (CLIP's low and high bound)  */
+} vc4_tf_ew;
+
+/*
+ * Add/AddV2, Mul, Sub, Div/RealDiv, Maximum and Minimum take two same-shape
+ * inputs and one selector each.  Relu and Sigmoid use the dedicated
+ * elementwise bodies (exact select / degree-5 2^f); the rest are the verified
+ * unary bodies (docs/ACCURACY.md): Neg, Clip (Relu6) bit-exact, Tanh 1.2e-7
+ * absolute, Log 4.8e-7, Sqrt 1.1e-7 and Exp 5.7e-6 relative.
+ *
+ * RealDiv is registered because that is what tf.math.divide lowers to; Div
+ * stays for graphs built with the raw op.  The elementwise selector column is
+ * 0 (unused) on the VC4_TF_UOP rows.
+ */
+#define VC4_TF_EW_KERNELS(X)                                                  \
+    X(Add,     2, VC4_TF_EW,  VC4_OP_ADD,     VC4_UOP_IDENTITY, 0.0f, 0.0f)   \
+    X(AddV2,   2, VC4_TF_EW,  VC4_OP_ADD,     VC4_UOP_IDENTITY, 0.0f, 0.0f)   \
+    X(Mul,     2, VC4_TF_EW,  VC4_OP_MUL,     VC4_UOP_IDENTITY, 0.0f, 0.0f)   \
+    X(Sub,     2, VC4_TF_EW,  VC4_OP_SUB,     VC4_UOP_IDENTITY, 0.0f, 0.0f)   \
+    X(Div,     2, VC4_TF_EW,  VC4_OP_DIV,     VC4_UOP_IDENTITY, 0.0f, 0.0f)   \
+    X(RealDiv, 2, VC4_TF_EW,  VC4_OP_DIV,     VC4_UOP_IDENTITY, 0.0f, 0.0f)   \
+    X(Maximum, 2, VC4_TF_EW,  VC4_OP_MAX,     VC4_UOP_IDENTITY, 0.0f, 0.0f)   \
+    X(Minimum, 2, VC4_TF_EW,  VC4_OP_MIN,     VC4_UOP_IDENTITY, 0.0f, 0.0f)   \
+    X(Relu,    1, VC4_TF_EW,  VC4_OP_RELU,    VC4_UOP_IDENTITY, 0.0f, 0.0f)   \
+    X(Sigmoid, 1, VC4_TF_EW,  VC4_OP_SIGMOID, VC4_UOP_IDENTITY, 0.0f, 0.0f)   \
+    X(Relu6,   1, VC4_TF_UOP, 0,              VC4_UOP_CLIP,     0.0f, 6.0f)   \
+    X(Tanh,    1, VC4_TF_UOP, 0,              VC4_UOP_TANH,     0.0f, 0.0f)   \
+    X(Neg,     1, VC4_TF_UOP, 0,              VC4_UOP_NEG,      0.0f, 0.0f)   \
+    X(Exp,     1, VC4_TF_UOP, 0,              VC4_UOP_EXP,      0.0f, 0.0f)   \
+    X(Log,     1, VC4_TF_UOP, 0,              VC4_UOP_LOG,      0.0f, 0.0f)   \
+    X(Sqrt,    1, VC4_TF_UOP, 0,              VC4_UOP_SQRT,     0.0f, 0.0f)
+
+typedef struct {
+    const char *op;
+    void *(*create)(TF_OpKernelConstruction *);
+} vc4_tf_reg;
+
+#define VC4_TF_EW_DEFINE(N, NIN, SEL, EW, UOP, P0, P1)                        \
+    static void *vc4_##N##_create(TF_OpKernelConstruction *c)                 \
+    {                                                                         \
+        static const vc4_tf_ew d = { #N, NIN, SEL, EW, UOP, P0, P1 };         \
+        (void)c;    /* no attributes: the table already holds the op */       \
+        return (void *)&d;                                                    \
+    }                                                                         \
+    static const vc4_tf_reg vc4_reg_##N = { #N, vc4_##N##_create };
+
+VC4_TF_EW_KERNELS(VC4_TF_EW_DEFINE)
+
+#define VC4_TF_EW_ENTRY(N, ...) vc4_reg_##N,
+static const vc4_tf_reg g_ew_regs[] = { VC4_TF_EW_KERNELS(VC4_TF_EW_ENTRY) };
+#undef VC4_TF_EW_ENTRY
+#undef VC4_TF_EW_DEFINE
+
+static void refuse(TF_Status *status, TF_Code code, const char *fmt, ...)
 {
-    (void)user;
-    TF_Status *status = TF_NewStatus();
-    TF_Tensor *a = NULL;
-    TF_Tensor *b = NULL;
+    char msg[400];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    TF_SetStatus(status, code, msg);
+}
 
-    TF_GetInput(ctx, 0, &a, status);
-    if (a && TF_GetCode(status) == TF_OK)
-        TF_GetInput(ctx, 1, &b, status);
-    if (TF_GetCode(status) != TF_OK) {
-        TF_OpKernelContext_Failure(ctx, status);
-        goto done;
+/* "[2,3]" for the refusal text; a shape never needs more than 8 dims here. */
+static void shape_text(TF_Tensor *t, char *buf, size_t len)
+{
+    size_t used = 0;
+    int nd = TF_NumDims(t);
+    if (len < 8) {
+        if (len)
+            buf[0] = 0;
+        return;
     }
-
-    if (TF_TensorType(a) != TF_FLOAT || TF_TensorType(b) != TF_FLOAT) {
-        TF_SetStatus(status, TF_INVALID_ARGUMENT,
-                     "tf-vc4 Add: only float32 is registered");
-        TF_OpKernelContext_Failure(ctx, status);
-        goto done;
+    buf[used++] = '[';
+    for (int i = 0; i < nd; ++i) {
+        int w = snprintf(buf + used, len - used - 1, i ? ",%lld" : "%lld",
+                         (long long)TF_Dim(t, i));
+        if (w < 0 || (size_t)w >= len - used - 1) {
+            used = len - 2;
+            break;
+        }
+        used += (size_t)w;
     }
+    buf[used++] = ']';
+    buf[used] = 0;
+}
 
-    int64_t n = TF_TensorElementCount(a);
-    if (n != TF_TensorElementCount(b)) {
-        TF_SetStatus(status, TF_INVALID_ARGUMENT,
-                     "tf-vc4 Add: inputs have different element counts; "
-                     "broadcasting is not implemented");
-        TF_OpKernelContext_Failure(ctx, status);
-        goto done;
-    }
+static int same_shape(TF_Tensor *a, TF_Tensor *b)
+{
+    if (TF_NumDims(a) != TF_NumDims(b))
+        return 0;
+    for (int i = 0; i < TF_NumDims(a); ++i)
+        if (TF_Dim(a, i) != TF_Dim(b, i))
+            return 0;
+    return 1;
+}
 
-    int nd = TF_NumDims(a);
-    int64_t dims[8];
-    if (nd > 8) {
-        TF_SetStatus(status, TF_INVALID_ARGUMENT,
-                     "tf-vc4 Add: rank > 8 is not supported");
-        TF_OpKernelContext_Failure(ctx, status);
-        goto done;
-    }
-    for (int i = 0; i < nd; ++i)
-        dims[i] = TF_Dim(a, i);
-
-    TF_Tensor *out = TF_AllocateOutput(ctx, 0, TF_FLOAT, dims, nd,
-                                       (size_t)n * sizeof(float), status);
-    if (!out || TF_GetCode(status) != TF_OK) {
-        TF_OpKernelContext_Failure(ctx, status);
-        goto done;
-    }
-
-    if (n == 0)            /* an empty tensor is a legal Add with no work */
-        goto done;
-
-    const void *pa = TF_TensorData(a);
-    const void *pb = TF_TensorData(b);
-    void *po = TF_TensorData(out);
-
+/* Lock the engine and require the arena backend.  Returns 1 with g_mu held;
+ * on failure the status is set and the mutex is not held. */
+static int engine_enter(const char *op, TF_Status *status)
+{
     pthread_mutex_lock(&g_mu);
     config_locked();
     if (g_host_arena) {
-        TF_SetStatus(status, TF_FAILED_PRECONDITION,
-                     "tf-vc4 Add needs the engine arena; VC4_TF_ARENA=host "
-                     "is a copy-path diagnostic only");
-    } else if (!engine_up_locked()) {
+        refuse(status, TF_FAILED_PRECONDITION,
+               "tf-vc4 %s needs the engine arena; VC4_TF_ARENA=host is a "
+               "copy-path diagnostic only", op);
+        pthread_mutex_unlock(&g_mu);
+        return 0;
+    }
+    if (!engine_up_locked()) {
         TF_SetStatus(status, TF_INTERNAL, g_engine_err);
-    } else {
-        vc4_buf ba, bb, bo;
-        if (!find_range_locked(pa, (uint64_t)n * 4, &ba) ||
-            !find_range_locked(pb, (uint64_t)n * 4, &bb) ||
-            !find_range_locked(po, (uint64_t)n * 4, &bo)) {
-            TF_SetStatus(status, TF_INTERNAL,
-                         "tf-vc4 Add: a tensor pointer is outside the arena "
-                         "(was it placed on the host?)");
+        pthread_mutex_unlock(&g_mu);
+        return 0;
+    }
+    return 1;
+}
+
+/* Caller holds g_mu.  A tensor that is not inside one of the allocator's
+ * arena blocks was placed by something else (a host tensor, a host-memory
+ * argument, a stale pointer) and may not be read by the QPUs. */
+static int arena_range(const char *op, const void *p, size_t bytes,
+                       vc4_buf *out, TF_Status *status)
+{
+    if (find_range_locked(p, (uint64_t)bytes, out))
+        return 1;
+    refuse(status, TF_INTERNAL,
+           "tf-vc4 %s: a tensor pointer is outside the arena (was it placed "
+           "on the host?)", op);
+    return 0;
+}
+
+/* Fetch the inputs, refuse what the engine cannot represent, and allocate an
+ * output with the first input's shape.  Returns 0 with the status set. */
+static int ew_check(const vc4_tf_ew *d, TF_OpKernelContext *ctx,
+                    TF_Tensor *in[2], TF_Tensor **out, int64_t *n,
+                    TF_Status *status)
+{
+    for (int i = 0; i < d->inputs; ++i) {
+        TF_GetInput(ctx, i, &in[i], status);
+        if (TF_GetCode(status) != TF_OK)
+            return 0;
+    }
+
+    for (int i = 0; i < d->inputs; ++i) {
+        if (TF_TensorType(in[i]) != TF_FLOAT) {
+            refuse(status, TF_INVALID_ARGUMENT,
+                   "tf-vc4 %s: only float32 is registered", d->op);
+            return 0;
+        }
+    }
+
+    int nd = TF_NumDims(in[0]);
+    if (nd > 8) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 %s: rank %d is over the kernel's limit of 8", d->op,
+               nd);
+        return 0;
+    }
+    int64_t dims[8];
+    for (int i = 0; i < nd; ++i)
+        dims[i] = TF_Dim(in[0], i);
+
+    if (d->inputs == 2 && !same_shape(in[0], in[1])) {
+        char sa[64], sb[64];
+        shape_text(in[0], sa, sizeof(sa));
+        shape_text(in[1], sb, sizeof(sb));
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 %s: inputs are not the same shape (%s and %s); "
+               "broadcasting is not implemented", d->op, sa, sb);
+        return 0;
+    }
+
+    *n = TF_TensorElementCount(in[0]);
+    *out = TF_AllocateOutput(ctx, 0, TF_FLOAT, dims, nd, (size_t)*n * 4,
+                             status);
+    return *out && TF_GetCode(status) == TF_OK;
+}
+
+/* Translate the tensors and run the selector.  Caller does not hold g_mu. */
+static int ew_run(const vc4_tf_ew *d, const void *pa, const void *pb, void *po,
+                  size_t n, TF_Status *status)
+{
+    if (!engine_enter(d->op, status))
+        return 0;
+
+    vc4_buf ba, bb, bo;
+    int ok = arena_range(d->op, pa, n * 4, &ba, status);
+    if (ok && pb)
+        ok = arena_range(d->op, pb, n * 4, &bb, status);
+    if (ok)
+        ok = arena_range(d->op, po, n * 4, &bo, status);
+
+    vc4_status st = VC4_OK;
+    if (ok) {
+        if (d->sel == VC4_TF_EW) {
+            st = vc4_elementwise(g_ctx, d->ew, &ba, pb ? &bb : NULL, &bo, n);
         } else {
-            vc4_status st = vc4_elementwise(g_ctx, VC4_OP_ADD, &ba, &bb, &bo,
-                                            (size_t)n);
-            if (st != VC4_OK) {
-                char msg[256];
-                snprintf(msg, sizeof(msg), "vc4_elementwise(add, %lld): %s",
-                         (long long)n, vc4_strerror(st));
-                TF_SetStatus(status, TF_INTERNAL, msg);
-            }
+            st = vc4_unary(g_ctx, d->uop, &ba, &bo, n, d->p0, d->p1, 0.0f);
         }
     }
     pthread_mutex_unlock(&g_mu);
 
+    if (!ok)
+        return 0;
+    if (st != VC4_OK) {
+        /* The ewb-backed selectors (sub, div, max, min) need an engine built
+         * from this tree: an older libvc4infer refuses them as unimplemented
+         * even though the QPU bodies are in its generator. */
+        refuse(status, TF_INTERNAL,
+               "tf-vc4 %s: %s failed on %zu elements: %s%s", d->op,
+               d->sel == VC4_TF_EW ? vc4_op_name(d->ew) : "the unary kernel",
+               n, vc4_strerror(st),
+               st == VC4_ERR_UNSUPPORTED
+                   ? " (this selector needs the libvc4infer from this tree)"
+                   : "");
+        return 0;
+    }
+    return 1;
+}
+
+static void ew_compute(void *user, TF_OpKernelContext *ctx)
+{
+    const vc4_tf_ew *d = user;
+    TF_Status *status = TF_NewStatus();
+    TF_Tensor *in[2] = { NULL, NULL };
+    TF_Tensor *out = NULL;
+    int64_t n = 0;
+
+    if (!d) {
+        TF_SetStatus(status, TF_INTERNAL,
+                     "tf-vc4: the kernel descriptor is missing");
+        goto finished;
+    }
+    if (!ew_check(d, ctx, in, &out, &n, status))
+        goto finished;
+    if (n == 0)             /* an empty tensor is a legal op with no work */
+        goto finished;
+    ew_run(d, TF_TensorData(in[0]),
+           d->inputs == 2 ? TF_TensorData(in[1]) : NULL, TF_TensorData(out),
+           (size_t)n, status);
+
+finished:
     if (TF_GetCode(status) != TF_OK)
         TF_OpKernelContext_Failure(ctx, status);
-
-done:
-    if (a) TF_DeleteTensor(a);
-    if (b) TF_DeleteTensor(b);
+    /* TF_AllocateOutput hands the caller a TF_Tensor that holds a reference to
+     * the output buffer; leaving it unreleased keeps the arena block alive
+     * after the graph has finished with the tensor. */
+    if (out)
+        TF_DeleteTensor(out);
+    if (in[0])
+        TF_DeleteTensor(in[0]);
+    if (in[1])
+        TF_DeleteTensor(in[1]);
     TF_DeleteStatus(status);
+}
+
+/* TypeConstraint("T", float) is the registry's dtype gate: a tensor of any
+ * other type cannot select one of these kernels.  No kernel declares a host
+ * memory argument (TF_KernelBuilder_HostMemory): every argument of these ops
+ * is arithmetic data and belongs in the arena.  If TensorFlow ever pins one to
+ * host memory the pointer would not resolve and the kernel would refuse. */
+static void register_kernel(const char *op,
+                            void *(*create)(TF_OpKernelConstruction *),
+                            void (*compute)(void *, TF_OpKernelContext *),
+                            TF_Status *status)
+{
+    TF_KernelBuilder *builder = TF_NewKernelBuilder(
+        op, VC4_TF_DEVICE_TYPE, create, compute, NULL);
+    TF_KernelBuilder_TypeConstraint(builder, "T", TF_FLOAT, status);
+    if (TF_GetCode(status) != TF_OK) {
+        fprintf(stderr, "tf-vc4: type constraint for %s: %s\n", op,
+                TF_Message(status));
+        TF_DeleteKernelBuilder(builder);
+        TF_SetStatus(status, TF_OK, "");
+        return;
+    }
+    TF_RegisterKernelBuilder(op, builder, status);
+    if (TF_GetCode(status) != TF_OK) {
+        fprintf(stderr, "tf-vc4: registering %s on %s: %s\n", op,
+                VC4_TF_DEVICE_TYPE, TF_Message(status));
+        TF_SetStatus(status, TF_OK, "");
+    }
 }
 
 void TF_InitKernel(void)
 {
-    static const char *const ops[] = { "Add", "AddV2" };
     TF_Status *status = TF_NewStatus();
 
-    for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); ++i) {
-        TF_KernelBuilder *builder =
-            TF_NewKernelBuilder(ops[i], VC4_TF_DEVICE_TYPE, NULL,
-                                vc4_add_compute, NULL);
-        TF_KernelBuilder_TypeConstraint(builder, "T", TF_FLOAT, status);
-        if (TF_GetCode(status) != TF_OK) {
-            fprintf(stderr, "tf-vc4: type constraint for %s: %s\n", ops[i],
-                    TF_Message(status));
-            TF_DeleteKernelBuilder(builder);
-            TF_SetStatus(status, TF_OK, "");
-            continue;
-        }
-        TF_RegisterKernelBuilder(ops[i], builder, status);
-        if (TF_GetCode(status) != TF_OK) {
-            fprintf(stderr, "tf-vc4: registering %s on %s: %s\n", ops[i],
-                    VC4_TF_DEVICE_TYPE, TF_Message(status));
-            TF_SetStatus(status, TF_OK, "");
-        }
-    }
+    for (size_t i = 0; i < sizeof(g_ew_regs) / sizeof(g_ew_regs[0]); ++i)
+        register_kernel(g_ew_regs[i].op, g_ew_regs[i].create, ew_compute,
+                        status);
+
     TF_DeleteStatus(status);
 }
 

@@ -39,6 +39,7 @@ EXPECT = {
     "mixed": [("CONV_2D", "yes"), ("AVERAGE_POOL_2D", "no"),
               ("CONV_2D", "yes"), ("SOFTMAX", "yes")],
     "hostonly": [("AVERAGE_POOL_2D", "no"), ("SIN", "no")],
+    "div": [("DIV", "yes")],
 }
 
 failures = []
@@ -124,7 +125,10 @@ def main():
     if gpu:
         print("VC4_LITERT_GPU=1: the on-device tier will launch QPU work")
 
-    for name in ("chain", "mixed", "hostonly"):
+    # partitions the claim table above must produce, per model
+    PARTS = {"chain": 1, "mixed": 2, "hostonly": 0, "div": 1}
+
+    for name in ("chain", "mixed", "hostonly", "div"):
         model = os.path.join(MODELS, name + ".tflite")
         print("\n== %s" % name)
         ref, _, ref_ms = run(model, repeat=3)
@@ -159,7 +163,7 @@ def main():
         check(rc == 0 and "VC4_ALLOC_OK" in out,
               "%s: dry partition replacement and kernel prepare" % name,
               err.strip()[-300:])
-        expect_parts = 1 if name == "chain" else 2
+        expect_parts = PARTS[name]
         if summary.get("claimed"):
             check(("partitions=%d" % expect_parts) in err,
                   "%s: replaced %d partition(s)" % (name, expect_parts))
@@ -186,11 +190,17 @@ def main():
             check(summary.get("claimed") == claimed_expect,
                   "%s: on-device claim count" % name, "got %r" % (summary,))
             worst = 0.0
+            worst_rel = 0.0
             for a, b in zip(ref, got):
                 np.testing.assert_allclose(a, b, rtol=1e-3, atol=1e-4)
                 worst = max(worst, float(np.max(np.abs(a - b))))
-            check(True, "%s: on-device outputs match CPU (max |d| %.3g)" %
-                  (name, worst))
+                den = np.maximum(np.abs(a), 1e-30)
+                worst_rel = max(worst_rel,
+                                float(np.max(np.abs(a - b) / den)))
+            # div's near-zero divisor makes the absolute figure meaningless
+            # (1e7-scale outputs), so report the relative one beside it
+            check(True, "%s: on-device outputs match CPU (max |d| %.3g, "
+                        "%.3g relative)" % (name, worst, worst_rel))
 
     print("\n%d checks, %d failure(s)" % (checks, len(failures)))
     return 1 if failures else 0

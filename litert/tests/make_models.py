@@ -11,6 +11,7 @@ Models:
   mixed.tflite     conv3x3+relu -> avgpool2x2 -> conv1x1 -> softmax
                    (the average pool is left to LiteRT)
   hostonly.tflite  avgpool2x2 -> sin                        (nothing claimable)
+  div.tflite       x / c, c a signed constant in [0.5, 2]   (the DIV claim)
 """
 import os
 
@@ -175,10 +176,32 @@ def build_hostonly(path, seed=3):
     return rng.standard_normal((1, 8, 8, C)).astype(np.float32)
 
 
+def build_div(path, seed=4):
+    """x / c with a signed constant divisor.
+
+    The operand that exposed the engine's div defect was a divisor with both
+    signs; a positive-only reciprocal clamp turned half of it into +-inf.  The
+    magnitudes stay in [0.5, 2] so the graph is an ordinary elementwise divide,
+    with one entry near zero to exercise the reciprocal's clamp.
+    """
+    rng = np.random.default_rng(seed)
+    C = 16
+    b = Builder()
+    x = b.tensor("input", [1, 8, 8, C])
+    c = rng.uniform(0.5, 2.0, (1, 8, 8, C)).astype(np.float32)
+    c = c * rng.choice([-1.0, 1.0], (1, 8, 8, C)).astype(np.float32)
+    c.flat[17] = -1e-7
+    div = b.const("divisor", c)
+    y = b.tensor("out", [1, 8, 8, C])
+    b.op(s.BuiltinOperator.DIV, [x, div], [y])
+    b.save(path, [x], [y])
+    return rng.standard_normal((1, 8, 8, C)).astype(np.float32)
+
+
 def main():
     os.makedirs(MODELS, exist_ok=True)
     for name, fn in (("chain", build_chain), ("mixed", build_mixed),
-                     ("hostonly", build_hostonly)):
+                     ("hostonly", build_hostonly), ("div", build_div)):
         path = os.path.join(MODELS, name + ".tflite")
         x = fn(path)
         np.save(path + ".input.npy", x)

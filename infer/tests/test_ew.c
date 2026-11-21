@@ -4,13 +4,18 @@
  * sigmoid/silu are approximations: the measured worst case is printed and
  * checked against a documented tolerance.
  *
+ * div is the kops.EWB body (reciprocal of |b|, sign restored, then multiply).
+ * It is checked relatively, with a signed divisor and one near-zero entry per
+ * 64 elements: the body used to clamp the divisor itself to [TINY, BIG], which
+ * turned every negative divisor into +TINY and the result into a * 1e38.
+ *
  * usage: test_ew [reps]
  */
 #include "vc4infer.h"
 #include "util.h"
 
 static int run(vc4_ctx *ctx, vc4_op op, const char *name, size_t n, int reps,
-               int binary, double tol, int exact)
+               int binary, double tol, int exact, int rel)
 {
     float *a = malloc(n * 4), *b = malloc(n * 4), *o = malloc(n * 4);
     if (!a || !b || !o)
@@ -18,6 +23,17 @@ static int run(vc4_ctx *ctx, vc4_op op, const char *name, size_t n, int reps,
     for (size_t i = 0; i < n; ++i) {
         a[i] = frand() * 8.0f;
         b[i] = frand() * 8.0f;
+    }
+    if (op == VC4_OP_DIV) {
+        /* both signs in every vector, ordinary magnitudes, and one divisor
+           near zero per 64 elements: 1/|b| is 1e7 there, so the result is only
+           bounded by the relative check */
+        for (size_t i = 0; i < n; ++i) {
+            b[i] = (i & 1 ? -1.0f : 1.0f) *
+                   (0.5f + (frand() + 1.0f) * 0.75f);
+            if (i % 64 == 17)
+                b[i] = -1e-7f;
+        }
     }
     vc4_buf ba, bb, bo;
     if (vc4_alloc(ctx, n * 4, &ba) != VC4_OK ||
@@ -51,9 +67,12 @@ static int run(vc4_ctx *ctx, vc4_op op, const char *name, size_t n, int reps,
             case VC4_OP_RELU:    ref = a[i] > 0 ? (double)a[i] : 0.0; break;
             case VC4_OP_SIGMOID: ref = 1.0 / (1.0 + exp(-(double)a[i])); break;
             case VC4_OP_SILU:    ref = (double)a[i] / (1.0 + exp(-(double)a[i])); break;
+            case VC4_OP_DIV:     ref = (double)a[i] / (double)b[i]; break;
             default: ref = 0; break;
             }
             double err = fabs(got - ref);
+            if (rel && fabs(ref) > 1e-30)
+                err /= fabs(ref);
             if (err > maxabs)
                 maxabs = err;
             if (exact) {
@@ -71,11 +90,13 @@ static int run(vc4_ctx *ctx, vc4_op op, const char *name, size_t n, int reps,
             worst = maxabs;
         if (mm == 0)
             clean++;
-        printf("  %-8s n=%zu rep%d: mismatches=%ld/%zu maxabs=%.3g%s\n",
-               name, n, r, mm, n, maxabs, exact ? " (bit-exact)" : "");
+        printf("  %-10s n=%zu rep%d: mismatches=%ld/%zu max %s=%.3g%s\n",
+               name, n, r, mm, n, rel ? "rel" : "abs", maxabs,
+               exact ? " (bit-exact)" : "");
     }
-    printf("%s %-8s n=%zu: %d/%d clean, worst |err| = %.3g%s\n",
-           clean == reps ? "PASS" : "FAIL", name, n, clean, reps, worst,
+    printf("%s %-10s n=%zu: %d/%d clean, worst %s = %.3g%s\n",
+           clean == reps ? "PASS" : "FAIL", name, n, clean, reps,
+           rel ? "|err|/|ref|" : "|err|", worst,
            exact ? " (must be 0 for bit-exact ops)" : "");
     free(a); free(b); free(o);
     return clean == reps ? 0 : 1;
@@ -98,12 +119,14 @@ int main(int argc, char **argv)
            VC4INFER_VERSION_STRING, (double)vc4_arena_bytes(ctx) / (1 << 20), reps);
 
     int rc = 0;
-    rc |= run(ctx, VC4_OP_ADD, "add", 4096, reps, 1, 0, 1);
-    rc |= run(ctx, VC4_OP_MUL, "mul", 4096, reps, 1, 0, 1);
-    rc |= run(ctx, VC4_OP_RELU, "relu", 4096, reps, 0, 0, 1);
-    rc |= run(ctx, VC4_OP_ADD, "add+tail", 1000, reps, 1, 0, 1);   /* not 256-aligned */
-    rc |= run(ctx, VC4_OP_SIGMOID, "sigmoid", 4096, reps, 0, 1e-5, 0);
-    rc |= run(ctx, VC4_OP_SILU, "silu", 4096, reps, 0, 1e-5, 0);
+    rc |= run(ctx, VC4_OP_ADD, "add", 4096, reps, 1, 0, 1, 0);
+    rc |= run(ctx, VC4_OP_MUL, "mul", 4096, reps, 1, 0, 1, 0);
+    rc |= run(ctx, VC4_OP_RELU, "relu", 4096, reps, 0, 0, 1, 0);
+    rc |= run(ctx, VC4_OP_ADD, "add+tail", 1000, reps, 1, 0, 1, 0);  /* not 256 */
+    rc |= run(ctx, VC4_OP_DIV, "div", 4096, reps, 1, 5e-7, 0, 1);
+    rc |= run(ctx, VC4_OP_DIV, "div+tail", 1000, reps, 1, 5e-7, 0, 1);
+    rc |= run(ctx, VC4_OP_SIGMOID, "sigmoid", 4096, reps, 0, 1e-5, 0, 0);
+    rc |= run(ctx, VC4_OP_SILU, "silu", 4096, reps, 0, 1e-5, 0, 0);
 
     vc4_print_supported_ops(stdout);
     vc4_shutdown(ctx);

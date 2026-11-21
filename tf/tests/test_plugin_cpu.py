@@ -337,27 +337,34 @@ def _operands(op, n, rng):
     return a, None
 
 
-# (op, callable, absolute/relative tolerance).  The tolerances are the measured
-# bounds in docs/ACCURACY.md with a small margin: the FPU truncates, so add,
-# mul and sub agree to ~1 ulp rather than bit for bit; Neg, Clip and the
-# max/min selects are exact.
+# (op, callable, absolute/relative tolerance, launches per call).  The
+# tolerances are the measured bounds in docs/ACCURACY.md with a small margin:
+# the FPU truncates, so add, mul and sub agree to ~1 ulp rather than bit for
+# bit; Neg, Clip and the max/min selects are exact.
+#
+# The launch count is the engine's group size, not an op property: the bodies
+# in kops.HEAVY are generated at 4 vectors per group (64 floats per QPU)
+# because their 16-vector copies do not fit the 2048-instruction code slot, so
+# 12 QPUs cover 768 floats per launch and 1024 elements need two.  Tanh, Exp,
+# Log and Sqrt are those bodies; Exp would fit at 16 vectors (1815 words) but
+# the engine's unary table keeps it on the same verified 4-vector path.
 KERNELS = [
-    ("Add", lambda a, b: tf.raw_ops.Add(x=a, y=b), 1e-6, 1e-6),
-    ("AddV2", lambda a, b: tf.raw_ops.AddV2(x=a, y=b), 1e-6, 1e-6),
-    ("Mul", tf.multiply, 1e-6, 1e-6),
-    ("Sub", tf.subtract, 1e-6, 1e-6),
-    ("Div", lambda a, b: tf.raw_ops.Div(x=a, y=b), 1e-6, 1e-6),
-    ("RealDiv", tf.divide, 1e-6, 1e-6),
-    ("Maximum", tf.maximum, 0.0, 0.0),
-    ("Minimum", tf.minimum, 0.0, 0.0),
-    ("Relu", tf.nn.relu, 0.0, 0.0),
-    ("Relu6", tf.nn.relu6, 0.0, 0.0),
-    ("Sigmoid", tf.nn.sigmoid, 1e-6, 1e-6),
-    ("Tanh", tf.math.tanh, 2e-6, 1e-6),
-    ("Neg", tf.math.negative, 0.0, 0.0),
-    ("Exp", tf.exp, 1e-6, 2e-5),
-    ("Log", tf.math.log, 1e-6, 1e-6),
-    ("Sqrt", tf.sqrt, 1e-6, 1e-6),
+    ("Add", lambda a, b: tf.raw_ops.Add(x=a, y=b), 1e-6, 1e-6, 1),
+    ("AddV2", lambda a, b: tf.raw_ops.AddV2(x=a, y=b), 1e-6, 1e-6, 1),
+    ("Mul", tf.multiply, 1e-6, 1e-6, 1),
+    ("Sub", tf.subtract, 1e-6, 1e-6, 1),
+    ("Div", lambda a, b: tf.raw_ops.Div(x=a, y=b), 1e-6, 1e-6, 1),
+    ("RealDiv", tf.divide, 1e-6, 1e-6, 1),
+    ("Maximum", tf.maximum, 0.0, 0.0, 1),
+    ("Minimum", tf.minimum, 0.0, 0.0, 1),
+    ("Relu", tf.nn.relu, 0.0, 0.0, 1),
+    ("Relu6", tf.nn.relu6, 0.0, 0.0, 1),
+    ("Sigmoid", tf.nn.sigmoid, 1e-6, 1e-6, 1),
+    ("Tanh", tf.math.tanh, 2e-6, 1e-6, 2),
+    ("Neg", tf.math.negative, 0.0, 0.0, 1),
+    ("Exp", tf.exp, 1e-6, 2e-5, 2),
+    ("Log", tf.math.log, 1e-6, 1e-6, 2),
+    ("Sqrt", tf.sqrt, 1e-6, 1e-6, 2),
 ]
 
 
@@ -393,7 +400,7 @@ def stage_kernels():
 
     for n in (1024, 1000):
         rng = np.random.default_rng(n)
-        for op, call, atol, rtol in KERNELS:
+        for op, call, atol, rtol, launches in KERNELS:
             a, b = _operands(op, n, rng)
             with tf.device("/cpu:0"):
                 ca = tf.constant(a, dtype=tf.float32)
@@ -406,7 +413,7 @@ def stage_kernels():
                 else:
                     tb = tf.constant(b, dtype=tf.float32)
                     got, used = _timed(lambda: call(ta, tb).numpy())
-            _compare(op, got, want, atol, rtol, "n=%d" % n, used, 1)
+            _compare(op, got, want, atol, rtol, "n=%d" % n, used, launches)
 
     # MatMul: 32x32x32 (1024 outputs) and a shape where M, N and K are all
     # non-multiples of the engine's 8/64/16 padding units.

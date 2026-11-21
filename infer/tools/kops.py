@@ -1701,10 +1701,53 @@ def b2_min(e, IN, G, OUT):
     e.op(e.k.ADD_FMIN, OUT, IN, G)
 
 
+def _rcp3(e, d, out):
+    """out = 1/d for a positive d, in three Newton steps.
+
+    d is clamped to [TINY, BIG] so the seed stays finite: this is a *magnitude*
+    clamp, and a caller with a signed divisor must take |d| first (b2_div).
+    The 4-step UOPS body is 2146 instructions at 16 vectors per group and the
+    code slot holds 2048; the seed is accurate to ~5e-2, so three steps still
+    land at one ulp of fp32.
+    """
+    k = e.k
+    a = e.ctx.tb()
+    e.op(k.ADD_FMAX, a, d, e.ctx.k('TINY'))
+    e.op(k.ADD_FMIN, a, a, e.ctx.k('BIG'))
+    e.op(k.ADD_SUB, out, e.ctx.k('RCPM'), a)
+    for _ in range(3):
+        q = e.ctx.tb()
+        e.mul(q, out, a)
+        e.op(k.ADD_FSUB, q, e.ctx.k('TWO'), q)
+        e.mul(out, out, q)
+        e.ctx.rel(q)
+    e.ctx.rel(a)
+
+
 def b2_div(e, IN, G, OUT):
-    t = e.ctx.tb()
-    k_recip(e, G, t)
-    e.mul(OUT, IN, t)
+    """OUT = a / b for either sign of b.
+
+    The reciprocal is taken of |b| and b's sign is OR-ed back: the clamp in
+    _rcp3 is a *magnitude* clamp, and handing it a negative divisor put
+    FMAX(b, TINY) in front of it, so every negative b became +TINY and a/b
+    came back as a * 1e38 (measured: about half the elements when the divisor
+    is signed, max|d| ~1e38).
+
+    Range: the same clamp means |b| < 2^-126 (zero and denormals) saturates at
+    a * 1/TINY = 8.5e37 * a instead of overflowing to +-inf.  Every normal
+    divisor, of either sign and down to 1e-38, is within 3e-7 relative.
+    """
+    k = e.k
+    a = e.ctx.tb()
+    sg = e.ctx.tb()
+    r = e.ctx.tb()
+    e.op(k.ADD_AND, a, G, e.ctx.k('ABSM'))
+    e.op(k.ADD_AND, sg, G, e.ctx.k('SIGNB'))
+    _rcp3(e, a, r)
+    # the seed and every Newton step stay positive for a positive divisor, so
+    # the sign can go on last as an OR
+    e.op(k.ADD_OR, r, r, sg)
+    e.mul(OUT, IN, r)
 
 
 def b2_eqmask(e, IN, G, OUT):
@@ -1910,18 +1953,7 @@ def b2_erf_bwd(e, IN, G, OUT):
 def b2_rcp(e, IN, G, OUT):
     """1/x with 3 Newton steps: the 4-step UOPS body is 2146 instructions at
     16 vectors per group and the code slot holds 2048."""
-    k = e.k
-    a = e.ctx.tb()
-    e.op(k.ADD_FMAX, a, IN, e.ctx.k('TINY'))
-    e.op(k.ADD_FMIN, a, a, e.ctx.k('BIG'))
-    e.op(k.ADD_SUB, OUT, e.ctx.k('RCPM'), a)
-    for _ in range(3):
-        q = e.ctx.tb()
-        e.mul(q, OUT, a)
-        e.op(k.ADD_FSUB, q, e.ctx.k('TWO'), q)
-        e.mul(OUT, OUT, q)
-        e.ctx.rel(q)
-    e.ctx.rel(a)
+    _rcp3(e, IN, OUT)
 
 
 # erf + exp share the exp2 core; the only constant the exp body adds on top
@@ -1934,7 +1966,7 @@ EWB = {
     'sub':            ((), b2_sub, ()),
     'max':            ((), b2_max, ()),
     'min':            ((), b2_min, ()),
-    'div':            (RCP_C2, b2_div, ()),
+    'div':            (('ABSM', 'SIGNB') + RCP_C2, b2_div, ()),
     'eqmask':         (('ONE',), b2_eqmask, ()),
     'sigmoid_bwd':    (SIG_C, b2_sigmoid_bwd, ()),
     'silu_bwd':       (SIG_C, b2_silu_bwd, ()),

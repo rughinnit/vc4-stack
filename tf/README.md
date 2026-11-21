@@ -123,7 +123,7 @@ Eighteen ops, all `T = float32`. Every one hands its arithmetic to a
 | `Add`, `AddV2` | `vc4_elementwise(ADD)` | `ew` 256 floats/group | ≤1 ulp (FPU truncates) |
 | `Mul` | `vc4_elementwise(MUL)` | `ew` | ≤1 ulp |
 | `Sub` | `vc4_elementwise(SUB)` | `ewb sub` (one FSUB) | ≤1 ulp |
-| `Div`, `RealDiv` | `vc4_elementwise(DIV)` | `ewb div` (reciprocal + multiply) | rel 3e-7 |
+| `Div`, `RealDiv` | `vc4_elementwise(DIV)` | `ewb div` (reciprocal of `\|b\|`, sign restored, multiply) | rel 3e-7 for any normal divisor; `\|b\| < 2^-126` saturates instead of returning ±inf |
 | `Maximum` | `vc4_elementwise(MAX)` | `ewb max` (one FMAX) | bit-exact selection |
 | `Minimum` | `vc4_elementwise(MIN)` | `ewb min` (one FMIN) | bit-exact selection |
 | `Relu` | `vc4_elementwise(RELU)` | `ew` | bit-exact |
@@ -361,17 +361,30 @@ built with (`/usr/lib/vc4infer/kgen` for the package, `infer/tools/kgen.py`
 for this tree) into `~/.cache/vc4infer/kcache` (`ew_0_q4.bin`,
 `ewb_sub_q4.bin`, `ewb_max_q4.bin`, `uop_exp_v16.bin`, …). The `ewb
 sub/max/min` bodies generate to 3320 bytes (415 64-bit instructions) and `ewb
-div` to 15288 bytes (1911 instructions), both inside the 2048-instruction
-code slot; `kgen.py ewb <out> --op max` produces them without touching the
-GPU.
+div` to 13656 bytes (1707 instructions — a three-step Newton reciprocal of
+`|b|` with the sign put back, then the multiply), both inside the
+2048-instruction code slot; `kgen.py ewb <out> --op max` produces them
+without touching the GPU.
 
-Launch counts for the pass, from the table above: 18 one-launch elementwise
-and unary checks per length (two lengths), 2 launches per MatMul shape, 1 and
-5 for the two BiasAdd shapes, and 5 for the graph. The test reads
-`vc4_tf_stats()` around every op and reports the delta next to the accuracy,
-so each line says `launches=1 (expected 1)` and a mismatch fails the check;
-the closing line prints the run's total launches, pack and kernel
+Launch counts for the pass: 16 kernels per length, of which 12 take one
+launch and four take two (40 launches over the two lengths), 2 per MatMul
+shape, 1 and 5 for the two BiasAdd shapes, 5 for the graph and 2 for the two
+`--add` lengths — 57 in total. The test reads `vc4_tf_stats()` around every
+op and reports the delta next to the accuracy, so each line says
+`launches=1 (expected 1)` or `launches=2 (expected 2)` and a mismatch fails
+the check; the closing line prints the run's total launches, pack and kernel
 milliseconds and FLOPs.
+
+The four two-launch ops are the bodies `kops.HEAVY` generates at 4 vectors per
+group — 64 floats per QPU instead of 256 — because their 16-vector copies
+measure 2945 (`Sqrt`), 3537 (`Tanh`) and 3641 (`Log`) instructions against a
+2048-instruction code slot. At that group size 12 QPUs cover 768 floats per
+launch, so 1024 elements is 16 groups and runs as 12 + 4; 1000 pads to the same
+1024. `Exp` would fit at 16 vectors (1815 words), but the engine's unary table
+keeps it on the same verified 4-vector path as the other three. This is
+group-size arithmetic, not a numerical defect: the four ops were 0 over
+tolerance on the same run in which the count was wrong, and only the
+expectation was corrected.
 
 Two process-level numbers are worth recording with the result: the engine
 prints `tf-vc4: engine up, arena <N> MiB, <M> MiB for tensors` once, and the

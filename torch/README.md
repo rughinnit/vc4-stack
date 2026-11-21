@@ -1,9 +1,10 @@
 # torch-vc4 — a subset PyTorch backend for the Raspberry Pi VideoCore IV
 
-> Part of the **VC4 stack**. The main repository — engine, kernels,
-> measurements, documentation and issue tracker — is
-> [`rughinnit/vc4-stack`](https://github.com/rughinnit/vc4-stack); see
-> `docs/ECOSYSTEM.md` there for how the repositories fit together.
+> Part of the **VC4 stack**. The backend lives in the main repository,
+> [`rughinnit/vc4-stack`](https://github.com/rughinnit/vc4-stack), under
+> `torch/` — next to the engine (`infer/`), `vc4d/` and the measurements. The
+> `rughinnit/torch-vc4` repository is a mirror kept for the published wheel;
+> this tree is the source of truth. See `docs/ECOSYSTEM.md`.
 
 
 Status: **feature-complete for the model families it declares** (version
@@ -29,15 +30,21 @@ anywhere in this backend.
 
 ## Install (on the Pi)
 
+The backend is `torch/` in the `vc4-stack` checkout; `setup.py` resolves the
+engine and the daemon client from that checkout (`../infer`, `../vc4d`), so no
+sibling clone is needed.
+
 ```sh
-cd /home/raspi/work/torch-vc4
-python3 -m venv .venv
+cd ~/work/vc4-stack
+python3 -m venv .venv                  # or reuse a venv with torch +cpu
 .venv/bin/pip install --no-cache-dir --no-deps \
     /path/to/torch-2.15.0+cpu-cp313-cp313-manylinux_2_28_aarch64.whl
 .venv/bin/pip install --no-cache-dir typing_extensions filelock sympy \
     networkx jinja2 fsspec setuptools
 ulimit -v 1800000                      # the one-TU compile peaks near 1 GB
-MAX_JOBS=1 .venv/bin/pip install --no-build-isolation -e .
+MAX_JOBS=1 .venv/bin/pip install --no-build-isolation -e torch
+
+make -C torch                          # -> dist/torch_vc4-<ver>-cp313-...whl
 ```
 
 The wheel must be the **`+cpu`** one (the PyPI aarch64 wheel is the CUDA
@@ -45,9 +52,10 @@ build and its dependency closure is ~3 GB).
 
 Prerequisites:
 - `vc4d.service` active and the user in group `vc4`;
-- `~/work/vc4-stack/engine` built (`make`), which provides
-  `build/libvc4infer.a` and `tools/kgen.py`; override the tree with
-  `VC4_ENGINE_DIR=...` (and `VC4D_DIR=` for `libvc4client.a`);
+- the engine and the daemon client built in the same checkout: `make -C infer`
+  and `make -C vc4d`, which provide `infer/build/libvc4infer.a` and
+  `vc4d/build/libvc4client.a`; override with `VC4_ENGINE_DIR=...` and
+  `VC4D_DIR=...` only for a split tree;
 - a 2 GB swapfile or `ulimit -v 1800000` if you rebuild.
 
 The extension is linked **statically** against `libvc4infer.a` +
@@ -82,15 +90,15 @@ extension statically linked against `libvc4infer.a`; install it on the Pi
 ## Run
 
 ```sh
-cd /home/raspi/work/torch-vc4
-.venv/bin/python tests/test_ops.py        # forward parity + strict rejection
-.venv/bin/python tests/test_complete.py   # batches, reductions, softmax, ...
-.venv/bin/python tests/test_autograd.py   # gradient parity + tiny CNN training
-.venv/bin/python tests/test_backend.py    # the original acceptance test
-.venv/bin/python tests/bench_ops.py       # per-op cost vs the CPU
-sh tests/run_all.sh                       # all four suites, one daemon each
+cd ~/work/vc4-stack
+.venv/bin/python torch/tests/test_ops.py        # forward parity + strict rejection
+.venv/bin/python torch/tests/test_complete.py   # batches, reductions, softmax, ...
+.venv/bin/python torch/tests/test_autograd.py   # gradient parity + tiny CNN training
+.venv/bin/python torch/tests/test_backend.py    # the original acceptance test
+.venv/bin/python torch/tests/bench_ops.py       # per-op cost vs the CPU
+sh torch/tests/run_all.sh                       # all four suites, one daemon each
 # run the same suite against an installed wheel:
-PYTHON=/path/to/cleanvenv/bin/python sh tests/run_all.sh
+PYTHON=/path/to/cleanvenv/bin/python sh torch/tests/run_all.sh
 ```
 
 `run_all.sh` restarts `vc4d` before each test file on purpose; see

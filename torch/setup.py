@@ -3,11 +3,16 @@ import os
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
-# The engine tree this backend is built against.  It must be the checkout that
-# has the training/ONNX kernels (conv backward, maxpooln, softmax_fwd,
-# matmul_bt), i.e. vc4-stack/infer (was vc4-stack/engine before the reorg).
-ENGINE = os.environ.get("VC4_ENGINE_DIR", "/home/raspi/work/vc4-stack/infer")
-VC4D = os.environ.get("VC4D_DIR", "/home/raspi/work/vc4d")
+# The engine tree this backend is built against.  In the monorepo the backend
+# lives at torch/, next to infer/ and vc4d/, so resolve both from this file:
+# a worktree or a renamed checkout then still builds against its own parent
+# tree instead of a hard-coded ~/work path.  The environment overrides stay
+# for a split checkout, where the backend is not next to the engine.
+HERE = os.path.dirname(os.path.abspath(__file__))
+ENGINE = os.path.abspath(
+    os.environ.get("VC4_ENGINE_DIR", os.path.join(HERE, os.pardir, "infer")))
+VC4D = os.path.abspath(
+    os.environ.get("VC4D_DIR", os.path.join(HERE, os.pardir, "vc4d")))
 
 # Linked *statically* on purpose: the engine's shared object gained an
 # SONAME (libvc4infer.so.1) that is not installed next to it, and a dlopen of

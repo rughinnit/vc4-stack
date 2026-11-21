@@ -4,8 +4,9 @@
 #   packaging/publish_apt.sh [DEB...]
 #
 # With no arguments every vc4* .deb in ../dist (the newest file per package
-# name) is published, together with the newest vc4infer wheel.  Named .debs
-# are published instead when given.
+# name) is published, together with the newest vc4infer wheel and, when it has
+# been built, the newest torch_vc4 wheel.  Named .debs are published instead
+# when given.
 #
 # The repository is the main branch (root) of github.com:rughinnit/vc4-apt,
 # served at https://rughinnit.github.io/vc4-apt and signed with the vc4top
@@ -52,6 +53,10 @@ fi
 [ -n "$debs" ] || { echo "no .deb files to publish in $dist" >&2; exit 1; }
 
 wheel=$(ls -t "$dist"/vc4infer-*-py3-none-any.whl 2>/dev/null | head -1 || true)
+# The PyTorch backend is built from torch/ by packaging/build_torch_wheel.sh.
+# Its filename is the published interface, so copy it unchanged (and leave the
+# existing one in place when this run did not rebuild it).
+torchwheel=$(ls -t "$dist"/torch_vc4-*.whl 2>/dev/null | head -1 || true)
 
 # ---- vc4-apt checkout -------------------------------------------------------
 if [ -e "$wt/.git" ]; then
@@ -81,6 +86,10 @@ done
 install -d "$wt/pip"
 if [ -n "${wheel:-}" ] && [ -f "$wheel" ]; then
 	cp -f "$wheel" "$wt/pip/"
+fi
+if [ -n "${torchwheel:-}" ] && [ -f "$torchwheel" ]; then
+	cp -f "$torchwheel" "$wt/pip/"
+	echo "wheel: $(basename "$torchwheel")"
 fi
 
 python3 - "$wt/pip" <<'PY'

@@ -31,6 +31,10 @@ static const vc4_op_info OPS[] = {
     { "sub", "qpu ewb(sub)", 1, "f32; n rounded to a 256-float group", 1 },
     { "mul", "qpu elementwise", 1, "f32, exact IEEE; n rounded to 256 internally", 1 },
     { "div", "qpu ewb(div)", 1, "f32; reciprocal + multiply (|err| < 3e-7)", 1 },
+    { "max", "qpu ewb(max)", 1,
+      "f32; one FPU FMAX per element, bit-exact selection; NaN follows FMAX", 1 },
+    { "min", "qpu ewb(min)", 1,
+      "f32; one FPU FMIN per element, bit-exact selection; NaN follows FMIN", 1 },
     { "relu", "qpu elementwise", 1, "f32, exact IEEE", 1 },
     { "sigmoid", "qpu elementwise", 1,
       "f32; 2^f degree-5 poly + 3x Newton rcp; |err| < 1e-6 (measured)", 1 },
@@ -196,6 +200,8 @@ const char *vc4_op_name(vc4_op op)
     case VC4_OP_MAXPOOL_BWD: return "maxpool_bwd";
     case VC4_OP_SUB:     return "sub";
     case VC4_OP_DIV:     return "div";
+    case VC4_OP_MAX:     return "max";
+    case VC4_OP_MIN:     return "min";
     case VC4_OP_SOFTMAX: return "softmax";
     case VC4_OP_SOFTMAX_BWD: return "softmax_bwd";
     case VC4_OP_SOFTMAX_CE_BWD: return "softmax_ce_bwd";

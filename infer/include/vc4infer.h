@@ -110,6 +110,10 @@ typedef enum {
     VC4_OP_CMP_LE,          /* a <= b                                        */
     VC4_OP_ISNAN,           /* a is NaN                                      */
     VC4_OP_ISINF,           /* a is +inf or -inf                             */
+    /* the elementwise selection pair: hardware FMAX/FMIN, the same bodies the
+     * elementwise-derivative family already carries (kops.EWB 'max'/'min') */
+    VC4_OP_MAX,             /* out = a >= b ? a : b                          */
+    VC4_OP_MIN,             /* out = a <= b ? a : b                          */
     VC4_OP_COUNT
 } vc4_op;
 

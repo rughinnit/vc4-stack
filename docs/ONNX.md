@@ -627,7 +627,7 @@ Every node is classified into exactly one tier, printed per node by
 | `folded` | Shape/Size/Constant/ConstantOfShape and integer shape arithmetic | plan-time only | metadata (runtime) | resolved during planning; zero runtime cost |
 | `host-meta` | metadata that could not be folded | **refused** (`HostNotAllowed`) | runs | runtime host metadata is still host compute |
 | `host-control` | `If`, `Loop`, `Scan` | **refused** (`NeedsDeviceDispatch`) | runs | the executor is host-scheduled; the QPU has no device-side work queue |
-| `host-unwritten` | `Erf`, `TopK`, `NonZero`, `Einsum`, `LSTM`, ... | **refused** (`HostNotAllowed`) | refused | a numeric operator with no VC4 kernel: DEBT |
+| `host-unwritten` | no member left in the default domain (the tier remains for a numeric operator with no kernel) | **refused** (`HostNotAllowed`) | refused | a numeric operator with no VC4 kernel: DEBT |
 | `unsupported-graph` | invalid domains/types, fp16/string tensors | refused | refused | cannot run on either backend |
 
 `host-control` is architectural, not "slow": every branch/iteration decision

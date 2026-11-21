@@ -125,7 +125,7 @@ be re-taken under `tools/thermal-guard.sh` before being quoted as a measurement.
 |---|---|---|---|---|
 | G5 | nv8 store path unexplained (`2^92` scale) | `Exp/Log/Round` limited to the nv4 path | works on nv4 | `docs/ONNX.md` §12 |
 | G6 | `Gelu`-erf **backward** impossible (4,222 words against a 2,048-instruction slot) | it is a splitting problem, not an impossibility | one fused body at **4 vectors per group** (64 floats): 1,967 words.  `-x^2/2` reuses `SIGNB` instead of a `-0.5` constant, and the erf half lives in the store register so the body needs seven A registers instead of eight; `kops.EWB_HEAVY` and `vc4__ewb`'s group size agree on 64 | `test_grad`: `PASS gelu_erf_bwd rel_L2=2.45e-07 over_tol=0` on silicon; model 0/64 | `fix/gated-kernels` |
-| G8 | **24 of 152 expressible ONNX ops still refused** (measured 2026-11-20, `docs/COMPLETENESS.md`) | models using them fail by name | `vc4infer nodes` before running; the list is geometry/detection (`ConvTranspose`, `GridSample`, `RoiAlign`, `NMS`, `Einsum`, `Det`, `DFT/STFT`), recurrent (`LSTM/GRU/RNN`), random/quantise, and `AffineGrid`/`Col2Im`/`DeformConv`/`MaxRoiPool` |
+| G8 | **24 of 152 expressible ONNX ops were still refused** (measured 2026-11-20, `docs/COMPLETENESS.md`) | models using them failed by name | closed: the geometry/detection, recurrent, random/quantise and DFT/STFT families were implemented, and the 2026-11-21 sweep records **152/152, 0 refused, 0 folded** | `ops-*` merges, `feat/op-152` |
 
 G7 left this table on 2026-11-21: `vc4_gather`, `vc4_reduce`, `vc4_cumsum` and
 `vc4_select3` are element-verified on silicon and their gates are gone

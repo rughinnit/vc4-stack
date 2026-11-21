@@ -42,10 +42,12 @@ metadata node, `Gather` as "activation data is not implemented").  After: all
 
 The subset percentage is **18/18 = 100%**; the global denominator this block
 sits in is 152 (the operators a static fp32 device can express at opset 22).
-Measured on the merged tree immediately after this block, the whole sweep is
+Measured on the merged tree immediately after this block, the whole sweep was
 **122/152 = 80.26% complete (`vc4`), 24 refused, 0 mismatch, 0 hang** -- 104 +
 the 18 here, with no other operator moving (the previously verified families
-were re-measured in the same run).
+were re-measured in the same run).  That was the state when the block landed;
+subsequent blocks closed the remainder, and the 2026-11-21 sweep records
+**152/152, 0 refused, 0 folded** (`docs/COMPLETENESS.md`).
 
 `infer/tests/test_onnx_gaps.py` adds **103 cases** (positive *and* refusal
 cases, `±inf`/NaN where the FPU allows them, negative axes and indices,

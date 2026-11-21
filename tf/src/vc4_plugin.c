@@ -9,10 +9,10 @@
  *                   H2D / D2H / D2D memcpy paths.
  *   TF_InitKernel   the op kernels, registered for this device type:
  *                   Add/AddV2, Mul, Sub, Div/RealDiv, Maximum, Minimum,
- *                   Relu, Relu6, Sigmoid, Tanh, Neg, Exp, Log and Sqrt, all
- *                   fp32.  Every kernel hands the arithmetic to a libvc4infer
- *                   QPU kernel and refuses (rather than computing on the
- *                   host) when the engine cannot take it.
+ *                   Relu, Relu6, Sigmoid, Tanh, Neg, Exp, Log, Sqrt, MatMul
+ *                   and BiasAdd, all fp32.  Every kernel hands the arithmetic
+ *                   to a libvc4infer QPU kernel and refuses (rather than
+ *                   computing on the host) when the engine cannot take it.
  *
  * The device type is "VC" by default.  TensorFlow 2.21 validates a
  * StreamExecutor platform name and type against [A-Z][A-Z_]*, so a digit is
@@ -1238,6 +1238,296 @@ finished:
     TF_DeleteStatus(status);
 }
 
+/* MatMul, fp32, rank 2, row-major, no transpose:
+ *
+ *   C[M][N] = A[M][K] * B[K][N]      through vc4_matmul()
+ *
+ * The GEMM pads M to 8 and N to 64 inside its own scratch, so no dimension has
+ * to be a multiple of anything; the padding rows and columns are never read
+ * back.  That costs one pack launch and one GEMM launch per call.
+ *
+ * Both transpose attributes are refused at construction: the engine has no
+ * transposed-input GEMM, and silently transposing on the host would put the
+ * arithmetic in the wrong place. */
+static void *matmul_create(TF_OpKernelConstruction *c)
+{
+    TF_Status *status = TF_NewStatus();
+    TF_Bool ta = 0, tb = 0;
+    TF_OpKernelConstruction_GetAttrBool(c, "transpose_a", &ta, status);
+    if (TF_GetCode(status) == TF_OK)
+        TF_OpKernelConstruction_GetAttrBool(c, "transpose_b", &tb, status);
+    if (TF_GetCode(status) == TF_OK && (ta || tb)) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 MatMul: transpose_%c is not supported; vc4_matmul takes "
+               "A[M][K] and B[K][N] row-major", ta ? 'a' : 'b');
+    }
+    if (TF_GetCode(status) != TF_OK)
+        TF_OpKernelConstruction_Failure(c, status);
+    TF_DeleteStatus(status);
+    return NULL;    /* stateless: the shapes arrive with each call */
+}
+
+static int matmul_run(const void *pa, const void *pb, void *po, int64_t M,
+                      int64_t N, int64_t K, TF_Status *status)
+{
+    const size_t abytes = (size_t)M * (size_t)K * 4;
+    const size_t bbytes = (size_t)K * (size_t)N * 4;
+    const size_t cbytes = (size_t)M * (size_t)N * 4;
+
+    if (!engine_enter("MatMul", status))
+        return 0;
+
+    vc4_buf ba, bb, bo;
+    int ok = arena_range("MatMul", pa, abytes, &ba, status) &&
+             arena_range("MatMul", pb, bbytes, &bb, status) &&
+             arena_range("MatMul", po, cbytes, &bo, status);
+
+    vc4_status st = VC4_OK;
+    if (ok)
+        st = vc4_matmul(g_ctx, &ba, &bb, &bo, (uint32_t)M, (uint32_t)N,
+                        (uint32_t)K, VC4_LAYOUT_ROW_MAJOR);
+    pthread_mutex_unlock(&g_mu);
+
+    if (!ok)
+        return 0;
+    if (st != VC4_OK) {
+        refuse(status, TF_INTERNAL,
+               "tf-vc4 MatMul: vc4_matmul(%lldx%lldx%lld) failed: %s",
+               (long long)M, (long long)N, (long long)K, vc4_strerror(st));
+        return 0;
+    }
+    return 1;
+}
+
+static void matmul_compute(void *user, TF_OpKernelContext *ctx)
+{
+    (void)user;
+    TF_Status *status = TF_NewStatus();
+    TF_Tensor *a = NULL;
+    TF_Tensor *b = NULL;
+    TF_Tensor *out = NULL;
+    int64_t M = 0, N = 0, K = 0;
+
+    TF_GetInput(ctx, 0, &a, status);
+    if (a && TF_GetCode(status) == TF_OK)
+        TF_GetInput(ctx, 1, &b, status);
+    if (TF_GetCode(status) != TF_OK || !a || !b)
+        goto finished;
+
+    if (TF_TensorType(a) != TF_FLOAT || TF_TensorType(b) != TF_FLOAT) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 MatMul: only float32 is registered");
+        goto finished;
+    }
+    if (TF_NumDims(a) != 2 || TF_NumDims(b) != 2) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 MatMul: both inputs must be rank 2 (A is rank %d, B is "
+               "rank %d); the batched forms are not registered",
+               TF_NumDims(a), TF_NumDims(b));
+        goto finished;
+    }
+    M = TF_Dim(a, 0);
+    K = TF_Dim(a, 1);
+    int64_t kb = TF_Dim(b, 0);
+    N = TF_Dim(b, 1);
+    if (K != kb) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 MatMul: inner dimensions disagree (A is [%lld,%lld], "
+               "B is [%lld,%lld])", (long long)M, (long long)K,
+               (long long)kb, (long long)N);
+        goto finished;
+    }
+    if (M > INT32_MAX || N > INT32_MAX || K > INT32_MAX) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 MatMul: a dimension is over the 2^31 address limit");
+        goto finished;
+    }
+    if (M && N && K == 0) {
+        /* TF defines this as a zero matrix; the engine has no GEMM with a
+         * zero reduction, and a host fill would be arithmetic on the host. */
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 MatMul: K == 0 is not supported (no zero-fill path)");
+        goto finished;
+    }
+
+    int64_t dims[2] = { M, N };
+    out = TF_AllocateOutput(ctx, 0, TF_FLOAT, dims, 2,
+                            (size_t)(M * N) * sizeof(float), status);
+    if (!out || TF_GetCode(status) != TF_OK)
+        goto finished;
+    if (M == 0 || N == 0)
+        goto finished;
+    matmul_run(TF_TensorData(a), TF_TensorData(b), TF_TensorData(out), M, N, K,
+               status);
+
+finished:
+    if (TF_GetCode(status) != TF_OK)
+        TF_OpKernelContext_Failure(ctx, status);
+    if (out)
+        TF_DeleteTensor(out);
+    if (a)
+        TF_DeleteTensor(a);
+    if (b)
+        TF_DeleteTensor(b);
+    TF_DeleteStatus(status);
+}
+
+/* BiasAdd, fp32, NHWC: y[..., c] = x[..., c] + bias[c].
+ *
+ * The engine's add is same-shape, so the bias row is expanded over the rows
+ * with a QPU layout copy whose source row stride is zero (every output row
+ * reads the same bias row) and the add then runs in place: the output is the
+ * bias plane until the add replaces it with bias + x.  Two launches when the
+ * row is a multiple of 16 floats, three with a tail copy, and one when the
+ * tensor is a single row (bias and x are the same shape then).  No temporary
+ * buffer is needed either way.
+ *
+ * data_format is checked at construction; only NHWC (bias on the last axis)
+ * is registered. */
+static void *biasadd_create(TF_OpKernelConstruction *c)
+{
+    TF_Status *status = TF_NewStatus();
+    char fmt[16] = { 0 };
+    TF_OpKernelConstruction_GetAttrString(c, "data_format", fmt,
+                                          sizeof(fmt) - 1, status);
+    if (TF_GetCode(status) == TF_OK && strcmp(fmt, "NHWC") != 0) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 BiasAdd: data_format=\"%s\" is not supported; only "
+               "NHWC (bias on the last axis) is", fmt);
+    }
+    if (TF_GetCode(status) != TF_OK)
+        TF_OpKernelConstruction_Failure(c, status);
+    TF_DeleteStatus(status);
+    return NULL;
+}
+
+static int biasadd_run(const void *px, const void *pbias, void *po,
+                       int64_t rows, int64_t cols, TF_Status *status)
+{
+    const size_t nbytes = (size_t)(rows * cols) * 4;
+
+    if (rows > INT32_MAX || cols > INT32_MAX / 4) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 BiasAdd: %lldx%lld is over the layout copy's address "
+               "limit", (long long)rows, (long long)cols);
+        return 0;
+    }
+    if (!engine_enter("BiasAdd", status))
+        return 0;
+
+    vc4_buf bx, bb, bo;
+    int ok = arena_range("BiasAdd", px, nbytes, &bx, status) &&
+             arena_range("BiasAdd", pbias, (size_t)cols * 4, &bb, status) &&
+             arena_range("BiasAdd", po, nbytes, &bo, status);
+
+    vc4_status st = VC4_OK;
+    if (ok) {
+        if (rows == 1) {
+            /* Same shape already: one add, no expansion. */
+            st = vc4_elementwise(g_ctx, VC4_OP_ADD, &bx, &bb, &bo, (size_t)cols);
+        } else {
+            const uint32_t drow = (uint32_t)cols * 4;
+            const uint32_t full = (uint32_t)(cols / 16);
+            const uint32_t tail = (uint32_t)(cols % 16);
+            if (full) {
+                /* rows x full vectors; srow 0 broadcasts the bias row. */
+                st = vc4_copy2d_n(g_ctx, &bb, &bo, (uint32_t)rows, full,
+                                  0, drow, 64, 64, 4, 16, 1, 16);
+            }
+            if (st == VC4_OK && tail) {
+                vc4_buf bsrc = { bb.off + full * 64, bb.bytes - full * 64 };
+                vc4_buf odst = { bo.off + full * 64, bo.bytes - full * 64 };
+                st = vc4_copy2d_n(g_ctx, &bsrc, &odst, (uint32_t)rows, 1,
+                                  0, drow, 64, 64, 4, tail, 1, tail);
+            }
+            if (st == VC4_OK) {
+                /* In place: the engine reads a group's operands before it
+                 * stores that group, and every group owns its own 256 floats. */
+                st = vc4_elementwise(g_ctx, VC4_OP_ADD, &bx, &bo, &bo,
+                                     (size_t)(rows * cols));
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+
+    if (!ok)
+        return 0;
+    if (st != VC4_OK) {
+        refuse(status, TF_INTERNAL,
+               "tf-vc4 BiasAdd: %lldx%lld bias add failed: %s",
+               (long long)rows, (long long)cols, vc4_strerror(st));
+        return 0;
+    }
+    return 1;
+}
+
+static void biasadd_compute(void *user, TF_OpKernelContext *ctx)
+{
+    (void)user;
+    TF_Status *status = TF_NewStatus();
+    TF_Tensor *x = NULL;
+    TF_Tensor *bias = NULL;
+    TF_Tensor *out = NULL;
+    int64_t rows = 0, cols = 0, total = 0;
+
+    TF_GetInput(ctx, 0, &x, status);
+    if (x && TF_GetCode(status) == TF_OK)
+        TF_GetInput(ctx, 1, &bias, status);
+    if (TF_GetCode(status) != TF_OK || !x || !bias)
+        goto finished;
+
+    if (TF_TensorType(x) != TF_FLOAT || TF_TensorType(bias) != TF_FLOAT) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 BiasAdd: only float32 is registered");
+        goto finished;
+    }
+    int nd = TF_NumDims(x);
+    if (nd < 1 || TF_NumDims(bias) != 1) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 BiasAdd: expects a rank>=1 input and a rank-1 bias "
+               "(input rank %d, bias rank %d)", nd, TF_NumDims(bias));
+        goto finished;
+    }
+    if (nd > 8) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 BiasAdd: rank %d is over the kernel's limit of 8", nd);
+        goto finished;
+    }
+    cols = TF_Dim(x, nd - 1);
+    if (TF_Dim(bias, 0) != cols) {
+        refuse(status, TF_INVALID_ARGUMENT,
+               "tf-vc4 BiasAdd: the bias has %lld elements but the input's "
+               "last dimension is %lld", (long long)TF_Dim(bias, 0),
+               (long long)cols);
+        goto finished;
+    }
+    total = TF_TensorElementCount(x);
+    rows = cols ? total / cols : 0;
+
+    int64_t dims[8];
+    for (int i = 0; i < nd; ++i)
+        dims[i] = TF_Dim(x, i);
+    out = TF_AllocateOutput(ctx, 0, TF_FLOAT, dims, nd,
+                            (size_t)total * sizeof(float), status);
+    if (!out || TF_GetCode(status) != TF_OK)
+        goto finished;
+    if (total == 0)
+        goto finished;
+    biasadd_run(TF_TensorData(x), TF_TensorData(bias), TF_TensorData(out),
+                rows, cols, status);
+
+finished:
+    if (TF_GetCode(status) != TF_OK)
+        TF_OpKernelContext_Failure(ctx, status);
+    if (out)
+        TF_DeleteTensor(out);
+    if (x)
+        TF_DeleteTensor(x);
+    if (bias)
+        TF_DeleteTensor(bias);
+    TF_DeleteStatus(status);
+}
+
 /* TypeConstraint("T", float) is the registry's dtype gate: a tensor of any
  * other type cannot select one of these kernels.  No kernel declares a host
  * memory argument (TF_KernelBuilder_HostMemory): every argument of these ops
@@ -1273,6 +1563,8 @@ void TF_InitKernel(void)
     for (size_t i = 0; i < sizeof(g_ew_regs) / sizeof(g_ew_regs[0]); ++i)
         register_kernel(g_ew_regs[i].op, g_ew_regs[i].create, ew_compute,
                         status);
+    register_kernel("MatMul", matmul_create, matmul_compute, status);
+    register_kernel("BiasAdd", biasadd_create, biasadd_compute, status);
 
     TF_DeleteStatus(status);
 }

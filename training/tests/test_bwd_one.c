@@ -355,6 +355,63 @@ int main(int argc, char **argv)
             }
             report(op, &bdx, H * W, ref);
         }
+    } else if (!strcmp(op, "resize_bilinear_fwd")) {
+        /* Forward resize, both coordinate mappings, non-integer scale
+         * (5x4 -> 9x7), two planes so the plane offset is exercised. */
+        const int planes = 2, Hh = 4, Ww = 5, Ho = 7, Wo = 9;
+        const size_t nin = (size_t)planes * Hh * Ww;
+        const size_t nout = (size_t)planes * Ho * Wo;
+        static float xin[2 * 4 * 5];
+        static double yref[2 * 7 * 9];
+        fill(xin, nin, -1.0f, 2.0f);
+        vc4_buf bx = bufs(nin, xin), by = bufs(nout, NULL);
+        static const char *nm[3] = { "half_pixel", "align_corners",
+                                     "asymmetric" };
+        static const vc4_resize_map maps[3] = { VC4_RESIZE_HALF_PIXEL,
+                                                VC4_RESIZE_ALIGN_CORNERS,
+                                                VC4_RESIZE_ASYMMETRIC };
+        for (int m = 0; m < 3; ++m) {
+            chk(vc4_resize_bilinear_mode(ctx, &bx, &by, planes, Hh, Ww, Ho, Wo,
+                                         maps[m]), nm[m]);
+            for (int p = 0; p < planes; ++p)
+                for (int oy = 0; oy < Ho; ++oy) {
+                    double sy;
+                    if (m == 1)
+                        sy = (double)oy * (Hh - 1) / (Ho - 1);
+                    else if (m == 2)
+                        sy = (double)oy * Hh / Ho;
+                    else
+                        sy = ((double)oy + 0.5) * Hh / Ho - 0.5;
+                    if (m == 0 && sy < 0) sy = 0;
+                    int i0 = (int)floor(sy);
+                    double fy = sy - i0;
+                    if (i0 < 0) { i0 = 0; fy = 0; }
+                    if (i0 >= Hh - 1) { i0 = Hh - 1; fy = 0; }
+                    int i1 = i0 + 1 < Hh ? i0 + 1 : Hh - 1;
+                    for (int ox = 0; ox < Wo; ++ox) {
+                        double sx;
+                        if (m == 1)
+                            sx = (double)ox * (Ww - 1) / (Wo - 1);
+                        else if (m == 2)
+                            sx = (double)ox * Ww / Wo;
+                        else
+                            sx = ((double)ox + 0.5) * Ww / Wo - 0.5;
+                        if (m == 0 && sx < 0) sx = 0;
+                        int j0 = (int)floor(sx);
+                        double fx = sx - j0;
+                        if (j0 < 0) { j0 = 0; fx = 0; }
+                        if (j0 >= Ww - 1) { j0 = Ww - 1; fx = 0; }
+                        int j1 = j0 + 1 < Ww ? j0 + 1 : Ww - 1;
+                        const float *pl = xin + (size_t)p * Hh * Ww;
+                        yref[((size_t)p * Ho + oy) * Wo + ox] =
+                            (1 - fy) * (1 - fx) * pl[i0 * Ww + j0]
+                          + (1 - fy) * fx * pl[i0 * Ww + j1]
+                          + fy * (1 - fx) * pl[i1 * Ww + j0]
+                          + fy * fx * pl[i1 * Ww + j1];
+                    }
+                }
+            report(nm[m], &by, nout, yref);
+        }
     } else if (!strcmp(op, "binop_bwd")) {
         /* (4,5) * (4,1) with broadcasting */
         float xg[4 * 5 + 4], dy[4 * 5];

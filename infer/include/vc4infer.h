@@ -634,10 +634,37 @@ vc4_status vc4_resize_nearest_bwd(vc4_ctx *ctx, const vc4_buf *dy,
                                   vc4_buf *dx, int planes, int H, int W,
                                   int Ho, int Wo);
 /*
- * Bilinear resize, half-pixel centres, edge clamp: the mapping ONNX calls
- * "half_pixel" with "nearest" border, which is what torch's
- * F.interpolate(mode='bilinear', align_corners=False) does.
+ * Which source coordinate an output index maps to, per axis.  These are the
+ * ONNX Resize coordinate_transformation_mode names, and they are what
+ * torch's two interpolate settings mean:
+ *
+ *   HALF_PIXEL     s = (o + 0.5) * in/out - 0.5, clamped at 0
+ *                  (ONNX "half_pixel"; torch align_corners=False)
+ *   ALIGN_CORNERS  s = o * (in-1)/(out-1), and s = 0 when out == 1
+ *                  (ONNX "align_corners"; torch align_corners=True)
+ *   ASYMMETRIC     s = o * in/out                   (ONNX "asymmetric")
+ *
+ * The taps are i0 = floor(s) and i1 = min(i0+1, in-1), the weight of i0 is
+ * s - i0, and an s at or past in-1 keeps the edge sample with weight 0 on
+ * the far tap (the clamped pair still sums to x[in-1]).
  */
+typedef enum {
+    VC4_RESIZE_HALF_PIXEL = 0,
+    VC4_RESIZE_ALIGN_CORNERS,
+    VC4_RESIZE_ASYMMETRIC
+} vc4_resize_map;
+/*
+ * Bilinear resize over [planes][H][W] with the mapping selected by `map`.
+ * Lowered to four vc4_gather passes plus the QPU elementwise multiply/add:
+ * the four int32 index tables and the four weight vectors are built from
+ * *geometry* on the ARM (no activation value is read), and every float
+ * operation on the data runs on the QPUs -- 4 gathers, 4 muls and 3 adds
+ * over the output, whatever the scale.
+ */
+vc4_status vc4_resize_bilinear_mode(vc4_ctx *ctx, const vc4_buf *x,
+                                    vc4_buf *y, int planes, int H, int W,
+                                    int Ho, int Wo, vc4_resize_map map);
+/* vc4_resize_bilinear_mode with VC4_RESIZE_HALF_PIXEL. */
 vc4_status vc4_resize_bilinear(vc4_ctx *ctx, const vc4_buf *x, vc4_buf *y,
                                int planes, int H, int W, int Ho, int Wo);
 /* The adjoint (scatter-add of the four corner weights). */

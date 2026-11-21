@@ -24,13 +24,13 @@
  *   softmax8    the fused row softmax (test_onnxops + test_grad)
  *   copy2d      pitched/affine copies (test_copyops)
  *
- * WHY NOT vc4_gather / vc4_reduce: both are in the kops "generic kernel"
- * family, which no test in this tree exercises.  On the board they wedge the
- * QPU (the gather kernel hands the TMU an address from an accumulator --
- * `areg(100)` -- and its pop order does not match the build_ew pipeline; the
- * reduce kernel seeds register 36 instead of r0 and walks a fixed 256-output
- * group past the caller's buffer).  The training path therefore does not call
- * them.  docs/TRAINING.md records this as a known gap in the *inference* path.
+ * vc4_gather is used by the bilinear resize below: it is one TMU read per
+ * output word from an int32 byte-offset table, and it is element-verified
+ * (docs/BUGS.md A18/B5: 0 bad at n = 1..1000, `tests/test_gated`).  It used
+ * to wedge the QPU -- the TMU address was taken from an accumulator and the
+ * fill mask was overwritten before use -- so the earlier version of this file
+ * avoided it.  vc4_reduce stays out of the training path: the compositions
+ * here use the GEMM, and no test in this tree exercises the reduce blobs.
  *
  * The ARM only
  *   - builds integer index tables / 0-1 weight matrices from *geometry*
@@ -1772,26 +1772,175 @@ static vc4_status bilin_matrix(vc4_ctx *ctx, int planes, int H, int W, int Ho,
     return VC4_OK;
 }
 
-vc4_status vc4_resize_bilinear(vc4_ctx *ctx, const vc4_buf *x, vc4_buf *y,
-                               int planes, int H, int W, int Ho, int Wo)
+/* The source coordinate and the two taps of one output index. */
+static void bilin_axis_map(int o, int in, int out, vc4_resize_map map,
+                           int *i0, int *i1, float *f)
+{
+    double s;
+    switch (map) {
+    case VC4_RESIZE_ALIGN_CORNERS:
+        s = out > 1 ? (double)o * (double)(in - 1) / (double)(out - 1) : 0.0;
+        break;
+    case VC4_RESIZE_ASYMMETRIC:
+        s = (double)o * (double)in / (double)out;
+        break;
+    case VC4_RESIZE_HALF_PIXEL:
+    default:
+        s = ((double)o + 0.5) * (double)in / (double)out - 0.5;
+        if (s < 0.0)
+            s = 0.0;
+        break;
+    }
+    int i = (int)floor(s);
+    double fv = s - (double)i;
+    if (i < 0) {
+        i = 0;
+        fv = 0.0;
+    }
+    if (i >= in - 1) {
+        i = in - 1;
+        fv = 0.0;
+    }
+    *i0 = i;
+    *i1 = i + 1 < in ? i + 1 : in - 1;
+    *f = (float)fv;
+}
+
+/*
+ * Bilinear resize as four index-map gathers of the source.
+ *
+ *   out[p][oy][ox] = wy0*wx0 * X[y0][x0] + wy0*wx1 * X[y0][x1]
+ *                  + wy1*wx0 * X[y1][x0] + wy1*wx1 * X[y1][x1]
+ *
+ * The ARM computes each axis pair and weight once per output coordinate
+ * (geometry: no activation is read) and expands them into four int32
+ * byte-offset tables and four weight vectors.  vc4_gather moves the four
+ * taps and vc4_elementwise does the muls and adds: 4 + 4 + 3 launches over
+ * the output, and 10 output-sized buffers of workspace (4 tables, 4 weight
+ * vectors, one accumulator and one scratch).
+ *
+ * The former lowering built the dense [n_out][n_in] interpolation matrix on
+ * the ARM and ran it as one matvec: O(n_out * n_in) MACs, and it hit
+ * VC4_MATVEC_MAX on any real resize (a 2x upsample of 128x128 needs 64 MiB
+ * of table).  This one is O(n_out).
+ */
+vc4_status vc4_resize_bilinear_mode(vc4_ctx *ctx, const vc4_buf *x,
+                                    vc4_buf *y, int planes, int H, int W,
+                                    int Ho, int Wo, vc4_resize_map map)
 {
     if (!ctx || !x || !y || planes <= 0 || H <= 0 || W <= 0 || Ho <= 0 ||
         Wo <= 0)
         return VC4_ERR_INVAL;
+    if (map != VC4_RESIZE_HALF_PIXEL && map != VC4_RESIZE_ALIGN_CORNERS &&
+        map != VC4_RESIZE_ASYMMETRIC)
+        return VC4_ERR_INVAL;
     if (ctx->dead)
         return VC4_ERR_TIMEOUT;
-    size_t n_out, n_in;
-    float *M = NULL;
-    vc4_status st = bilin_matrix(ctx, planes, H, W, Ho, Wo, &M, &n_out,
-                                 &n_in);
-    if (st != VC4_OK)
-        return st;
+    const size_t n_out = (size_t)planes * (size_t)Ho * (size_t)Wo;
+    if (x->bytes < (size_t)planes * (size_t)H * (size_t)W * 4 ||
+        y->bytes < n_out * 4)
+        return VC4_ERR_INVAL;
+
+    int *ay0 = malloc((size_t)Ho * 4), *ay1 = malloc((size_t)Ho * 4);
+    int *ax0 = malloc((size_t)Wo * 4), *ax1 = malloc((size_t)Wo * 4);
+    float *fy = malloc((size_t)Ho * 4), *fx = malloc((size_t)Wo * 4);
+    if (!ay0 || !ay1 || !ax0 || !ax1 || !fy || !fx) {
+        free(ay0); free(ay1); free(ax0); free(ax1);
+        free(fy); free(fx);
+        return VC4_ERR_NOMEM;
+    }
+    for (int oy = 0; oy < Ho; ++oy)
+        bilin_axis_map(oy, H, Ho, map, &ay0[oy], &ay1[oy], &fy[oy]);
+    for (int ox = 0; ox < Wo; ++ox)
+        bilin_axis_map(ox, W, Wo, map, &ax0[ox], &ax1[ox], &fx[ox]);
+
     bw_ws w;
     ws_on(&w, ctx);
-    st = matvec_w(&w, M, (uint32_t)n_out, (uint32_t)n_in, x, y);
+    const size_t per = al64(n_out * 4) + 64;
+    vc4_buf tab_b[4], wt_b[4], acc, scr;
+    int32_t *tab_p[4];
+    float *wt_p[4];
+    for (int j = 0; j < 4; ++j) {
+        tab_b[j] = ws_get(&w, per);
+        wt_b[j] = ws_get(&w, per);
+        if (!w.ok) {
+            ws_off(&w);
+            free(ay0); free(ay1); free(ax0); free(ax1);
+            free(fy); free(fx);
+            return VC4_ERR_NOMEM;
+        }
+        tab_p[j] = malloc(n_out * 4);
+        wt_p[j] = malloc(n_out * 4);
+        if (!tab_p[j] || !wt_p[j]) {
+            w.ok = 0;
+            break;
+        }
+    }
+    if (w.ok) {
+        acc = ws_get(&w, per);
+        scr = ws_get(&w, per);
+    }
+    vc4_status st = w.ok ? VC4_OK : VC4_ERR_NOMEM;
+    if (st != VC4_OK) {
+        vc4__set_err(ctx, "resize bilinear: %zu B of index/weight workspace "
+                     "for a %d x %d output does not fit (%.1f MiB free)",
+                     per * 10, Ho, Wo, (double)vc4__ws_free(ctx) / (1 << 20));
+    }
+    for (int j = 0; j < 4 && st == VC4_OK; ++j) {
+        if (!tab_p[j] || !wt_p[j]) {
+            st = VC4_ERR_NOMEM;
+            break;
+        }
+        const int ty = (j >> 1) ? 1 : 0, tx = (j & 1) ? 1 : 0;
+        int32_t *t = tab_p[j];
+        float *v = wt_p[j];
+        for (int p = 0; p < planes; ++p) {
+            const size_t base = (size_t)p * (size_t)H * (size_t)W;
+            for (int oy = 0; oy < Ho; ++oy) {
+                const int ry = ty ? ay1[oy] : ay0[oy];
+                const float wy = ty ? fy[oy] : 1.0f - fy[oy];
+                for (int ox = 0; ox < Wo; ++ox) {
+                    const int rx = tx ? ax1[ox] : ax0[ox];
+                    const float wx = tx ? fx[ox] : 1.0f - fx[ox];
+                    const size_t o = ((size_t)p * Ho + oy) * Wo + ox;
+                    t[o] = (int32_t)(x->off + (base +
+                          (size_t)ry * W + rx) * 4u);
+                    v[o] = wy * wx;
+                }
+            }
+        }
+        vc4__write(ctx, tab_b[j].off, t, n_out * 4);
+        vc4__write(ctx, wt_b[j].off, v, n_out * 4);
+    }
+    if (st == VC4_OK)
+        st = vc4_gather(ctx, &tab_b[0], &acc, n_out, 0.0f);
+    if (st == VC4_OK)
+        st = vc4_elementwise(ctx, VC4_OP_MUL, &acc, &wt_b[0], &acc, n_out);
+    for (int j = 1; j < 4 && st == VC4_OK; ++j) {
+        st = vc4_gather(ctx, &tab_b[j], &scr, n_out, 0.0f);
+        if (st == VC4_OK)
+            st = vc4_elementwise(ctx, VC4_OP_MUL, &scr, &wt_b[j], &scr,
+                                 n_out);
+        if (st == VC4_OK)
+            st = vc4_elementwise(ctx, VC4_OP_ADD, &acc, &scr, &acc, n_out);
+    }
+    if (st == VC4_OK && y->off != acc.off)
+        st = copy_floats(ctx, &acc, y, n_out);
     ws_off(&w);
-    free(M);
+    for (int j = 0; j < 4; ++j) {
+        free(tab_p[j]);
+        free(wt_p[j]);
+    }
+    free(ay0); free(ay1); free(ax0); free(ax1);
+    free(fy); free(fx);
     return st;
+}
+
+vc4_status vc4_resize_bilinear(vc4_ctx *ctx, const vc4_buf *x, vc4_buf *y,
+                               int planes, int H, int W, int Ho, int Wo)
+{
+    return vc4_resize_bilinear_mode(ctx, x, y, planes, H, W, Ho, Wo,
+                                    VC4_RESIZE_HALF_PIXEL);
 }
 
 vc4_status vc4_resize_bilinear_bwd(vc4_ctx *ctx, const vc4_buf *dy,

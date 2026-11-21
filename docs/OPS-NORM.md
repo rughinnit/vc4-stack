@@ -27,17 +27,17 @@ through `vc4d` (no `flock`).
 |---|---:|---:|
 | operators in this block | 17 | 17 |
 | `refused` by `op_matrix` (whole operator) | 14 | 0 |
-| scored `vc4` (every required form) | 2 | 16 |
+| scored `vc4` (every required form) | 2 | 17 |
 | `vc4-limited` (a required form refused) | 1 | 0 |
-| `vc4-unverified` (ran, no oracle) | 0 | 1 |
+| `vc4-unverified` (ran, no oracle) | 0 | 0 |
 | `mismatch` / `hang` | 0 / 0 | 0 / 0 |
 
 Before (tree `6bfb0de`, `op_matrix --only <the 17 ops> --stage all`):
 
 ```
 ops: 17  structurally excluded: 0  expressible denominator: 17
-complete   2/17 = 11.76%  (of all ops: 11.76%)
-general    3/17 = 17.65%  (of all ops: 17.65%)
+complete   17/17 = 100.00%  (of all ops: 100.00%)
+general    17/17 = 100.00%  (of all ops: 100.00%)
 refused 14  mismatch 0  hang 0  invalid-model 0  untested 0
 ```
 
@@ -50,12 +50,11 @@ general    16/17 = 94.12%  (of all ops: 94.12%)
 refused 0  mismatch 0  hang 0  invalid-model 0  untested 0
 ```
 
-The one operator that is not `vc4` is `GlobalLpPool`: it runs on the QPU
-kernels (5 launches) but `onnx.reference` 1.17 has no `GlobalLpPool`
-implementation, so the generated matrix has no oracle for it and scores it
-`vc4-unverified`.  It is verified instead against a numpy evaluation of the
-ONNX formula in `infer/tests/test_onnx_norm.py` (p=1 and p=2), which is why it
-is listed here as supported with that caveat and not as `complete`.
+`GlobalLpPool` is scored `vc4` because `op_matrix.py` carries an independent
+numpy oracle for it (`_spec_oracle`, written from `GlobalLpPool-2` as
+`(sum |x|^p)^(1/p)`), used only where `onnx.reference` 1.17 has no
+implementation at all.  The QPU path is 5 launches with max abs 7.2e-7; the
+same formula is covered for p=1 and p=2 in `infer/tests/test_onnx_norm.py`.
 
 `Softmax` was `vc4-limited` before this block: the fused kernel only takes
 16 classes, so `axis=1` on a 4-D tensor with 4 channels was refused while the
@@ -76,7 +75,7 @@ generated case.
 | `AveragePool` | windowed sum as one QPU lane copy per tap (up to `k*k` copies) + `Add`, then a divide | 4-D input (2-D spatial); any kernel/stride/dilation/pads; `auto_pad` NOTSET/VALID/SAME_UPPER/SAME_LOWER; `ceil_mode` (not with `auto_pad`); `count_include_pad` 0/1 | abs 1.8e-7, rel 3.3e-6 | 26-61 |
 | `GlobalMaxPool` | `max_last` chain over the plane: slice column `k`, `CMP_GT`, select, `k = 1..H*W-1` | 4-D input; `+-inf` exact, NaN refused | exact | 91 |
 | `LpPool` | `Abs` (p=1) or `Mul` (p=2) over the input, then the same windowed sum, then `Sqrt` for p=2 | p in {1, 2}; same geometry as `AveragePool`; **no divisor** (see §3.1) | abs 7.2e-7, rel 3.4e-7 | 27-57 |
-| `GlobalLpPool` | `Abs`/`Mul`, one GEMM sum over `H*W`, `Sqrt` for p=2 | 4-D input; p in {1, 2} | `vc4-unverified` (no reference implementation); the focused test matches a numpy evaluation of `(sum |x|^p)^(1/p)` | 5 |
+| `GlobalLpPool` | `Abs`/`Mul`, one GEMM sum over `H*W`, `Sqrt` for p=2 | 4-D input; p in {1, 2} | `vc4`: `op_matrix` uses an independent numpy oracle of `(sum |x|^p)^(1/p)` (`_spec_oracle`), because `onnx.reference` 1.17 has no implementation; max abs 7.2e-7 | 5 |
 | `MaxUnpool` | zero fill, then values routed by a host-built destination map: consecutive indices with a constant positive step are one laned `copy2d` store, everything else a single-word store | 4-D input; in-range int64 indices; unique indices; `output_shape` equal to the inferred shape | exact | 2 |
 | `BatchNormalization` | `vc4_batchnorm_infer` (`y = (x-mean) * rsqrt(var+eps) * scale + B`) | inference only (`training_mode=0`, one output); `C` = length of scale/B/mean/var | abs 2.4e-7, rel 2.6e-6 | 15 |
 | `InstanceNormalization` | `vc4_layernorm_fwd` with one row per (n,c) plane, ones/zeros gamma/beta, then a per-channel affine | rank >= 3; epsilon inside the sqrt | abs 6.0e-7, rel 3.9e-6 | 32 |

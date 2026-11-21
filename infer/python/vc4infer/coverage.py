@@ -204,6 +204,11 @@ OPS = {
     "DynamicQuantizeLinear": "QPU max/min tree + affine/round/clip",
     "DFT": "QPU GEMM against a constant cos/sin twiddle matrix",
     "STFT": "QPU copy2d framing + window MUL + the DFT GEMM",
+    "HannWindow": "QPU index ramp + QPU SIN squared (window table)",
+    "HammingWindow": "QPU index ramp + QPU COS + QPU affine (window table)",
+    "BlackmanWindow": "QPU index ramp + two QPU COS + QPU affine",
+    "MelWeightMatrix": "QPU triangle arithmetic over parameter-derived "
+                      "index ramps",
     "RandomUniform": "QPU VC4_UOP_RNG (counter-based hash)",
     "RandomUniformLike": "QPU VC4_UOP_RNG (counter-based hash)",
     "RandomNormal": "QPU VC4_UOP_RNG x2 + Box-Muller (Log/Sqrt/Cos/MUL)",
@@ -222,6 +227,11 @@ if os.environ.get("VC4_UNARY_VERIFIED", "1") == "0":
 # tiers ---------------------------------------------------------------------
 META_OPS = frozenset(("Shape", "Size", "Constant", "ConstantOfShape"))
 CONTROL_OPS = frozenset(("If", "Loop", "Scan"))
+# Table generators whose only inputs are scalars.  They are numeric ops with
+# QPU kernels (index ramp + unary/compare arithmetic), so they are neither
+# metadata nor foldable: see _dispatch_sig._Window and MelWeightMatrix.
+TABLES = frozenset(("HannWindow", "HammingWindow", "BlackmanWindow",
+                    "MelWeightMatrix"))
 
 _FLOAT_TYPES = frozenset(
     t for t in (TensorProto.FLOAT, TensorProto.DOUBLE, TensorProto.FLOAT16,
@@ -724,13 +734,11 @@ def _tier(node, status, reason, dtypes, model):
 
     if op in META_OPS:
         return "host-meta", "metadata: %s (no activation arithmetic)" % op
-    if op == "MelWeightMatrix":
-        # every input is a scalar parameter (num_mel_bins, dft_length,
-        # sample_rate, the two edges), so the output is a constant table: it
-        # is generated once at plan time and folded, never run at run time
-        return ("host-meta",
-                "constant table generator: a mel filterbank from scalar "
-                "parameters, folded at plan time")
+    if op in TABLES:
+        # scalar parameters in, a float table out: the table is built on the
+        # QPUs from an index ramp, so it is measured work, not metadata
+        return ("vc4", "QPU table construction from scalar parameters: %s"
+                % OPS.get(op, op))
     if op in CONTROL_OPS:
         return ("host-control",
                 "control flow %s: subgraphs are host-scheduled (a persistent "
@@ -952,56 +960,6 @@ def host_debt(rep):
     return [n for n in rep["nodes"] if n.get("tier") == "host-unwritten"]
 
 
-def _mel_table(node, known):
-    """MelWeightMatrix as a plan-time constant (ONNX's formula, verbatim).
-
-    num_spectrogram_bins = dft_length // 2 + 1; each of the num_mel_bins
-    triangles sits between consecutive points of a mel-spaced grid mapped back
-    to DFT bins.  Every input is a scalar; there are no activations.
-    """
-    def arg(name, i):
-        if len(node.input) > i and node.input[i]:
-            if node.input[i] in known:
-                return float(np.asarray(known[node.input[i]]).ravel()[0])
-        return float(_attr(node, name))
-    try:
-        mel = int(arg("num_mel_bins", 0))
-        dft_length = int(arg("dft_length", 1))
-        sample_rate = int(arg("sample_rate", 2))
-        low = float(arg("lower_edge_hertz", 3))
-        high = float(arg("upper_edge_hertz", 4))
-    except Exception:                                # noqa: BLE001
-        return None
-    if mel < 1 or dft_length < 2 or sample_rate <= 0:
-        return None
-    bins = dft_length // 2 + 1
-    f = np.arange(mel + 2)
-    lo_mel = 2595.0 * np.log10(1.0 + low / 700.0)
-    hi_mel = 2595.0 * np.log10(1.0 + high / 700.0)
-    step = (hi_mel - lo_mel) / f.shape[0]
-    f = f * step + lo_mel
-    f = 700.0 * (np.power(10.0, f / 2595.0) - 1.0)
-    f = ((dft_length + 1) * f) // sample_rate
-    f = f.astype(int)
-    out = np.zeros((bins, mel), np.float64)
-    for i in range(mel):
-        a, b, c = int(f[i]), int(f[i + 1]), int(f[i + 2])
-        lc = b - a
-        if lc == 0:
-            if 0 <= b < bins:
-                out[b, i] = 1.0
-        else:
-            for j in range(a, b + 1):
-                if 0 <= j < bins:
-                    out[j, i] = float(j - a) / float(lc)
-        ch = c - b
-        if ch > 0:
-            for j in range(b, c):
-                if 0 <= j < bins:
-                    out[j, i] = float(c - j) / float(ch)
-    return out.astype(np.float32)
-
-
 def fold_metadata(model, rep):
     """Plan-time constant/shape resolution for the device policy.
 
@@ -1051,15 +1009,6 @@ def fold_metadata(model, rep):
                 n *= int(d)
             known[outs[0]] = np.asarray(n, dtype=np.int64)
             folded.add(idx)
-            continue
-        if op == "MelWeightMatrix":
-            # onnx.reference 1.17 crashes on this graph (it passes the 0-d int
-            # inputs to np.zeros), so the table is generated here from the
-            # same formula -- it is a constant generator, not tensor maths.
-            vals = _mel_table(node, known)
-            if vals is not None:
-                known[outs[0]] = vals
-                folded.add(idx)
             continue
         feeds = {}
         ok = True

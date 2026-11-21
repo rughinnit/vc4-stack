@@ -30,8 +30,8 @@ for every launch; a client that wrapped itself in it would deadlock, see
 |---|---:|---:|
 | operators in this block | 14 | 14 |
 | `refused` by `op_matrix` | 14 | **0** |
-| scored `vc4` (all required forms) | 0 | **13** |
-| `folded` (plan-time constant table) | 0 | **1** (`MelWeightMatrix`) |
+| scored `vc4` (all required forms) | 0 | **14** |
+| `folded` (plan-time constant table) | 0 | **0** |
 | `mismatch` / `hang` / `untested` | 0 / 0 / 0 | 0 / 0 / 0 |
 
 Before (`op_matrix --only <the 14 ops> --stage all`):
@@ -46,15 +46,15 @@ After:
 
 ```
 ops: 14  structurally excluded: 0  expressible denominator: 14
-complete   13/14 = 92.86%  (of all ops: 92.86%)
-general    13/14 = 92.86%  (of all ops: 92.86%)
+complete   14/14 = 100.00%  (of all ops: 100.00%)
+general    14/14 = 100.00%  (of all ops: 100.00%)
 refused 0  mismatch 0  hang 0  invalid-model 0  untested 0
 ```
 
-`MelWeightMatrix` is `folded`: it is a constant table generated from scalar
-parameters at plan time (section 5.4), reported but never counted as a vc4
-run, exactly like the three `*Window` operators.  It is not `vc4` and this
-document does not claim it is.
+`MelWeightMatrix` is a `vc4` operator: its bins are index metadata derived from
+the five scalar parameters and the filterbank values are engine kernels
+(section 5.4).  Nothing in this block is folded, and the table's `launches`
+column is therefore non-zero for every row.
 
 Per case, from the tool's own record (`launches` is the QPU launch count of the
 whole one-node graph, `gpu ms` its device time):
@@ -74,7 +74,7 @@ whole one-node graph, `gpu ms` its device time):
 | `DynamicQuantizeLinear` | float_input | vc4 | 238 | 18.47 | `y`/`zp` exact, scale 9.3e-10 |
 | `DFT` | real_onesided | vc4 | 43 | 3.12 | 3.6e-7 |
 | `STFT` | frame8_step4 | vc4 | 23 | 1.70 | 9.5e-7 |
-| `MelWeightMatrix` | 4mel_dft8 | **folded** | 0 | 0 | **exact** |
+| `MelWeightMatrix` | 4mel_dft8 | vc4 | 72 | 5.37 | 6.0e-8 |
 
 Two things are worth stating plainly, because they are the opposite of what a
 completeness table usually implies:
@@ -383,19 +383,38 @@ for the generated case.  `frame_length` comes from the window (ONNX's rule),
 the error is the fp32 GEMM's, and a power-of-two length is not special-cased
 because it does not need to be.
 
-### 5.4 `MelWeightMatrix` is `folded`
+### 5.4 `MelWeightMatrix` and the windows: QPU tables, not plan-time constants
 
-Every input of `MelWeightMatrix` is a scalar parameter (`num_mel_bins`,
-`dft_length`, `sample_rate`, the two edges), so its output is a **constant
-table**: it is generated once at plan time and folded, exactly like
-`HannWindow`.  It is reported as `folded`, costs zero runtime launches, and is
-never counted as a `vc4` operator.  `coverage._tier` classifies it as a
-constant generator and `coverage.fold_metadata` (`_mel_table`) computes the ONNX
-formula — because `onnx.reference` 1.17 *crashes* on the graph (it passes 0-d
-numpy scalars to `np.zeros`) and `op_matrix`'s fallback oracle calls the same
-reference implementation with python scalars, so the table is still checked
-against the reference's own numbers (max abs 0.0 over the generated case and
-both focused cases).
+`MelWeightMatrix` takes only scalar parameters (`num_mel_bins`, `dft_length`,
+`sample_rate`, the two edges) and the three window generators take only
+`size`, so an earlier revision resolved all four at plan time: the tables were
+computed on the ARM and the sweep scored them `folded`, never `vc4`.  They are
+now computed by the QPUs on every run (`_dispatch_sig._Window` and
+`MelWeightMatrix`), which is what the coverage table measures.
+
+* The **bins** are index metadata: `bin_i = floor((dft_length + 1) f_i /
+  sample_rate)` with `f_i` from the mel grid, i.e. five scalar parameters in
+  and integers out, the same class of work as an axis list.  `coverage._tier`
+  returns `vc4` for the four operators (`TABLES`), and `_tier`'s
+  "non-float input means metadata" rule no longer applies to them.
+* The **values** are engine kernels.  For a band `(a, b, c) = (bin_i,
+  bin_i+1, bin_i+2)` the table rises from 0 at `a` to 1 at `b` and falls to 0
+  at `c`; the handler keeps the two degenerate cases the reference defines
+  (`b == a` puts a single 1 at `b`, `c == b` has no falling half).  The ramps
+  and the per-band gathers are index maps, and the arithmetic is subtract,
+  reciprocal-multiply (divide), the exact fp32 comparisons, the two clamps and
+  the max of the two halves: 72 launches for the generated 4-mel case, max abs
+  6.0e-8.
+* The windows are one index ramp plus `VC4_UOP_SIN` (Hann, `sin^2`) or
+  `VC4_UOP_COS` (Hamming, Blackman: 3 and 7 launches, max abs 1.8e-7 and
+  6.7e-8).  Only fp32 output is wired; `output_datatype` naming half or double
+  is refused by name, and `size: 1` with `periodic: 0` (which leaves `N_1 = 0`)
+  is refused rather than answered with NaN.
+
+The oracle is still `onnx.reference`'s own window classes; for
+`MelWeightMatrix` it is the reference implementation called with python
+scalars, because onnx.reference 1.17 crashes on the graph itself (it passes 0-d
+numpy scalars to `np.zeros`).
 
 ## 6. Engine facts this block established
 
@@ -453,7 +472,7 @@ VC4INFER_DAEMON=1 PYTHONPATH=$PWD/python \
     python3 tools/op_matrix.py --stage all \
     --only RNN,GRU,LSTM,RandomNormal,RandomNormalLike,RandomUniform,\
 RandomUniformLike,Bernoulli,Multinomial,QuantizeLinear,DynamicQuantizeLinear,\
-DFT,STFT,MelWeightMatrix
+DFT,STFT,MelWeightMatrix,HannWindow,HammingWindow,BlackmanWindow
 
 VC4INFER_DAEMON=1 python3 tests/test_onnx_rnn.py      # 62 cases
 VC4INFER_DAEMON=1 python3 tests/test_onnx_sig.py      # 56 cases
@@ -500,7 +519,9 @@ the matrix tolerance `1e-4 + 1e-4*max(|ref|,1)`, under which nothing is over.
   boundary-dtype feature only, and this document does not present them as a
   speedup.
 * The RNG is not cryptographic and is not advertised as such.
-* `MelWeightMatrix` is folded, not run on the QPU.
+* `MelWeightMatrix` and the three `*Window` operators are run on the QPU as
+  table generators; they are not folded, and their QPU cost is what the table
+  above reports.
 * No operator here is claimed for a form the tables above do not list:
   `sequence_lens`, `ScaledTanh`, `saturate=0`, `block_size` and a DFT axis that
   is not second-to-last above 20000 output pairs are refused with the invariant

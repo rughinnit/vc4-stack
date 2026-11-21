@@ -1250,6 +1250,122 @@ def _gap_oracle(spec):
     return None
 
 
+# ------------------------------------------- independent oracles (spec, numpy)
+# Three operators run on the QPUs but onnx.reference 1.17 cannot evaluate the
+# graphs this tool builds for them: Col2Im raises on a valid graph (it indexes
+# a flat `pads` list with a 2-D pair, the model PyTorch exports), and
+# GlobalLpPool and MaxRoiPool have no implementation at all.  Scoring them
+# "vc4-unverified" forever hides whether the engine is right, so the fallback
+# below implements each operator in numpy from its ONNX definition.  It is
+# independent of the engine by construction -- it reads only the graph inputs
+# and attributes, and never the engine's output.
+_SPEC_SOURCE = {
+    "Col2Im": "ONNX operator Col2Im-18, Summary and the accumulation rule",
+    "GlobalLpPool": "ONNX operator GlobalLpPool-2, Summary",
+    "MaxRoiPool": "ONNX operator MaxRoiPool-1, Summary and Note",
+}
+
+
+def _round_away(v):
+    """round() with ties away from zero (the Fast R-CNN quantisation)."""
+    return np.sign(v) * np.floor(np.abs(v) + 0.5)
+
+
+def _spec_oracle(spec):
+    """Numpy reference for the three operators the reference evaluator lacks.
+
+    Returns a list of output arrays, or None for any other operator.  Every
+    formula below is the operator's ONNX definition, spelled out in the
+    operator's own terms:
+
+      Col2Im (Col2Im-18)        the inverse of im2col: the input is
+          [N, C*kh*kw, nb_h*nb_w] and block (hb, wb) of kernel tap (ky, kx)
+          adds X[n, c*kh*kw + ky*kw + kx, hb*nb_w + wb] into
+          out[n, c, hb*sh - ph + ky*dh, wb*sw - pw + kx*dw] when that lands
+          inside the image.
+      GlobalLpPool (GlobalLpPool-2)  out[n, c, 0, 0] =
+          (sum over h, w of |X[n, c, h, w]|^p) ^ (1/p).
+      MaxRoiPool (MaxRoiPool-1)  a ROI is (batch, x1, y1, x2, y2); the
+          coordinates are multiplied by spatial_scale and rounded, then each
+          ROI is split into pooled_shape bins whose edges are the floor and
+          ceil of the linear bin grid (the Fast R-CNN geometry the operator
+          Note describes); the output is the max of the pixels in each bin.
+    """
+    op = spec.op
+    if op not in _SPEC_SOURCE:
+        return None
+    vals = dict(spec.inits or {})
+    vals.update({k: v for k, v in (spec.feeds or {}).items()})
+    a = spec.attrs or {}
+
+    def iv(name, dflt):
+        return [int(v) for v in a.get(name, dflt)]
+
+    try:
+        if op == "Col2Im":
+            x = np.asarray(vals["input"], np.float64)
+            image = np.asarray(vals["image_shape"]).ravel()
+            block = np.asarray(vals["block_shape"]).ravel()
+            N, C, H, W = (int(v) for v in image)
+            kh, kw = (int(v) for v in block)
+            dh, dw = iv("dilations", [1, 1])
+            ph, pw, ph2, pw2 = iv("pads", [0, 0, 0, 0])
+            sh, sw = iv("strides", [1, 1])
+            nb_h = (H + ph + ph2 - dh * (kh - 1) - 1) // sh + 1
+            nb_w = (W + pw + pw2 - dw * (kw - 1) - 1) // sw + 1
+            out = np.zeros((N, C, H, W), np.float64)
+            for c in range(C):
+                for ky in range(kh):
+                    for kx in range(kw):
+                        plane = c * kh * kw + ky * kw + kx
+                        for hb in range(nb_h):
+                            h = hb * sh - ph + ky * dh
+                            if not 0 <= h < H:
+                                continue
+                            for wb in range(nb_w):
+                                w = wb * sw - pw + kx * dw
+                                if not 0 <= w < W:
+                                    continue
+                                out[:, c, h, w] += x[:, plane,
+                                                     hb * nb_w + wb]
+            return [out.astype(np.float32)]
+        if op == "GlobalLpPool":
+            x = np.asarray(vals["X"], np.float64)
+            p = float(a.get("p", 2))
+            s = np.sum(np.abs(x) ** p, axis=(2, 3), keepdims=True)
+            return [(s ** (1.0 / p)).astype(np.float32)]
+        if op == "MaxRoiPool":
+            x = np.asarray(vals["X"], np.float64)
+            rois = np.asarray(vals["rois"], np.float64)
+            N, C, H, W = x.shape
+            ph, pw = iv("pooled_shape", [1, 1])
+            scale = float(a.get("spatial_scale", 1.0))
+            R = int(rois.shape[0])
+            out = np.zeros((R, C, ph, pw), np.float64)
+            for r in range(R):
+                b = int(_round_away(rois[r, 0]))
+                if not 0 <= b < N:
+                    raise ValueError("batch index %d outside [0, %d)" % (b, N))
+                y1, x1, y2, x2 = (_round_away(rois[r, k] * scale)
+                                  for k in (2, 1, 4, 3))
+                roi_h = max(y2 - y1 + 1.0, 1.0)
+                roi_w = max(x2 - x1 + 1.0, 1.0)
+                for i in range(ph):
+                    h0 = int(np.clip(np.floor(roi_h * i / ph + y1), 0, H))
+                    h1 = int(np.clip(np.ceil(roi_h * (i + 1) / ph + y1), 0, H))
+                    for j in range(pw):
+                        w0 = int(np.clip(np.floor(roi_w * j / pw + x1), 0, W))
+                        w1 = int(np.clip(np.ceil(roi_w * (j + 1) / pw + x1),
+                                         0, W))
+                        win = x[b, :, h0:h0 + max(h1 - h0, 1),
+                                w0:w0 + max(w1 - w0, 1)]
+                        out[r, :, i, j] = win.max(axis=(1, 2))
+            return [out.astype(np.float32)]
+    except Exception:                                    # noqa: BLE001
+        return None
+    return None
+
+
 # ---------------------------------------------------------- statistical check
 def stochastic_check(spec, ref, runs):
     """Compare a random op by distribution, not by value.
@@ -1509,6 +1625,17 @@ def run_case(spec, schema, default_opset, workdir, eng, do_engine=True,
                                           "reference implementation called "
                                           "with python scalars" %
                                           onnx.__version__)
+            else:
+                fb = _spec_oracle(spec)
+                if fb is not None:
+                    ref_vals = fb
+                    oracle = "ok"
+                    rec["oracle_impl"] = "spec-numpy"
+                    rec["oracle_fallback"] = (
+                        "onnx.reference %s cannot evaluate this graph; the "
+                        "value oracle is an independent numpy implementation "
+                        "of the operator written from %s"
+                        % (onnx.__version__, _SPEC_SOURCE[spec.op]))
             rec["oracle_error"] = "%s: %s" % (type(e).__name__, msg)
             rec["oracle_note"] = ("onnx.reference %s cannot evaluate this "
                                   "checker-valid graph (%s)" %
@@ -2124,8 +2251,10 @@ def write_markdown(path, payload):
         (payload["runner"]["mode"], payload["runner"]["host_policy"]))
     add("| ONNX / opset | onnx %s, default domain opset **%s** |" %
         (payload["versions"]["onnx"], payload["opset"]))
-    add("| Oracle | onnx.reference.ReferenceEvaluator %s |" %
-        payload["versions"]["onnx"])
+    add("| Oracle | onnx.reference.ReferenceEvaluator %s, plus an independent "
+        "numpy oracle written from the ONNX definition where the reference "
+        "has no implementation (each affected case records `oracle_impl`) |"
+        % payload["versions"]["onnx"])
     add("| Tolerance | `abs(got-ref) <= %g + %g*max(|ref|,1)` |" %
         (payload["tolerance"]["abs"], payload["tolerance"]["rel"]))
     add("| Hardware | %s, kernel %s, stock clocks |" %

@@ -31,8 +31,8 @@ are already element-verified:
 |---|---:|---:|
 | operators in this block | 10 | 10 |
 | `refused` by `op_matrix` | 10 | **0** |
-| operators scored `vc4` (every required form) | 0 | **8** |
-| `vc4-unverified` (ran, no usable oracle) | 0 | **2** |
+| operators scored `vc4` (every required form) | 0 | **10** |
+| `vc4-unverified` (ran, no usable oracle) | 0 | **0** |
 | `mismatch` / `hang` | 0 / 0 | 0 / 0 |
 | focused cases in `test_onnx_geom.py` | 0 | **82, 0 failed** |
 
@@ -48,23 +48,25 @@ After (the tree this document describes):
 
 ```
 ops: 10  structurally excluded: 0  expressible denominator: 10
-complete   8/10 = 80.00%  (of all ops: 80.00%)
-general    8/10 = 80.00%  (of all ops: 80.00%)
+complete   10/10 = 100.00%  (of all ops: 100.00%)
+general    10/10 = 100.00%  (of all ops: 100.00%)
 refused 0  mismatch 0  hang 0  invalid-model 0  untested 0
 ```
 
-The two operators that are not `vc4` are not engine failures: **`Col2Im` and
-`MaxRoiPool` have no working oracle in `onnx.reference` 1.17**, so the
-generated matrix has nothing to compare against and scores them
-`vc4-unverified` (the same treatment `GlobalLpPool` gets in
-`docs/OPS-NORM.md`).  Both run entirely on the QPU kernels (17 and 238
-launches) and are verified against a numpy implementation of the ONNX formula
-in `test_onnx_geom.py`: five `Col2Im` forms (blocks 2x2 and 3x3, pads, stride 2,
-dilation 2, non-square blocks) and four `MaxRoiPool` forms (2x2 and 3x3
-pooling, `spatial_scale`, two batches).  `onnx.reference`'s `Col2Im` passes the
-4-D `image_shape` where its own helper expects a 2-D pads array
-(`IndexError: index 2 is out of bounds`), and its based-on-torchvision
-`MaxRoiPool` simply is not there.
+`Col2Im` and `MaxRoiPool` are scored `vc4` because `op_matrix.py` now carries an
+**independent numpy oracle** for them (`_spec_oracle`, written from the ONNX
+definition: the accumulation rule of `Col2Im-18` and the Fast R-CNN bin geometry
+of `MaxRoiPool-1`).  It is used only where `onnx.reference` 1.17 cannot
+evaluate the graph: its `Col2Im` passes the flat `pads` list where a 2-D array
+is expected (`IndexError: index 2 is out of bounds`), and its
+based-on-torchvision `MaxRoiPool` is not registered at all.  The oracle reads
+only the graph inputs and attributes, never the engine's output.
+
+Both operators run entirely on the QPU kernels: 17 launches, max abs 2.4e-7 for
+`Col2Im`; 238 launches, max abs 0.0 for `MaxRoiPool` (a max is exact).  The
+same formulas are covered form by form in `test_onnx_geom.py`: five `Col2Im`
+cases (blocks 2x2 and 3x3, pads, stride 2, dilation 2, non-square blocks) and
+four `MaxRoiPool` cases (2x2 and 3x3 pooling, `spatial_scale`, two batches).
 
 ## 2. Per-operator record
 
@@ -85,11 +87,11 @@ warm window (exit 99), which is the guard doing its job, not a test failure.
 | op | method | worst measured | launches | gpu ms |
 |---|---|---|---:|---:|
 | `ConvTranspose` | `cols = W^T @ X` (one GEMM per batch and group), then the same k^2-tap scatter Col2Im uses; bias by QPU broadcast | abs 2.4e-7, rel 1.8e-5 | 41 | 3.3 |
-| `Col2Im` | k^2 zeroed tap buffers, one scatter copy per (plane, tap), one vector add per tap | unverified (numpy oracle) | 17 | 1.3 |
+| `Col2Im` | k^2 zeroed tap buffers, one scatter copy per (plane, tap), one vector add per tap | abs 2.4e-7 (spec-numpy oracle) | 17 | 1.3 |
 | `AffineGrid` | two QPU affine planes per batch + an interleaved one-word store | abs 6.0e-8, rel 1.1e-7 | 18 | 1.4 |
 | `GridSample` | QPU denormalise / reflect / floor, index read-back, four `copy2d` tap gathers, QPU bilinear weights | abs 5.4e-7, rel 9.2e-6 | 238 | 17.0 |
 | `RoiAlign` | QPU ROI scalars and sample coordinates, four tap gathers per sample, GEMM sum (avg) or exact max chain (max) | abs 2.4e-7, rel 7.3e-6 | 297 | 21.4 |
-| `MaxRoiPool` | QPU-rounded ROI edges and bin bounds, one window copy per channel plane, exact max chain | unverified (no reference class) | 238 | 17.5 |
+| `MaxRoiPool` | QPU-rounded ROI edges and bin bounds, one window copy per channel plane, exact max chain | exact (spec-numpy oracle) | 238 | 17.5 |
 | `NonMaxSuppression` | QPU IoU matrix, pairwise score ranks (2 GEMMs), boolean suppression closure (`log2 N` squarings), QPU cap | **exact** | 173 | 12.6 |
 | `Det` | Leibniz expansion: one constant-stride gather per factor, one mul/add chain per permutation | abs 1.2e-7, rel 1.6e-7 | 36 | 2.6 |
 | `Einsum` | lowered to permutations + one GEMM per batch (not a kernel) | abs 1.2e-7, rel 4.5e-7 | 8 | 0.6 |

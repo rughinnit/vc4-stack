@@ -6,17 +6,17 @@ synthesised single-operator graphs, not of reading a table.
 
 | | |
 |---|---|
-| Generated | 2026-11-20T16:17:00Z |
-| Engine | vc4infer 1.2.8 |
-| Python package | `/home/raspi/work/vc4-stack/infer/python/vc4infer/__init__.py` |
-| Engine library | `/home/raspi/work/vc4-stack/infer/build/libvc4infer.so` |
+| Generated | 2026-11-21T04:23:54Z |
+| Engine | vc4infer 1.2.10 |
+| Python package | `/home/raspi/work/vc4-ops152/infer/python/vc4infer/__init__.py` |
+| Engine library | `/home/raspi/work/vc4-ops152/infer/build/libvc4infer.so` |
 | Runner | `mode=hybrid`, `host_policy=device` |
 | ONNX / opset | onnx 1.17.0, default domain opset **22** |
-| Oracle | onnx.reference.ReferenceEvaluator 1.17.0 |
+| Oracle | onnx.reference.ReferenceEvaluator 1.17.0, plus an independent numpy oracle written from the ONNX definition where the reference has no implementation (each affected case records `oracle_impl`) |
 | Tolerance | `abs(got-ref) <= 0.0001 + 0.0001*max(|ref|,1)` |
 | Hardware | Raspberry Pi 3 Model B Rev 1.2, kernel 6.18.50+rpt-rpi-v8, stock clocks |
 | Scope | ONNX default domain (`ai.onnx`); other domains are not enumerated |
-| Provenance | vc4infer 1.2.8 repaired: rnn+geometry+daemon merges restored, stock 400 MHz, fanless |
+| Provenance | source build of feat/op-152: general Slice/Transpose, spec oracles for Col2Im/GlobalLpPool/MaxRoiPool, QPU window and mel tables; fresh vc4d, stock 400 MHz, fanless |
 
 ## Headline
 
@@ -28,8 +28,8 @@ second number is never presented as the first.
 
 | denominator | ops | **complete (vc4)** | vc4-limited | refused | mismatch | hang | folded | unmeasured | invalid | excluded | **pct_complete** | pct_expressible |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| all ops in opset 22 | 193 | **143** | 2 | 0 | 0 | 0 | 4 | 0 | 0 | 41 | **74.09%** | 75.13% |
-| ops not structurally host-only | 152 | **143** | 2 | 0 | 0 | 0 | 4 | 0 | 0 | 0 | **94.08%** | 95.39% |
+| all ops in opset 22 | 193 | **152** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 41 | **78.76%** | 78.76% |
+| ops not structurally host-only | 152 | **152** | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **100.00%** | 100.00% |
 
 `folded` = resolved by the engine at plan time with the host
 reference evaluator (constant table generators).  It is reported,
@@ -41,7 +41,7 @@ same number as `pct_complete` and is never presented as it.
 
 Structural exclusions from the second denominator: **41** operators (control-flow 3, deprecated 2, io-decode 1, metadata 4, non-fp32 14, sequence/optional 12, string 5).  They are listed with their exact reason in `completeness.json` under `excluded`.
 
-Sensitivity: if the 14 integer/bool-only operators (including the quantized ones) were counted as expressible, the denominator would be **166** and the complete figure **143/166 = 86.14%**.  They are excluded because `Runner.__init__` accepts fp32 graph inputs only, so no valid instance of those operators can reach the arena.
+Sensitivity: if the 14 integer/bool-only operators (including the quantized ones) were counted as expressible, the denominator would be **166** and the complete figure **152/166 = 91.57%**.  They are excluded because `Runner.__init__` accepts fp32 graph inputs only, so no valid instance of those operators can reach the arena.
 
 ## Excluded operators (with the reason)
 
@@ -98,87 +98,87 @@ because the engine fails it; the reason is structural.
 
 | ops | vc4 | vc4-limited | refused | mismatch | untested | host-only |
 |---:|---:|---:|---:|---:|---:|---:|
-| 193 | 143 | 2 | 0 | 0 | 7 | 41 |
+| 193 | 152 | 0 | 0 | 0 | 0 | 41 |
 
 #### Activation / elementwise
 
 | op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
 |---|---:|---|---:|---:|---:|---:|---:|---|
-| `Abs` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0767 |  |
-| `Acos` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 1.98e-07 | 0.0794 |  |
-| `Acosh` | 22 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 2.24e-07 | 0.076 |  |
-| `Add` | 14 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.13e-07 | 0.0769 |  |
-| `Asin` | 22 | **vc4** | 1/1 | 0/0 | 1.79e-07 | 3.07e-07 | 0.0786 |  |
-| `Asinh` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 6.37e-06 | 0.0799 |  |
-| `Atan` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 3.20e-07 | 0.0794 |  |
-| `Atanh` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 5.93e-07 | 0.11 |  |
-| `Ceil` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0842 |  |
-| `Celu` | 12 | **vc4** | 1/1 | 0/0 | 2.98e-07 | 4.78e-07 | 0.747 |  |
-| `Clip` | 13 | **vc4** | 3/3 | 0/0 | 0 | 0 | 0.0848 |  |
-| `Cos` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 1.09e-07 | 0.0759 |  |
-| `Cosh` | 22 | **vc4** | 1/1 | 0/0 | 9.54e-07 | 6.24e-07 | 0.0788 |  |
-| `Div` | 14 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 1.19e-07 | 0.155 |  |
-| `Elu` | 22 | **vc4** | 1/1 | 0/0 | 1.85e-06 | 6.49e-06 | 0.0778 |  |
-| `Erf` | 13 | **vc4** | 1/1 | 0/0 | 8.94e-07 | 1.55e-06 | 0.0795 |  |
-| `Exp` | 13 | **vc4** | 1/1 | 0/0 | 1.79e-06 | 1.38e-06 | 0.0784 |  |
-| `Floor` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0845 |  |
-| `Gelu` | 20 | **vc4** | 1/1 | 0/0 | 5.36e-07 | 2.82e-06 | 0.384 |  |
-| `HardSigmoid` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 1.02e-07 | 0.0787 |  |
-| `HardSwish` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 2.34e-07 | 0.0788 |  |
-| `Hardmax` | 13 | **vc4** | 2/2 | 0/0 | 0 | 0 | 11.2 |  |
-| `IsInf` | 20 | **vc4** | 1/1 | 0/0 | 0 | - | 0.0788 |  |
-| `IsNaN` | 20 | **vc4** | 1/1 | 0/0 | 0 | - | 0.0758 |  |
-| `LeakyRelu` | 16 | **vc4** | 1/1 | 0/0 | 4.66e-10 | 1.14e-07 | 0.0758 |  |
-| `Log` | 13 | **vc4** | 1/1 | 0/0 | 8.94e-08 | 3.01e-07 | 0.0765 |  |
-| `LogSoftmax` | 13 | **vc4** | 2/2 | 0/0 | 1.43e-06 | 1.13e-06 | 0.896 |  |
-| `Max` | 13 | **vc4** | 2/2 | 0/0 | 0 | 0 | 1.77 |  |
-| `Mean` | 13 | **vc4** | 2/2 | 0/0 | 1.19e-07 | 1.09e-05 | 0.232 |  |
-| `Min` | 13 | **vc4** | 2/2 | 0/0 | 0 | 0 | 1.77 |  |
-| `Mish` | 22 | **vc4** | 1/1 | 0/0 | 3.58e-07 | 1.35e-06 | 0.234 |  |
-| `Mod` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.738 |  |
-| `Mul` | 14 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0801 |  |
-| `Neg` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.079 |  |
-| `PRelu` | 16 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.379 |  |
-| `Pow` | 15 | **vc4** | 1/1 | 0/0 | 4.29e-06 | 3.02e-06 | 0.248 |  |
-| `Reciprocal` | 13 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 9.93e-08 | 0.08 |  |
-| `Relu` | 14 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0837 |  |
-| `Round` | 22 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0787 |  |
-| `Selu` | 22 | **vc4** | 1/1 | 0/0 | 2.03e-06 | 8.34e-06 | 0.0795 |  |
-| `Shrink` | 9 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.605 |  |
-| `Sigmoid` | 13 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 5.63e-07 | 0.0858 |  |
-| `Sign` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.085 |  |
-| `Sin` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 1.18e-07 | 0.0802 |  |
-| `Sinh` | 22 | **vc4** | 1/1 | 0/0 | 2.41e-06 | 6.45e-06 | 0.08 |  |
-| `Softmax` | 13 | **vc4** | 2/2 | 0/0 | 4.47e-07 | 2.72e-06 | 0.543 |  |
-| `Softplus` | 22 | **vc4** | 1/1 | 0/0 | 1.07e-06 | 3.20e-06 | 0.0992 |  |
+| `Abs` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0801 |  |
+| `Acos` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 1.98e-07 | 0.0759 |  |
+| `Acosh` | 22 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 2.24e-07 | 0.0758 |  |
+| `Add` | 14 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.13e-07 | 0.0758 |  |
+| `Asin` | 22 | **vc4** | 1/1 | 0/0 | 1.79e-07 | 3.07e-07 | 0.0753 |  |
+| `Asinh` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 6.37e-06 | 0.0757 |  |
+| `Atan` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 3.20e-07 | 0.0761 |  |
+| `Atanh` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 5.93e-07 | 0.0753 |  |
+| `Ceil` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0851 |  |
+| `Celu` | 12 | **vc4** | 1/1 | 0/0 | 2.98e-07 | 4.78e-07 | 0.748 |  |
+| `Clip` | 13 | **vc4** | 3/3 | 0/0 | 0 | 0 | 0.0859 |  |
+| `Cos` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 1.09e-07 | 0.0852 |  |
+| `Cosh` | 22 | **vc4** | 1/1 | 0/0 | 9.54e-07 | 6.24e-07 | 0.0751 |  |
+| `Div` | 14 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 1.19e-07 | 0.157 |  |
+| `Elu` | 22 | **vc4** | 1/1 | 0/0 | 1.85e-06 | 6.49e-06 | 0.0756 |  |
+| `Erf` | 13 | **vc4** | 1/1 | 0/0 | 8.94e-07 | 1.55e-06 | 0.0752 |  |
+| `Exp` | 13 | **vc4** | 1/1 | 0/0 | 1.79e-06 | 1.38e-06 | 0.0839 |  |
+| `Floor` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0901 |  |
+| `Gelu` | 20 | **vc4** | 1/1 | 0/0 | 5.36e-07 | 2.82e-06 | 0.383 |  |
+| `HardSigmoid` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 1.02e-07 | 0.0764 |  |
+| `HardSwish` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 2.34e-07 | 0.0755 |  |
+| `Hardmax` | 13 | **vc4** | 2/2 | 0/0 | 0 | 0 | 11.4 |  |
+| `IsInf` | 20 | **vc4** | 1/1 | 0/0 | 0 | - | 0.075 |  |
+| `IsNaN` | 20 | **vc4** | 1/1 | 0/0 | 0 | - | 0.0928 |  |
+| `LeakyRelu` | 16 | **vc4** | 1/1 | 0/0 | 4.66e-10 | 1.14e-07 | 0.0759 |  |
+| `Log` | 13 | **vc4** | 1/1 | 0/0 | 8.94e-08 | 3.01e-07 | 0.0782 |  |
+| `LogSoftmax` | 13 | **vc4** | 2/2 | 0/0 | 1.43e-06 | 1.13e-06 | 0.882 |  |
+| `Max` | 13 | **vc4** | 2/2 | 0/0 | 0 | 0 | 1.78 |  |
+| `Mean` | 13 | **vc4** | 2/2 | 0/0 | 1.19e-07 | 1.09e-05 | 0.229 |  |
+| `Min` | 13 | **vc4** | 2/2 | 0/0 | 0 | 0 | 1.78 |  |
+| `Mish` | 22 | **vc4** | 1/1 | 0/0 | 3.58e-07 | 1.35e-06 | 0.23 |  |
+| `Mod` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.729 |  |
+| `Mul` | 14 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0836 |  |
+| `Neg` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0756 |  |
+| `PRelu` | 16 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.406 |  |
+| `Pow` | 15 | **vc4** | 1/1 | 0/0 | 4.29e-06 | 3.02e-06 | 0.23 |  |
+| `Reciprocal` | 13 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 9.93e-08 | 0.0756 |  |
+| `Relu` | 14 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0795 |  |
+| `Round` | 22 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0823 |  |
+| `Selu` | 22 | **vc4** | 1/1 | 0/0 | 2.03e-06 | 8.34e-06 | 0.0803 |  |
+| `Shrink` | 9 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.64 |  |
+| `Sigmoid` | 13 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 5.63e-07 | 0.0785 |  |
+| `Sign` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0822 |  |
+| `Sin` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 1.18e-07 | 0.0849 |  |
+| `Sinh` | 22 | **vc4** | 1/1 | 0/0 | 2.41e-06 | 6.45e-06 | 0.077 |  |
+| `Softmax` | 13 | **vc4** | 2/2 | 0/0 | 4.47e-07 | 2.72e-06 | 0.515 |  |
+| `Softplus` | 22 | **vc4** | 1/1 | 0/0 | 1.07e-06 | 3.20e-06 | 0.0843 |  |
 | `Softsign` | 22 | **vc4** | 1/1 | 0/0 | 2.98e-08 | 8.68e-08 | 0.077 |  |
-| `Sqrt` | 13 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.28e-07 | 0.0864 |  |
-| `Sub` | 14 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.18e-07 | 0.155 |  |
-| `Sum` | 13 | **vc4** | 2/2 | 0/0 | 2.38e-07 | 1.96e-07 | 0.746 |  |
-| `Tan` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 2.03e-07 | 0.0798 |  |
-| `Tanh` | 13 | **vc4** | 1/1 | 0/0 | 7.75e-07 | 5.03e-06 | 0.0807 |  |
-| `ThresholdedRelu` | 22 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.279 |  |
+| `Sqrt` | 13 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.28e-07 | 0.0794 |  |
+| `Sub` | 14 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.18e-07 | 0.153 |  |
+| `Sum` | 13 | **vc4** | 2/2 | 0/0 | 2.38e-07 | 1.96e-07 | 0.72 |  |
+| `Tan` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 2.03e-07 | 0.0764 |  |
+| `Tanh` | 13 | **vc4** | 1/1 | 0/0 | 7.75e-07 | 5.03e-06 | 0.0844 |  |
+| `ThresholdedRelu` | 22 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.233 |  |
 
 #### Signal / random / other
 
 | op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
 |---|---:|---|---:|---:|---:|---:|---:|---|
 | `AffineGrid` | 20 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 1.12e-07 | 1.31 |  |
-| `Bernoulli` | 22 | **vc4** | 1/1 | 0/0 | - | - | 0.151 |  |
-| `BlackmanWindow` | 17 | folded (host) | 0/1 | 0/0 | 0 | 0 | - |  |
-| `DFT` | 20 | **vc4** | 1/1 | 0/0 | 3.58e-07 | 3.92e-04 | 3.1 |  |
-| `HammingWindow` | 17 | folded (host) | 0/1 | 0/0 | 0 | 0 | - |  |
-| `HannWindow` | 17 | folded (host) | 0/1 | 0/0 | 0 | 0 | - |  |
+| `Bernoulli` | 22 | **vc4** | 1/1 | 0/0 | - | - | 0.152 |  |
+| `BlackmanWindow` | 17 | **vc4** | 1/1 | 0/0 | 6.71e-08 | 2.98e+04 | 0.528 |  |
+| `DFT` | 20 | **vc4** | 1/1 | 0/0 | 3.58e-07 | 3.92e-04 | 3.05 |  |
+| `HammingWindow` | 17 | **vc4** | 1/1 | 0/0 | 1.94e-07 | 8.78e-07 | 0.235 |  |
+| `HannWindow` | 17 | **vc4** | 1/1 | 0/0 | 1.79e-07 | 9.16e-07 | 0.231 |  |
 | `ImageDecoder` | 20 | excluded | 0/0 | 0/0 | - | - | - |  |
-| `MelWeightMatrix` | 17 | folded (host) | 0/1 | 0/0 | 0 | 0 | - |  |
-| `Multinomial` | 22 | **vc4** | 1/1 | 0/0 | - | - | 2.64 |  |
-| `NonMaxSuppression` | 11 | **vc4** | 1/1 | 0/0 | 0 | - | 12.7 |  |
-| `NonZero` | 13 | **vc4** | 1/1 | 0/0 | 0 | - | 0.155 |  |
-| `RandomNormal` | 22 | **vc4** | 1/1 | 0/0 | - | - | 0.742 |  |
-| `RandomNormalLike` | 22 | **vc4** | 1/1 | 0/0 | - | - | 0.739 |  |
-| `RandomUniform` | 22 | **vc4** | 1/1 | 0/0 | - | - | 0.0817 |  |
-| `RandomUniformLike` | 22 | **vc4** | 1/1 | 0/0 | - | - | 0.0811 |  |
-| `STFT` | 17 | **vc4** | 1/1 | 0/0 | 9.54e-07 | 1.35e-05 | 1.68 |  |
+| `MelWeightMatrix` | 17 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 5.96e-08 | 5.31 |  |
+| `Multinomial` | 22 | **vc4** | 1/1 | 0/0 | - | - | 2.72 |  |
+| `NonMaxSuppression` | 11 | **vc4** | 1/1 | 0/0 | 0 | - | 13 |  |
+| `NonZero` | 13 | **vc4** | 1/1 | 0/0 | 0 | - | 0.158 |  |
+| `RandomNormal` | 22 | **vc4** | 1/1 | 0/0 | - | - | 0.75 |  |
+| `RandomNormalLike` | 22 | **vc4** | 1/1 | 0/0 | - | - | 0.747 |  |
+| `RandomUniform` | 22 | **vc4** | 1/1 | 0/0 | - | - | 0.0854 |  |
+| `RandomUniformLike` | 22 | **vc4** | 1/1 | 0/0 | - | - | 0.0804 |  |
+| `STFT` | 17 | **vc4** | 1/1 | 0/0 | 9.54e-07 | 1.35e-05 | 1.66 |  |
 
 #### Logical / comparison
 
@@ -190,107 +190,107 @@ because the engine fails it; the reason is structural.
 | `BitwiseNot` | 18 | excluded | 0/0 | 0/0 | - | - | - |  |
 | `BitwiseOr` | 18 | excluded | 0/0 | 0/0 | - | - | - |  |
 | `BitwiseXor` | 18 | excluded | 0/0 | 0/0 | - | - | - |  |
-| `Equal` | 19 | **vc4** | 1/1 | 0/0 | 0 | - | 0.0748 |  |
-| `Greater` | 13 | **vc4** | 1/1 | 0/0 | 0 | - | 0.083 |  |
-| `GreaterOrEqual` | 16 | **vc4** | 1/1 | 0/0 | 0 | - | 0.079 |  |
-| `Less` | 13 | **vc4** | 1/1 | 0/0 | 0 | - | 0.0883 |  |
-| `LessOrEqual` | 16 | **vc4** | 1/1 | 0/0 | 0 | - | 0.0827 |  |
+| `Equal` | 19 | **vc4** | 1/1 | 0/0 | 0 | - | 0.0753 |  |
+| `Greater` | 13 | **vc4** | 1/1 | 0/0 | 0 | - | 0.0873 |  |
+| `GreaterOrEqual` | 16 | **vc4** | 1/1 | 0/0 | 0 | - | 0.0811 |  |
+| `Less` | 13 | **vc4** | 1/1 | 0/0 | 0 | - | 0.125 |  |
+| `LessOrEqual` | 16 | **vc4** | 1/1 | 0/0 | 0 | - | 0.0872 |  |
 | `Not` | 1 | excluded | 0/0 | 0/0 | - | - | - |  |
 | `Or` | 7 | excluded | 0/0 | 0/0 | - | - | - |  |
-| `Where` | 16 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.305 |  |
+| `Where` | 16 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.278 |  |
 | `Xor` | 7 | excluded | 0/0 | 0/0 | - | - | - |  |
 
 #### Matrix / reduction / loss
 
 | op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
 |---|---:|---|---:|---:|---:|---:|---:|---|
-| `ArgMax` | 13 | **vc4** | 2/2 | 0/0 | 0 | - | 2.29 |  |
-| `ArgMin` | 13 | **vc4** | 2/2 | 0/0 | 0 | - | 2.28 |  |
+| `ArgMax` | 13 | **vc4** | 2/2 | 0/0 | 0 | - | 2.31 |  |
+| `ArgMin` | 13 | **vc4** | 2/2 | 0/0 | 0 | - | 2.3 |  |
 | `CumSum` | 14 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.13e-07 | 0.455 |  |
-| `Det` | 22 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.60e-07 | 2.64 |  |
-| `Einsum` | 12 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 4.54e-07 | 0.585 |  |
-| `Gemm` | 13 | **vc4** | 1/1 | 1/1 | 3.58e-07 | 3.26e-07 | 0.228 |  |
-| `MatMul` | 13 | **vc4** | 1/1 | 0/0 | 4.77e-07 | 1.14e-06 | 0.157 |  |
-| `NegativeLogLikelihoodLoss` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 6.69e-08 | 0.893 |  |
-| `ReduceL1` | 18 | **vc4** | 3/3 | 0/0 | 3.81e-06 | 2.38e-07 | 0.729 |  |
-| `ReduceL2` | 18 | **vc4** | 3/3 | 0/0 | 9.54e-07 | 2.19e-07 | 0.811 |  |
-| `ReduceLogSum` | 18 | **vc4** | 3/3 | 0/0 | 2.38e-07 | 1.68e-07 | 0.742 |  |
-| `ReduceLogSumExp` | 18 | **vc4** | 3/3 | 0/0 | 1.19e-06 | 6.06e-07 | 0.818 |  |
-| `ReduceMax` | 20 | **vc4** | 3/3 | 0/0 | 0 | 0 | 2.88 |  |
+| `Det` | 22 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.60e-07 | 2.67 |  |
+| `Einsum` | 12 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 4.54e-07 | 0.588 |  |
+| `Gemm` | 13 | **vc4** | 1/1 | 1/1 | 3.58e-07 | 3.26e-07 | 0.229 |  |
+| `MatMul` | 13 | **vc4** | 1/1 | 0/0 | 4.77e-07 | 1.14e-06 | 0.151 |  |
+| `NegativeLogLikelihoodLoss` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-08 | 6.69e-08 | 0.885 |  |
+| `ReduceL1` | 18 | **vc4** | 3/3 | 0/0 | 3.81e-06 | 2.38e-07 | 0.758 |  |
+| `ReduceL2` | 18 | **vc4** | 3/3 | 0/0 | 9.54e-07 | 2.19e-07 | 0.826 |  |
+| `ReduceLogSum` | 18 | **vc4** | 3/3 | 0/0 | 2.38e-07 | 1.68e-07 | 0.736 |  |
+| `ReduceLogSumExp` | 18 | **vc4** | 3/3 | 0/0 | 1.19e-06 | 6.06e-07 | 0.822 |  |
+| `ReduceMax` | 20 | **vc4** | 3/3 | 0/0 | 0 | 0 | 2.89 |  |
 | `ReduceMean` | 18 | **vc4** | 3/3 | 0/0 | 1.19e-07 | 1.26e-07 | 0.749 |  |
 | `ReduceMin` | 20 | **vc4** | 3/3 | 0/0 | 0 | 0 | 2.87 |  |
 | `ReduceProd` | 18 | **vc4** | 3/3 | 0/0 | 7.45e-09 | 7.46e-08 | 1.11 |  |
-| `ReduceSum` | 13 | **vc4** | 3/3 | 0/0 | 1.91e-06 | 1.59e-07 | 0.66 |  |
-| `ReduceSumSquare` | 18 | **vc4** | 3/3 | 0/0 | 3.81e-06 | 1.80e-07 | 0.743 |  |
+| `ReduceSum` | 13 | **vc4** | 3/3 | 0/0 | 1.91e-06 | 1.59e-07 | 0.665 |  |
+| `ReduceSumSquare` | 18 | **vc4** | 3/3 | 0/0 | 3.81e-06 | 1.80e-07 | 0.742 |  |
 | `SoftmaxCrossEntropyLoss` | 13 | **vc4** | 1/1 | 0/0 | 9.54e-07 | 5.13e-07 | 1.63 |  |
-| `TopK` | 11 | **vc4** | 1/1 | 0/0 | 0 | 0 | 14.4 |  |
-| `Unique` | 11 | **vc4** | 1/1 | 0/0 | 0 | 0 | 4.63 |  |
+| `TopK` | 11 | **vc4** | 1/1 | 0/0 | 0 | 0 | 14.6 |  |
+| `Unique` | 11 | **vc4** | 1/1 | 0/0 | 0 | 0 | 4.6 |  |
 
 #### NN / convolution / pooling
 
 | op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
 |---|---:|---|---:|---:|---:|---:|---:|---|
-| `AveragePool` | 22 | **vc4** | 3/3 | 1/1 | 1.79e-07 | 3.33e-06 | 4.43 |  |
-| `BatchNormalization` | 15 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 2.62e-06 | 1.1 |  |
-| `Col2Im` | 18 | vc4-unverified | 1/1 | 0/0 | - | - | 1.24 |  |
-| `Conv` | 22 | **vc4** | 9/9 | 1/1 | 1.34e-04 | 0.232 | 0.875 |  |
+| `AveragePool` | 22 | **vc4** | 3/3 | 1/1 | 1.79e-07 | 3.33e-06 | 4.47 |  |
+| `BatchNormalization` | 15 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 2.62e-06 | 1.09 |  |
+| `Col2Im` | 18 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 1.32e-07 | 1.26 |  |
+| `Conv` | 22 | **vc4** | 9/9 | 1/1 | 1.34e-04 | 0.232 | 0.868 |  |
 | `ConvInteger` | 10 | excluded | 0/0 | 0/0 | - | - | - |  |
-| `ConvTranspose` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 1.79e-05 | 3.02 |  |
+| `ConvTranspose` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 1.79e-05 | 3.01 |  |
 | `DeformConv` | 22 | **vc4** | 1/1 | 0/0 | 6.56e-07 | 3.10e-05 | 231 |  |
-| `DepthToSpace` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 2.3 |  |
+| `DepthToSpace` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 2.27 |  |
 | `Dropout` | 22 | **vc4** | 1/1 | 0/0 | 0 | 0 | - |  |
-| `GlobalAveragePool` | 22 | **vc4** | 1/1 | 0/0 | 8.94e-08 | 1.49e-06 | 0.14 |  |
-| `GlobalLpPool` | 22 | vc4-unverified | 1/1 | 0/0 | - | - | 0.379 |  |
-| `GlobalMaxPool` | 22 | **vc4** | 1/1 | 0/0 | 0 | 0 | 6.75 |  |
-| `GridSample` | 22 | **vc4** | 1/1 | 0/0 | 5.36e-07 | 9.23e-06 | 17 |  |
-| `GroupNormalization` | 21 | **vc4** | 1/1 | 0/0 | 9.54e-07 | 2.08e-06 | 2.36 |  |
-| `InstanceNormalization` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-07 | 3.88e-06 | 2.33 |  |
-| `LRN` | 13 | **vc4** | 1/1 | 0/0 | 6.29e-05 | 6.82e-05 | 1.15 |  |
-| `LayerNormalization` | 17 | **vc4** | 1/1 | 0/0 | 7.15e-07 | 1.87e-06 | 1.58 |  |
-| `LpNormalization` | 22 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.87e-07 | 0.757 |  |
-| `LpPool` | 22 | **vc4** | 3/3 | 0/0 | 7.15e-07 | 3.36e-07 | 4.2 |  |
-| `MaxPool` | 22 | **vc4** | 3/3 | 0/1 | 0 | 0 | 0.0756 | numeric op with no VC4 kernel: ceil_mode |
-| `MaxRoiPool` | 22 | vc4-unverified | 1/1 | 0/0 | - | - | 17.5 |  |
+| `GlobalAveragePool` | 22 | **vc4** | 1/1 | 0/0 | 8.94e-08 | 1.49e-06 | 0.154 |  |
+| `GlobalLpPool` | 22 | **vc4** | 1/1 | 0/0 | 7.15e-07 | 3.15e-07 | 0.385 |  |
+| `GlobalMaxPool` | 22 | **vc4** | 1/1 | 0/0 | 0 | 0 | 6.82 |  |
+| `GridSample` | 22 | **vc4** | 1/1 | 0/0 | 5.36e-07 | 9.23e-06 | 17.1 |  |
+| `GroupNormalization` | 21 | **vc4** | 1/1 | 0/0 | 9.54e-07 | 2.08e-06 | 2.31 |  |
+| `InstanceNormalization` | 22 | **vc4** | 1/1 | 0/0 | 5.96e-07 | 3.88e-06 | 2.31 |  |
+| `LRN` | 13 | **vc4** | 1/1 | 0/0 | 6.29e-05 | 6.82e-05 | 1.14 |  |
+| `LayerNormalization` | 17 | **vc4** | 1/1 | 0/0 | 7.15e-07 | 1.87e-06 | 1.55 |  |
+| `LpNormalization` | 22 | **vc4** | 1/1 | 0/0 | 1.19e-07 | 1.87e-07 | 0.763 |  |
+| `LpPool` | 22 | **vc4** | 3/3 | 0/0 | 7.15e-07 | 3.36e-07 | 4.16 |  |
+| `MaxPool` | 22 | **vc4** | 3/3 | 0/1 | 0 | 0 | 0.0797 | numeric op with no VC4 kernel: ceil_mode |
+| `MaxRoiPool` | 22 | **vc4** | 1/1 | 0/0 | 0 | 0 | 17.5 |  |
 | `MaxUnpool` | 22 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.154 |  |
-| `MeanVarianceNormalization` | 13 | **vc4** | 1/1 | 0/0 | 3.58e-07 | 1.09e-06 | 3.66 |  |
-| `RoiAlign` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 7.27e-06 | 21.4 |  |
-| `SpaceToDepth` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 4.59 |  |
+| `MeanVarianceNormalization` | 13 | **vc4** | 1/1 | 0/0 | 3.58e-07 | 1.09e-06 | 3.63 |  |
+| `RoiAlign` | 22 | **vc4** | 1/1 | 0/0 | 2.38e-07 | 7.27e-06 | 21.6 |  |
+| `SpaceToDepth` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 4.57 |  |
 
 #### Tensor / shape manipulation
 
 | op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
 |---|---:|---|---:|---:|---:|---:|---:|---|
-| `Cast` | 21 | **vc4** | 1/1 | 1/1 | 0 | 0 | 0.597 |  |
+| `Cast` | 21 | **vc4** | 1/1 | 1/1 | 0 | 0 | 0.608 |  |
 | `CastLike` | 21 | **vc4** | 1/1 | 0/0 | 0 | 0 | - |  |
-| `CenterCropPad` | 18 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.518 |  |
-| `Compress` | 11 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0756 |  |
+| `CenterCropPad` | 18 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.514 |  |
+| `Compress` | 11 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0764 |  |
 | `Concat` | 13 | **vc4** | 1/1 | 0/2 | 0 | 0 | - | Concat Concat_rank2_axis1: axis 1 of rank 2 |
 | `Constant` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
 | `ConstantOfShape` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
 | `Expand` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.367 |  |
 | `EyeLike` | 22 | **vc4** | 1/1 | 0/0 | 0 | 0 | - |  |
 | `Flatten` | 21 | **vc4** | 1/1 | 1/1 | 0 | 0 | - |  |
-| `Gather` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.434 |  |
-| `GatherElements` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0757 |  |
-| `GatherND` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0789 |  |
+| `Gather` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.386 |  |
+| `GatherElements` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0761 |  |
+| `GatherND` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0852 |  |
 | `Identity` | 21 | **vc4** | 1/1 | 0/0 | 0 | 0 | - |  |
 | `OneHot` | 11 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.163 |  |
 | `Pad` | 21 | **vc4** | 1/1 | 2/2 | 0 | 0 | 1.8 |  |
 | `Range` | 11 | **vc4** | 1/1 | 0/0 | 0 | 0 | - |  |
 | `Reshape` | 21 | **vc4** | 2/2 | 1/1 | 0 | 0 | - |  |
-| `Resize` | 19 | **vc4** | 4/4 | 2/3 | 1.19e-07 | 3.08e-05 | 0.561 | numeric op with no VC4 kernel: mode=cubic (nearest, linear) |
-| `ReverseSequence` | 10 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.796 |  |
+| `Resize` | 19 | **vc4** | 4/4 | 2/3 | 1.19e-07 | 3.08e-05 | 0.535 | numeric op with no VC4 kernel: mode=cubic (nearest, linear) |
+| `ReverseSequence` | 10 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.799 |  |
 | `Scatter` | 11 | excluded | 0/0 | 0/0 | - | - | - |  |
-| `ScatterElements` | 18 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.157 |  |
-| `ScatterND` | 18 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.225 |  |
+| `ScatterElements` | 18 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.153 |  |
+| `ScatterND` | 18 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.25 |  |
 | `Shape` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
 | `Size` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
-| `Slice` | 13 | vc4-limited | 2/3 | 0/1 | 0 | 0 | 0.0894 | Slice Slice_two_axes: two sliced axes |
-| `Split` | 18 | **vc4** | 2/2 | 0/0 | 0 | 0 | 0.162 |  |
+| `Slice` | 13 | **vc4** | 3/3 | 1/1 | 0 | 0 | 0.0835 |  |
+| `Split` | 18 | **vc4** | 2/2 | 0/0 | 0 | 0 | 0.159 |  |
 | `Squeeze` | 21 | **vc4** | 2/2 | 0/0 | 0 | 0 | - |  |
-| `Tile` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.451 |  |
-| `Transpose` | 21 | vc4-limited | 1/2 | 0/1 | 0 | 0 | 0.078 | Transpose Transpose_perm_0132: perm [0, 1, 3, 2] needs a general permute kernel (the affine copy covers the head's [0,2,1,3]) |
-| `Trilu` | 14 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0806 |  |
+| `Tile` | 13 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.454 |  |
+| `Transpose` | 21 | **vc4** | 2/2 | 1/1 | 0 | 0 | 0.0852 |  |
+| `Trilu` | 14 | **vc4** | 1/1 | 0/0 | 0 | 0 | 0.0808 |  |
 | `Unsqueeze` | 21 | **vc4** | 1/1 | 0/0 | 0 | 0 | - |  |
 | `Upsample` | 10 | excluded | 0/0 | 0/0 | - | - | - |  |
 
@@ -328,15 +328,15 @@ because the engine fails it; the reason is structural.
 | `MatMulInteger` | 10 | excluded | 0/0 | 0/0 | - | - | - |  |
 | `QLinearConv` | 10 | excluded | 0/0 | 0/0 | - | - | - |  |
 | `QLinearMatMul` | 21 | excluded | 0/0 | 0/0 | - | - | - |  |
-| `QuantizeLinear` | 21 | **vc4** | 1/1 | 0/0 | 0 | - | 0.252 |  |
+| `QuantizeLinear` | 21 | **vc4** | 1/1 | 0/0 | 0 | - | 0.219 |  |
 
 #### Recurrent
 
 | op | since | status | required forms | edge forms | max abs | max rel | gpu ms | refusal / constraint |
 |---|---:|---|---:|---:|---:|---:|---:|---|
-| `GRU` | 22 | **vc4** | 1/1 | 0/0 | 4.02e-07 | 2.64e-06 | 5.3 |  |
-| `LSTM` | 22 | **vc4** | 1/1 | 0/0 | 5.22e-07 | 2.65e-06 | 3.93 |  |
-| `RNN` | 22 | **vc4** | 1/1 | 0/0 | 5.07e-07 | 2.01e-06 | 2.36 |  |
+| `GRU` | 22 | **vc4** | 1/1 | 0/0 | 4.02e-07 | 2.64e-06 | 5.28 |  |
+| `LSTM` | 22 | **vc4** | 1/1 | 0/0 | 5.22e-07 | 2.65e-06 | 3.97 |  |
+| `RNN` | 22 | **vc4** | 1/1 | 0/0 | 5.07e-07 | 2.01e-06 | 2.17 |  |
 
 ## Refusals, verbatim
 
@@ -350,10 +350,6 @@ any node executed; `run` means it refused during execution.
 | `Concat` | axis0 | run | `UnsupportedNode` | `Concat Concat_axis0: axis 0 of rank 2` |
 | `MaxPool` | ceil_mode | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: ceil_mode` |
 | `Resize` | cubic | plan | `HostNotAllowed` | `numeric op with no VC4 kernel: mode=cubic (nearest, linear)` |
-| `Slice` | two_axes | run | `UnsupportedNode` | `Slice Slice_two_axes: two sliced axes` |
-| `Slice` | step2 | run | `UnsupportedNode` | `Slice Slice_step2: step 2` |
-| `Transpose` | perm_0132 | run | `UnsupportedNode` | `Transpose Transpose_perm_0132: perm [0, 1, 3, 2] needs a general permute kernel (the affine copy covers the head's [0,2,1,3])` |
-| `Transpose` | rank2 | run | `UnsupportedNode` | `Transpose Transpose_rank2: perm [1, 0] needs a general permute kernel (the affine copy covers the head's [0,2,1,3])` |
 
 ## Oracle gaps
 
@@ -364,9 +360,6 @@ refusal could be scored.  The exact reference error is in
 
 | op | variant | reference evaluator error |
 |---|---|---|
-| `Col2Im` | 4x4_blocks2 | `IndexError: index 2 is out of bounds for axis 0 with size 2` |
-| `GlobalLpPool` | p2 | `RuntimeImplementationError: No registered implementation for operator 'GlobalLpPool' and domain '', schema.has_function is False, schema.has_context_dependent_function is False. Yo` |
-| `MaxRoiPool` | 2_rois_2x2 | `RuntimeImplementationError: No registered implementation for operator 'MaxRoiPool' and domain '', schema.has_function is False, schema.has_context_dependent_function is False. You ` |
 | `Multinomial` | 2x4_sample3 | `RuntimeImplementationError: No registered implementation for operator 'Multinomial' and domain '', schema.has_function is False, schema.has_context_dependent_function is False. You` |
 
 ## Top refusals by real-model usage

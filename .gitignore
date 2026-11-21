@@ -2,6 +2,7 @@
 /build/
 /dist/
 infer/build/
+tf/build/
 infer.egg-info/
 *.egg-info/
 *.o

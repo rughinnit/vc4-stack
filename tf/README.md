@@ -168,6 +168,10 @@ PASS  H2D/D2H round-trip is exact: max|d|=0
 PASS  Add dispatched to the VC kernel: ... tf-vc4 Add needs the engine arena
 ```
 
+That last line is the point: eager placed `AddV2` on `/device:VC:0` and called
+this plugin's kernel. The refusal is the plugin refusing to compute without
+the engine.
+
 The same copy stage against the engine arena, no host mode and no QPU
 launch, with an 8 MiB arena on the shared daemon:
 
@@ -184,10 +188,6 @@ PASS  H2D/D2H round-trip is exact: max|d|=0
 `tf-vc4: engine up, arena 8 MiB, 3 MiB for tensors, device type VC` is
 printed on stderr the first time device memory is touched, which is when the
 allocator maps the real dma-buf.
-
-That last line is the point: eager placed `AddV2` on `/device:VC:0` and called
-this plugin's kernel. The refusal is the plugin refusing to compute without
-the engine.
 
 ## The serialized silicon pass
 

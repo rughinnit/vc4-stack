@@ -5,11 +5,14 @@
 
 Writes, under ``$HYBRID_MODELS`` or ``/home/raspi/work/onnx/models``:
 
-    hybrid_mixed.onnx   Split/Shape/Gather + Einsum + TopK + NonZero + LSTM
-                        (numeric host debt under `any`; structural refuses)
+    hybrid_mixed.onnx   Split/Shape/Gather + Einsum + TopK + NonZero + LSTM.
+                        All four compute operators are QPU kernels now; the
+                        graph keeps them together with plan-time metadata so a
+                        regression in either tier is visible.
     hybrid_meta.onnx    Shape/Gather/Slice/Concat shape arithmetic feeding a
                         Resize with computed sizes (host-meta, structural OK)
-    hybrid_erf.onnx     Conv/Relu/Erf/GAP/Gemm/Softmax (Erf is host debt)
+    hybrid_erf.onnx     Conv/Relu/Erf/GAP/Gemm/Softmax.  Erf used to be
+                        numeric host debt and is now a QPU kernel.
     hybrid_if.onnx      Slice+Cast predicate into If with captured x
                         (host-control, structural OK; two inputs)
 

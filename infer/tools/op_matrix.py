@@ -2251,8 +2251,10 @@ def write_markdown(path, payload):
         (payload["runner"]["mode"], payload["runner"]["host_policy"]))
     add("| ONNX / opset | onnx %s, default domain opset **%s** |" %
         (payload["versions"]["onnx"], payload["opset"]))
-    add("| Oracle | onnx.reference.ReferenceEvaluator %s |" %
-        payload["versions"]["onnx"])
+    add("| Oracle | onnx.reference.ReferenceEvaluator %s, plus an independent "
+        "numpy oracle written from the ONNX definition where the reference "
+        "has no implementation (each affected case records `oracle_impl`) |"
+        % payload["versions"]["onnx"])
     add("| Tolerance | `abs(got-ref) <= %g + %g*max(|ref|,1)` |" %
         (payload["tolerance"]["abs"], payload["tolerance"]["rel"]))
     add("| Hardware | %s, kernel %s, stock clocks |" %

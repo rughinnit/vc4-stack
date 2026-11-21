@@ -1605,3 +1605,26 @@ const char *vc4_tf_arena_status(void)
     pthread_mutex_unlock(&g_mu);
     return buf;
 }
+
+/* The engine's own counters (vc4_stats): launches, pack and kernel time and
+ * the FLOPs issued on the QPU.  The tests read this around each op, so the
+ * launch counts in the README are measured rather than derived from the group
+ * arithmetic.  It never starts the engine. */
+const char *vc4_tf_stats(void)
+{
+    static char buf[256];
+    pthread_mutex_lock(&g_mu);
+    if (!g_ctx) {
+        snprintf(buf, sizeof(buf), "engine not started");
+    } else {
+        vc4_stats s;
+        vc4_get_stats(g_ctx, &s);
+        snprintf(buf, sizeof(buf),
+                 "launches=%llu pack_ms=%.3f kernel_ms=%.3f flops=%.3g",
+                 (unsigned long long)s.launches,
+                 (double)s.pack_ns / 1e6, (double)s.kernel_ns / 1e6,
+                 (double)s.flops);
+    }
+    pthread_mutex_unlock(&g_mu);
+    return buf;
+}

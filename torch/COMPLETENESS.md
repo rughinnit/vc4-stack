@@ -249,8 +249,8 @@ statically linked against `libvc4infer.a`), published next to `vc4infer` in
 the signed `vc4-apt` repository:
 
 * index: <https://rughinnit.github.io/vc4-apt/pip/simple/>
-* wheel: `pip/torch_vc4-0.3.1-cp313-cp313-linux_aarch64.whl` (797,258 B)
-* sha256: `457791f211e1adb16eef6e6de4b437cd064606e9dcde79b946bde73736485489`
+* wheel: `pip/torch_vc4-0.3.1-cp313-cp313-linux_aarch64.whl` (797,409 B)
+* sha256: `5267cb5aac96aaacfd57808f9f376e18d34005446351005fa03d08fd531ac462`
 
 ## Reproduce
 

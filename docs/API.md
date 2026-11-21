@@ -5,7 +5,7 @@ Two public surfaces share one engine and one privileged helper (`vc4d`):
 | package | what it is | version on the reference board (2026-11-20) |
 |---|---|---|
 | `vc4infer` | ONNX graph executor, YOLO adapter, CLI, ctypes binding | **1.2.1** (.deb + wheel in the vc4-apt archive) |
-| `torch_vc4` | a declared subset PyTorch `PrivateUse1` backend | **0.3.1** in the source tree (`setup.py`, `torch_vc4.__version__`) and in the vc4-apt pip index as `torch_vc4-0.3.1-cp313-cp313-linux_aarch64.whl` (797,258 B). An editable install made before the bumps still reports **0.2.0** in its metadata. |
+| `torch_vc4` | a declared subset PyTorch `PrivateUse1` backend | **0.3.1** in the source tree (`setup.py`, `torch_vc4.__version__`) and in the vc4-apt pip index as `torch_vc4-0.3.1-cp313-cp313-linux_aarch64.whl` (797,409 B). An editable install made before the bumps still reports **0.2.0** in its metadata. |
 
 The measured performance numbers in TUTORIAL.md section 7 are from the 0.2.0
 surface, and the `torch_vc4` table in Part 2 describes that surface.  The

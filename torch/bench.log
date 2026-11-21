@@ -1,0 +1,9 @@
+/home/raspi/work/torch-vc4/.venv/lib/python3.13/site-packages/torch/_subclasses/functional_tensor.py:377: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:82.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+{'region_off': 1048576.0, 'region_bytes': 25165824.0, 'arena_bytes': 67108864.0, 'arena_used': 26214400.0}
+64x64x64: wall    0.424 ms ( 1.24 GFLOP/s)   engine gpu    0.214 ms ( 2.45 GFLOP/s)   max|err| 4.97e-05
+128x128x128: wall    1.254 ms ( 3.34 GFLOP/s)   engine gpu    0.850 ms ( 4.93 GFLOP/s)   max|err| 1.70e-04
+256x256x256: wall    4.990 ms ( 6.72 GFLOP/s)   engine gpu    4.409 ms ( 7.61 GFLOP/s)   max|err| 5.91e-04
+elementwise relu n=65536: 3.8070 ms (0.017 G elem/s)
+elementwise add n=65536: 3.8903 ms (0.017 G elem/s)
+elementwise mul n=65536: 5.3322 ms (0.012 G elem/s)

@@ -5,14 +5,25 @@ unary/indexing surface, float64 rejection and autograd for all of it.
 Every forward check is against the CPU on at least three shapes and prints the
 max abs / max rel error.  Unsupported cases must raise with the precise reason.
 
-Run on the Pi:  .venv/bin/python tests/test_complete.py
+Run on the Pi from the repo root:  .venv/bin/python torch/tests/test_complete.py
 """
 
 import math
+import os
 import sys
 
 import torch
 import torch.nn.functional as F
+
+# Measure the checkout this file is in when its extension has been built.  A
+# pip-installed or editable torch_vc4 can point at another tree; importing that
+# by accident tests the wrong backend.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACKAGE = os.path.join(ROOT, "torch_vc4")
+if os.path.isdir(PACKAGE) and any(
+        name.startswith("_C") and name.endswith(".so")
+        for name in os.listdir(PACKAGE)):
+    sys.path.insert(0, ROOT)
 
 import torch_vc4 as tv
 

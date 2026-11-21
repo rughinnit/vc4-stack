@@ -10,11 +10,17 @@ CPPFLAGS = -I$(PJRT_INC)
 # ungated gather/reduce/select3/conv kernels the lowering uses; fall back to
 # the installed libvc4infer.  Override VC4INFER_LIB for a packaged build.
 ENGINE_DIR := $(abspath $(CURDIR)/../infer/build)
+# Refuse to fall back to the installed library when the checkout's engine is
+# missing: the loader would then resolve libvc4infer.so.1 from /usr/lib and the
+# tests would measure an older engine without saying so.
+ifeq ($(origin VC4INFER_LIB), undefined)
+ifeq ($(filter clean,$(MAKECMDGOALS)),)
 ifeq ($(wildcard $(ENGINE_DIR)/libvc4infer.so),)
-VC4INFER_LIB ?= -lvc4infer
-else
-VC4INFER_LIB ?= -L$(ENGINE_DIR) -lvc4infer -Wl,-rpath,$(ENGINE_DIR)
+$(error missing $(ENGINE_DIR)/libvc4infer.so: build the engine first         (make -C infer), or set VC4INFER_LIB for a packaged build)
 endif
+endif
+endif
+VC4INFER_LIB ?= -L$(ENGINE_DIR) -lvc4infer -Wl,-rpath,$(ENGINE_DIR)
 LDLIBS  = $(VC4INFER_LIB) -lm
 
 BUILD = build

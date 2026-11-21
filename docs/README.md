@@ -42,6 +42,7 @@ and every path below is relative to the repository root unless it starts with
 | `VC4INFER.md` | the packaged product: install, `run`/`bench`/`nodes`/`selftest`, guarantees, measured performance, package layout |
 | `PYTHON-API.md` | the earlier `Engine`, `Device`, `Detector`, threading, error and Ultralytics reference (kept for history; `API.md` is current) |
 | `FRAMEWORKS.md` | framework support survey: what runs today, what needs a relay, effort/evidence for each |
+| [`../tvm_byoc/README.md`](../tvm_byoc/README.md) | TVM Relax BYOC vertical slice: the `matmul + bias` pattern table, the `relax.ext.vc4` codegen and its JSON descriptor, the runtime's `record`/`host`/`vc4` modes, CPU checks and the serialized silicon pass |
 | `TRAINING.md` | training design, backward kernels, capacity limits |
 | `TRAINING-RESULTS.md` | MLP 64-32-10 at 100% on SGD/Adam, gradchecks, throughput |
 | `CONV-RESULTS.md` | col2im, im2col-row, maxpool fwd/bwd, conv dX/dW, conv-net at 100% |

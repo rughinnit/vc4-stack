@@ -43,7 +43,7 @@ numerical contract, not because it beats a 1.2 GHz Cortex-A53.
 
 Sizes are the three listed per row.  Accuracy is the worst over the three
 shapes in `tests/completeness.py`; `tests/test_complete.py` independently
-checks the same ops (244 checks on silicon, all passing, peak 66.1 C);
+checks the same ops (244 checks on silicon, all passing, peak 59.1 C);
 `tests/test_cpu_registration.py` adds 48 device-free checks for registration,
 the broadcast and reduction plans, and the exact-GELU derivative.
 
@@ -288,10 +288,11 @@ $tools --max 71 -- ~/work/torch-vc4/.venv/bin/python \
     tests/completeness.py)
 ```
 
-The silicon run recorded here started at 63.4 C (the board was still warm
-from another job, not the 58 C the protocol asks for), peaked at 66.1 C with
-`throttled=0x0` at the stock 400 MHz core, and passed 244/244 checks.  The
-timings were taken on a quiet board at 65.0 C peak.
+The silicon run recorded here (`test_complete.py` at
+`feat/torch-finish` 9242fed) started at 56.9 C, peaked at 59.1 C with
+`throttled=0x0` at the stock 400 MHz core, and passed 244/244 checks;
+`test_cpu_registration.py` passed 48/48 in the same session.  The timings
+above were taken on a quiet board with a 65.0 C peak.
 
 The engine side of the resize is one process per op:
 

@@ -54,6 +54,23 @@ static int ew_is_binary(vc4_op op)
            op == VC4_OP_CMP_LE;
 }
 
+/* Sub, Div, Maximum and Minimum are kops.EWB bodies (FSUB, FMAX, FMIN and
+ * "reciprocal + multiply") rather than members of the older ew family, but
+ * they take the same two streams and the same 256-float group, so the public
+ * entry point serves both.  The bodies are the verified ones: docs/ACCURACY.md
+ * lists sub/div among the elementwise ops at <= 3e-7, and max/min are a single
+ * FPU select, i.e. bit-exact. */
+static const char *ew_ewb_name(vc4_op op)
+{
+    switch (op) {
+    case VC4_OP_SUB: return "sub";
+    case VC4_OP_DIV: return "div";
+    case VC4_OP_MAX: return "max";
+    case VC4_OP_MIN: return "min";
+    default:         return NULL;
+    }
+}
+
 static int ew_op_ok(vc4_op op)
 {
     switch (op) {
@@ -129,6 +146,17 @@ vc4_status vc4_elementwise(vc4_ctx *ctx, vc4_op op,
         return VC4_ERR_INVAL;
     if (ctx->dead)
         return VC4_ERR_TIMEOUT;
+
+    /* One entry point, two body families: see ew_ewb_name().  The ewb path
+     * owns its own tail padding, scratch reset and group batching, so it is
+     * handed the caller's buffers unchanged. */
+    const char *ewb = ew_ewb_name(op);
+    if (ewb) {
+        if (!b || a->bytes < n * 4 || b->bytes < n * 4 || out->bytes < n * 4)
+            return VC4_ERR_INVAL;
+        return vc4__ewb(ctx, ewb, 0, a, b, out, n, 0.0f, 0.0f);
+    }
+
     if (!ew_op_ok(op))
         return VC4_ERR_UNSUPPORTED;
     if (ew_is_binary(op) && !b)

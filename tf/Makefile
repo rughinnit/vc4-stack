@@ -23,8 +23,10 @@ TF_INC   = $(TF_DIR)/include
 TF_LIB   = $(TF_DIR)/libtensorflow_framework.so.2
 
 # The engine header comes from this checkout (infer/include); the library is
-# the installed one unless VC4INFER_LIB is given, e.g.
-#   make VC4INFER_LIB="-L$(CURDIR)/../infer/build -lvc4infer -Wl,-rpath,$(CURDIR)/../infer/build"
+# the installed one unless VC4_LIBS is given, e.g. to measure against an engine
+# built from this tree (the ewb-backed elementwise selectors need it):
+#   make VC4_LIBS="-L$(abspath $(CURDIR)/../infer/build) -lvc4infer \
+#                  -Wl,-rpath,$(abspath $(CURDIR)/../infer/build)"
 VC4_CFLAGS ?= -I$(abspath $(CURDIR)/../infer/include)
 VC4_LIBS   ?= $(shell pkg-config --libs vc4infer)
 

@@ -66,7 +66,7 @@ the same static report as `vc4infer nodes`:
 | `vc4` | a QPU kernel exists and the static constraints hold | vc4 |
 | `host-meta` | Constant/Shape and integer shape arithmetic resolved at plan time | vc4-folded |
 | `unknown` | an implementation exists but a shape could not be proven | ort-cpu |
-| `host-unwritten` | a numeric op with no QPU kernel (Einsum, TopK, ...) | ort-cpu |
+| `host-unwritten` | a numeric op with no QPU kernel (the current sweep finds none; the tier remains for new operators) | ort-cpu |
 | `host-control` | If/Loop/Scan | ort-cpu |
 
 A whole connected component is downgraded when any boundary tensor is not

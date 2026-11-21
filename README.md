@@ -28,9 +28,9 @@ channel.
 
 | repository | role |
 |---|---|
-| **`vc4-stack`** (this repo) | **main**: inference engine, QPU kernels, training, docs, measurements |
+| **`vc4-stack`** (this repo) | **main**: inference engine, QPU kernels, training, PyTorch backend (`torch/`), docs, measurements |
 | `vc4-apt` | the only install source: signed apt repo + pip index (`apt install vc4-toolkit`) |
-| `torch-vc4` | PyTorch `PrivateUse1` backend (`torch_vc4 0.3.0`) |
+| `torch-vc4` | **mirror** of `torch/`; the source of truth is this repository |
 | `vc4top` | GPU monitor TUI + the `vc4mon` DKMS module |
 | `VC4C` | OpenCL C → QPU compiler (fork; performance branches) |
 | `VC4CL` | OpenCL runtime (fork; Debian 13 + unprivileged fixes) |
@@ -74,6 +74,7 @@ your user is in the `vc4` group, then
 | path | what it is | start here | status |
 |---|---|---|---|
 | `infer/` | **libvc4infer + vc4infer** — the engine (dma-buf arena, kernel JIT/cache, strict op registry, matmul/conv/elementwise), the ONNX executor, the Python API, the CLI, and the `.deb`/wheel builders | [`infer/README.md`](infer/README.md), [`docs/VC4INFER.md`](docs/VC4INFER.md) | active — vc4infer **1.2.1**; YOLOv8n 160x160 runs end to end on the QPUs at **2.09 FPS** (stock clocks, quiet board) |
+| `torch/` | **torch_vc4** — the PyTorch `PrivateUse1` backend: compiled extension over the same engine and `vc4d`, the aten subset, autograd, the op table | [`torch/README.md`](torch/README.md), [`torch/COMPLETENESS.md`](torch/COMPLETENESS.md) | feature-complete for its declared subset — 46 registration checks, 222 completeness checks on silicon |
 | `kernels/` | hand-written QPU kernels: `wider-tile/asm6..asm10`, each with its NOTES/RESULTS and generator, plus the `attempt-asm10` history | [`kernels/wider-tile/`](kernels/wider-tile) | verified, frozen (results in `kernels/wider-tile/RESULTS*.md`) |
 | `training/` | backward kernels (`vc4_train.c`, `vc4_convbwd.c`) and the MLP/conv trainer with finite-difference checks | [`training/README.md`](training/README.md) | toy scale; gradients verified |
 | `tools/` | `build-fast.sh` (memory-aware `-j` + ccache), `qpu_disasm.py`, `xcheck/` (four independent encoders), `gput.sh` (locked GPU run + board check) | script headers | in use |
@@ -113,7 +114,7 @@ vc4infer selftest     # 4/4 bundled models
 For the speed-tuned rebuild of the same stack (`-O3 -march=native`, a
 prewarmed read-only kernel cache and a tuned daemon), install
 `vc4-toolkit-fast` instead.  Both paths, the pip index (`vc4infer`,
-`torch-vc4`) and the framework support table are in
+`torch_vc4`) and the framework support table are in
 [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Build and run
@@ -128,7 +129,17 @@ REPS=5 VC4INFER_DAEMON=1 infer/run_tests.sh  # same, unprivileged through vc4d
 infer/cli/vc4infer nodes infer/packaging/vc4infer/data/models/modelA.onnx
 infer/packaging/vc4infer/build_deb.sh        # -> dist/vc4infer_<ver>_arm64.deb
 infer/packaging/build_wheel.sh               # -> dist/vc4infer-<ver>-py3-none-any.whl
+
+make -C torch                                # -> dist/torch_vc4-<ver>-cp313-...whl
 ```
+
+`make -C torch` (equivalently `packaging/build_torch_wheel.sh`) builds the
+PyTorch backend wheel into the same shared `dist/` from `torch/`, against this
+checkout's `infer/` and `vc4d/` builds.  It needs an interpreter with torch
+`2.15.0+cpu` installed and refuses to run with a message naming what is
+missing; `make -C infer` does not depend on it (nor on torch being present).
+`packaging/publish_apt.sh` copies `dist/torch_vc4-*.whl` into `vc4-apt/pip/`
+under its unchanged name.
 
 **One GPU user at a time.**  Two concurrent workloads, or a wild kernel, can
 hang the V3D hard enough to need a power cycle.  In daemon mode `vc4d` takes
@@ -190,6 +201,7 @@ Every reported number must have a run log and a mismatch count.  Raw logs live i
 | `pyproject.toml` | `infer/pyproject.toml` |
 | `cli/`, `examples/`, `packaging/` | `infer/cli/`, `infer/examples/`, `infer/packaging/` |
 | `engine/src/vc4_train.c`, `vc4_convbwd.c`, training tests | `training/src/`, `training/tests/` |
+| the `torch-vc4` repository (backend, tests, `COMPLETENESS.md`) | `torch/` (history grafted; the repository is a mirror) |
 
 ## References and licence
 

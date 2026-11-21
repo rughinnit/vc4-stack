@@ -1,0 +1,10 @@
+.venv/
+.tmp/
+build/
+*.egg-info/
+__pycache__/
+*.so
+pip-install.log
+install*.log
+curl*.log
+build.log

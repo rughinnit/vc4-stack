@@ -53,7 +53,7 @@ Ranked by value delivered per unit of effort on *this* board.
 | # | framework | extension point (the API a third party implements) | effort | testable here | status in this project | what a user writes to enable it | what this buys |
 |---|---|---|---|---|---|---|---|
 | 1 | **ONNX** | none needed — native executor over the strict op table (`infer/python/vc4infer/_onnxrun.py`) | **available now** — shipped executor, 263-node YOLOv8n run end to end | yes — `onnx` 1.23.2 (cp312-abi3) installs and imports on cp313 | **implemented** — YOLOv8n 160/320 end-to-end, 0 host compute, 100% MACs | `vc4infer run m.onnx --input x.npy`<br>`Engine("m.onnx").run({"x": a})` | the widest model zoo with no framework installed; the export target every other framework can reach |
-| 2 | **PyTorch** | `PrivateUse1` + `PrivateUse1HooksInterface` + `AutogradPrivateUse1` (`TORCH_LIBRARY_IMPL(aten, PrivateUse1, …)`) | **available now** — built backend, 46 grad checks, subset raises | yes — torch 2.15.0+cpu wheel; `torch_vc4` built for cp313 | **implemented** — `~/work/torch-vc4` @ 6496a83, 46 gradient checks, CNN trains on-device | `import torch_vc4; d = torch_vc4.device()`<br>`model.to(d); y = model(x.to(d))`<br>`y.sum().backward()` | the only path where the framework's own autograd drives QPU backward kernels; users keep torch code |
+| 2 | **PyTorch** | `PrivateUse1` + `PrivateUse1HooksInterface` + `AutogradPrivateUse1` (`TORCH_LIBRARY_IMPL(aten, PrivateUse1, …)`) | **available now** — built backend, 46 grad checks, subset raises | yes — torch 2.15.0+cpu wheel; `torch_vc4` built for cp313 from `torch/` | **implemented** — `torch/COMPLETENESS.md` (history grafted from `torch-vc4` at 41ba1a1), 46 registration checks and 222 completeness checks on silicon, CNN trains on-device | `import torch_vc4; d = torch_vc4.device()`<br>`model.to(d); y = model(x.to(d))`<br>`y.sum().backward()` | the only path where the framework's own autograd drives QPU backward kernels; users keep torch code |
 | 3 | **ONNX Runtime** | EP C API: `OrtEpFactory`/`OrtEp`/`OrtNodeComputeInfo`, entry points `CreateEpFactories`/`ReleaseEpFactory`; Python `register_execution_provider_library` | **medium (weeks)** for a real EP; the Python provider was **small (days)** | ORT 1.32.0 cp313/aarch64 installs; no VC4 EP exists; wheel ships **no headers** | **in progress** — `vc4infer.ort` graph-partitioning provider + `infer/onnxruntime_ep/tests` | today: `import vc4infer.ort`<br>`InferenceSession(m, providers=["vc4"]).run(None, {"x": a})`<br>EP: `register_execution_provider_library("vc4", "libvc4_ep.so")` | the widest inference ecosystem: every ORT consumer (Python/C/C++/Java/JS) and its quantisation tooling |
 | 4 | **ggml / gguf** | `ggml_backend_i` + `ggml_backend_reg_i` + `GGML_BACKEND_DL_IMPL`/`ggml_backend_score`; loaded by `ggml_backend_load_all` | **medium (weeks)** | yes: ggml built from the vendored tree, backend loads both ways (`docs/GGML.md`) | **backend shipped (fp32 subset)** | drop `libggml-vc4.so` in the backend search path;<br>`ggml_backend_load_all()` then lists the device;<br>llama.cpp runs with it | LLM/transformer graphs with the smallest plugin ABI (no compiler), plus `ggml-opt` training |
 | 5 | **TFLite / LiteRT** | external delegate `.so`: `tflite_plugin_create_delegate` / `tflite_plugin_destroy_delegate`; internally `TfLiteDelegate::Prepare` + `ReplaceNodeSubsetsWithDelegateKernels` (the dispatch API is exported too, but its header is `litert/c/internal/`) | **medium (weeks)** | yes — `ai-edge-litert` 2.3.0 cp313/aarch64; `Interpreter` + `load_delegate` | **runs on the QPUs** — `litert/`; 34 checks, 0 failures on silicon, max |d| 1.71e-07 against the LiteRT CPU reference | `i.load_delegate("litert/build/libvc4_delegate.so")`<br>`i.allocate_tensors(); i.invoke()` | the edge model zoo; the claimed subset runs on the QPUs and every other node stays in LiteRT |
@@ -207,7 +207,7 @@ examples.
    same graph, compare per element with `|got-ref| <= atol + rtol*max(|ref|,1)`
    (the project uses 1e-4/1e-4 for op tests, 5e-4/5e-4 for YOLO).  The
    patterns to copy are `infer/tools/onnx/verify_extra.py` (ONNX graphs),
-   `infer/tests/genops_probe.py` (single ops) and `torch-vc4/tests/test_ops.py`
+   `infer/tests/genops_probe.py` (single ops) and `torch/tests/test_ops.py`
    (aten ops).  A pass is a mismatch count, not a boolean.
 3. **Publish the coverage table.**  Claimed nodes, refused nodes with the
    reason, `%` of graph MACs on the QPUs, host bytes moved, launches.
@@ -354,7 +354,7 @@ grep Cma /proc/meminfo        CmaTotal: 262144 kB
 * `docs/CONV-RESULTS.md`: conv toy net 7.56 steps/s, 121 samples/s, 100%.
 * `docs/TRAINING-RESULTS.md`: MLP 103.5 steps/s SGD, 90.5 Adam, 100%,
   gradient checks 1e-7–1e-5.
-* `torch-vc4/RESULTS.md`: 46 gradient checks ≤5.4e-6 norm-rel; tiny CNN
+* `torch/RESULTS.md`: 46 gradient checks ≤5.4e-6 norm-rel; tiny CNN
   39 ms/step, 77 launches/step, 3080 launches total.
 * `docs/int8-RESULTS.md`: int8 vs fp32 MAC rate within 0.5%; no packed byte MAC.
 * `docs/NUMERICS.md` §1: FPU truncates; fp32 only.

@@ -1,0 +1,31 @@
+/home/raspi/work/torch-vc4/.venv/lib/python3.13/site-packages/torch/_subclasses/functional_tensor.py:377: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:82.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+torch 2.15.0+cpu  python 3.13.5
+PASS  backend renamed to vc4  vc4
+PASS  torch_vc4.device()  vc4:0
+      torch.device('vc4') string: rejected by torch's parser (Invalid device string: 'vc4'); torch_vc4.device() is the supported spelling
+      arena: {'region_off': 1048576, 'region_bytes': 25165824, 'arena_bytes': 67108864, 'arena_used': 26214400}
+PASS  engine arena up (vc4d)
+PASS  randn on vc4 (host RNG + upload)  torch.Size([256, 256])
+PASS  vc4->cpu copy is bit exact
+PASS  x @ x returns a vc4 tensor
+      256^3 wall 18.661 ms, engine gpu 4.036 ms (9.33 GFLOP/s kernel), 2 launches
+PASS  matmul matches CPU (allclose rtol 1e-4, atol 1e-3)  max rel 1.78e-04, max abs 5.04e-04 (fp64 ref: 4.54e-04)
+PASS  matmul max relative error < 1e-3 (engine-style denominator)  1.78e-04
+      256^3 best wall 4.585 ms -> 7.32 GFLOP/s wall; engine GPU 4.114 ms
+PASS  256^3 wall time is plausible (>1 ms, <60 s)  4.59 ms
+PASS  add on vc4 == CPU
+PASS  mul on vc4 == CPU
+PASS  relu on vc4 == CPU
+PASS  odd-shaped mm 20x36x44 == CPU  max rel 7.05e-06, max abs 1.91e-05
+PASS  torch.sin(vc4) raises  raised: torch_vc4: 'aten::sin' is not implemented for device vc4.  This backend has no CPU fallback by design; support
+PASS  torch.mean(vc4) raises  raised: torch_vc4: 'aten::mean' is not implemented for device vc4.  This backend has no CPU fallback by design; suppor
+PASS  broadcasting add raises  raised: torch_vc4: add requires identical shapes, got [256, 256] and [256, 1]; broadcasting is not implemented
+PASS  slicing a vc4 tensor raises (as_strided missing)  raised: torch_vc4: 'aten::as_strided' is not implemented for device vc4.  This backend has no CPU fallback by design; 
+PASS  float64 on vc4 raises  raised: torch_vc4: only float32 tensors are supported, got Double
+PASS  mm cpu x vc4 raises  raised: torch_vc4: mm(A): expected a vc4 tensor, got cpu
+PASS  client process has no /dev/mem fd  /home/raspi/work/torch-vc4/acceptance.log, pipe:[116124], socket:[114675]
+PASS  client holds a vc4d socket  ['socket:[114675]']
+      CapEff:	0000000000000000  uid=1000
+
+ALL CHECKS PASSED

@@ -29,7 +29,7 @@ import tempfile
 import onnx
 from onnx import ModelProto, TensorProto
 
-from .. import coverage
+from .. import UnsupportedNode, __version__, coverage
 
 # Bump when the sub-model shape changes: invalidates the on-disk cache.
 FORMAT = "vc4infer-ort-1"
@@ -207,6 +207,27 @@ def _submodel(model, indices, inputs, outputs, values, shapes):
     return m
 
 
+def unclaimed(partitions, rep):
+    """Coverage entries for the nodes assigned to ORT's CPU EP."""
+    out = []
+    for p in partitions:
+        if p.backend == "ort-cpu":
+            out.extend(rep["nodes"][i] for i in p.indices)
+    out.sort(key=lambda e: e["index"])
+    return out
+
+
+def refuse(partitions, rep):
+    """Raise :class:`UnsupportedNode` if any node must run on ORT."""
+    debt = unclaimed(partitions, rep)
+    if debt:
+        first = debt[0]
+        raise UnsupportedNode(
+            first["name"], first["op"],
+            "fallback='error': %d node(s) cannot run on VC4: %s"
+            % (len(debt), ", ".join(e["name"] for e in debt[:6])))
+
+
 def _cache_root():
     base = os.environ.get("VC4INFER_ORT_CACHE")
     if not base:
@@ -254,8 +275,11 @@ def build(model, model_bytes):
 
     # Control flow is never split: a subgraph attribute can capture tensors
     # from the outer graph, and reconstructing that capture safely is ORT's
-    # job, not this partitioner's.
-    if any(_has_subgraph(n) for n in graph.node):
+    # job, not this partitioner's.  Such a model is handed to ORT verbatim
+    # (see the ``has_subgraph`` branch below) rather than rebuilt as a
+    # sub-model, which would drop capture-only initialisers.
+    has_subgraph = any(_has_subgraph(n) for n in graph.node)
+    if has_subgraph:
         claimable = set()
 
     # Refuse to claim a component unless its whole boundary is fp32/static.
@@ -289,13 +313,23 @@ def build(model, model_bytes):
 
     parts = []
     for i, (indices, backend) in enumerate(groups):
-        ins, outs = _boundaries(indices, graph, produced_by, consumed_by,
-                                inits, gouts)
+        if has_subgraph:
+            # The whole graph is the partition: its own inputs and outputs.
+            ins = [vi.name for vi in graph.input]
+            outs = [vi.name for vi in graph.output]
+        else:
+            ins, outs = _boundaries(indices, graph, produced_by, consumed_by,
+                                    inits, gouts)
         macs = sum(int(rep["nodes"][j].get("macs") or 0) for j in indices)
         p = Partition(i, backend, indices, ins, outs, macs)
         if backend == "vc4":
             proto = _submodel(model, indices, ins, outs, values, shapes)
             p.path = _write_cached(model_bytes, p, proto)
+        elif has_subgraph:
+            # A captured outer-scope tensor (a weight inside an If/Loop body)
+            # is not a boundary tensor and would be lost by _submodel, so the
+            # whole model goes to ORT exactly as it arrived.
+            p.model_bytes = model_bytes
         else:
             proto = _submodel(model, indices, ins, outs, values, shapes)
             p.model_bytes = proto.SerializeToString()
@@ -324,3 +358,69 @@ def build(model, model_bytes):
         remaining.remove(p)
 
     return order, rep
+
+
+class Plan:
+    """The static claim table for one model: no session, no daemon, no GPU.
+
+    ``partitions`` is dependency-ordered and names the backend of every node;
+    ``coverage`` is the per-node tier report from :mod:`vc4infer.coverage`.
+    :meth:`summary`, :meth:`rows` and :meth:`report` are the same objects
+    ``InferenceSession`` reports, so a claim table printed from a desk is the
+    one the device would execute.
+    """
+
+    def __init__(self, model, model_bytes, partitions, rep, path=None):
+        self.model = model
+        self.model_bytes = model_bytes
+        self.partitions = list(partitions)
+        self.coverage = rep
+        self.model_name = os.path.basename(path) if path else "<bytes>"
+        self.providers = ["vc4"]
+        self.version = __version__
+        self.last_timing = None
+
+    def rows(self):
+        from . import _report
+        return _report.rows(self)
+
+    def summary(self):
+        from . import _report
+        return _report.summary(self)
+
+    def report(self, per_node=False, out=None):
+        from . import _report
+        return _report.render(self, per_node=per_node, out=out)
+
+    def unclaimed(self):
+        return unclaimed(self.partitions, self.coverage)
+
+
+def plan(source, fallback="cpu"):
+    """Partition ``source`` (path, bytes or ModelProto) without a session.
+
+    This is the claim decision ``InferenceSession(providers=["vc4"])`` makes,
+    exposed on its own so it can be measured with no daemon and no GPU:
+    no engine is opened and no node is executed.  ``fallback="error"`` raises
+    :class:`vc4infer.UnsupportedNode` for the first node that cannot run on
+    VC4, exactly as the session does.
+    """
+    if fallback not in ("cpu", "error"):
+        raise ValueError("fallback must be 'cpu' or 'error'")
+    if isinstance(source, ModelProto):
+        model = source
+        model_bytes = source.SerializeToString()
+        path = None
+    elif isinstance(source, (bytes, bytearray, memoryview)):
+        model_bytes = bytes(source)
+        model = onnx.load_from_string(model_bytes)
+        path = None
+    else:
+        path = os.path.abspath(os.fspath(source))
+        with open(path, "rb") as f:
+            model_bytes = f.read()
+        model = onnx.load_from_string(model_bytes)
+    parts, rep = build(model, model_bytes)
+    if fallback == "error":
+        refuse(parts, rep)
+    return Plan(model, model_bytes, parts, rep, path)

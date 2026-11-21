@@ -563,6 +563,32 @@ class Tensor:
                                     if self.layout == "nhwc" else "")
 
 
+def _flat_index(shape, axes, rngs):
+    """Flat source index per flat destination index (integer metadata).
+
+    ``axes[k]`` is the source axis that destination axis ``k`` walks and
+    ``rngs[k]`` the index values it walks.  A Slice passes identity axes with
+    per-axis ranges, a Transpose passes the permutation with full ranges, so
+    one helper builds both tables.  This is integer index arithmetic on
+    metadata; no tensor value is read or computed here.
+    """
+    shape = [int(d) for d in shape]
+    rank = len(shape)
+    stride = [1] * rank
+    for k in range(rank - 2, -1, -1):
+        stride[k] = stride[k + 1] * shape[k + 1]
+    out_shape = [int(len(r)) for r in rngs]
+    tab = np.zeros(out_shape, np.int64)
+    for k, (ax, r) in enumerate(zip(axes, rngs)):
+        # a one-element range still contributes its start offset, so only an
+        # *empty* range is skipped (the reshape needs a known size)
+        if len(r) > 0 and stride[int(ax)]:
+            b = np.asarray(r, np.int64).reshape(
+                [(-1 if a == k else 1) for a in range(rank)])
+            tab += b * stride[int(ax)]
+    return tab.ravel(), out_shape
+
+
 def _attr(node, name, default=None):
     for a in node.attribute:
         if a.name == name:
@@ -1065,6 +1091,28 @@ class Runner:
         elif nv:
             self._x(src, dst, rows, nv, srow, drow, svec, dvec, slane, 16, 1,
                     64, 64, 1, 16)
+
+    def _gather_flat(self, x, tab, shape):
+        """out[flat i] = x[tab[i]]: one ``vc4_gather`` launch.
+
+        ``tab`` is a flat *word* index per flat output element, i.e. integer
+        index arithmetic on metadata (never on tensor data).  The engine's
+        gather reads arena *byte* offsets, so the table becomes ``x``'s base
+        offset plus 4*index and is uploaded as raw int32 -- a byte copy of
+        metadata, the same class of host traffic as an index map in
+        ``_dispatch_geom.word_gather``.
+        """
+        out = self._alloc_t(shape)
+        n = int(tab.size)
+        if n == 0:
+            return out
+        ent = np.asarray(tab, np.int64) * 4 + int(x.buf.off)
+        tb = self.pool.alloc(n * 4)
+        self._charge_host("upload", n * 4)
+        self.eng.upload(ent.astype(np.int32).tobytes(), tb)
+        self.eng.gather(tb, out.buf, n, 0.0)
+        self.pool.release(tb)
+        return out
 
     def _alloc_t(self, shape, layout="nchw", pitch=None, extra=0):
         """An activation buffer from the pool, released after this node
@@ -2167,10 +2215,23 @@ class Runner:
     def _slice(self, node):
         """Slice, on the QPUs.
 
-        The affine copy covers one sliced axis followed only by full axes,
-        which makes every output row a contiguous run of the source: that is
-        every Slice in YOLOv8n (the head's channel pairs).  Anything else
-        names the missing capability instead of falling back.
+        The affine copy2d path covers the common case: one sliced axis whose
+        trailing axes are all full, so every output row is a contiguous run of
+        the source.  That is every Slice in YOLOv8n and costs one launch.
+
+        Every other form -- several axes, an interior axis with sliced trailing
+        axes, or any step other than 1 including a negative one -- becomes one
+        ``vc4_gather`` over an index table: the table is built per output
+        element by integer index arithmetic (numpy, metadata only), the QPUs
+        read the table and move the words.  No tensor value is computed on the
+        ARM either way.
+
+        Endpoints and steps follow the ONNX definition (operator Slice-13,
+        "Attributes/Inputs: starts, ends, axes, steps"): a negative start/end
+        counts from the back, then the effective start/end are clamped to
+        [0, dim] for a positive step and to [-1, dim-1] for a negative step,
+        which is how INT_MAX / INT_MIN mean "to the end" / "before the start".
+        A step of 0 is invalid.
         """
         x = self._float(node.input[0])
 
@@ -2190,41 +2251,65 @@ class Runner:
             axes = list(range(len(starts)))
         if steps is None:
             steps = [1] * len(starts)
+        if not (len(starts) == len(ends) == len(axes) == len(steps)):
+            raise UnsupportedNode("Slice %s: starts/ends/axes/steps lengths "
+                                  "%d/%d/%d/%d" % (node.name, len(starts),
+                                                    len(ends), len(axes),
+                                                    len(steps)))
         if x.layout != "nchw":
             raise UnsupportedNode("Slice %s: needs the compact NCHW source"
                                   % node.name)
-        shp = list(x.shape)
-        cut = None
+        shp = [int(d) for d in x.shape]
+        rank = len(shp)
+        norm = []
+        used = set()
         for st, en, ax, sp in zip(starts, ends, axes, steps):
-            if int(sp) != 1:
-                raise UnsupportedNode("Slice %s: step %d" % (node.name, sp))
-            ax = int(ax) % len(shp)
-            en = shp[ax] if int(en) >= 2 ** 31 else int(en)
+            ax = int(ax) % rank
+            sp = int(sp)
+            if sp == 0:
+                raise UnsupportedNode("Slice %s: step 0 is invalid (axis %d)"
+                                      % (node.name, ax))
+            if ax in used:
+                raise UnsupportedNode("Slice %s: axis %d named twice"
+                                      % (node.name, ax))
+            used.add(ax)
+            d = shp[ax]
             st = int(st)
+            en = int(en)
             if st < 0:
-                st += shp[ax]
+                st += d
             if en < 0:
-                en += shp[ax]
-            if st < 0 or en > shp[ax] or en < st:
-                raise UnsupportedNode("Slice %s: [%d:%d] of dim %d"
-                                      % (node.name, st, en, ax))
-            if st == 0 and en == shp[ax]:
-                continue
-            if cut is not None:
-                raise UnsupportedNode("Slice %s: two sliced axes" % node.name)
-            cut = (ax, st, en)
-        if cut is None:
+                en += d
+            if sp > 0:
+                st = min(max(st, 0), d)
+                en = min(max(en, 0), d)
+            else:
+                st = min(max(st, 0), d - 1)
+                en = min(max(en, -1), d - 1)
+            norm.append((ax, st, en, sp))
+        cut = [(ax, st, en, sp) for ax, st, en, sp in norm
+               if not (st == 0 and en == shp[ax] and sp == 1)]
+        if not cut:
             return x
-        ax, st, en = cut
-        inner = int(np.prod(shp[ax + 1:]))
-        out_shape = list(shp)
-        out_shape[ax] = en - st
-        out = self._alloc_t(out_shape)
-        rows = int(np.prod(shp[:ax])) if ax else 1
-        run = (en - st) * inner
-        self._runs(self._buf_at(x, st * inner * 4), out.buf, rows, run,
-                   shp[ax] * inner * 4, run * 4)
-        return out
+        if len(cut) == 1 and cut[0][3] == 1:
+            # affine: one sliced axis, contiguous output rows
+            ax, st, en, _ = cut[0]
+            inner = int(np.prod(shp[ax + 1:]))
+            out_shape = list(shp)
+            out_shape[ax] = en - st
+            out = self._alloc_t(out_shape)
+            rows = int(np.prod(shp[:ax])) if ax else 1
+            run = (en - st) * inner
+            if run > 0:
+                self._runs(self._buf_at(x, st * inner * 4), out.buf, rows,
+                           run, shp[ax] * inner * 4, run * 4)
+            return out
+        # general: one index table, one gather launch
+        rngs = [np.arange(d, dtype=np.int64) for d in shp]
+        for ax, st, en, sp in norm:
+            rngs[ax] = np.arange(st, en, sp, dtype=np.int64)
+        tab, out_shape = _flat_index(shp, list(range(rank)), rngs)
+        return self._gather_flat(x, tab, out_shape)
 
     def _softmax(self, node):
         x = self._float(node.input[0])
@@ -2288,14 +2373,19 @@ class Runner:
     def _transpose(self, node):
         """Arbitrary permutation, on the QPUs.
 
-        The copy2d_x block loop covers exactly the permutations a layout op
+        The affine copy2d_x block loop covers the permutation a layout op
         needs: for perm [0,2,1,3] on [1][J][K][W] the vector is 16 consecutive
         W positions, the row is K (the outer swapped axis) and the block is J,
         with the two streams advancing by different block steps.
+
+        Every other permutation, and any rank, is one ``vc4_gather`` over a
+        permutation index table: destination element ``i`` names its source
+        word, so an arbitrary perm (and the absent-attribute "reverse the
+        axes" form) needs no new kernel and no host arithmetic on values.
         """
         x = self._float(node.input[0])
         perm = _attr(node, "perm", None)
-        shp = x.shape
+        shp = [int(d) for d in x.shape]
         if perm is None:
             perm = list(range(len(shp)))[::-1]
         perm = [int(p) % len(shp) for p in perm]
@@ -2304,13 +2394,10 @@ class Runner:
         if x.layout != "nchw":
             raise UnsupportedNode("Transpose %s: needs the compact NCHW "
                                   "source" % node.name)
-        oshp = [shp[p] for p in perm]
-        # only a 2-axis swap of the form [0] + swapped pair + [W] is affine in
-        # the vector decomposition; everything else is refused
         if len(shp) != 4 or perm != [0, 2, 1, 3]:
-            raise UnsupportedNode("Transpose %s: perm %s needs a general "
-                                  "permute kernel (the affine copy covers the "
-                                  "head's [0,2,1,3])" % (node.name, perm))
+            rngs = [np.arange(shp[p], dtype=np.int64) for p in perm]
+            tab, out_shape = _flat_index(shp, perm, rngs)
+            return self._gather_flat(x, tab, out_shape)
         n, a, b, w = shp                 # source [n][a][b][w] -> [n][b][a][w]
         out = self._alloc_t((n, b, a, w))
         nv = w // 16

@@ -94,8 +94,8 @@ the single 64 MiB arena.
 | `Add`, `Mul` | `vc4_elementwise` | equal shapes (layouts/pitches matched on the host) or a constant broadcast |
 | `Sub`, `Div` | GPU `Mul(-1)` + `Add`; `Div` by a constant -> GPU `Mul` | see section 7.1 |
 | `Split` | host byte gather | channel axis of a 4-D tensor |
-| `Slice` | host gather | any axis, int64 starts/ends/axes/steps |
-| `Transpose` | host permute | any permutation |
+| `Slice` | affine `vc4_copy2d` runs, else index table + `vc4_gather` | any axes, any non-zero step (negative included), int64 starts/ends/axes/steps |
+| `Transpose` | affine block copy, else index table + `vc4_gather` | any permutation, any rank; `perm` absent reverses the axes |
 | `Softmax` | `vc4_softmax_fwd` | any axis (host permute to the last), <=16 classes, rows%8 |
 | `Shape`, `Gather` | host int64 | static shapes |
 | `Squeeze`, `Unsqueeze`, `Cast`, `Flatten` | view / type change | fp32 targets |
@@ -259,12 +259,12 @@ bring-up, found by the per-node check).
 |---|---|
 | `Split` (axis 1, 4-D) | host byte gather, keeps the source pitch |
 | `Concat` axis 1 (4-D) and axis 1/-1 (3-D) | host byte concat |
-| `Slice` | host gather, int64 starts/ends/axes/steps |
+| `Slice` | QPU contiguous runs (one sliced axis) or QPU gather table, int64 starts/ends/axes/steps |
 | `Div` | GPU `Mul` by the reciprocal of a *graph constant* (folded) |
 | `Sub` | GPU `Mul(-1)` + GPU `Add`; `const - x` and `x - const` likewise |
 | broadcast `Add`/`Mul` | constant operand expanded on the host (bytes), GPU op |
 | `Softmax` any axis | host permute to the last axis, `vc4_softmax_fwd` (<= 16 classes, rows padded to 8), permute back - this is the DFL softmax on axis 1 |
-| `Transpose` | host permute |
+| `Transpose` | QPU block copy (`[0,2,1,3]`) or QPU gather table (any perm) |
 | `Shape`, `Gather` | int64 host tensors (static shapes) |
 | `Squeeze`, `Unsqueeze`, `Cast`, `Flatten` | view / type change |
 
@@ -818,13 +818,16 @@ bigger.
 #### 10.4.4 What the device paths refuse (named, never a host fallback)
 
 These raise `UnsupportedNode` with the invariant in the message; they are not
-widened to make a byte count smaller:
+widened to make a byte count smaller.  (Two rows below were lifted afterwards:
+`Slice` and `Transpose` now fall back to a rank-generic index table and
+`vc4_gather`, which is ungated and element-verified — see the "Update" note at
+the end of this section.)
 
 | op | refused | invariant that blocks it |
 |---|---|---|
 | Resize | any nearest other than exact 2x NHWC | the source index of an output pixel is `floor(x*in/out)`, not affine in the vector index (a pixel repeats every `C/16` vectors while the row step is a different constant); it needs a per-output gather table or a `--dup N` kernel variant |
-| Transpose | any perm other than `[0,2,1,3]` on a 4-D NCHW tensor | the affine copy needs the vector to be 16 consecutive words of one stream and a single (row, block) decomposition; a general permute needs a rank-generic index table |
-| Slice | two sliced axes, or a sliced axis followed by a non-full axis | the output row must be one contiguous run of the source |
+| Transpose | ~~any perm other than `[0,2,1,3]`~~ **lifted** | the affine copy needs the vector to be 16 consecutive words of one stream and a single (row, block) decomposition; the general form is now one rank-generic index table + `vc4_gather` |
+| Slice | ~~two sliced axes, or a sliced axis followed by a non-full axis~~ **lifted** | the output row had to be one contiguous run of the source; everything else is now one index table + `vc4_gather` (any step, negative steps included) |
 | Concat | axes other than 1 on 4-D NHWC / 1 and -1 on 3-D | the destination vector is a pixel's 16-channel block |
 | Conv / to_nhwc | an NHWC tensor needing a *different* channel padding | the lane count is a uniform, not a permutation |
 | Softmax | more than 16 classes | the fused kernel's 16-lane rows (engine limit, unchanged) |

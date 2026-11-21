@@ -445,13 +445,75 @@ def shape_cases(rng):
     ]
 
 
+def slice_transpose_cases(rng):
+    """General Slice and Transpose: any axis set, any step, any perm, any rank.
+
+    The affine copy2d path covers one sliced axis with step 1 followed by full
+    axes and the [0,2,1,3] swap; the cases below deliberately exercise the
+    general index-table + vc4_gather path, and the last case of each block
+    keeps the affine path covered in the same file.
+    """
+    a5 = rng.uniform(-1, 1, (2, 3, 4, 5, 6)).astype(np.float32)
+    a4 = rng.uniform(-1, 1, (1, 8, 8, 8)).astype(np.float32)
+    a3 = rng.uniform(-1, 1, (2, 3, 4)).astype(np.float32)
+    a2 = rng.uniform(-1, 1, (3, 4)).astype(np.float32)
+    return [
+        Case("Slice", "rank5-two-axes",
+             {"data": a5, "starts": i64(1, 0), "ends": i64(2, 3),
+              "axes": i64(0, 2)},
+             inputs=["data", "starts", "ends", "axes"],
+             note="two non-adjacent axes, rank 5"),
+        Case("Slice", "negative-step-last",
+             {"data": a4, "starts": i64(-1), "ends": i64(-9),
+              "axes": i64(3), "steps": i64(-2)},
+             inputs=["data", "starts", "ends", "axes", "steps"],
+             note="negative step counting from the back"),
+        Case("Slice", "three-axes-mixed-steps",
+             {"data": a4, "starts": i64(0, 1, 7), "ends": i64(8, 6, 0),
+              "axes": i64(1, 2, 3), "steps": i64(2, 1, -3)},
+             inputs=["data", "starts", "ends", "axes", "steps"],
+             note="positive and negative steps in one node"),
+        Case("Slice", "interior-and-last",
+             {"data": a4, "starts": i64(1, 2), "ends": i64(3, 6),
+              "axes": i64(1, 3)},
+             inputs=["data", "starts", "ends", "axes"],
+             note="interior axis with a sliced trailing axis"),
+        Case("Slice", "clamped-identity",
+             {"data": a4, "starts": i64(-100), "ends": i64(100),
+              "axes": i64(2)},
+             inputs=["data", "starts", "ends", "axes"],
+             note="endpoints clamp to the whole axis (no copy needed)"),
+        Case("Slice", "rank2-reverse",
+             {"data": a2, "starts": i64(3), "ends": i64(-5),
+              "axes": i64(1), "steps": i64(-1)},
+             inputs=["data", "starts", "ends", "axes", "steps"]),
+        Case("Slice", "affine-single-axis",
+             {"data": a4, "starts": i64(1), "ends": i64(3),
+              "axes": i64(1)},
+             inputs=["data", "starts", "ends", "axes"],
+             note="stays on the contiguous-run copy"),
+        Case("Transpose", "rank3-201", {"data": a3},
+             attrs={"perm": [2, 0, 1]}, inputs=["data"]),
+        Case("Transpose", "rank5", {"data": a5},
+             attrs={"perm": [4, 0, 3, 1, 2]}, inputs=["data"]),
+        Case("Transpose", "reverse-no-perm", {"data": a5}, inputs=["data"],
+             note="perm absent: reverse every axis"),
+        Case("Transpose", "perm-0231", {"data": a4},
+             attrs={"perm": [0, 2, 3, 1]}, inputs=["data"]),
+        Case("Transpose", "affine-0213", {"data": a4},
+             attrs={"perm": [0, 2, 1, 3]}, inputs=["data"],
+             note="stays on the affine block copy"),
+    ]
+
+
 ALL = {}
 
 
 def _register():
     rng = np.random.default_rng(20261120)
     for fn in (reduction_cases, compare_cases, where_cases, arg_cases,
-               cumsum_cases, pow_cases, mod_cases, shape_cases):
+               cumsum_cases, pow_cases, mod_cases, shape_cases,
+               slice_transpose_cases):
         for c in fn(rng):
             ALL.setdefault(c.op, []).append(c)
 

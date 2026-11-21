@@ -142,7 +142,7 @@ refused), a `reduce` whose body is not `add`/`maximum`/`minimum` (for example
 `multiply_v1` for `prod`), a `reduce` whose initial value is not that op's
 identity, a `gather` whose index operand is not a compile-time constant or
 that carries operand batching dimensions, a `pad` whose padding value is not
-a compile-time constant, a `slice` that leaves its axis extent or has a
+a compile-time constant, a `slice` with bounds outside its axis or a
 non-positive stride, a `convolution` with stride other than 1, dilation,
 groups, window reversal, a non-NCHW dimension order, a non-square or larger
 than 3x3 kernel, asymmetric padding, a padded image beyond the 8191-byte VDR
@@ -214,8 +214,8 @@ plugin; the engine's own numbers (a 256³ GEMM at 8.5 GFLOP/s, YOLOv8n at
 
 `pjrt/tests/test_lower.py` needs no QPU.  It exports each program with
 `jax.export` -- the same portable artifact the compile path receives -- and
-runs `pjrt/tools/pjrt_decode` on it, which links the reader and the lowering
-and nothing else.  Thirty-three checks, all passing on the current tree:
+runs `pjrt/build/pjrt_decode` on it (source in `pjrt/tools`), which links the
+reader and the lowering and nothing else.  Thirty-three checks, all passing on the current tree:
 
 * the instruction list of every new op, so a case that starts or stops
   lowering is visible;

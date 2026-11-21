@@ -503,6 +503,18 @@ def cases():
              ["num_mel_bins", "dft_length", "sample_rate", "lower_edge_hertz",
               "upper_edge_hertz"],
              oracle=lambda: _ref_mel(10, 16, 16000, 0.0, 8000.0)),
+        # both degenerate band forms in one table: edges [0,0,0,0,1,1,2,3]
+        # give b == a for bands 0, 1, 2 and 4 and c == b for bands 0, 1 and 3
+        Case("MelWeightMatrix", "6mel-dft8-degenerate",
+             {}, {"num_mel_bins": np.asarray(6, np.int64),
+                  "dft_length": np.asarray(8, np.int64),
+                  "sample_rate": np.asarray(8000, np.int64),
+                  "lower_edge_hertz": np.asarray(0.0, np.float32),
+                  "upper_edge_hertz": np.asarray(4000.0, np.float32)},
+             ["num_mel_bins", "dft_length", "sample_rate", "lower_edge_hertz",
+              "upper_edge_hertz"],
+             oracle=lambda: _ref_mel(6, 8, 8000, 0.0, 4000.0),
+             note="degenerate bands: b == a and c == b in one table"),
     ]
 
     # ------------------------------------------------------------ windows

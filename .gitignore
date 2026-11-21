@@ -29,3 +29,4 @@ infer/tools/onnx/models/
 *.log
 !docs/logs/*.log
 vc4d/build/
+tvm_byoc/build/

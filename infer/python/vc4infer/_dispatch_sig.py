@@ -9,8 +9,11 @@ random / signal / quantise block).  Contents:
                             QPUs (a 16-wide max/min tree)
     DFT                     one GEMM against a constant cos/sin matrix
     STFT                    framing (copy2d) + the DFT core
-    MelWeightMatrix         plan-time folded: a constant table, no activations
-                            (coverage.fold_metadata owns it)
+    HannWindow(+Hamming, Blackman)
+                            QPU index ramp + QPU SIN/COS: the window table is
+                            produced by the device on every run
+    MelWeightMatrix         QPU triangle arithmetic over parameter-derived
+                            index ramps (the bins are index metadata)
     RandomUniform(+Like)    VC4_UOP_RNG, a counter-based device RNG
     RandomNormal(+Like)     two draws + Box-Muller on the QPUs
     Bernoulli               one draw + an exact fp32 compare
@@ -642,6 +645,169 @@ class Multinomial(_Sig):
         return out.astype(_NP[dtype])
 
 
+
+# =====================================================================
+# window tables and the mel filterbank
+# =====================================================================
+class _Window(_Sig):
+    """HannWindow / HammingWindow / BlackmanWindow, evaluated on the QPUs.
+
+    ONNX "Windows" (HannWindow-17, HammingWindow-17, BlackmanWindow-17): with
+    N_1 = size when periodic else size - 1 and n = 0 .. size-1,
+
+        Hann       w[n] = sin^2(pi n / N_1)
+        Hamming    w[n] = alpha - beta cos(2 pi n / N_1),
+                        alpha = 25/46, beta = 1 - alpha
+        Blackman   w[n] = 0.42 - 0.5 cos(2 pi n / N_1)
+                           + 0.08 cos(4 pi n / N_1)
+
+    The index ramp n is integer metadata (a plan-time constant panel); the
+    angle scaling, the SIN/COS and the coefficient arithmetic are engine
+    kernels, so the table is computed by the QPU on every run instead of being
+    folded into the plan.  Only fp32 output is wired: ``output_datatype`` may
+    name half or double, which the fp32 arena cannot hold.
+    """
+
+    def size_and_n1(self):
+        node = self.node
+        size = int(np.asarray(self.host_or_fail(node.input[0])).ravel()[0])
+        if size < 1:
+            self.fail("size must be >= 1 (got %d)" % size)
+        odt = int(_attr(node, "output_datatype", onnx.TensorProto.FLOAT))
+        if odt != onnx.TensorProto.FLOAT:
+            self.fail("output_datatype=%s: the arena is fp32 only"
+                      % onnx.TensorProto.DataType.Name(odt))
+        periodic = int(_attr(node, "periodic", 1))
+        n1 = size if periodic else size - 1
+        if n1 < 1:
+            self.fail("size 1 with periodic=0 leaves N_1 = 0: the window is "
+                      "undefined (division by zero)")
+        return size, n1
+
+    def ramp(self, size):
+        return self.const(("win_ramp", int(size)),
+                          np.arange(int(size), dtype=np.float32))
+
+
+class HannWindow(_Window):
+    def run(self):
+        size, n1 = self.size_and_n1()
+        s = self.unary(self.affine(self.ramp(size), math.pi / n1, 0.0),
+                       vc4infer.UOP_SIN)
+        return self.mul(s, s)
+
+
+class HammingWindow(_Window):
+    def run(self):
+        size, n1 = self.size_and_n1()
+        alpha = 25.0 / 46.0
+        beta = 1.0 - alpha
+        c = self.unary(self.affine(self.ramp(size),
+                                   2.0 * math.pi / n1, 0.0),
+                       vc4infer.UOP_COS)
+        return self.affine(c, -beta, alpha)
+
+
+class BlackmanWindow(_Window):
+    ALPHA = 0.42
+    BETA = 0.08
+
+    def run(self):
+        size, n1 = self.size_and_n1()
+        r = self.ramp(size)
+        w = 2.0 * math.pi / n1
+        c1 = self.unary(self.affine(r, w, 0.0), vc4infer.UOP_COS)
+        c2 = self.unary(self.affine(r, 2.0 * w, 0.0), vc4infer.UOP_COS)
+        return self.add(self.affine(c1, -0.5, 0.0),
+                        self.affine(c2, self.BETA, self.ALPHA))
+
+
+class MelWeightMatrix(_Sig):
+    """MelWeightMatrix: the filterbank values are QPU arithmetic.
+
+    ONNX MelWeightMatrix-17 (formula spelled out in the operator
+    documentation): with mel(f) = 2595 log10(1 + f/700),
+
+        m_i   = mel(low) + i * (mel(high) - mel(low)) / (num_mel_bins + 2)
+        f_i   = 700 (10^(m_i/2595) - 1)
+        bin_i = floor((dft_length + 1) f_i / sample_rate)
+
+    and band i, with (a, b, c) = (bin_i, bin_i+1, bin_i+2), owns the triangle
+    that rises from 0 at a to 1 at b and falls back to 0 at c.  The two
+    degenerate cases the reference defines are kept: b == a gives the single
+    entry at b the value 1, and c == b has no falling half.
+
+    The bins are *index metadata*: five scalar parameters in, integers out,
+    the same class of work as an axis list or a padding map.  The ramps and
+    the per-band gathers are index maps, and every value in the table is
+    produced by engine kernels -- subtract, reciprocal-multiply (divide),
+    exact comparisons, the two clamps and the max of the rising and falling
+    halves -- so no tensor arithmetic runs on the ARM.
+    """
+
+    def run(self):
+        node = self.node
+        if len(node.input) < 5:
+            self.fail("needs five scalar inputs (got %d)" % len(node.input))
+        v = [np.asarray(self.host_or_fail(node.input[i])).ravel()[0]
+             for i in range(5)]
+        mel, dft, sr = int(v[0]), int(v[1]), int(v[2])
+        low, high = float(v[3]), float(v[4])
+        odt = int(_attr(node, "output_datatype", onnx.TensorProto.FLOAT))
+        if odt != onnx.TensorProto.FLOAT:
+            self.fail("output_datatype=%s: the arena is fp32 only"
+                      % onnx.TensorProto.DataType.Name(odt))
+        if mel < 1 or dft < 2 or sr <= 0:
+            self.fail("need num_mel_bins >= 1, dft_length >= 2 and a positive "
+                      "sample_rate (got %d, %d, %d)" % (mel, dft, sr))
+        bins = dft // 2 + 1
+        lo_mel = 2595.0 * np.log10(1.0 + low / 700.0)
+        hi_mel = 2595.0 * np.log10(1.0 + high / 700.0)
+        step = (hi_mel - lo_mel) / (mel + 2)
+        f = 700.0 * (np.power(10.0, (lo_mel + step * np.arange(mel + 2))
+                              / 2595.0) - 1.0)
+        edge = np.floor((dft + 1) * f / sr).astype(np.int64)
+        a = edge[:mel]
+        b = edge[1:mel + 1]
+        c = edge[2:mel + 2]
+        if int(a.min()) < 0 or int(c.max()) > bins:
+            self.fail("mel edges [%d..%d] fall outside the %d DFT bins"
+                      % (int(a.min()), int(c.max()), bins))
+        n = bins * mel
+        k = np.arange(n, dtype=np.int64)
+        jj = (k // mel).astype(np.float32)
+        ii = (k % mel)
+        key = (int(mel), int(dft), int(sr), round(low, 6), round(high, 6))
+        J = self.const(("mel_j",) + key, jj)
+        A = self.const(("mel_a",) + key, a[ii].astype(np.float32))
+        B = self.const(("mel_b",) + key, b[ii].astype(np.float32))
+        C = self.const(("mel_c",) + key, c[ii].astype(np.float32))
+        one = self.const(("mel_one", n), np.ones(n, np.float32))
+        zero = self.const(("mel_zero", n), np.zeros(n, np.float32))
+
+        def clamp(t):
+            return self.maxmin(self.maxmin(t, one, False), zero, True)
+
+        def rcp(t):
+            return self.unary(t, vc4infer.UOP_RECIPROCAL)
+
+        lc = self.sub(B, A)                       # b - a
+        lc0 = self.cmp(vc4infer.OP_CMP_EQ, lc, zero)
+        lcs = self.add(lc, lc0)                   # >= 1, so the divide is safe
+        rise = clamp(self.mul(self.sub(J, A), rcp(lcs)))
+        rise = self.mul(rise, self.cmp(vc4infer.OP_CMP_LE, J, B))
+        ch = self.sub(C, B)                       # c - b
+        chp = self.cmp(vc4infer.OP_CMP_GT, ch, zero)
+        chs = self.add(ch, self.cmp(vc4infer.OP_CMP_EQ, ch, zero))
+        fall = clamp(self.mul(self.sub(C, J), rcp(chs)))
+        fall = self.mul(fall, self.cmp(vc4infer.OP_CMP_GE, J, B))
+        fall = self.mul(fall, chp)                # c == b: no falling half
+        out = self.maxmin(rise, fall, True)
+        spike = self.mul(lc0, self.cmp(vc4infer.OP_CMP_EQ, J, B))
+        out = self.maxmin(out, spike, True)       # b == a: the entry at b is 1
+        return self.tag(out, (bins, mel))
+
+
 # =====================================================================
 # dispatch table
 # =====================================================================
@@ -665,4 +831,8 @@ HANDLERS = {
     "RandomNormalLike": _mk(RandomNormal),
     "Bernoulli": _mk(Bernoulli),
     "Multinomial": _mk(Multinomial),
+    "HannWindow": _mk(HannWindow),
+    "HammingWindow": _mk(HammingWindow),
+    "BlackmanWindow": _mk(BlackmanWindow),
+    "MelWeightMatrix": _mk(MelWeightMatrix),
 }

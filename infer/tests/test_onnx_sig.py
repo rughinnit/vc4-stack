@@ -156,6 +156,20 @@ def _ref_stft(sig, step, win=None, onesided=1):
                              onesided=bool(onesided)), np.float32)]
 
 
+def _ref_window(op, size, periodic):
+    """onnx.reference's own window class, called with python scalars."""
+    if op == "HannWindow":
+        from onnx.reference.ops.op_hann_window import HannWindow as W
+    elif op == "HammingWindow":
+        from onnx.reference.ops.op_hamming_window import HammingWindow as W
+    else:
+        from onnx.reference.ops.op_blackman_window import BlackmanWindow as W
+    obj = object.__new__(W)
+    # _run returns a 1-tuple: (window,)
+    return [np.asarray(W._run(obj, int(size), TensorProto.FLOAT,
+                              int(periodic))[0], np.float32)]
+
+
 def _ref_mel(mel, dft, rate, lo, hi):
     from onnx.reference.ops.op_mel_weight_matrix import MelWeightMatrix
     obj = object.__new__(MelWeightMatrix)
@@ -479,7 +493,7 @@ def cases():
              ["num_mel_bins", "dft_length", "sample_rate", "lower_edge_hertz",
               "upper_edge_hertz"],
              oracle=lambda: _ref_mel(4, 8, 8000, 20.0, 4000.0),
-             note="folded at plan time (a constant table)"),
+             note="QPU table: bins are index metadata, values QPU arithmetic"),
         Case("MelWeightMatrix", "10mel-dft16",
              {}, {"num_mel_bins": np.asarray(10, np.int64),
                   "dft_length": np.asarray(16, np.int64),
@@ -490,6 +504,17 @@ def cases():
               "upper_edge_hertz"],
              oracle=lambda: _ref_mel(10, 16, 16000, 0.0, 8000.0)),
     ]
+
+    # ------------------------------------------------------------ windows
+    for op in ("HannWindow", "HammingWindow", "BlackmanWindow"):
+        for tag, periodic, size in (("periodic", 1, 8),
+                                    ("symmetric", 0, 9),
+                                    ("size1", 1, 1)):
+            out.setdefault(op, []).append(
+                Case(op, tag, {}, {"size": np.asarray(size, np.int64)},
+                     ["size"], attrs={"periodic": periodic},
+                     oracle=(lambda o=op, s=size, p=periodic:
+                             _ref_window(o, s, p))))
 
     # -------------------------------------------------------- the RNG family
     ru = []

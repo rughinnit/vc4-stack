@@ -20,6 +20,7 @@ and every path below is relative to the repository root unless it starts with
 | [`../infer/README.md`](../infer/README.md) | libvc4infer: API, build, kernel JIT, daemon backend, op coverage, limits |
 | [`../training/README.md`](../training/README.md) | backward kernels and the MLP/conv trainer, how to run them |
 | [`../vc4d/README.md`](../vc4d/README.md) | the privileged helper daemon: protocol, build, install |
+| [`../tf/README.md`](../tf/README.md) | the TensorFlow PluggableDevice: StreamExecutor API 0.0.1, the device type constraint, the implemented allocator/copy callbacks, the one op and what the next one costs |
 | `NCNN.md` | **ncnn vs the VC4 engine**: same model, same image — ncnn 74.8 ms vs VC4 481.7 ms (6.4×), detections identical to 0.00 px, and why the gap is launch count rather than arithmetic |
 | `ACCURACY.md` | **accuracy ledger**: VC4 vs the CPU on the same image (identical boxes, 0.00 px), per-op error bounds, training gradients, determinism, and where the error comes from (truncating FPU, no FMA, denormals) |
 | `BUGS.md` | every bug, its root cause, the fix, the verification and the commit — plus the open ones with workarounds and the process failures that cost time |

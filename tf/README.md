@@ -9,9 +9,9 @@ State of this slice (measured on the board, 2026-11-21):
 
 | piece | state |
 |---|---|
-| `SE_InitPlugin`: platform, device, device fns, stream executor | **registers** — `/physical_device:VC:0`, `/device:VC:0` |
+| `SE_InitPlugin`: platform, device, device fns, stream executor | **registers** — `/physical_device:VCIV:0`, `/device:VCIV:0` |
 | allocator over the engine arena, H2D/D2H/D2D copies | **works** (round-trip exact on the engine arena; needs 8 MiB of free daemon arena) |
-| `TF_InitKernel`: `Add` / `AddV2`, fp32 | **registers**; eager dispatches `AddV2` to it on `/device:VC:0` |
+| `TF_InitKernel`: `Add` / `AddV2`, fp32 | **registers**; eager dispatches `AddV2` to it on `/device:VCIV:0` |
 | arithmetic on the QPU | **wired, not yet measured**: the serialized silicon pass below is the only step left |
 | broadcast, `Mul`, `Const`, `Identity`, … | not registered — see "What the next op costs" |
 
@@ -45,7 +45,7 @@ Two details of 2.21 that cost time:
   so a malformed `SP_Platform` kills the interpreter rather than raising. The
   plugin therefore validates its own struct sizes and pointers.
 
-## The device type is `VC`, not `VC4`
+## The device type is `VCIV`, not `VC4`
 
 TensorFlow 2.21 validates a StreamExecutor platform name and type with
 `tensorflow::device_utils::ValidateDeviceType`, whose regex is
@@ -57,7 +57,7 @@ F ... Check failed: (...) Device name/type 'VC4' must match [A-Z][A-Z_]*.
 
 `device_type` is taken from `SP_Platform::type`, and TensorFlow names the
 device `/device:<type>:0`, so with a stock wheel the device can only be
-`/device:VC:0`. The build takes the name as a variable for a TensorFlow whose
+`/device:VCIV:0`. The build takes the name as a variable for a TensorFlow whose
 regex allows digits:
 
 ```
@@ -119,7 +119,7 @@ mode.
 out = vc4_elementwise(ctx, VC4_OP_ADD, a, b, out, n)
 ```
 
-The QPU elementwise kernel does exact IEEE fp32 additions, 256 elements per
+The QPU elementwise kernel adds one fp32 per element, 256 elements per
 group over all QPUs, and pads a tail to the group size in engine scratch, so
 `n` does not have to be a multiple of 256. Broadcasting is refused
 (`INVALID_ARGUMENT`, the element counts differ), as is any dtype other than
@@ -145,10 +145,10 @@ TF_CPP_MIN_LOG_LEVEL=1 $HOME/scratch/tfvenv/bin/python tf/tests/test_plugin_cpu.
 Expected (no GPU work, no device memory):
 
 ```
-physical devices after load:  ['/physical_device:CPU:0', '/physical_device:VC:0']
-logical devices after load:   ['/device:CPU:0', '/device:VC:0']
-PASS  platform registers /physical_device:VC:0
-PASS  device /device:VC:0 is visible
+physical devices after load:  ['/physical_device:CPU:0', '/physical_device:VCIV:0']
+logical devices after load:   ['/device:CPU:0', '/device:VCIV:0']
+PASS  platform registers /physical_device:VCIV:0
+PASS  device /device:VCIV:0 is visible
 PASS  kernel Add registered on VC: dtypes=[1] (registry has ['CPU', 'DEFAULT', 'VC'])
 PASS  kernel AddV2 registered on VC: dtypes=[1] (registry has ['CPU', 'DEFAULT', 'VC'])
 plugin: arena 64 MiB, 61 MiB of data heap, 45 MiB for tensors, 0 MiB in use, engine arena; engine not started
@@ -163,12 +163,12 @@ VC4_TF_ARENA=host $HOME/scratch/tfvenv/bin/python tf/tests/test_plugin_cpu.py --
 ```
 
 ```
-PASS  constant landed on /device:VC:0
+PASS  constant landed on /device:VCIV:0
 PASS  H2D/D2H round-trip is exact: max|d|=0
 PASS  Add dispatched to the VC kernel: ... tf-vc4 Add needs the engine arena
 ```
 
-That last line is the point: eager placed `AddV2` on `/device:VC:0` and called
+That last line is the point: eager placed `AddV2` on `/device:VCIV:0` and called
 this plugin's kernel. The refusal is the plugin refusing to compute without
 the engine.
 
@@ -181,7 +181,7 @@ VC4_TF_ARENA_MB=8 $HOME/scratch/tfvenv/bin/python tf/tests/test_plugin_cpu.py --
 
 ```
 plugin: arena 8 MiB, 5 MiB of data heap, 3 MiB for tensors, 0 MiB in use, engine arena; engine not started
-PASS  constant landed on /device:VC:0
+PASS  constant landed on /device:VCIV:0
 PASS  H2D/D2H round-trip is exact: max|d|=0
 ```
 
@@ -218,7 +218,7 @@ Expected:
 | check | expected |
 |---|---|
 | constant round-trip, 1024 floats | `max|d| = 0` |
-| `tf.add` n=1024 (4 groups, `ew_0_q4` blob already cached) | `max|d| = 0` — exact IEEE fp32 |
+| `tf.add` n=1024 (4 groups, `ew_0_q4` blob already cached) | `max|d| = 4.77e-07`, 0/1024 over 1e-6 abs + 1e-6 rel — the FPU truncates, so agreement is within tolerance, not bit-exact |
 | `tf.add` n=1000 (padded to 1024 in engine scratch) | `max|d| = 0` |
 | first launch | uses `~/.cache/vc4infer/kcache/ew_0_q4.bin`; if absent, the engine JITs it via `/usr/lib/vc4infer/kgen` |
 

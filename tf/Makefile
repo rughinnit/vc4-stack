@@ -14,8 +14,8 @@
 # `make clean` does not pay for an `import tensorflow` (seconds on an idle
 # board, minutes under load).
 #
-# DEVICE_TYPE defaults to VC because TensorFlow 2.21 rejects a digit in a
-# StreamExecutor platform name/type; see README.md.
+# DEVICE_TYPE defaults to VCIV (VideoCore IV) because TensorFlow 2.21
+# rejects a digit in a StreamExecutor platform name/type; see README.md.
 
 PYTHON  ?= python3
 TF_DIR  ?= $(shell $(PYTHON) -c 'import os, tensorflow; print(os.path.dirname(tensorflow.__file__))')
@@ -28,7 +28,7 @@ TF_LIB   = $(TF_DIR)/libtensorflow_framework.so.2
 VC4_CFLAGS ?= -I$(abspath $(CURDIR)/../infer/include)
 VC4_LIBS   ?= $(shell pkg-config --libs vc4infer)
 
-DEVICE_TYPE ?= VC
+DEVICE_TYPE ?= VCIV
 CC      ?= cc
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=gnu11 -fPIC
 CPPFLAGS = -I$(TF_INC) $(VC4_CFLAGS) -DVC4_TF_DEVICE_TYPE='"$(DEVICE_TYPE)"'

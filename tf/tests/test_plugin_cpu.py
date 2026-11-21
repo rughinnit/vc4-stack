@@ -30,7 +30,7 @@ import tensorflow as tf
 from tensorflow.python.framework import kernels as tf_kernels
 from tensorflow.python.framework.load_library import load_pluggable_device_library
 
-DEVICE_TYPE = os.environ.get("VC4_TF_DEVICE_TYPE", "VC")
+DEVICE_TYPE = os.environ.get("VC4_TF_DEVICE_TYPE", "VCIV")
 DEVICE = "/device:%s:0" % DEVICE_TYPE
 LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "build", "libtf_vc4_plugin.so")
@@ -168,8 +168,14 @@ def stage_add():
             z = tf.add(x, y)
             got = z.numpy()
         d = float(np.max(np.abs(got - want)))
-        check("tf.add n=%d on %s" % (n, DEVICE), d == 0.0,
-              "max|d|=%g (expected 0: the QPU add is exact IEEE fp32)" % d)
+        # The FPU truncates toward zero (docs/NUMERICS.md), so a single add
+        # agrees with round-to-nearest to a documented tolerance, not bit for
+        # bit.  The bound is the one the engine's own checks use.
+        tol = 1e-6 + 1e-6 * np.abs(want)
+        over = int(np.sum(np.abs(got - want) > tol))
+        check("tf.add n=%d on %s" % (n, DEVICE), over == 0,
+              "max|d|=%g over=%d/%d (tolerance 1e-6 abs + 1e-6 rel; "
+              "the FPU truncates)" % (d, over, n))
 
 
 def main():

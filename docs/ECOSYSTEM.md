@@ -54,6 +54,9 @@ Two execution paths and one distribution channel:
 | change the OpenCL compiler or runtime | `VC4C` / `VC4CL` branches |
 | monitor the GPU | `vc4top` |
 
+The state of every workstream, with the file or test behind it, is in
+[STATUS.md](STATUS.md).
+
 ## Rules this family follows
 
 1. **One main repo.** Plans, measurements, tolerances and known limitations live

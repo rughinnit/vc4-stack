@@ -48,6 +48,9 @@ identical detections) is in [`docs/NCNN.md`](docs/NCNN.md).
 Full table, the two execution paths and a "which repo do I open" guide:
 [`docs/ECOSYSTEM.md`](docs/ECOSYSTEM.md).
 
+**Current state:** [`docs/STATUS.md`](docs/STATUS.md) — what is done,
+limited, open or in progress, and the evidence behind each row.
+
 ## Start here
 
 New to the stack?  Follow the tutorial, in this order:

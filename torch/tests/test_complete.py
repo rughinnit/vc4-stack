@@ -112,15 +112,28 @@ def main():
         (2, 4, 9, 9, 5, 1, 2, 0, 1),
         (2, 6, 8, 8, 6, 3, 1, 1, 6),
         (3, 6, 9, 9, 6, 3, 2, 1, 6),
+        # grouped beyond depthwise: the engine's grouped NHWC kernel wants
+        # Cin/groups and Cout/groups to be multiples of 16
+        (2, 32, 8, 8, 32, 3, 1, 1, 2),
+        (2, 32, 9, 9, 64, 3, 2, 1, 2),
+        (2, 64, 8, 8, 64, 3, 1, 1, 4),
+        (1, 64, 8, 8, 128, 1, 1, 0, 4),
     ]
     for (N, C, H, W, Co, k, s, p, gr) in conv_cases:
         xi = torch.randn(N, C, H, W)
-        wi = torch.randn(Co, C // gr if gr == 1 else 1, k, k)
+        wi = torch.randn(Co, C // gr, k, k)
         bi = torch.randn(Co)
         ref = F.conv2d(xi, wi, bi, stride=s, padding=p, groups=gr)
         got = F.conv2d(U(xi), U(wi), U(bi), stride=s, padding=p, groups=gr)
         check("conv N%d %d->%d k%d s%d p%d g%d" % (N, C, Co, k, s, p, gr),
               got, ref, atol=5e-4)
+
+    # Unsupportable grouped shapes are refused by name, never expanded into a
+    # dense conv: a 3-channel group has no 16-lane panel.
+    raises("grouped conv 3-channel group raises",
+           lambda: F.conv2d(U(torch.randn(1, 12, 8, 8)),
+                            U(torch.randn(12, 3, 3, 3)),
+                            padding=1, groups=4), "multiples of 16")
 
     for N, C, H, W in ((2, 4, 16, 16), (3, 3, 8, 8)):
         x = torch.randn(N, C, H, W)
@@ -140,6 +153,27 @@ def main():
         check("upsample nearest (7,5) N%d" % N,
               F.interpolate(U(x), size=(7, 5), mode="nearest"),
               F.interpolate(x, size=(7, 5), mode="nearest"), exact=True)
+        check("upsample nearest 1.5x N%d" % N,
+              F.interpolate(U(x), scale_factor=1.5, mode="nearest"),
+              F.interpolate(x, scale_factor=1.5, mode="nearest"), exact=True)
+        # bilinear: both coordinate mappings, integer and non-integer scale
+        for ac in (False, True):
+            tag = "ac%d" % int(ac)
+            check("upsample bilinear 2x %s N%d" % (tag, N),
+                  F.interpolate(U(x), scale_factor=2, mode="bilinear",
+                                align_corners=ac),
+                  F.interpolate(x, scale_factor=2, mode="bilinear",
+                                align_corners=ac), atol=2e-6)
+            check("upsample bilinear (7,5) %s N%d" % (tag, N),
+                  F.interpolate(U(x), size=(7, 5), mode="bilinear",
+                                align_corners=ac),
+                  F.interpolate(x, size=(7, 5), mode="bilinear",
+                                align_corners=ac), atol=2e-6)
+            check("upsample bilinear 1.5x %s N%d" % (tag, N),
+                  F.interpolate(U(x), scale_factor=1.5, mode="bilinear",
+                                align_corners=ac),
+                  F.interpolate(x, scale_factor=1.5, mode="bilinear",
+                                align_corners=ac), atol=2e-6)
 
     for N in (2, 3):
         a = torch.randn(N, 3, 5, 5)
@@ -323,6 +357,12 @@ def main():
     parity("upsample nearest N2", lambda x: F.interpolate(
         x, scale_factor=2, mode="nearest"), [torch.randn(2, 3, 4, 5)],
         limit=1e-6)
+    parity("upsample bilinear N2", lambda x: F.interpolate(
+        x, scale_factor=2, mode="bilinear"), [torch.randn(2, 3, 4, 5)],
+        limit=1e-5)
+    parity("upsample bilinear ac N2", lambda x: F.interpolate(
+        x, size=(7, 5), mode="bilinear", align_corners=True),
+        [torch.randn(2, 3, 4, 5)], limit=1e-5)
     parity("softmax 3-D big classes", lambda x: F.softmax(x, -1),
            [torch.randn(2, 3, 40)], limit=3e-3)
     parity("broadcast add", lambda a, b: a + b,
@@ -375,6 +415,11 @@ def main():
            lambda: torch.amax(U(torch.randn(3, 4)).requires_grad_(),
                               dim=1).sum().backward(),
            "amax")
+    raises("grouped conv backward raises precisely",
+           lambda: F.conv2d(U(torch.randn(1, 32, 8, 8)).requires_grad_(),
+                            U(torch.randn(32, 16, 3, 3)), padding=1,
+                            groups=2).sum().backward(),
+           "grouped conv2d backward")
     raises("gather backward raises precisely",
            lambda: torch.gather(U(torch.randn(3, 4)).requires_grad_(), 1,
                                 U(torch.tensor([[0, 1, 2, 3]]))).sum()

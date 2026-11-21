@@ -1,4 +1,4 @@
-# torch_vc4 0.3.0 — completeness, accuracy and measured cost
+# torch_vc4 0.3.1 — completeness, accuracy and measured cost
 
 This is the authoritative op table for the backend.  Every aten op that
 `torch_vc4` intercepts is listed with
@@ -43,9 +43,9 @@ numerical contract, not because it beats a 1.2 GHz Cortex-A53.
 
 Sizes are the three listed per row.  Accuracy is the worst over the three
 shapes in `tests/completeness.py`; `tests/test_complete.py` independently
-checks the same ops (222 checks, all passing); `tests/test_cpu_registration.py`
-adds 46 device-free checks for registration, the broadcast and reduction
-plans, and the exact-GELU derivative.
+checks the same ops (244 checks on silicon, all passing, peak 66.1 C);
+`tests/test_cpu_registration.py` adds 48 device-free checks for registration,
+the broadcast and reduction plans, and the exact-GELU derivative.
 
 | aten op | backend | max abs / max rel | vc4 ms (3 sizes) | CPU ms (3 sizes) |
 |---|---|---|---|---|
@@ -54,9 +54,13 @@ plans, and the exact-GELU derivative.
 | `conv2d` dense stride 1 | device (native NHWC for batches) | 5.11e-04 / 2.62e-04 | 1.565 / 10.066 / 9.486 | 0.077 / 2.450 / 3.209 |
 | `conv2d` dense stride 2 | device (native NHWC, stride 2) | 4.69e-04 / 1.85e-04 | 1.781 / 5.680 / 6.122 | 0.085 / 1.589 / 1.899 |
 | `conv2d` depthwise 3x3 | device (native NHWC depthwise) | 5.72e-06 / 1.80e-06 | 1.970 / 3.376 / 7.342 | 0.893 / 1.138 / 1.405 |
+| `conv2d` grouped g2, 16-channel groups | device (native grouped NHWC) | 2.17e-04 / 8.95e-05 | 2.805 / 6.524 / 15.655 | 0.827 / 2.944 / 4.604 |
+| `conv2d` grouped g4, 16-channel groups | device (native grouped NHWC) | 2.02e-04 / 9.67e-05 | 4.671 / 12.124 / 21.706 | 1.245 / 4.703 / 9.330 |
 | `max_pool2d 2x2` | device | 0 / 0 (exact) | 0.898 / 3.610 / 5.121 | 0.053 / 0.302 / 0.633 |
 | `adaptive_avg_pool2d 1x1` | composite (GEMM) | 2.60e-06 / 2.60e-06 | 1.352 / 2.624 / 4.226 | 0.073 / 0.098 / 0.152 |
 | `upsample_nearest2d 2x` | composite | 0 / 0 (exact) | 0.489 / 5.304 / 14.616 | 0.107 / 1.360 / 4.497 |
+| `upsample_bilinear2d` 2x, align_corners=False | device (4 gathers + mul/add) | 7.15e-07 / 3.58e-07 | 6.387 / 82.101 / 350.166 | 0.370 / 4.531 / 4.573 |
+| `upsample_bilinear2d` (7,5), align_corners=True | device (4 gathers + mul/add) | 4.77e-06 / 4.77e-06 | 2.404 / 2.963 / 3.932 | 0.111 / 0.307 / 1.029 |
 | `aten::cat` (channel) | composite (host byte copy) | 0 / 0 (exact) | 0.711 / 5.357 / 9.376 | 0.046 / 0.240 / 1.237 |
 | `softmax` <= 16 classes | device | 4.47e-07 / 4.47e-07 | 0.660 / 0.784 / 2.301 | 0.027 / 0.035 / 0.098 |
 | `softmax` > 16 classes | composite (sigmoid-exp + max/sum) | 8.49e-07 / 8.49e-07 | 10.272 / 37.214 / 503.317 | 0.027 / 0.073 / 1.195 |
@@ -78,6 +82,28 @@ per-channel reduction plus each full-map elementwise op is many ~3K-element
 launches, so a 32 Ki-element BN costs ~126 launches (~12 ms of GPU kernel
 time, the rest is round-trip latency).  A fused device BN kernel would fix
 this; it is on the engine's side, not hidden here.
+
+Bilinear resize is the second case: `vc4_resize_bilinear_mode` lowers it to
+four index-map gathers of the source plus four multiplies and three adds
+(4 + 4 + 3 passes over the output), so the ARM only writes integer tables
+and per-output weights from the output grid -- no activation value reaches
+the CPU.  That is 11 passes per 3,072 output elements (12 QPUs x 256 lanes),
+i.e. 350 ms at 1x32x128x128 against 4.57 ms on the CPU.  The previous
+lowering built the dense `[n_out][n_in]` interpolation matrix and ran it as
+one matvec: exact, but O(n_out*n_in), and it refused any resize over the
+32 MiB table cap (a 2x upsample of 128x128 needs 256 GiB).  Both coordinate
+mappings are measured above; `align_corners=True` is the engine's
+`VC4_RESIZE_ALIGN_CORNERS` and `False` its `VC4_RESIZE_HALF_PIXEL`.
+
+Grouped conv is the engine's `vc4_conv_nhwc_group`: one packed weight panel
+per group and one GEMM per group, each writing its own channel range of the
+single NHWC output (the GEMM C row stride is Cout), so the MACs are the real
+grouped MACs and nothing is interleaved on the ARM.  The per-group panel is
+k-major with one 16-channel block per tap, which is why `Cin/groups` and
+`Cout/groups` must be multiples of 16; anything else is refused by name
+rather than expanded into a dense conv.  Both g2 and g4 are measured above
+and checked against the CPU in `tests/test_complete.py`; grouped backward
+raises (see below).
 
 ## Newly routed unary bodies (measured 2026-11-21)
 
@@ -143,9 +169,10 @@ the table stays readable.
 | `aten::max.dim` / `min.dim` | composite (values + host indices) | values 2e-5, indices exact |
 | `aten::gather`, `aten::index_select` | composite (host word gather) | exact |
 | `aten::sigmoid`, `aten::silu`, `aten::relu` | device | 2e-6 / 2e-6 (sigmoid/silu), exact (relu) |
-| `aten::convolution` any batch, stride 1/2, depthwise | device | 5.6e-04 / 2.6e-04 |
+| `aten::convolution` any batch, stride 1/2, depthwise, grouped | device | 5.6e-04 / 2.6e-04 |
 | `aten::max_pool2d` generic NxN/stride/pad, any batch | device | exact |
 | `aten::_adaptive_avg_pool2d`, `upsample_nearest2d`, any batch | composite | 2.6e-06 / 2.6e-06; resize exact |
+| `aten::upsample_bilinear2d`, any scale, both `align_corners` | device (4 gathers + mul/add) | 4.8e-06 / 4.8e-06 |
 | `aten::native_batch_norm` / `batch_norm` train+eval | composite | 8.4e-05 / 2.4e-05 |
 | `aten::view` / `flatten` / `reshape` / `as_strided` | metadata only | exact |
 | autograd | see README | gradients <= 2e-3 relative vs CPU (measured) |
@@ -159,12 +186,27 @@ the table stays readable.
 | `amax`/`amin` **backward**, `gather`/`index_select` **backward** | Their gradients need an additive scatter (equality mask for ties); no such kernel exists.  Forward is supported. |
 | float64 (`.double()`, `dtype=torch.float64`) | Unsupported **by design**: the VC4 QPU and every engine kernel are float32-only.  Emulating fp64 would double storage and add conversion launches while still computing in fp32 — rejected instead of silently downgraded. |
 | conv `dilation != 1` | The engine's NHWC path has an explicit-dilation entry point, but it is not wired into this backend; the NCHW/NHWC paths used here are dilation 1. |
-| transposed conv, `output_padding`, `ceil_mode` pooling, non-square stride/padding, kernels other than 1x1/3x3, `groups` other than 1 or depthwise | Not implemented by the kernels this backend wires; the message names the constraint. |
+| transposed conv, `output_padding`, `ceil_mode` pooling, non-square stride/padding, kernels other than 1x1/3x3 | Not implemented by the kernels this backend wires; the message names the constraint. |
+| grouped conv with `Cin/groups % 16 != 0` or `Cout/groups % 16 != 0` | The engine's grouped panel is k-major with one 16-channel block per tap, so a group needs 16-channel blocks; the error names both counts. |
+| grouped conv **backward** (groups > 1 beyond depthwise) | The engine's dX/dW kernels run one dense GEMM over the whole channel axis and have no per-group binder; forward is supported, the backward raises with that reason. |
 | `torch.device("vc4")` string | torch 2.15's device-string parser was initialised before the PrivateUse1 rename; use `torch_vc4.device()` (documented in the README). |
 | host RNG (`normal_`, `uniform_`) | The GPU has no RNG kernel; parameters/data are generated on the host and uploaded.  Stated, not hidden: data generation, never compute. |
 
 ## Engine findings that shaped the implementation (measured)
 
+* **Bilinear resize is a composition, not a kernel.**  `vc4_resize_bilinear`
+  had no QPU body: it built the dense interpolation matrix on the ARM and
+  ran it as one matvec (`O(n_out*n_in)`, capped at 32 MiB of table).  It is
+  now `vc4_resize_bilinear_mode`, four `vc4_gather` passes (int32 byte-offset
+  tables) plus the element-verified elementwise multiply/add, with all three
+  coordinate mappings (`half_pixel`, `align_corners`, `asymmetric`) and
+  element error <= 4.8e-06 against an fp64 oracle on silicon
+  (`test_bwd_one resize_bilinear_fwd`).  The gathered tables are geometry
+  only: no activation value is read by the ARM.
+* **`vc4_gather` is verified and used.**  It was gated after it wedged the
+  QPU; the store and TMU defects behind that are fixed (`vc4-stack`
+  `docs/BUGS.md` A18/B5: 0 bad at n = 1..1000).  The resize lowering above is
+  its first use in this backend's path.
 * **`vc4_reduce` hangs the GPU in this engine build.**  A single call on a
   1x37 tensor returned `VC4_ERR_TIMEOUT` (-4) and killed the context.  Reductions
   therefore use a GEMM (sum/mean) or a relu max tree (amax/amin), all on the QPU.
@@ -207,33 +249,56 @@ statically linked against `libvc4infer.a`), published next to `vc4infer` in
 the signed `vc4-apt` repository:
 
 * index: <https://rughinnit.github.io/vc4-apt/pip/simple/>
-* wheel: `pip/torch_vc4-0.3.0-cp313-cp313-linux_aarch64.whl`
-* sha256: `9fdc000e215f6192d5de7164d7caee84433fa52876515a92a33b7b9f8c9e3759`
+* wheel: `pip/torch_vc4-0.3.1-cp313-cp313-linux_aarch64.whl` (797,258 B)
+* sha256: `457791f211e1adb16eef6e6de4b437cd064606e9dcde79b946bde73736485489`
 
 ## Reproduce
 
 ```sh
-.venv/bin/python tests/test_cpu_registration.py  # device-free: 46 checks
-.venv/bin/python tests/test_complete.py   # this table's accuracy checks
+.venv/bin/python tests/test_cpu_registration.py  # device-free: 48 checks
+.venv/bin/python tests/test_complete.py   # this table's accuracy checks (244)
 .venv/bin/python tests/completeness.py    # this table's timings
 sh tests/run_all.sh                       # all five suites
 # against an installed wheel (a clean venv):
 PYTHON=/path/to/cleanvenv/bin/python sh tests/run_all.sh
 ```
 
-The unary rows above were measured with the worktree engine and kgen:
+`test_complete.py` and `completeness.py` prefer the `torch_vc4` beside them
+when that package carries a built `_C*.so`, so an editable install elsewhere
+cannot be measured by accident.
+
+The rows measured on 2026-11-21 (grouped conv, bilinear resize and the whole
+table) came from the monorepo worktree `vc4-stack` at `torch/`, with the
+engine and daemon client built from the same tree:
 
 ```sh
-cd ~/work/vc4-kops && make -C infer -j2
-cd ~/work/torch-vc4-gaps
-export PYTHONPATH=$PWD TMPDIR=$HOME/scratch/tmp VC4INFER_DAEMON=1
-export VC4INFER_KGEN=$PWD/../vc4-kops/infer/tools/kgen.py
-export ASM3_DIR=$PWD/../vc4-kops/infer/tools
-tools=../vc4-kops/tools/thermal-guard.sh
-$tools --interval 10 --max 71 -- ../torch-vc4/.venv/bin/python \
-    tests/test_cpu_registration.py
-$tools --interval 10 --max 71 -- ../torch-vc4/.venv/bin/python \
-    tests/test_ops.py
-$tools --interval 10 --max 71 -- ../torch-vc4/.venv/bin/python \
-    tests/test_autograd.py
+cd ~/work/vc4-torch-fin
+make -C vc4d build/libvc4client.a
+make -C infer build/libvc4infer.a
+# the tests load this checkout's extension, so build it in place
+(cd torch && MAX_JOBS=1 ~/work/torch-vc4/.venv/bin/python setup.py \
+    build_ext --inplace)
+export TMPDIR=$HOME/scratch/tmp VC4INFER_DAEMON=1 MAX_JOBS=1
+tools=$HOME/work/vc4-torch-fin/tools/thermal-guard.sh
+$tools --max 71 -- ~/work/torch-vc4/.venv/bin/python \
+    torch/tests/test_cpu_registration.py
+$tools --max 71 -- ~/work/torch-vc4/.venv/bin/python \
+    torch/tests/test_complete.py
+(cd torch && $tools --max 71 -- ~/work/torch-vc4/.venv/bin/python \
+    tests/completeness.py)
+```
+
+The silicon run recorded here started at 63.4 C (the board was still warm
+from another job, not the 58 C the protocol asks for), peaked at 66.1 C with
+`throttled=0x0` at the stock 400 MHz core, and passed 244/244 checks.  The
+timings were taken on a quiet board at 65.0 C peak.
+
+The engine side of the resize is one process per op:
+
+```sh
+cd ~/work/vc4-torch-fin/infer
+VC4INFER_DAEMON=1 ./build/test_bwd_one resize_bilinear_fwd
+#  half_pixel    max_abs 4.88e-07  bad 0
+#  align_corners max_abs 1.19e-07  bad 0
+#  asymmetric    max_abs 2.99e-07  bad 0
 ```

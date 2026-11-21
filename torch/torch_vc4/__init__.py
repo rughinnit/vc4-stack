@@ -7,7 +7,8 @@ Usage:
     y = x @ x
 
 A usable subset exists on the device: gemm/linear, conv2d (batched, stride
-1/2, depthwise), pools, softmax for any class count, nearest resize,
+1/2, depthwise and grouped), pools, softmax for any class count, nearest and
+bilinear resize,
 elementwise/unary ops, broadcasting, arbitrary-dim reductions, indexing,
 batch norm (eval and training), views, and autograd for the training path.
 Anything else raises instead of falling back to the CPU; COMPLETENESS.md is
@@ -29,6 +30,8 @@ import sys as _sys
 import types as _types
 
 import torch as _torch
+
+__version__ = "0.3.1"
 
 # The native part is a plain shared object (no pybind11: it would not fit in
 # this board's compile budget).  Loading it runs the static registrations:
@@ -183,11 +186,14 @@ SUPPORTED_OPS = (
     "aten::linear (F.linear / nn.Linear; x @ W^T + bias, all on the QPU)",
     # conv / pool (batch > 1, stride 1/2, 1x1/3x3, depthwise)
     "aten::convolution_overrideable (conv2d, any batch, stride 1/2, "
-    "pad, groups=1 and depthwise)",
+    "pad, groups=1, grouped (needs Cin/groups and Cout/groups multiples of "
+    "16; forward only) and depthwise)",
     "aten::max_pool2d (2x2/2 engine kernel, any NxN/stride/pad generic, "
     "any batch)",
     "aten::_adaptive_avg_pool2d (any output size, GEMM reduction, any batch)",
     "aten::upsample_nearest2d (nearest, any scale, any batch)",
+    "aten::upsample_bilinear2d (any scale, align_corners True/False, any "
+    "batch)",
     # elementwise / unary (verified engine bodies)
     "aten::add.Tensor / sub.Tensor / mul.Tensor / div.Tensor "
     "(N-D broadcasting, per-channel, scalars)",
@@ -215,7 +221,8 @@ SUPPORTED_OPS = (
     "autograd for mm/matmul, linear, broadcast add/sub/mul/div, scalar ops, "
     "relu, silu, sigmoid, abs, sign, clip, leaky_relu, hardsigmoid, "
     "hardswish, tanh, sqrt, reciprocal, gelu, softmax, conv2d, "
-    "max_pool2d, adaptive_avg_pool2d, batch_norm (train+eval), sum/mean "
+    "max_pool2d, adaptive_avg_pool2d, upsample_nearest2d, "
+    "upsample_bilinear2d, batch_norm (train+eval), sum/mean "
     "(full and dim), view/as_strided(contiguous); amax/amin, gather and "
     "scatter-like backwards raise with the precise reason",
 )

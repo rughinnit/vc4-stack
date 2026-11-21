@@ -51,7 +51,9 @@ def check(name, ok, detail=""):
 def registration():
     key = "PrivateUse1"
     for name in ("aten::floor", "aten::ceil", "aten::round",
-                 "aten::exp", "aten::log", "aten::erf"):
+                 "aten::exp", "aten::log", "aten::erf",
+                 "aten::upsample_bilinear2d",
+                 "aten::upsample_bilinear2d.vec"):
         check("registered " + name,
               torch._C._dispatch_has_kernel_for_dispatch_key(name, key))
 

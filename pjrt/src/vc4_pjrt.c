@@ -1051,6 +1051,16 @@ static vc4_buf slot_buf(PJRT_Executable *e, int slot) {
     return b;
 }
 
+/* A view of `words` f32 elements starting at element `start` of a slot.  A
+ * batched GEMM and a convolution walk the batch axis this way. */
+static vc4_buf slot_view(PJRT_Executable *e, int slot, size_t start,
+                         size_t words) {
+    vc4_buf b = slot_buf(e, slot);
+    b.off += (uint32_t)(start * 4);
+    b.bytes = words * 4;
+    return b;
+}
+
 /* Parse the module and give every tensor a fixed slot in one arena slab.
  * Constants and layout tables are written once, here; Execute only uploads
  * the parameters and downloads the results. */
@@ -1467,7 +1477,7 @@ static PJRT_Error *run_insn(VC4PjrtClient *c, PJRT_Executable *e,
         if (in->table < 0 || in->table_slot < 0)
             return make_error(PJRT_Error_Code_INTERNAL, "missing layout table");
         vc4_buf T = slot_buf(e, in->table_slot);
-        st = vc4_gather(ctx, &T, &D, n, 0.0f);
+        st = vc4_gather(ctx, &T, &D, n, in->fill);
         break;
     }
     case VC4SL_SELECT: {
@@ -1475,10 +1485,52 @@ static PJRT_Error *run_insn(VC4PjrtClient *c, PJRT_Executable *e,
         st = vc4_select3(ctx, VC4_SEL_WHERE, &A, &B, &C, &D, n);
         break;
     }
-    case VC4SL_REDUCE_SUM:
+    case VC4SL_REDUCE:
+        if (in->aux[2] < VC4_RED_SUM || in->aux[2] > VC4_RED_MIN)
+            return make_error(PJRT_Error_Code_UNIMPLEMENTED,
+                              "%s: reduction %lld", in->name,
+                              (long long)in->aux[2]);
         st = vc4_reduce(ctx, &A, &D, (uint32_t)in->aux[0],
-                        (uint32_t)in->aux[1], VC4_RED_SUM);
+                        (uint32_t)in->aux[1], (vc4_redop)in->aux[2]);
         break;
+    case VC4SL_DOT_N: {
+        /* One GEMM per batch element; every slice is contiguous because the
+         * lowering ordered the operands as [batch][M][K] and [batch][K][N]. */
+        uint32_t M = (uint32_t)in->aux[0], N = (uint32_t)in->aux[1];
+        uint32_t K = (uint32_t)in->aux[2];
+        long nb = (long)in->aux[3];
+        for (long b = 0; b < nb && st == VC4_OK; b++) {
+            vc4_buf Ab = slot_view(e, in->a, (size_t)b * M * K,
+                                   (size_t)M * K);
+            vc4_buf Bb = slot_view(e, in->b, (size_t)b * K * N,
+                                   (size_t)K * N);
+            vc4_buf Db = slot_view(e, in->dst, (size_t)b * M * N,
+                                   (size_t)M * N);
+            st = vc4_matmul(ctx, &Ab, &Bb, &Db, M, N, K,
+                            VC4_LAYOUT_ROW_MAJOR);
+        }
+        break;
+    }
+    case VC4SL_CONV: {
+        int Cin = (int)in->aux[0], H = (int)in->aux[1], W = (int)in->aux[2];
+        int Cout = (int)in->aux[3], K = (int)in->aux[4], pad = (int)in->aux[5];
+        int nimg = (int)in->aux[6], HO = (int)in->aux[7], WO = (int)in->aux[8];
+        size_t iwords = (size_t)Cin * (size_t)H * (size_t)W;
+        size_t owords = (size_t)Cout * (size_t)HO * (size_t)WO;
+        vc4_buf Wt = slot_buf(e, in->b);
+        for (int b = 0; b < nimg && st == VC4_OK; b++) {
+            vc4_buf Ib = slot_view(e, in->a, (size_t)b * iwords, iwords);
+            vc4_buf Ob = slot_view(e, in->dst, (size_t)b * owords, owords);
+            int ho = 0, wo = 0;
+            st = vc4_conv2d(ctx, &Ib, Cin, H, W, &Wt, Cout, K, K, NULL, 1,
+                            pad, &Ob, &ho, &wo);
+            if (st == VC4_OK && (ho != HO || wo != WO))
+                return make_error(PJRT_Error_Code_INTERNAL,
+                                  "%s: conv2d wrote %dx%d, expected %dx%d",
+                                  in->name, ho, wo, HO, WO);
+        }
+        break;
+    }
     case VC4SL_CONSTANT:
         return NULL;
     default:

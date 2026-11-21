@@ -40,8 +40,8 @@ int main(int argc, char **argv) {
     static const char *ops[] = {"add", "sub", "mul", "maximum", "abs",
                                 "affine", "gather", "negate", "relu",
                                 "compare", "select", "dot", "dot_bt",
-                                "bcast", "transpose", "reduce_sum",
-                                "constant"};
+                                "bcast", "transpose", "reduce",
+                                "constant", "dot_n", "conv"};
     for (int i = 0; i < p->num_insns; i++) {
         vc4sl_insn *in = &p->insns[i];
         printf("  %-10s a=%d b=%d c=%d -> t%d", ops[in->op], in->a, in->b,
@@ -50,15 +50,27 @@ int main(int argc, char **argv) {
         if (in->op == VC4SL_DOT || in->op == VC4SL_DOT_BT)
             printf(" M=%lld N=%lld K=%lld", (long long)in->aux[0],
                    (long long)in->aux[1], (long long)in->aux[2]);
-        if (in->op == VC4SL_REDUCE_SUM)
-            printf(" outer=%lld red=%lld", (long long)in->aux[0],
-                   (long long)in->aux[1]);
+        if (in->op == VC4SL_DOT_N)
+            printf(" batches=%lld M=%lld N=%lld K=%lld", (long long)in->aux[3],
+                   (long long)in->aux[0], (long long)in->aux[1],
+                   (long long)in->aux[2]);
+        if (in->op == VC4SL_CONV)
+            printf(" Cin=%lld H=%lld W=%lld Cout=%lld k=%lld pad=%lld "
+                   "images=%lld out=%lldx%lld",
+                   (long long)in->aux[0], (long long)in->aux[1],
+                   (long long)in->aux[2], (long long)in->aux[3],
+                   (long long)in->aux[4], (long long)in->aux[5],
+                   (long long)in->aux[6], (long long)in->aux[7],
+                   (long long)in->aux[8]);
+        if (in->op == VC4SL_REDUCE)
+            printf(" outer=%lld red=%lld redop=%lld", (long long)in->aux[0],
+                   (long long)in->aux[1], (long long)in->aux[2]);
         if (in->table >= 0) printf(" table=%d", in->table);
         printf("\n");
     }
     for (int i = 0; i < p->num_tables; i++) {
         printf("  table%d n=%d:", i, p->tables[i].n);
-        for (int k = 0; k < p->tables[i].n && k < 32; k++)
+        for (int k = 0; k < p->tables[i].n && k < 4096; k++)
             printf(" %d", p->tables[i].idx[k]);
         printf("\n");
     }

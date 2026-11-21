@@ -16,12 +16,14 @@ primitives on the QPUs through `libvc4infer`.  The plugin is in `pjrt/`.
 
 ## 1. Build, load, register
 
-The lowering uses `vc4_gather`, `vc4_reduce` and `vc4_select3`; build the
-engine from this checkout first (the installed `vc4infer` 1.2.8 predates the
-commit that ungated them).
+The lowering uses `vc4_gather`, `vc4_reduce`, `vc4_select3`, `vc4_matmul` and
+`vc4_conv2d`; build the engine from this checkout first (the installed
+`vc4infer` 1.2.8 predates the commit that ungated the first three).
 
     make -C infer
     make -C pjrt      # links infer/build when it exists, else the installed lib
+    make -C pjrt decode        # pjrt_decode: reader and lowering, no engine
+    make -C pjrt test-lower PYTHON=~/scratch/jaxvenv/bin/python3
     # either registration path works:
     PYTHONPATH=pjrt/python JAX_PLATFORMS=vc4 python3 -c 'import jax; print(jax.devices())'
     PJRT_NAMES_AND_LIBRARY_PATHS=vc4:$PWD/pjrt/build/libpjrt_vc4.so \
@@ -80,10 +82,24 @@ it to a linear instruction list over **one arena slab per executable**:
   list, downloads the result slots, and returns fresh buffers.  No value
   changes representation between kernels.
 
-Layout is a QPU gather: `broadcast_in_dim`, `transpose`, and the operand
-transpose a `dot_general` needs become `vc4_gather` with an int32 table of
-arena byte offsets computed at compile time.  `vc4_gather` is one launch per
-op, including its padded tail (the kernel pads into scratch itself).
+Layout is a QPU gather: `broadcast_in_dim`, `transpose`, `slice`, `pad`,
+`reverse`, and the operand permutations a `dot_general` or a non-trailing
+`reduce` needs become `vc4_gather` with an int32 table of arena byte offsets
+computed at compile time.  `vc4_gather` is one launch per op, including its
+padded tail (the kernel pads into scratch itself).  A `pad` puts its padding
+value in the gather's fill slot, which is the one runtime value a table can
+carry; `gather_v1` tables hold the values of a static index tensor.
+
+Integer values never reach a kernel.  An expression whose leaves are all
+`constant_v1` -- the index arithmetic JAX emits around a gather, a bounds
+mask, an `iota` ramp -- is folded at compile time and used to build the
+tables.  The fold reads no argument and no kernel result, so it is not host
+arithmetic on device data.
+
+Three instruction kinds drive more than one kernel launch: `VC4SL_DOT_N` runs
+one `vc4_matmul` per batch element, `VC4SL_CONV` runs one `vc4_conv2d` per
+image (im2col gather, weight pack, GEMM), and `VC4SL_REDUCE` carries the
+reduction op (`SUM`, `MAX`, `MIN`) instead of hard-coding a sum.
 
 ## 4. Op subset
 
@@ -95,28 +111,53 @@ message.  There is no CPU arithmetic fallback anywhere.
 | `add_v1`, `multiply_v1` | `vc4_elementwise(ADD/MUL)` | 1 |
 | `subtract_v1` | `vc4_unary(NEG)` + `vc4_elementwise(ADD)` | 2 |
 | `negate_v1` | `vc4_unary(NEG)` | 1 |
-| `maximum_v1` | `vc4_elementwise(CMP_GE)` + `vc4_select3(WHERE)` | 2 |
+| `maximum_v1`, `minimum_v1` | `vc4_elementwise(CMP_GE/CMP_LE)` + `vc4_select3(WHERE)` | 2 |
 | `relu_v1` (accepted; JAX emits `maximum` instead) | `vc4_relu` | 1 |
 | `compare_v1` (GT/GE/LT/LE/EQ) | `vc4_elementwise(CMP_*)` | 1 |
 | `select_v1` | `vc4_select3(WHERE)` | 1 |
-| `dot_general_v1/v2`, rank 2, no batching, one contracting dim each | `vc4_matmul`; a contracting dim 0 on either side becomes a `vc4_gather`, then `vc4_matmul` | 2 (pack + GEMM), +1 if transposed |
-| `reduce_v1` with `add`, trailing contiguous axes, zero init | `vc4_reduce(SUM)` | 1 |
+| `dot_general_v1/v2/v3`, any rank, any number of batching and contracting dimensions | layout gathers to `[batch][M][K]` and `[batch][K][N]` where the operands are not already in that order, then one `vc4_matmul` per batch element | 2 per batch element, +1 per permuted operand |
+| `reduce_v1` with `add`, `maximum` or `minimum`, any axes | layout gather to put the reduced axes last (skipped when they already are), then `vc4_reduce(SUM/MAX/MIN)` | 1, +1 when the axes are not trailing |
 | `broadcast_in_dim_v1` | compile-time index table, `vc4_gather` | 1 |
 | `transpose_v1` | compile-time permutation table, `vc4_gather` | 1 |
+| `slice_v1`, any rank, any axes, static strides | start/limit/stride table, `vc4_gather` | 1 |
+| `pad_v1`, edge and interior padding | table with a fill entry per padding slot, `vc4_gather` | 1 |
+| `reverse_v1` (what a negative-step slice becomes) | table, `vc4_gather` | 1 |
+| `gather_v1/v2` with a static index tensor, no operand batching dimensions | table, `vc4_gather` | 1 |
+| `iota_v1` | integer ramp materialised at compile time and uploaded | 0 |
+| `convolution_v1`, NCHW/OIHW/NCHW, 3x3 or 1x1, stride 1, symmetric padding, `Cin`/`Cout` a multiple of 16 | `vc4_conv2d` per image | 3 per image (im2col, weight pack, GEMM) |
 | `reshape_v1` | alias | 0 |
-| `convert_v1` f32→f32 | alias | 0 |
+| `convert_v1` f32→f32, and a constant integer converted to f32 | alias / compile-time constant | 0 |
 | `constant_v1` | uploaded once at compile | 0 |
 | `call_v1`, `return_v1`, `func_v1`, builtin `module` | inlined / structural | — |
 
-Eighteen VHLO operation names are accepted (the rows above, counting
+Twenty-five VHLO operation names are accepted (the rows above, counting
 `func_v1`, `call_v1` and `return_v1`, and not counting `relu_v1`, which no
-producer emits).
+producer emits).  The version suffix is not part of the match: `gather_v1`
+and `gather_v2` both lower, and their property lists differ only in the
+batching-dimension fields.
 
-Refused with a named op, by design: `iota_v1`, `slice_v1`, `gather_v1`,
-`convolution_v1`, `while_v1`/`if_v1`, any `dot_general` with batching
-dimensions or rank > 2, any `reduce` that is not a trailing contiguous sum
-with a zero initial value, any non-fp32 compute, and any predicate result
-returned to the host.
+Refused with a named op and the offending attribute or shape: `while_v1` and
+`if_v1`, `divide_v1` (so `mean` is `reduce` + `divide`, and the divide is
+refused), a `reduce` whose body is not `add`/`maximum`/`minimum` (for example
+`multiply_v1` for `prod`), a `reduce` whose initial value is not that op's
+identity, a `gather` whose index operand is not a compile-time constant or
+that carries operand batching dimensions, a `pad` whose padding value is not
+a compile-time constant, a `slice` with bounds outside its axis or a
+non-positive stride, a `convolution` with stride other than 1, dilation,
+groups, window reversal, a non-NCHW dimension order, a non-square or larger
+than 3x3 kernel, asymmetric padding, a padded image beyond the 8191-byte VDR
+pitch, or channels that are not a multiple of 16, any non-fp32 compute, and
+any predicate or integer result returned to the host.  Each message states
+the value that was refused, for example
+
+    convolution_v1: 3 input channels are not a multiple of 16
+    convolution_v1: window_strides [2,2] are outside the executed subset ([1,1])
+    reduce_v1: the reduction body multiply_v1 is outside the executed subset
+        (add, maximum, minimum)
+    gather_v2: the indices are not a compile-time constant, so there is no
+        static gather window
+
+
 
 ## 5. Measurements
 
@@ -150,7 +191,9 @@ are not bit-identical (the GEMM's summation order differs).
 | **grad_x** | 4.77e-07 | 0 / 6 | 6 |
 | **grad_w** | 0 | 0 / 12 | 0 |
 
-`iota` and `slice` are refused and the error names the op.
+That table predates the ops added below: `iota` and `slice` are accepted now,
+and the refusal checks that used them were replaced by value comparisons that
+have not run on silicon yet.
 
 Per call, warm, median of 20, including Python and transfer overhead:
 
@@ -166,6 +209,68 @@ the upload/download of every parameter and result, and the compile-time
 tables dominate 18 MACs.  The crossover is a matter of size, not of the
 plugin; the engine's own numbers (a 256³ GEMM at 8.5 GFLOP/s, YOLOv8n at
 2 FPS) are the scale at which the QPUs win.
+
+### 5.1 What the lowering checks measure
+
+`pjrt/tests/test_lower.py` needs no QPU.  It exports each program with
+`jax.export` -- the same portable artifact the compile path receives -- and
+runs `pjrt/build/pjrt_decode` on it (source in `pjrt/tools`), which links the
+reader and the lowering and nothing else.  Thirty-three checks, all passing on the current tree:
+
+* the instruction list of every new op, so a case that starts or stops
+  lowering is visible;
+* the reduction geometry (`outer`, `red`, the reduction op) and the GEMM and
+  convolution geometry (M, N, K, batches; Cin, H, W, Cout, kernel, padding,
+  images);
+* the exact source element of every output element for `slice`, `reverse`,
+  `pad` and `gather`, computed in numpy by applying the same operation to an
+  `arange` tensor, and for `pad` the fill entries as -1.
+
+That is a check of the lowering, not of the kernels: it proves the tables and
+the geometry say what they claim, and says nothing about the values the QPUs
+produce.  Those need the serialized pass below.
+
+### 5.2 The serialized GPU pass (not yet run)
+
+The board was busy with another run while this change was made, so no kernel
+was launched.  The pass to run, on an idle board:
+
+    cd ~/work/vc4-pjrt2
+    make -C infer -j2                    # gather/reduce/select3/conv2d kernels
+    make -C pjrt
+    TMPDIR=$HOME/scratch/tmp PYTHONPATH=pjrt/python JAX_PLATFORMS=vc4,cpu \
+      VC4PJRT_LOG=$HOME/scratch/logs/pjrt-ops.log \
+      tools/thermal-guard.sh --max 71 -- \
+      ~/scratch/jaxvenv/bin/python3 pjrt/tests/test_pjrt.py
+
+`test_pjrt.py` runs every case on both backends, compares element by element
+at the project tolerance (5e-4) and prints the launches the plugin logged.
+Expected per case: `over=0` of the element count, and these instruction and
+launch counts, which come from the lowered program (exact) and from the
+launch table above (predicted):
+
+| case | instructions | launches |
+|---|---|---:|
+| `slice`, `slice_step`, `slice_rank3` | gather | 1 |
+| `reverse` (negative step) | gather | 1 |
+| `pad`, `pad_interior` | gather with fill | 1 |
+| `iota` | none | 0 |
+| `gather_axis0`, `gather_2d` | gather | 1 |
+| `take` | gather, gather, select | 3 |
+| `sum_leading`, `max_leading` | gather, reduce | 2 |
+| `min_trailing`, `max_last` | reduce | 1 |
+| `sum_nontrailing` | gather, reduce | 2 |
+| `dot_batched` (2 x 3x4 · 4x3) | gather, batched GEMM | 5 |
+| `dot_rank3` (2x3x4 · 4x4) | GEMM | 2 |
+| `conv_3x3` (1x16x5x5, 16 filters) | conv | 3 |
+| `conv_1x1` (1x16x5x5, 16 filters) | conv | 3 |
+
+The refusals are checked in the same run and must print `refused (names op)`:
+`reduce_product`, `divide`, `conv_channels`, `conv_stride`, `while_loop`.
+
+Bit-exactness is not expected from the GEMM, convolution or reduction paths:
+their summation order differs from XLA:CPU's.  A pass is `ALL PJRT TESTS
+PASSED` with every case at `over=0`.
 
 ## 6. Does the backward pass stay on the device?
 
@@ -208,11 +313,13 @@ for the launch and transfer costs a real backend would have to hide.
 
     make -C infer
     make -C pjrt
+    make -C pjrt test-lower PYTHON=~/scratch/jaxvenv/bin/python3   # no QPU
     cd /home/raspi/work/vc4-pjrt
     export TMPDIR=$HOME/scratch/tmp
     PYTHONPATH=pjrt/python JAX_PLATFORMS=vc4,cpu \
       VC4PJRT_LOG=$HOME/scratch/logs/pjrt.log \
-      tools/thermal-guard.sh --max 71 -- python3 pjrt/tests/test_pjrt.py
+      tools/thermal-guard.sh --max 71 -- \
+      ~/scratch/jaxvenv/bin/python3 pjrt/tests/test_pjrt.py
 
 `VC4PJRT_LOG` records each compile (`format`, size) and each execution
 (instructions, launches, QPU kernel nanoseconds).  `VC4PJRT_DUMP_DIR` writes

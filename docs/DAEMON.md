@@ -132,6 +132,37 @@ which is launch-bound.  First 128³ run after boot is colder (1.25 ms wall).
   64 MiB client region and the 72 MiB daemon; `test_convgrad` was also verified
   separately against this exact unit.
 
+## Client arenas and CMA accounting
+
+`vc4d` allocates **one** dma-buf from the 256 MiB CMA pool at startup and
+divides it into per-client regions, so a managed engine does not allocate CMA.
+Closing an engine (`vc4_shutdown` -> `vc4c_close`) sends `CLOSE`, and the
+daemon frees the region before it replies; `arena_used` also returns to 0 B
+when the peer socket outlives the process that allocated (B10).
+
+Measured on this board with the 96 MiB unit: 16 engine open/close cycles in one
+process left `arena_used == 0 B` after every close, and `CmaFree` was flat to
+the kilobyte.  Three engines opened at once with `arena_mb=24` also fit, and
+all three regions were released.
+
+`CmaFree` is nevertheless a poor leak counter, because the pool is declared
+`reusable` and page cache occupies it between CMA allocations.  One short
+Python run moved `CmaFree` from 104300 kB to 62256 kB with no GPU client open;
+`echo 3 > /proc/sys/vm/drop_caches` moved it back to 104296 kB.  A low
+`CmaFree` at idle therefore does not mean an arena leaked.
+
+The kernel lines
+
+    cma: __cma_alloc: alloc failed, req-size: 16384 pages, ret: -16
+    cma: __cma_alloc: alloc failed, req-size: 8192 pages, ret: -16
+
+are the *direct* backend's `gpu_alloc()` ladder (64 MiB, then `want/2`), not
+vc4d: a managed client asks the daemon for a region and never calls
+`DMA_HEAP_IOCTL_ALLOC`.  With two daemons holding 48 + 96 MiB, ~58 MiB of free
+pages split by page cache cannot satisfy a 64 MiB contiguous request, and the
+32 MiB retry can still fail on fragmentation.  `infer/tests/test_hybrid.py`
+refuses to run on the direct backend for this reason.
+
 ## G2/G3/G4 (1.2.7): the three that turned a transient condition permanent
 
 Each of these was a case where a moment of bad luck (CMA busy, more shapes

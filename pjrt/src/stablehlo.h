@@ -43,8 +43,11 @@ typedef enum {
     VC4SL_DOT_BT,
     VC4SL_BROADCAST,
     VC4SL_TRANSPOSE,
-    VC4SL_REDUCE_SUM,
+    VC4SL_REDUCE,            /* aux[0] outer, aux[1] red, aux[2] vc4_redop */
     VC4SL_CONSTANT,
+    VC4SL_DOT_N,             /* batched GEMM: aux[0..3] = M, N, K, batches */
+    VC4SL_CONV,              /* NCHW conv: aux[0..8] = Cin,H,W,Cout,K,pad,
+                                images,HO,WO */
 } vc4sl_opcode;
 
 typedef struct {
@@ -53,7 +56,8 @@ typedef struct {
     int dst;
     int a, b, c;
     vc4sl_shape shape;      /* result shape */
-    int64_t aux[8];         /* cmp direction, outer/red, ... */
+    int64_t aux[12];        /* cmp direction, outer/red, dot geometry, ... */
+    float fill;             /* VC4SL_GATHER: value for negative table entries */
     int table;              /* index into program tables, or -1 */
     int table_slot;         /* arena tensor holding the int32 table */
 } vc4sl_insn;

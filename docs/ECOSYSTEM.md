@@ -7,9 +7,9 @@ here, or a fork of an upstream project that this stack improves.
 
 | repository | provenance | what it is | state | artifacts |
 |---|---|---|---|---|
-| **`rughinnit/vc4-stack`** | this stack | **MAIN.** The stack: inference engine (`libvc4infer` + `vc4infer`), QPU kernels, training core, ONNX runner and ORT provider, `vc4d` helper, docs, tools | **v1.2.3**, suite green, YOLOv8n 160 at **487 ms / 2.05 FPS** | nothing published directly; packages come from `vc4-apt` |
+| **`rughinnit/vc4-stack`** | this stack | **MAIN.** The stack: inference engine (`libvc4infer` + `vc4infer`), QPU kernels, training core, ONNX runner and ORT provider, `vc4d` helper, PyTorch `PrivateUse1` backend (`torch/`), docs, tools | **v1.2.3**, suite green, YOLOv8n 160 at **487 ms / 2.05 FPS** | nothing published directly; packages come from `vc4-apt` |
 | `rughinnit/vc4-apt` | this stack | **The only installation source.** Signed apt repository + PEP 503 pip index (`https://rughinnit.github.io/vc4-apt`) | live, key `E4CB3BA0…`, `InRelease` signed | `vc4infer`, `vc4infer-dev`, `vc4-toolkit`, `vc4-toolkit-fast`, `vc4d`, `vc4train`, `vc4-query`, `vc4-smi`, `vc4top`, `vc4top-dkms`, `torch_vc4` wheel |
-| `rughinnit/torch-vc4` | this stack | PyTorch `PrivateUse1` backend: conv/pool/norm/activation/linear with autograd | **0.3.0**, 204 checks, native NHWC conv | `torch_vc4-0.3.0-cp313-…whl` via `vc4-apt` |
+| `rughinnit/torch-vc4` | this stack | **Mirror** of `vc4-stack/torch/`. The backend's history was grafted into `vc4-stack` under `torch/`; this repository is kept so the published wheel's metadata and old links keep resolving, and it is not a second source tree | source of truth is `vc4-stack/torch/` (`torch/COMPLETENESS.md`); the mirror follows it without carrying new work | `torch_vc4-0.3.0-cp313-…whl` via `vc4-apt` (built from `vc4-stack`) |
 | `rughinnit/vc4top` | fork (extended) | GPU monitor TUI + the **`vc4mon`** read-only DKMS module for unprivileged counters | **1.0.5**, 78-register parity with DRM debugfs | `vc4top`, `vc4top-dkms` via `vc4-apt` |
 | `rughinnit/VC4C` | fork of `doe300/VC4C` | OpenCL C → QPU compiler. Our performance work lives on branches, with a combined branch as the recommended one | `perf/combined` (+ `perf/spill-retry`, `perf/product-acc`, `perf/pipeline2/3/4`); 130/130 kernels compile | feeds VC4CL |
 | `rughinnit/VC4CL` | fork of `doe300/VC4CL` | OpenCL runtime. Debian 13 fixes, unprivileged operation, the M21 GEMM investigation | branches `fix/debian13-*`, `docs/m21-gemm-findings`; **3.085 GFLOP/s** with the improved compiler | `.deb` for VC4CL |
@@ -50,7 +50,7 @@ Two execution paths and one distribution channel:
 | install and run something | `vc4-apt` (`apt install vc4-toolkit`), documented in `vc4-stack/docs/INSTALL.md` |
 | understand how it works / read measurements | **`vc4-stack`** (`docs/TUTORIAL.md` first) |
 | report a bug or a wrong number | **`vc4-stack`** |
-| use PyTorch on the GPU | `torch-vc4` (and `vc4-stack/docs/API.md`) |
+| use PyTorch on the GPU | **`vc4-stack/torch/`** (`torch_vc4`; the `torch-vc4` repository is a mirror) |
 | change the OpenCL compiler or runtime | `VC4C` / `VC4CL` branches |
 | monitor the GPU | `vc4top` |
 
@@ -59,9 +59,11 @@ The state of every workstream, with the file or test behind it, is in
 
 ## Rules this family follows
 
-1. **One main repo.** Plans, measurements, tolerances and known limitations live
-   in `vc4-stack`; the other repos link back here rather than keeping their own
-   version of the truth.
+1. **One main repo.** Plans, measurements, tolerances, known limitations and
+   the framework adapters live in `vc4-stack` (`infer/`, `torch/`, `litert/`,
+   `pjrt/`, `tf/`, `ggml/`, `tvm_byoc/`); the other repos link back here rather
+   than keeping their own version of the truth.  `torch-vc4` is a mirror of
+   `torch/`, not a second source tree.
 2. **One distribution channel.** Every published artifact is built and signed
    through `vc4-apt`. No repository ships a binary that `vc4-apt` does not.
 3. **Forks stay forks.** `VC4C`, `VC4CL` and `VC4CLStdLib` keep their upstream

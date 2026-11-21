@@ -8,8 +8,9 @@
 Cases
   cnn        a small CNN exported by torch.onnx.export, fully claimed by VC4,
              compared with ORT CPU alone (0 over 1e-4 + 1e-4*max(|ref|,1))
-  split      a model with one deliberately unsupported node (Einsum), proving
-             the partition is reported and the result still matches ORT CPU
+  split      a model with one deliberately unsupported node (Resize with
+             mode="cubic"), proving the partition is reported and the result
+             still matches ORT CPU
   yolo160    the shipped YOLOv8n-160, compared with the stored CPU reference
              (0/44100 over 5e-4 when fully claimed)
   passthrough providers=["CPUExecutionProvider"] stays pure ORT
@@ -53,11 +54,14 @@ def compare(got, ref, tol):
 
 
 def make_split_model(path, seed=7):
-    """Conv -> Relu -> Einsum -> Conv -> Relu, with Einsum in the middle.
+    """Conv -> Relu -> Resize(cubic) -> Conv -> Relu, with Resize in the middle.
 
-    vc4infer has no Einsum kernel, so a correct provider must cut the graph in
-    three and say so.  ORT CPU evaluates the Einsum; the two Conv/Relu islands
-    stay on the QPUs.
+    vc4infer has no cubic Resize form (nearest and linear only), so a correct
+    provider must cut the graph in three and say so.  ORT CPU evaluates the
+    Resize; the two Conv/Relu islands stay on the QPUs.  ``up`` is declared in
+    value_info so the shape inference the partitioner relies on can prove the
+    boundary of the second island; without it the dynamic output would also
+    downgrade the downstream Conv/Relu (see test_ort_claims_cpu.py).
     """
     rng = np.random.default_rng(seed)
     w1 = rng.standard_normal((16, 3, 3, 3), dtype=np.float32) * 0.1
@@ -69,14 +73,15 @@ def make_split_model(path, seed=7):
         numpy_helper.from_array(b1, "b1"),
         numpy_helper.from_array(w2, "w2"),
         numpy_helper.from_array(b2, "b2"),
+        numpy_helper.from_array(np.array([1, 1, 2, 2], np.float32), "scales"),
     ]
     nodes = [
         helper.make_node("Conv", ["input", "w1", "b1"], ["c1"],
                          name="conv1", pads=[1, 1, 1, 1]),
         helper.make_node("Relu", ["c1"], ["r1"], name="relu1"),
-        helper.make_node("Einsum", ["r1", "r1"], ["e1"], name="einsum",
-                         equation="nchw,nchw->nchw"),
-        helper.make_node("Conv", ["e1", "w2", "b2"], ["c2"],
+        helper.make_node("Resize", ["r1", "", "scales"], ["up"],
+                         name="resize_cubic", mode="cubic"),
+        helper.make_node("Conv", ["up", "w2", "b2"], ["c2"],
                          name="conv2"),
         helper.make_node("Relu", ["c2"], ["output"], name="relu2"),
     ]
@@ -85,8 +90,10 @@ def make_split_model(path, seed=7):
         [helper.make_tensor_value_info("input", TensorProto.FLOAT,
                                        [1, 3, 16, 16])],
         [helper.make_tensor_value_info("output", TensorProto.FLOAT,
-                                       [1, 8, 16, 16])],
+                                       [1, 8, 32, 32])],
         inits)
+    graph.value_info.append(helper.make_tensor_value_info(
+        "up", TensorProto.FLOAT, [1, 16, 32, 32]))
     model = helper.make_model(graph, opset_imports=[
         helper.make_opsetid("", 17)])
     model.ir_version = 10
@@ -133,7 +140,7 @@ def case_cnn(data_dir, work_dir, reps):
 
 
 def case_split(data_dir, work_dir, reps):
-    path = os.path.join(work_dir, "split_einsum.onnx")
+    path = os.path.join(work_dir, "split_cubic.onnx")
     if not os.path.isfile(path):
         make_split_model(path)
     x = np.random.default_rng(11).standard_normal(
@@ -146,13 +153,14 @@ def case_split(data_dir, work_dir, reps):
         sess.run(None, {"input": x})
         s = sess.report(per_node=True)
         assert s["counts"]["ort-cpu"] == 1, s["counts"]
-        assert s["counts"]["vc4"] >= 3, s["counts"]
+        assert s["counts"]["vc4"] == 4, s["counts"]
         c = compare(got[0], ref[0], tol_1e4(ref[0]))
         assert c["over"] == 0, c
-        print("  split: reported %d vc4 + %d ort-cpu node(s); %d/%d over tol; "
-              "max abs %.3g; %.2f ms vs %.2f ms"
-              % (s["counts"]["vc4"], s["counts"]["ort-cpu"], c["over"],
-                 c["elements"], c["max_abs"], vc4_ms, ref_ms))
+        print("  split: %d partition(s), reported %d vc4 + %d ort-cpu "
+              "node(s); %d/%d over tol; max abs %.3g; %.2f ms vs %.2f ms"
+              % (len(sess.partitions), s["counts"]["vc4"],
+                 s["counts"]["ort-cpu"], c["over"], c["elements"],
+                 c["max_abs"], vc4_ms, ref_ms))
         sess.close()
 
     # The hard guarantee: refuse to fall back at all.
@@ -161,7 +169,8 @@ def case_split(data_dir, work_dir, reps):
     except vc4infer.UnsupportedNode as e:
         print("  split: fallback='error' refused: %s" % str(e).splitlines()[0])
     else:
-        raise AssertionError("fallback='error' did not refuse the Einsum node")
+        raise AssertionError(
+            "fallback='error' did not refuse the cubic Resize node")
     return {"name": "split", **c, "vc4_ms": vc4_ms, "ort_ms": ref_ms}
 
 

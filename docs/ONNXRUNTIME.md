@@ -42,19 +42,27 @@ exported, the plugin entry points (`CreateEpFactories`, `ReleaseEpFactory`)
 are present as strings, and the Python binding exposes
 `register_execution_provider_library(name, path)`, `get_ep_devices()`,
 `OrtEpDevice` and `SessionOptions.add_provider_for_devices(devices, opts)`.
-The missing piece is the ABI itself: a plugin must be compiled against
-`onnxruntime_ep_c_api.h` at exactly this version, and that header is not in
-the wheel, is not in an sdist (there is no onnxruntime sdist on PyPI), and the
-source tree is not reachable from the board (`raw.githubusercontent.com`
-returns 404 for every onnxruntime path). Compiling against a guessed struct
-layout is how you get a segfault in someone else's inference server, so this
-is not attempted.
+The ABI is the missing piece: a plugin must be compiled against
+`onnxruntime_ep_c_api.h` at exactly this version. The wheel does not ship it,
+PyPI publishes no onnxruntime sdist, and the source tree is not reachable from
+the board (`raw.githubusercontent.com` answers 404 for every onnxruntime
+path). It was obtained at the exact version instead, from the conda-forge
+`onnxruntime-cpp` 1.32.0 package (a build of the `v1.32.0` tag), and vendored
+in `infer/onnxruntime_ep/third_party/onnxruntime-1.32.0/` with the tarball
+hash and package hash in `PROVENANCE.md`.
 
-What ships instead is the provider ORT users see anyway: a graph partitioner
-on the public Python API. The static node-claiming logic lives in one module
-(`vc4infer/ort/_partition.py`) and is exactly the input a native EP's
-`GetCapability` would consume, so the work is not wasted if a future image
-ships the header.
+So there are two separate things in this tree, and they should not be
+confused:
+
+* **`vc4infer.ort`** — a graph-partitioning provider on the public Python API.
+  It is what actually runs models today, it claims a node only when the strict
+  engine can execute it exactly, and the claim table below is measured with
+  it.
+* **`infer/onnxruntime_ep/c_ep/libvc4_ep.so`** — a native plugin built against
+  the vendored ABI. It registers with ORT 1.32.0, advertises one VideoCore IV
+  EP device and claims **zero** nodes: no compute path is wired into it. It is
+  evidence that the ABI is usable, not an acceleration path. A user adding it
+  to a session gets CPU results with one extra capability query per graph.
 
 ## What is claimed
 
@@ -66,19 +74,24 @@ the same static report as `vc4infer nodes`:
 | `vc4` | a QPU kernel exists and the static constraints hold | vc4 |
 | `host-meta` | Constant/Shape and integer shape arithmetic resolved at plan time | vc4-folded |
 | `unknown` | an implementation exists but a shape could not be proven | ort-cpu |
-| `host-unwritten` | a numeric op with no QPU kernel (the current sweep finds none; the tier remains for new operators) | ort-cpu |
+| `host-unwritten` | a numeric op or attribute form with no QPU kernel; measured forms are `Compress` with `axis=None`, `Resize` with `mode="cubic"`, `MaxPool` with `dilations`, and `Conv` with dilation above 8 | ort-cpu |
 | `host-control` | If/Loop/Scan | ort-cpu |
 
 A whole connected component is downgraded when any boundary tensor is not
-fp32 or has a dynamic dimension, and models containing control-flow
-subgraphs are not split at all. There is no CPU compute inside a claimed
-partition: the sub-model is executed by `mode="strict"`, which raises rather
-than fall back.
+fp32 or has a dynamic dimension. That is not a per-node penalty: a
+`Compress(axis=None)` in the middle of a CNN costs the node that produced the
+dynamic tensor *and* the island downstream of it, because the partitioner
+cannot prove that boundary either (measured below: 4 of 6 nodes fall back).
+Models containing control-flow subgraphs are not split at all, and they are
+handed to ORT verbatim: an `If`/`Loop` body can capture an outer-scope
+initialiser that is not a boundary tensor, so rebuilding a sub-model would
+drop it. There is no CPU compute inside a claimed partition: the sub-model is
+executed by `mode="strict"`, which raises rather than fall back.
 
 The report is per node, with measured time where it exists:
 
 ```
-vc4infer.ort 1.2.2 -- yolov8n_160.onnx (263 nodes, 1 partition)
+vc4infer.ort 1.2.10 -- yolov8n_160.onnx (263 nodes, 1 partition)
   providers requested: vc4
   backend       nodes   %nodes        MACs    %MACs
   vc4             233    88.6%      273.2M   100.0%
@@ -100,21 +113,43 @@ of nodes and 2% of MACs is not accelerating anything, and the table says so.
 time to the VC4 rows. ORT nodes only have a partition-level measurement, so
 their per-node time stays blank instead of being invented.
 
-### Deliberately unsupported node
+### Measured claim table (CPU side)
 
-`infer/onnxruntime_ep/tests/test_vc4_ep.py` builds Conv → Relu → **Einsum** →
-Conv → Relu. vc4infer has no Einsum kernel, so the graph must split in three:
+`infer/onnxruntime_ep/tests/test_ort_claims_cpu.py` exercises the claim
+decision through `vc4infer.ort.plan()`. It needs no daemon, opens no engine and
+dispatches nothing, so it is safe to run while the GPU is busy. Every plan is
+then executed on ORT's CPU EP partition by partition and compared with the
+whole model; that isolates the graph surgery (sub-model nodes, initialisers,
+boundary order) from the QPU kernels, and a difference there would be a
+partitioner bug rather than kernel approximation.
 
-```
-  backend       nodes   %nodes        MACs    %MACs
-  vc4               4    80.0%         ...
-  ort-cpu           1    20.0%         ...
-  NOT fully claimed: 1 node(s) run on the ORT CPU EP
-```
+| model | nodes | vc4 | vc4-folded | ort-cpu | partitions | MACs on vc4 | plan on CPU vs whole model |
+|---|---:|---:|---:|---:|---:|---:|---|
+| small CNN (`torch.onnx.export`) | 12 | 12 | 0 | 0 | 1 | 100% | 0/10 over tol, max abs 0 |
+| CNN + `Resize(mode="cubic")` | 5 | 4 | 0 | 1 | 2 vc4 + 1 ORT | 100% (Resize reports 0 MACs) | 0/4096, max abs 0 |
+| CNN + `Compress(axis=None)` | 6 | 2 | 0 | 4 | 1 + 1 | 87.1% | 0/1024, max abs 0 |
+| `If` | 1 | 0 | 0 | 1 | 0 + 1 | n/a (no MACs) | 0/4, max abs 0 |
+| YOLOv8n-160 | 263 | 233 | 30 | 0 | 1 | 100% of 273.2M | 0/44100 over 5e-4, max abs 0 |
 
-and the output still matches ORT CPU to `1e-4 + 1e-4*max(|ref|,1)` on every
-element. `providers=[("vc4", {"fallback": "error"})]` refuses the model at
-session creation instead, naming the node.
+`plan()` is the same decision `InferenceSession(providers=["vc4"])` makes:
+`plan.report()` prints the table above per node, and
+`plan(path, fallback="error")` raises for the first node that would fall back.
+Two negative results are part of the measurement:
+
+* with `vc4d` absent, `InferenceSession(providers=["vc4"])` raises
+  `DeviceError` naming the missing socket instead of running the graph on ORT
+  and calling it acceleration;
+* a cubic `Resize` is refused with
+  `node 'resize_cubic' (Resize): fallback='error': 1 node(s) cannot run on
+  VC4`, and the `If` model with `node 'if' (If)`.
+
+### What the fallback costs
+
+The split case shows the contract ORT defines: the claimed islands are still
+VC4 work, the one unclaimed node runs on ORT's CPU EP, and the report names it.
+What it does *not* do is hide the boundary: each ORT island is a separate
+`onnxruntime.InferenceSession`, so the tensors crossing it are copied into and
+out of ORT. For the cubic-Resize split that is 3 dispatches per inference.
 
 ## Installation
 
@@ -141,6 +176,52 @@ import vc4infer.ort
 print(vc4infer.ort.get_available_providers())    # ['vc4', ...]
 print(vc4infer.ort.is_available())               # True with vc4d running
 ```
+
+## The C plugin: registration without pretense
+
+`infer/onnxruntime_ep/c_ep` builds `libvc4_ep.so` from `vc4_ep.cc` against the
+vendored headers:
+
+```sh
+make -C infer/onnxruntime_ep/c_ep     # ~72 KiB, exports CreateEpFactories/ReleaseEpFactory
+```
+
+`CreateEpFactories` returns one factory; `GetSupportedDevices` creates a GPU
+hardware device for the VideoCore IV and one `OrtEpDevice` carrying
+`vc4.mode=capability-only`; `CreateEp` returns an `OrtEp` whose `GetCapability`
+adds nothing to the graph support info. `tests/test_ep_register.py` builds,
+registers and runs it on the board:
+
+```
+available providers: ['AzureExecutionProvider', 'CPUExecutionProvider', 'vc4']
+device: ep=vc4 vendor=vc4infer type=OrtHardwareDeviceType.GPU
+        meta={'vc4.mode': 'capability-only',
+              'vc4.execution': 'none: claims 0 nodes',
+              'vc4.driver': 'vc4d', 'library_path': '.../libvc4_ep.so'}
+vc4_ep: GetCapability on 4 node(s), claimed 0 (capability-only build)
+session providers: ['vc4', 'CPUExecutionProvider']
+output vs CPU EP: 0/6 over 1e-6, max abs 0
+plugin counters: 1 capability call(s), 4 node(s) examined, 0 claimed
+```
+
+Two ABI facts were established by building it, not by reading:
+
+* `ORT_API_VERSION` is 32 in both the vendored header and the installed
+  library. A plugin compiled against another version gets `NULL` from
+  `OrtApiBase::GetApi()` inside `CreateEpFactories` and registers no factory,
+  so it cannot run with a mismatched struct layout.
+* `OrtEpFactory::CreateDataTransfer` is documented as optional, but 1.32 calls
+  it during `register_execution_provider_library` without checking for `NULL`.
+  A factory that leaves it `NULL` segfaults the interpreter at registration,
+  before a session exists. The plugin returns an empty transfer, which is
+  accurate: it never owns device memory.
+
+Making it execute would need three things that are not written: `GetCapability`
+building the claim list (`_partition.plan()` already produces it), `Compile`
+returning an `OrtNodeComputeInfo` that feeds the boundary tensors through
+`libvc4infer`'s strict runner, and an allocator/memory description for the EP
+device. Until those exist, `vc4_ep_nodes_claimed()` stays zero and this section
+says so; the Python provider remains the only path that runs a node.
 
 ## Threading, arena and lifetime
 
@@ -194,7 +275,7 @@ reference at the same 5e-4 tolerance as `vc4infer selftest`.
 | case | graph | tolerance | result |
 |---|---|---|---|
 | small CNN (torch.onnx.export) | 12 nodes, all vc4 | 1e-4 + 1e-4·max(\|ref\|,1) | **0/10**, max abs 2.53e-07 |
-| CNN + Einsum split | 5 nodes, 4 vc4 + 1 ort | 1e-4 + 1e-4·max(\|ref\|,1) | **0/2,048**, max abs 3.1e-06 |
+| CNN + `Resize(cubic)` split | 5 nodes, 4 vc4 + 1 ort, 3 partitions | 1e-4 + 1e-4·max(\|ref\|,1) | plan on CPU: **0/4096**, max abs 0 (the device row is re-measured by the acceptance run; the fixture replaced Einsum, which is now a VC4 op) |
 | YOLOv8n 160 | 263 nodes, all vc4 | 5e-4 + 5e-4·max(\|ref\|,1) | **0/44,100**, max abs 0.0204 (max scaled 0.43) |
 
 ## Performance
@@ -225,12 +306,32 @@ ORT users, not to claim a speedup that is not there.
 ## Reproducing
 
 ```sh
-# export the torch CNN (any venv with torch)
-python infer/onnxruntime_ep/export_cnn.py /tmp/smallcnn.onnx
+# export the torch CNN (any venv with torch); nothing goes under /tmp, which
+# is tmpfs on this board
+python infer/onnxruntime_ep/export_cnn.py ~/scratch/tmp/vc4ort/smallcnn.onnx
 
-# all acceptance cases (needs vc4d and a free GPU)
+# CPU-side claim table and partition equivalence: no daemon, no GPU
 PYTHONPATH=infer/python ~/scratch/ortvenv/bin/python \
-    infer/onnxruntime_ep/tests/test_vc4_ep.py --reps 3
+    infer/onnxruntime_ep/tests/test_ort_claims_cpu.py \
+    --cnn ~/scratch/tmp/vc4ort/smallcnn.onnx \
+    --json ~/scratch/tmp/vc4ort/claims.json
+# expects "OK: 6 CPU-side case(s) passed": cnn 12/12; split 4 vc4 + 1 ort and
+# 0/4096; poison 2 vc4 + 4 ort; If 0 claimed; YOLO 233 + 30 + 0 and 0/44100;
+# and max abs 0 for every plan against the whole model on ORT CPU
+
+# the C plugin: build, register, compare with the CPU EP (claims no nodes)
+PYTHONPATH=infer/python ~/scratch/ortvenv/bin/python \
+    infer/onnxruntime_ep/tests/test_ep_register.py
+# expects: 'vc4' in available providers, one GPU device, 4 nodes examined,
+# 0 claimed, output max abs 0
+
+# device acceptance: needs vc4d and the GPU to itself
+sudo systemctl restart vc4d          # after any client that timed out
+PYTHONPATH=infer/python ~/scratch/ortvenv/bin/python \
+    infer/onnxruntime_ep/tests/test_vc4_ep.py \
+    --data /usr/share/vc4infer/models --work ~/scratch/tmp/vc4ort --reps 3
+# expects: cnn fully claimed, 0/10 over tol; split 3 partitions, 4 vc4 + 1 ort,
+# 0/4096, refusal names resize_cubic; yolo 263/263 claimed, 0/44100
 
 # three-way YOLO benchmark, each backend in its own process
 PYTHONPATH=infer/python ~/scratch/ortvenv/bin/python \
@@ -244,7 +345,17 @@ PYTHONPATH=infer/python ~/scratch/ortvenv/bin/python \
   are 2-D single-image).
 * Control flow, custom domains and any numeric operator without a VC4 kernel
   are executed by ORT and reported. This is ORT's contract, made visible.
+* A model with control flow is never split, even partially: the whole model is
+  handed to ORT, because an `If`/`Loop` body can capture an outer-scope
+  initialiser that the boundary list does not contain.
+* A data-dependent boundary downgrades the island downstream of it as well as
+  the node that produced it. `Compress(axis=None)` in a 6-node CNN moves 4
+  nodes to ORT.
+* The claim decision is static. A boundary whose shape is not in the graph
+  (no shape inference result and no `value_info`) is not claimed, even when a
+  run would have a fixed shape.
+* The native plugin `libvc4_ep.so` claims no nodes and executes nothing. Adding
+  it to a session costs a capability query per graph and returns CPU results;
+  it is evidence about the plugin ABI, not an acceleration path.
 * The provider does not implement ORT's IOBinding, CUDA-style streams or
   device-memory `OrtValue`s; inputs and outputs are numpy arrays.
-* A native in-process EP would remove the Python boundary copies. It needs
-  `onnxruntime_ep_c_api.h` for the installed version; see the evidence above.

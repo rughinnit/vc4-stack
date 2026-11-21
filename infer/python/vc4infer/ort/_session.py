@@ -1,23 +1,14 @@
 """``vc4infer.ort`` -- an ONNX Runtime execution provider for the VC4 QPUs.
 
-Why this is a graph-partitioning provider and not an in-process EP plugin:
+Why this is a graph-partitioning provider rather than only an in-process EP:
 the onnxruntime 1.32.0 wheel installs **no C/C++ headers at all** (the
-``capi`` directory holds shared objects only), and the out-of-tree EP ABI
-lives in ``onnxruntime_ep_c_api.h``, which is not shipped and is not
-obtainable from this board (GitHub is unreachable).  The runtime advertises
-``RegisterExecutionProviderLibrary``/``CreateEpFactories`` and the Python
-binding exposes ``register_execution_provider_library``, so a plugin *would*
-be possible with a version-locked header -- but not with what is installed.
-So the provider is built on the public Python API instead, which the
-installed package does support: the graph is cut into VC4 and ORT
-partitions, and the VC4 partitions are executed by libvc4infer.
-
-Usage is ORT-shaped::
-
-    import vc4infer.ort
-    sess = vc4infer.ort.InferenceSession("yolov8n_160.onnx", providers=["vc4"])
-    out = sess.run(None, {"images": x})
-    sess.report()            # vc4 | vc4-folded | ort-cpu, %nodes, %MACs, ms
+``capi`` directory holds shared objects only), so the plugin ABI cannot be
+compiled from what pip installs.  The header was obtained at the exact version
+from the conda-forge ``onnxruntime-cpp`` 1.32.0 package and vendored under
+``infer/onnxruntime_ep/third_party``; ``libvc4_ep.so`` builds against it and
+registers (one VideoCore IV device, zero claimed nodes, no execute path).  This
+module is the path that executes: it cuts the graph into VC4 and ORT
+partitions, and the VC4 partitions are run by libvc4infer.
 
 One session per process: the engine maps the daemon's single 64 MiB arena, so
 a second live VC4 session raises ``DeviceError``.  Use one session and call
@@ -32,7 +23,7 @@ import weakref
 import numpy as np
 import onnx
 
-from .. import UnsupportedNode, __version__
+from .. import __version__
 from .._errors import DeviceError
 from .. import _runtime
 from . import _partition, _report
@@ -223,17 +214,8 @@ class InferenceSession:
         return out
 
     def _check_fallback(self):
-        has_ort = any(p.backend == "ort-cpu" for p in self.partitions)
-        if has_ort and self._fallback == "error":
-            debt = []
-            for p in self.partitions:
-                if p.backend == "ort-cpu":
-                    debt += [self.coverage["nodes"][i] for i in p.indices]
-            first = debt[0]
-            raise UnsupportedNode(
-                first["name"], first["op"],
-                "fallback='error': %d node(s) cannot run on VC4: %s"
-                % (len(debt), ", ".join(e["name"] for e in debt[:6])))
+        if self._fallback == "error":
+            _partition.refuse(self.partitions, self.coverage)
 
     def _whole_ort(self, sess_options, vc4_opts):
         opts = sess_options or self._ort.SessionOptions()

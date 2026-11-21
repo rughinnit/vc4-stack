@@ -31,3 +31,6 @@ infer/tools/onnx/models/
 !docs/logs/*.log
 vc4d/build/
 tvm_byoc/build/
+
+# Built execution-provider plugin (make -C infer/onnxruntime_ep/c_ep)
+infer/onnxruntime_ep/c_ep/*.so

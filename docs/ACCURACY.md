@@ -75,6 +75,7 @@ runs, so it is accumulation order, not a race.
 | **`Abs`, `Neg`, `Sign`, `Clip`** | **bit-exact** | |
 | **comparisons** (`Equal/Greater/Less/…`, `IsNaN`, `IsInf`) | **bit-exact** | integer key ordering + explicit NaN mask, no subtraction |
 | elementwise (`Add`, `Mul`, `Relu`, `Silu`, `Sigmoid`) | ≤2.4e-7 | correctly-rounded multiply, see §5 |
+| `Sub`, `Div`, `Max`, `Min` (`vc4_elementwise`) | `Sub` ≤1 ulp, `Div` rel **2.9e-7**, max/min bit-exact | `Div` is a three-step Newton reciprocal of `\|b\|` with the sign restored, then a multiply.  The reciprocal's magnitude clamp means a divisor below 2^-126 saturates at `8.5e37 * a` rather than returning ±inf |
 | `Softmax` (≤16 classes) | 2.6e-7 … 3.4e-7 | |
 | copies, concat, split, pad, transpose, resize-nearest | **byte-exact** | max abs error 0 on 14 shapes |
 | conv / GEMM (fp32) | ≤2e-4 abs | accumulation order vs the reference |

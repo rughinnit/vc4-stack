@@ -177,7 +177,7 @@ V=~/scratch/tmp/fw/litert
 make -C litert test PYTHON=$V/bin/python
 ```
 
-The tests build three models with the FlatBuffers schema shipped in the wheel
+The tests build four models with the FlatBuffers schema shipped in the wheel
 (no TensorFlow, no network):
 
 | model | graph | expected claim |
@@ -185,6 +185,7 @@ The tests build three models with the FlatBuffers schema shipped in the wheel
 | `chain.tflite` | conv3x3+relu → conv1x1 → softmax | 3 nodes, 1 partition |
 | `mixed.tflite` | conv3x3+relu → average_pool2x2 → conv1x1 → softmax | 3 nodes, 2 partitions; the pool stays with LiteRT |
 | `hostonly.tflite` | average_pool2x2 → sin | 0 nodes; LiteRT executes the whole graph |
+| `div.tflite` | `x / c`, `c` a signed constant in [0.5, 2] with one entry at -1e-7 | 1 node, 1 partition; the regression case for the div body |
 
 What the CPU tiers prove: the plugin ABI loads; `Prepare` runs and the claim
 table matches the model; `mode=off` is bit-identical to the reference
@@ -203,14 +204,15 @@ workload held the board):
 |---|---|
 | shared object | 146,128 B file, 21,210 B text; `NEEDED libvc4infer.so.1` only |
 | claim-table unit test | 37 checks, 0 failures |
-| end-to-end CPU tiers | 28 checks, 0 failures |
-| `chain.tflite` / `mixed.tflite` / `hostonly.tflite` | 11,356 / 11,508 / 532 B |
-| claim report | chain 3/0 nodes, 1 partition; mixed 3/1, 2 partitions; hostonly 0/2, 0 partitions |
+| end-to-end CPU tiers | 36 checks, 0 failures |
+| `chain.tflite` / `mixed.tflite` / `hostonly.tflite` / `div.tflite` | 11,356 / 11,508 / 532 / 4,564 B |
+| claim report | chain 3/0 nodes, 1 partition; mixed 3/1, 2 partitions; hostonly 0/2, 0 partitions; div 1/0, 1 partition |
 | LiteRT CPU reference invoke | 0.167 / 0.153 / 0.030 ms (not a delegate number) |
 
-There are **no QPU timings yet**.  The on-device tier exists in
+There are **no QPU timings in this table**: it records the pass that ran with
+the board held by another workload.  The on-device tier exists in
 `tests/test_litert.py` behind `VC4_LITERT_GPU=1` and must be run with the board
-exclusive to this workload.
+exclusive to this workload; the div run below is one.
 
 ## 8. The on-device verification pass
 
@@ -247,6 +249,21 @@ $V/bin/python litert/tests/_run_one.py litert/tests/models/mixed.tflite \
     --output /home/raspi/scratch/tmp/mixed.npz \
     --delegate litert/build/libvc4_delegate.so --mode auto --repeat 5
 ```
+
+### The div claim on silicon (2026-11-21)
+
+Run with the QPUs to itself: 44 checks, 0 failures. The `DIV` node in
+`div.tflite` is claimed (1 of 1 node, 1 partition) and returns **2.38e-07**
+relative error against the CPU reference; the absolute figure is 2 because the
+-1e-7 divisor puts one element at 1e+07. Delegate invoke: 0.153 ms (minimum of
+three repeats).
+
+That model is the regression case for the engine's div body. `VC4_OP_DIV`
+takes the reciprocal of `|b|` and puts the sign back; before that it handed
+`b` itself to a reciprocal whose `FMAX(x, TINY)` clamp is meant for the
+positive domain, so every negative element of a signed divisor came back as
+`a * 1e38` (measured with `vc4_elementwise`: 2,046 of 4,096 elements over,
+max|d| 1.7e38).
 
 The expected first failures, in order, if the silicon does not agree with the
 plan: `vc4_init` (daemon/arena), weight packing at `allocate_tensors`,

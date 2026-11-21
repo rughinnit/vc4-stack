@@ -12,6 +12,7 @@ No GPU is used.
 import os
 import struct
 import sys
+import tempfile
 
 import numpy as np
 
@@ -30,7 +31,7 @@ def _bits(v):
 def run_kernel(op, x, nvec, params=()):
     """Return the nvec*16 values the store would write (row-major)."""
     p = kops.build_uop(kgen, op, nvec)
-    ws = p.write('/tmp/emu_kernel.bin')
+    ws = p.write(os.path.join(tempfile.gettempdir(), "emu_kernel.bin"))
     m = emu_alu.Machine(ws)
     a_bus, o_bus = 0xE0000000, 0xE1000000
     prm = list(params) + [0.0] * (3 - len(params))
@@ -85,6 +86,8 @@ OPS = {
     'sin': np.sin,
     'cos': np.cos,
     'round': np.round,
+    'floor': np.floor,
+    'ceil': np.ceil,
     'softsign': lambda z: z / (1 + np.abs(z)),
     'mish': lambda z: z * np.tanh(softplus(z)),
     'acos': np.arccos,
@@ -108,6 +111,10 @@ EDGES = {
                    2.0, -2.0, 1e10, -1e10, 1e30, -1e30, 3.0, -3.0],
     'round': [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 2.4, 2.6, -2.4,
               -2.6, 0.0, -0.0, 1e7, -1e7],
+    'floor': [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5, -1e-8, 1e-8,
+              -0.0, 0.0, 8388608.0, -8388608.0, 1e10, -1e10],
+    'ceil': [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5, -1e-8, 1e-8,
+             -0.0, 0.0, 8388608.0, -8388608.0, 1e10, -1e10],
     'asin': [-1.0, -0.99999994, -0.75, -0.5, -0.50000006, -1e-7, 0.0, 1e-7,
              0.5, 0.50000006, 0.75, 0.99999994, 1.0, -0.25, 0.25, -0.0],
     'acos': [-1.0, -0.99999994, -0.75, -0.5, -0.50000006, -1e-7, 0.0, 1e-7,

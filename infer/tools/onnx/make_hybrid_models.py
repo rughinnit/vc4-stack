@@ -216,8 +216,17 @@ def save(m, path):
     return path
 
 
-def ensure(models_dir):
-    """Create the models and references if missing; return their metadata."""
+def ensure(models_dir, force=None):
+    """Create the models and references that are missing; return metadata.
+
+    Rebuilding unconditionally runs ReferenceEvaluator over the whole LSTM
+    graph in every sub-test.  That is tens of seconds of ARM work and heat (it
+    can push the board into the thermal guard) for files that are already
+    correct, so an existing model, input and reference set is left alone.
+    Set HYBRID_REBUILD=1 (or pass force=True) to regenerate them.
+    """
+    if force is None:
+        force = os.environ.get("HYBRID_REBUILD", "") not in ("", "0")
     os.makedirs(models_dir, exist_ok=True)
     made = {}
     specs = {
@@ -231,6 +240,14 @@ def ensure(models_dir):
         if "x" in cases:
             cases = {"default": cases}
         path = os.path.join(models_dir, stem + ".onnx")
+        needed = [path]
+        for case in cases:
+            suffix = "" if case == "default" else "." + case
+            needed.append(os.path.join(models_dir, stem + suffix + ".in.npy"))
+            needed.append(os.path.join(models_dir, stem + suffix + ".ref.npz"))
+        if not force and all(os.path.isfile(f) for f in needed):
+            made[stem] = {"model": path, "cases": list(cases)}
+            continue
         save(m, path)
         refs = reference(m, cases)
         for case, feeds in cases.items():

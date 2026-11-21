@@ -8,11 +8,12 @@
 
 
 Status: **feature-complete for the model families it declares** (version
-0.3.0). `torch_vc4.device()` is a real PyTorch device (`PrivateUse1`,
+0.3.1). `torch_vc4.device()` is a real PyTorch device (`PrivateUse1`,
 renamed `vc4`).  Batch > 1, arbitrary-dim reductions, softmax for any class
-count, N-D broadcasting, training-mode batch norm, batched/stride-2/depthwise
-conv, the verified unary set, gather/index_select/argmax and autograd for all
-of it are measured against the CPU in `tests/test_complete.py`.
+count, N-D broadcasting, training-mode batch norm, batched/stride-2/
+depthwise/grouped conv, nearest and bilinear resize in both `align_corners`
+settings, the verified unary set, gather/index_select/argmax and autograd for
+all of it are measured against the CPU in `tests/test_complete.py`.
 **`COMPLETENESS.md` is the authoritative op table**: every intercepted aten op
 with its backend (device / composite / raise), measured accuracy and vc4-vs-CPU
 time at three sizes, plus the precise reason for every raise.  Everything
@@ -74,13 +75,13 @@ cache fails.
 
 ## Install from the signed package archive
 
-The 0.3.0 wheel is published next to `vc4infer`:
+The 0.3.1 wheel is published next to `vc4infer`:
 
 ```sh
 pip install --extra-index-url https://rughinnit.github.io/vc4-apt/pip/simple/ \
     torch_vc4
 # or the wheel directly
-pip install https://rughinnit.github.io/vc4-apt/pip/torch_vc4-0.3.0-cp313-cp313-linux_aarch64.whl
+pip install https://rughinnit.github.io/vc4-apt/pip/torch_vc4-0.3.1-cp313-cp313-linux_aarch64.whl
 ```
 
 The wheel is a **cp313 / aarch64 binary** because the backend is a compiled

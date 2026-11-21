@@ -836,6 +836,74 @@ class UpsampleNearestFn(torch.autograd.Function):
         return _below(f), None, None, None, None
 
 
+def _bilin_matrix(H, W, ho, wo, align_corners):
+    """A[o][p]: the four bilinear weights of output o over source p.
+
+    Geometry only -- the same taps and weights the forward uses, built once
+    per backward from the output grid; no activation value is read.  The
+    adjoint is then ``g @ A``, a device GEMM (the pattern
+    ``UpsampleNearestFn`` already uses for the nearest mapping).
+    """
+    import math
+    a = torch.zeros((ho * wo, H * W), dtype=torch.float32)
+
+    def axis(n_out, n_in):
+        taps = []
+        for o in range(n_out):
+            if align_corners:
+                s = (o * (n_in - 1) / (n_out - 1)) if n_out > 1 else 0.0
+            else:
+                s = (o + 0.5) * n_in / n_out - 0.5
+                if s < 0.0:
+                    s = 0.0
+            i0 = int(math.floor(s))
+            f = s - i0
+            if i0 < 0:
+                i0, f = 0, 0.0
+            if i0 >= n_in - 1:
+                i0, f = n_in - 1, 0.0
+            i1 = i0 + 1 if i0 + 1 < n_in else n_in - 1
+            taps.append((i0, i1, f))
+        return taps
+
+    ty, tx = axis(ho, H), axis(wo, W)
+    for oy, (y0, y1, fy) in enumerate(ty):
+        for ox, (x0, x1, fx) in enumerate(tx):
+            o = oy * wo + ox
+            a[o, y0 * W + x0] += (1.0 - fy) * (1.0 - fx)
+            a[o, y0 * W + x1] += (1.0 - fy) * fx
+            a[o, y1 * W + x0] += fy * (1.0 - fx)
+            a[o, y1 * W + x1] += fy * fx
+    return a
+
+
+class UpsampleBilinearFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, ho, wo, align_corners):
+        ctx.shape = tuple(x.shape)
+        ctx.out = (ho, wo)
+        ctx.ac = bool(align_corners)
+        return _below(lambda: ops.upsample_bilinear2d(x, (ho, wo), ctx.ac))
+
+    @staticmethod
+    def backward(ctx, g):
+        g = _g(g)
+        N, C, H, W = ctx.shape
+        oh, ow = ctx.out
+        n_in, n_out = H * W, oh * ow
+        if n_out * n_in * 4 > (32 << 20):
+            raise RuntimeError(
+                "torch_vc4: upsample_bilinear2d backward builds a %dx%d "
+                "geometry matrix (%.1f MiB); over the 32 MiB cap.  Decode at a "
+                "smaller stage or run the backward on the CPU."
+                % (n_out, n_in, n_out * n_in * 4 / float(1 << 20)))
+
+        def f():
+            a = _bilin_matrix(H, W, oh, ow, ctx.ac).to(g.device)
+            return torch.mm(g.view(N * C, n_out), a).view(ctx.shape)
+        return _below(f), None, None, None
+
+
 # ------------------------------------------------------------- indexing
 
 class GatherFn(torch.autograd.Function):
@@ -1076,6 +1144,20 @@ def register():
                                        int(math.floor(W * sw)), sh, sw)
 
     lib.impl("upsample_nearest2d.vec", up_vec)
+    lib.impl("upsample_bilinear2d",
+             lambda x, size, ac, sh=None, sw=None:
+             UpsampleBilinearFn.apply(x, int(size[0]), int(size[1]), ac))
+
+    def up_bilin_vec(x, size, ac, scales):
+        if size is not None:
+            return UpsampleBilinearFn.apply(x, int(size[0]), int(size[1]), ac)
+        import math
+        H, W = x.shape[-2], x.shape[-1]
+        sh, sw = float(scales[0]), float(scales[1])
+        return UpsampleBilinearFn.apply(x, int(math.floor(H * sh)),
+                                        int(math.floor(W * sw)), ac)
+
+    lib.impl("upsample_bilinear2d.vec", up_bilin_vec)
     lib.impl("gather", lambda x, dim, index, sparse_grad=False:
              GatherFn.apply(x, int(dim), index, False))
     lib.impl("index_select", lambda x, dim, index:

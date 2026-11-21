@@ -4,10 +4,22 @@ three sizes (vc4 through vc4d vs the same PyTorch op on the CPU).
 Run on the Pi:  .venv/bin/python tests/completeness.py > completeness.table
 """
 
+import os
+import sys
 import time
 
 import torch
 import torch.nn.functional as F
+
+# Measure the checkout this file is in when its extension has been built, not
+# whichever torch_vc4 an editable install points at (the same rule
+# test_complete.py applies).
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACKAGE = os.path.join(ROOT, "torch_vc4")
+if os.path.isdir(PACKAGE) and any(
+        name.startswith("_C") and name.endswith(".so")
+        for name in os.listdir(PACKAGE)):
+    sys.path.insert(0, ROOT)
 
 import torch_vc4 as tv
 
@@ -121,6 +133,21 @@ def main():
     row("conv2d depthwise 3x3", "device",
         [(1, 6, 16, 16), (2, 16, 16, 16), (1, 32, 24, 24)], b_dw)
 
+    def b_conv_group(sh):
+        n, c, h, w, co, k, s, p, g = sh
+        x, wt = torch.randn(n, c, h, w), torch.randn(co, c // g, k, k)
+        xv, wv = U(x), U(wt)
+        return (lambda: F.conv2d(xv, wv, padding=p, stride=s, groups=g),
+                lambda: F.conv2d(x, wt, padding=p, stride=s, groups=g),
+                F.conv2d(xv, wv, padding=p, stride=s, groups=g),
+                F.conv2d(x, wt, padding=p, stride=s, groups=g))
+    row("conv2d grouped g2", "device (grouped NHWC)",
+        [(1, 32, 8, 8, 32, 3, 1, 1, 2), (2, 32, 16, 16, 32, 3, 1, 1, 2),
+         (1, 32, 32, 32, 64, 3, 1, 1, 2)], b_conv_group)
+    row("conv2d grouped g4", "device (grouped NHWC)",
+        [(1, 64, 8, 8, 64, 3, 1, 1, 4), (2, 64, 16, 16, 64, 3, 1, 1, 4),
+         (1, 64, 32, 32, 64, 3, 1, 1, 4)], b_conv_group)
+
     # pools / resize
     def b_pool(sh):
         n, c, h, w = sh
@@ -151,6 +178,25 @@ def main():
                 F.interpolate(x, scale_factor=2, mode="nearest"))
     row("upsample_nearest2d 2x", "composite",
         [(1, 4, 8, 8), (2, 16, 16, 16), (1, 32, 32, 32)], b_up)
+
+    def b_bilin(sh):
+        n, c, h, w, ho, wo, ac = sh
+        x = torch.randn(n, c, h, w)
+        xv = U(x)
+        return (lambda: F.interpolate(xv, size=(ho, wo), mode="bilinear",
+                                      align_corners=ac),
+                lambda: F.interpolate(x, size=(ho, wo), mode="bilinear",
+                                      align_corners=ac),
+                F.interpolate(xv, size=(ho, wo), mode="bilinear",
+                              align_corners=ac),
+                F.interpolate(x, size=(ho, wo), mode="bilinear",
+                              align_corners=ac))
+    row("upsample_bilinear2d 2x ac=0", "device (4 gathers + mul/add)",
+        [(1, 8, 16, 16, 32, 32, False), (2, 16, 32, 32, 64, 64, False),
+         (1, 32, 64, 64, 128, 128, False)], b_bilin)
+    row("upsample_bilinear2d (7,5) ac=1", "device (4 gathers + mul/add)",
+        [(1, 8, 16, 16, 7, 5, True), (2, 16, 32, 20, 7, 5, True),
+         (1, 32, 64, 40, 7, 5, True)], b_bilin)
 
     def b_cat(sh):
         n, c, h, w = sh

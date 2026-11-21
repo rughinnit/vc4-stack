@@ -5,13 +5,13 @@ Two public surfaces share one engine and one privileged helper (`vc4d`):
 | package | what it is | version on the reference board (2026-11-20) |
 |---|---|---|
 | `vc4infer` | ONNX graph executor, YOLO adapter, CLI, ctypes binding | **1.2.1** (.deb + wheel in the vc4-apt archive) |
-| `torch_vc4` | a declared subset PyTorch `PrivateUse1` backend | **0.3.0** in the source tree (`setup.py`); the installed editable metadata says **0.2.0** because it predates the bump. **No `torch_vc4` wheel is in the pip index as of 2026-11-20** (`pip download torch_vc4` -> `No matching distribution found`). Build from source. |
+| `torch_vc4` | a declared subset PyTorch `PrivateUse1` backend | **0.3.1** in the source tree (`setup.py`, `torch_vc4.__version__`) and in the vc4-apt pip index as `torch_vc4-0.3.1-cp313-cp313-linux_aarch64.whl` (797,409 B). An editable install made before the bumps still reports **0.2.0** in its metadata. |
 
 The measured performance numbers in TUTORIAL.md section 7 are from the 0.2.0
 surface, and the `torch_vc4` table in Part 2 describes that surface.  The
-source tree's `setup.py` says 0.3.0 and is still landing; its authoritative
-per-op table (with accuracy and timing at three sizes) is `COMPLETENESS.md`.
-Do not assume a 0.3.0 row from this document.
+source tree's `setup.py` says 0.3.1; its authoritative per-op table (with
+accuracy and timing at three sizes) is `COMPLETENESS.md`.  Do not assume a row
+from this document that the table does not carry.
 
 Neither package ever falls back to CPU arithmetic.  An operator, attribute or
 shape outside the table raises and names the node/op.
@@ -311,11 +311,12 @@ ulimit -v 1800000
 MAX_JOBS=1 pip install --no-build-isolation -e .
 ```
 
-**No wheel in the pip index as of 2026-11-20.**  If a `torch_vc4` wheel is
-published later, `pip install --extra-index-url
-https://rughinnit.github.io/vc4-apt/pip/simple/ torch_vc4` is the command; the
-current index contains `vc4infer` only.  The source tree's `setup.py` says
-0.3.0; the installed editable metadata on the reference board says 0.2.0.
+The wheel is in the pip index:
+`pip install --extra-index-url
+https://rughinnit.github.io/vc4-apt/pip/simple/ torch_vc4` installs 0.3.1.
+It is a cp313/aarch64 build (the backend is a compiled extension), so it
+needs the `+cpu` torch wheel on the board.  The source tree's `setup.py` says
+0.3.1; an editable install made before the bumps still says 0.2.0.
 
 Prerequisites: `vc4d` active, user in `vc4`, an engine tree with
 `build/libvc4infer.a` and `tools/kgen.py`, and the `+cpu` torch wheel (the
@@ -356,11 +357,10 @@ Use `tv.device()` or `torch.device("privateuseone")`.  Tensors still report
 ## 2.3 Op table
 
 The table below is the **0.2.0** surface: it is what the measured numbers and
-the tutorial use, and what the published `torch_vc4` README described.  The
-source tree's `setup.py` now says 0.3.0 and its README claims wider coverage,
-but that work was still landing while this document was written and its
-authoritative per-op table is `COMPLETENESS.md`.  Do not assume a 0.3.0 row
-from memory; run the op or read that table.
+the tutorial use, and what the `torch_vc4` README described then.  The current
+tree is 0.3.1, with grouped conv, bilinear resize and the routed unary bodies
+on top of this table; its authoritative per-op table is `COMPLETENESS.md`.
+Do not assume a row from memory; run the op or read that table.
 
 Status meanings:
 
@@ -534,7 +534,7 @@ tables and the per-op harness are `RESULTS.md` and `tests/bench_ops.py` in the
 * **No `torch.compile`, no streams, no multi-device, no fp16/bf16, no int8
   compute, no float64 compute.**  This is not CUDA parity.
 * **BatchNorm training mode** is not in the 0.2.0 surface; use `.eval()` or
-  `fold_bn_into_conv`.  The 0.3.0 tree adds it; see `COMPLETENESS.md`.
+  `fold_bn_into_conv`.  The 0.3.x trees add it; see `COMPLETENESS.md`.
 * **Importing prints a kernel-override warning**; it is expected and refers to
   the `PrivateUse1` stubs the backend replaces.
 

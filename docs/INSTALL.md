@@ -252,7 +252,7 @@ package, no wheel, nothing to install.
 |---|---|---|
 | **NumPy / Python (ONNX)** | `apt install vc4infer` + `pip install .../pip/simple/ vc4infer` | published |
 | **C / C++** | `apt install vc4infer-dev` (header, `-lvc4infer`, pkg-config, CMake) | published |
-| **PyTorch** | `pip install --extra-index-url https://rughinnit.github.io/vc4-apt/pip/simple/ torch_vc4` | published (`torch_vc4-0.3.0`, cp313 aarch64 wheel) |
+| **PyTorch** | `pip install --extra-index-url https://rughinnit.github.io/vc4-apt/pip/simple/ torch_vc4` | published (`torch_vc4-0.3.1`, cp313 aarch64 wheel) |
 | **ONNX Runtime** | `apt install vc4infer` then `import vc4infer.ort` (the EP is inside the engine package; no separate wheel) | published as part of `vc4infer` 1.2.2 |
 | **TVM** | — | not published yet |
 | **TFLite / LiteRT** | — | not published yet |

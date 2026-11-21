@@ -1161,6 +1161,33 @@ static at::Tensor vc4_up_nearest(const at::Tensor &t, int64_t ho, int64_t wo,
     return host_put({C, ho, wo}, dst.data(), dst.size());
 }
 
+/* Bilinear resize over NCHW [N][C][H][W]: planes = N*C, so the tensor is
+ * already the engine's [planes][H][W] layout.  align_corners selects the
+ * source-coordinate mapping (VC4_RESIZE_ALIGN_CORNERS vs HALF_PIXEL); the
+ * engine does four index-map gathers plus the QPU multiply/add. */
+static at::Tensor vc4_up_bilinear(const at::Tensor &t, int64_t ho, int64_t wo,
+                                  bool align_corners)
+{
+    ensure_init();
+    check_vc4_f32(t, "upsample_bilinear2d");
+    TORCH_CHECK(t.dim() == 4 && t.is_contiguous(),
+                "torch_vc4: upsample_bilinear2d expects contiguous NCHW");
+    int64_t N = t.size(0), C = t.size(1), H = t.size(2), W = t.size(3);
+    TORCH_CHECK(ho > 0 && wo > 0, "torch_vc4: upsample_bilinear2d: empty "
+                "output ", ho, "x", wo);
+    auto out = make_arena_tensor({N, C, ho, wo});
+    invalidate_for_cpu(t);
+    State &s = state();
+    std::lock_guard<std::mutex> g(s.gpu_mu);
+    vc4_buf bi = buf_of(t), bo = buf_of(out);
+    vc4_status st = vc4_resize_bilinear_mode(
+        s.ctx, &bi, &bo, (int)(N * C), (int)H, (int)W, (int)ho, (int)wo,
+        align_corners ? VC4_RESIZE_ALIGN_CORNERS : VC4_RESIZE_HALF_PIXEL);
+    if (st != VC4_OK)
+        throw_st(st, "upsample_bilinear2d");
+    return out;
+}
+
 /* ------------------------------------------------------------ weight maps */
 /* All of these are byte copies / permutations of the weight tensor; no
  * arithmetic.  They exist because the engine's conv wants [Cout][Cin][k][k]
@@ -2069,6 +2096,56 @@ static at::Tensor vc4_conv_nhwc_op(const at::Tensor &in,
     return out;
 }
 
+/* Grouped conv over the whole batch in NHWC: one packed panel per group,
+ * each GEMM writing its own channel range of the single output (the engine
+ * sets the GEMM C row stride to Cout, so nothing is interleaved on the ARM).
+ * Returns [nimg][ho][align16(wo)][Cout] like vc4_conv_nhwc_op. */
+static at::Tensor vc4_conv_nhwc_group_op(
+    const at::Tensor &in, const std::vector<at::Tensor> &panels, int64_t nimg,
+    int64_t cin, int64_t H, int64_t W, int64_t cout, int64_t groups,
+    int64_t KH, int64_t KW, int64_t stride, int64_t pad, int64_t dil)
+{
+    ensure_init();
+    check_vc4_f32(in, "conv2d(nhwc group)");
+    TORCH_CHECK(in.dim() == 4 && in.is_contiguous(),
+                "torch_vc4: grouped conv expects contiguous NHWC");
+    TORCH_CHECK(in.size(0) == nimg && in.size(1) == H && in.size(2) == W &&
+                in.size(3) == cin,
+                "torch_vc4: grouped conv input ", in.sizes(), " != [", nimg,
+                "][", H, "][", W, "][", cin, "]");
+    TORCH_CHECK(groups >= 1 && (int64_t)panels.size() == groups,
+                "torch_vc4: grouped conv needs one packed panel per group, "
+                "got ", panels.size(), " for groups=", groups);
+    for (const auto &p : panels)
+        check_vc4_f32(p, "conv2d(group panel)");
+    int64_t effh = (KH - 1) * dil + 1, effw = (KW - 1) * dil + 1;
+    int64_t ho = (H + 2 * pad - effh) / stride + 1;
+    int64_t wo = (W + 2 * pad - effw) / stride + 1;
+    TORCH_CHECK(ho > 0 && wo > 0, "torch_vc4: grouped conv: empty output");
+    int64_t Wg = (wo + 15) & ~int64_t(15);
+    auto out = make_arena_tensor({nimg, ho, Wg, cout});
+    invalidate_for_cpu(in);
+    State &s = state();
+    std::lock_guard<std::mutex> g(s.gpu_mu);
+    vc4_buf bi = buf_of(in), bo = buf_of(out);
+    std::vector<vc4_buf> bp(panels.size());
+    std::vector<const vc4_buf *> bpp(panels.size());
+    for (size_t i = 0; i < panels.size(); ++i) {
+        bp[i] = buf_of(panels[i]);
+        bpp[i] = &bp[i];
+    }
+    int gho = 0, gwo = 0, op = 0;
+    vc4_status st = vc4_conv_nhwc_group(s.ctx, &bi, (int)nimg, (int)cin,
+                                        (int)H, (int)W, (int)W, bpp.data(),
+                                        (int)cout, (int)groups, (int)KH,
+                                        (int)KW, (int)stride, (int)pad,
+                                        (int)dil, &bo, &gho, &gwo, &op);
+    if (st != VC4_OK)
+        throw_st(st, "conv2d(nhwc group)");
+    TORCH_CHECK(gho == ho && gwo == wo, "torch_vc4: grouped conv size drift");
+    return out;
+}
+
 /* 3x3 depthwise panel: [C][1][3][3] -> engine block-diagonal panel, with the
  * channel count padded to a multiple of 16 (zero weights). */
 static at::Tensor vc4_depthwise_panel(const at::Tensor &w, int64_t cpad)
@@ -2353,6 +2430,8 @@ TORCH_LIBRARY(torch_vc4, m)
           &torch_vc4::vc4_bcast_ch);
     m.def("up_nearest(Tensor t, int ho, int wo, float sh, float sw) -> Tensor",
           &torch_vc4::vc4_up_nearest);
+    m.def("up_bilinear(Tensor t, int ho, int wo, bool align_corners) "
+          "-> Tensor", &torch_vc4::vc4_up_bilinear);
     m.def("pad_w(Tensor w, int cin_pad, int cout_pad) -> Tensor",
           &torch_vc4::vc4_pad_w);
     m.def("dense_dw_w(Tensor w, int cin_pad, int cout_pad) -> Tensor",
@@ -2418,6 +2497,9 @@ TORCH_LIBRARY(torch_vc4, m)
     m.def("conv_nhwc(Tensor src, Tensor panel, int nimg, int cin, int h, "
           "int w, int cout, int kh, int kw, int stride, int pad, int dil) "
           "-> Tensor", &torch_vc4::vc4_conv_nhwc_op);
+    m.def("conv_nhwc_group(Tensor src, Tensor[] panels, int nimg, int cin, "
+          "int h, int w, int cout, int groups, int kh, int kw, int stride, "
+          "int pad, int dil) -> Tensor", &torch_vc4::vc4_conv_nhwc_group_op);
     m.def("depthwise_panel(Tensor w, int cpad) -> Tensor",
           &torch_vc4::vc4_depthwise_panel);
     m.def("depthwise_nhwc(Tensor src, Tensor panel, int nimg, int c, int h, "

@@ -14,7 +14,9 @@
 #
 #   pool/main/<letter>/<package>/<package>_<version>_<arch>.deb
 #   pip/<project>-<version>-py3-none-any.whl
-#   pip/simple/<project>/index.html        (PEP 503; one directory per project)
+#   pip/simple/<project>/index.html        (PEP 503; one directory per project,
+#                                           named by the normalised project name
+#                                           and carrying each wheel's sha256)
 #   dists/stable/{Release,Release.gpg,InRelease}
 #
 # Packages/Release/InRelease are regenerated over the whole pool, so adding a
@@ -93,20 +95,35 @@ if [ -n "${torchwheel:-}" ] && [ -f "$torchwheel" ]; then
 fi
 
 python3 - "$wt/pip" <<'PY'
-import os, sys, html
+import hashlib, os, re, shutil, sys
 
 pip = sys.argv[1]
 wheels = sorted(f for f in os.listdir(pip) if f.endswith(".whl"))
+
+
+def normalise(name):
+    """PEP 503 project name: lowercase, runs of -_. become one -."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 projects = {}
 for f in wheels:
     parts = f.split("-")
     cut = next((i for i, p in enumerate(parts) if p and p[0].isdigit()), None)
     if cut is None:
         continue
-    projects.setdefault("-".join(parts[:cut]), []).append(f)
+    projects.setdefault(normalise("-".join(parts[:cut])), []).append(f)
 
 simple = os.path.join(pip, "simple")
 os.makedirs(simple, exist_ok=True)
+# A directory under a non-canonical spelling of a project we publish is stale
+# (pip only ever asks for the normalised name): drop it so the index has one
+# entry point per project.
+for entry in os.listdir(simple):
+    path = os.path.join(simple, entry)
+    if os.path.isdir(path) and normalise(entry) in projects \
+            and normalise(entry) != entry:
+        shutil.rmtree(path)
 for proj, files in sorted(projects.items()):
     d = os.path.join(simple, proj)
     os.makedirs(d, exist_ok=True)
@@ -116,7 +133,9 @@ for proj, files in sorted(projects.items()):
         "</head><body>",
     ]
     for f in sorted(files):
-        lines.append('<a href="../../%s">%s</a><br>' % (f, f))
+        with open(os.path.join(pip, f), "rb") as handle:
+            sha = hashlib.sha256(handle.read()).hexdigest()
+        lines.append('<a href="../../%s#sha256=%s">%s</a><br>' % (f, sha, f))
     lines.append("</body></html>")
     open(os.path.join(d, "index.html"), "w").write("\n".join(lines) + "\n")
 

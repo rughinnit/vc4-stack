@@ -15,8 +15,9 @@ maths and no CPU fallback: a shape or attribute the engine cannot do raises.
 Batches run through the engine's batched NHWC conv path; pools/resize/cat
 use one launch per image.  Reductions over arbitrary dims are GEMMs
 (sum/mean) or a relu/sign max tree (amax/amin) because the engine's generic
-``vc4_reduce``/``vc4_gather`` kernels hang this board (measured; see
-COMPLETENESS.md).  Gather/index_select are host word gathers (pure copies).
+``vc4_reduce`` blob is not used by this backend's paths (see COMPLETENESS.md).
+Gather/index_select are host word gathers (pure copies); bilinear resize is
+the engine's four-gather lowering (`vc4_resize_bilinear_mode`).
 """
 
 import math
@@ -332,20 +333,37 @@ def _conv_geom(x, w, b, stride, pad, groups):
     Cout, Cin, kh, kw = w.shape
     if N < 1:
         raise RuntimeError("torch_vc4: conv2d needs a non-empty batch")
-    depthwise = groups != 1
-    if depthwise:
-        if groups != C:
+    if groups < 1:
+        raise RuntimeError("torch_vc4: conv2d groups must be >= 1, got %d"
+                           % groups)
+    depthwise = False
+    if groups == 1:
+        if Cin != C:
+            raise RuntimeError("torch_vc4: conv2d: weight has %d input "
+                               "channels, input has %d" % (Cin, C))
+    elif groups == C:
+        if Cin != 1:
             raise RuntimeError(
-                "torch_vc4: conv2d supports groups=1 and depthwise "
-                "groups=Cin, got groups=%d with Cin=%d" % (groups, C))
-        if not (Cout == C and Cin == 1):
+                "torch_vc4: conv2d with groups == Cin needs a [C][1][k][k] "
+                "weight (multiplier 1); got Cin=%d" % Cin)
+        if Cout != C:
             raise RuntimeError(
-                "torch_vc4: depthwise conv2d needs Cout == Cin and a "
-                "[C][1][k][k] weight (multiplier 1); got %d -> %d"
+                "torch_vc4: depthwise conv2d needs Cout == Cin, got %d -> %d"
                 % (C, Cout))
-    elif Cin != C:
-        raise RuntimeError("torch_vc4: conv2d: weight has %d input channels, "
-                           "input has %d" % (Cin, C))
+        depthwise = True
+    else:
+        # grouped: the weight is [Cout][Cin/groups][k][k]
+        if Cin * groups != C:
+            raise RuntimeError(
+                "torch_vc4: conv2d: weight has %d channels per group and "
+                "groups=%d, so it covers %d input channels; the input has %d "
+                "(the weight must be [Cout][Cin/groups][k][k])"
+                % (Cin, groups, Cin * groups, C))
+        if groups > C or C % groups or Cout % groups:
+            raise RuntimeError(
+                "torch_vc4: conv2d: groups=%d does not divide Cin=%d and "
+                "Cout=%d (the weight is [Cin][Cin/groups][k][k] and the bias "
+                "is [Cout])" % (groups, C, Cout))
     if kh != kw or kh not in (1, 3):
         raise RuntimeError("torch_vc4: conv2d supports 1x1 and 3x3 kernels, "
                            "got %dx%d" % (kh, kw))
@@ -437,9 +455,54 @@ def _conv2d_nchw(x, w, b, stride, pad, depthwise):
     return y3.view(1, Cout, y3.shape[1], y3.shape[2])
 
 
+def _conv2d_grouped(x, w, b, stride, pad, groups):
+    """groups > 1 beyond depthwise: the engine's grouped NHWC kernel.
+
+    ``vc4_conv_nhwc_group`` runs one packed-panel GEMM per group and writes
+    each group's channel range straight into the single NHWC output (the GEMM
+    C row stride is Cout), so nothing is interleaved on the ARM and the MACs
+    are the real grouped MACs.  The per-group panel is k-major with one
+    16-channel block per tap, which is where the multiple-of-16 requirement
+    comes from; an unsupported shape is refused by name, never split.
+    """
+    N, C, H, W = x.shape
+    Cout, Cin, kh, kw = w.shape
+    cg, og = C // groups, Cout // groups
+    if Cin != cg:
+        raise RuntimeError("torch_vc4: grouped conv2d: weight has %d channels "
+                           "per group, input has %d over groups=%d"
+                           % (Cin, C, groups))
+    if cg % 16 or og % 16:
+        raise RuntimeError(
+            "torch_vc4: grouped conv2d needs Cin/groups and Cout/groups to be "
+            "multiples of 16 (a group's weight panel is one 16-channel block "
+            "per tap); got Cin/groups=%d and Cout/groups=%d for groups=%d. "
+            "Pad the channels, or run this layer on the CPU."
+            % (cg, og, groups))
+    if stride * C * 4 > 8191:
+        raise RuntimeError(
+            "torch_vc4: grouped conv2d: the engine reads the padded image at "
+            "a VDR pitch of stride*Cin*4 = %d B (Cin=%d, stride=%d), over its "
+            "8191 B field; run this layer at a smaller stride or with fewer "
+            "input channels" % (stride * C * 4, C, stride))
+    xp = T.nhwc_pack(x, C)                        # [N][H][W][C]
+    panels = []
+    for g in range(groups):
+        wg = w[g * og:(g + 1) * og]
+        bg = b[g * og:(g + 1) * og] if b is not None else None
+        panels.append(T.conv_nhwc_pack_w(wg.contiguous(), bg, cg, og))
+    y = T.conv_nhwc_group(xp, panels, N, C, H, W, Cout, groups, kh, kw,
+                          stride, pad, 1)
+    ho = y.shape[1]
+    wo = (W + 2 * pad - kh) // stride + 1
+    return T.nhwc_unpack(y, N, Cout, ho, wo)
+
+
 def conv2d(x, w, b, stride=1, pad=0, groups=1):
     N, C, H, W, Cout, k, stride, pad, depthwise = _conv_geom(
         x, w, b, stride, pad, groups)
+    if groups > 1 and not depthwise:
+        return _conv2d_grouped(x, w, b, stride, pad, groups)
     # The engine's batched NHWC kernels take stride 1/2 and a whole batch in
     # one launch; the native 3x3 depthwise kernel covers pad-1/stride-1, the
     # other depthwise cases use its exact block-diagonal decomposition.
@@ -454,6 +517,13 @@ def conv2d(x, w, b, stride=1, pad=0, groups=1):
 def _conv2d_backward_single(x, w, dy, stride, pad, groups):
     _, C, H, W, Cout, k, stride, pad, depthwise = _conv_geom(
         x, w, None, stride, pad, groups)
+    if groups > 1 and not depthwise:
+        raise RuntimeError(
+            "torch_vc4: grouped conv2d backward (groups=%d, beyond depthwise) "
+            "is not implemented: the engine's dX/dW kernels run one dense "
+            "GEMM over the whole channel axis and there is no per-group "
+            "binder for them; grouped conv is forward only in this version"
+            % groups)
     f32(dy, "conv2d_backward(dy)")
     ho = (H + 2 * pad - k) // stride + 1
     wo = (W + 2 * pad - k) // stride + 1
@@ -1005,6 +1075,41 @@ def upsample_nearest2d(x, output_size, scales_h=None, scales_w=None):
     return y.view(N, C, ho, wo)
 
 
+def upsample_bilinear2d(x, output_size, align_corners=False, scales_h=None,
+                        scales_w=None):
+    """Bilinear resize from the engine's four-gather lowering.
+
+    The engine builds four int32 index maps and four weight vectors from the
+    output grid (geometry only) and runs 4 gathers + 4 multiplies + 3 adds on
+    the QPUs, so the ARM never touches an activation value.  Both torch
+    mappings are supported: align_corners=False is ONNX "half_pixel",
+    align_corners=True is "align_corners".  The scale arguments are not
+    needed: torch has already resolved output_size from them.
+    """
+    f32(x, "upsample_bilinear2d")
+    if x.dim() != 4:
+        raise RuntimeError("torch_vc4: upsample_bilinear2d expects NCHW")
+    ho, wo = int(output_size[0]), int(output_size[1])
+    if ho <= 0 or wo <= 0:
+        raise RuntimeError("torch_vc4: upsample_bilinear2d: empty output "
+                           "%dx%d" % (ho, wo))
+    return T.up_bilinear(x, ho, wo, bool(align_corners))
+
+
+def upsample_bilinear2d_vec(x, output_size, align_corners=False,
+                           scale_factors=None):
+    if output_size is not None:
+        return upsample_bilinear2d(x, output_size, align_corners)
+    if scale_factors is None:
+        raise RuntimeError("torch_vc4: upsample_bilinear2d needs a size or "
+                           "scale factors")
+    H, W = x.shape[-2], x.shape[-1]
+    sh, sw = float(scale_factors[0]), float(scale_factors[1])
+    ho = int(math.floor(H * sh))
+    wo = int(math.floor(W * sw))
+    return upsample_bilinear2d(x, (ho, wo), align_corners)
+
+
 def upsample_nearest2d_vec(x, output_size, scale_factors):
     if output_size is not None:
         return upsample_nearest2d(x, output_size)
@@ -1442,6 +1547,8 @@ def register():
     impl("cat", cat)
     impl("upsample_nearest2d", upsample_nearest2d)
     impl("upsample_nearest2d.vec", upsample_nearest2d_vec)
+    impl("upsample_bilinear2d", upsample_bilinear2d)
+    impl("upsample_bilinear2d.vec", upsample_bilinear2d_vec)
     impl("native_batch_norm", native_batch_norm)
     impl("batch_norm", batch_norm)
     impl("linear", linear)

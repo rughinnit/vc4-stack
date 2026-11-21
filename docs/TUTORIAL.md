@@ -691,12 +691,12 @@ ERROR: Could not find a version that satisfies the requirement torch_vc4 (from v
 ERROR: No matching distribution found for torch_vc4
 ```
 
-The backend is a compiled `cp313`/`aarch64` extension, so build it from the
-`torch-vc4` checkout.  The version in the source tree is **0.3.0** (the
-installed editable metadata on the reference board still says 0.2.0 because it
-predates the bump).  The measured numbers in section 7 are from the 0.2.0
-surface; the 0.3.0 tree was still landing while this document was written, and
-`COMPLETENESS.md` is its authoritative per-op table.
+The backend is a compiled `cp313`/`aarch64` extension, published as
+`torch_vc4-0.3.1-cp313-cp313-linux_aarch64.whl` in the vc4-apt pip index and
+built from the `torch-vc4` checkout.  The version in the source tree is
+**0.3.1** (an editable install made before the bumps still says 0.2.0 in its
+metadata).  The measured numbers in section 7 are from the 0.2.0 surface, and
+`COMPLETENESS.md` is the authoritative per-op table.
 
 ```sh
 sudo apt install vc4infer vc4top          # engine library + daemon client
@@ -872,7 +872,7 @@ mm cpu x vc4            mm(A): expected a vc4 tensor, got cpu
 ```
 
 A non-contiguous view is a metadata alias; a compute op on it raises rather
-than silently copying.  The exact op table, including the 0.3.0 work, is in
+than silently copying.  The exact op table, including the 0.3.x work, is in
 [API.md](API.md); `COMPLETENESS.md` is the $1 work's authoritative
 per-op table.
 

@@ -1,0 +1,322 @@
+{
+ "generated": "2026-11-22",
+ "board": {
+  "model": "Raspberry Pi 3B, BCM2837, VideoCore IV, 905 MiB RAM",
+  "kernel": "6.18 arm64, Debian 13",
+  "core_hz": 400000000,
+  "v3d_hz": 300000000,
+  "throttled": "0x20000",
+  "temperature_c": [
+   59.6,
+   65.0
+  ],
+  "guard": "tools/thermal-guard.sh --max 71",
+  "clients": 1
+ },
+ "engine": {
+  "lib": "in-tree infer/build/libvc4infer.so.1 (conv/matmul activation epilogue)",
+  "python": "in-tree infer/python",
+  "daemon": "vc4d 1.2.9, managed backend",
+  "opt": "VC4_OPT=all",
+  "mode": "strict",
+  "arena_mb": 64,
+  "kcache": "~/scratch/kcache-model"
+ },
+ "protocol": {
+  "bench": "vc4infer bench --reps 5, three runs per model; median of the three means",
+  "warmup": "JIT warm-up excluded by the bench",
+  "input": "random normal, numpy default_rng(0)",
+  "weights": "random initialisation; latency does not depend on weights"
+ },
+ "cost_model": {
+  "launch_floor_ms_tiny_elementwise": 0.28,
+  "asm10_gemm_gflops": 13.72,
+  "engine_gemm_gflops_256": 8.44,
+  "measured_conv_gflops_96": 3.3,
+  "measured_launch_path_ms_per_launch": 0.77,
+  "fit": {
+   "96": {
+    "intercept_ms": 2.5,
+    "ms_per_conv": 3.13,
+    "qpu_ms_per_conv": 1.97
+   },
+   "128": {
+    "intercept_ms": 5.4,
+    "ms_per_conv": 4.33,
+    "qpu_ms_per_conv": 3.07
+   }
+  }
+ },
+ "variants": [
+  {
+   "name": "vc4det-t",
+   "yaml": "infer/tools/det/vc4det-t.yaml",
+   "width": 0.25,
+   "channels": [
+    16,
+    32,
+    64
+   ],
+   "convs": 5,
+   "params": 25862,
+   "compute_nodes": 13,
+   "onnx_ops": {
+    "Conv": 5,
+    "Sigmoid": 4,
+    "Mul": 4,
+    "Identity": 1
+   },
+   "modelled_launches": 10,
+   "onnx_nodes": 14
+  },
+  {
+   "name": "vc4det-n",
+   "yaml": "infer/tools/det/vc4det-n.yaml",
+   "width": 0.25,
+   "channels": [
+    16,
+    32,
+    64
+   ],
+   "convs": 8,
+   "params": 81286,
+   "compute_nodes": 22,
+   "onnx_ops": {
+    "Conv": 8,
+    "Sigmoid": 7,
+    "Mul": 7,
+    "Identity": 4
+   },
+   "modelled_launches": 16,
+   "onnx_nodes": 26
+  },
+  {
+   "name": "vc4det-s",
+   "yaml": "infer/tools/det/vc4det-s.yaml",
+   "width": 0.5,
+   "channels": [
+    32,
+    64,
+    128
+   ],
+   "convs": 8,
+   "params": 323334,
+   "compute_nodes": 22,
+   "onnx_ops": {
+    "Conv": 8,
+    "Sigmoid": 7,
+    "Mul": 7,
+    "Identity": 4
+   },
+   "modelled_launches": 16,
+   "onnx_nodes": 26
+  }
+ ],
+ "measured": [
+  {
+   "name": "vc4det-t",
+   "imgsz": 96,
+   "convs": 5,
+   "launches": 12,
+   "macs_issued": 10988928,
+   "gflop": 0.022,
+   "runs_ms": [
+    18.0,
+    18.9,
+    18.1
+   ],
+   "wall_ms": 18.1,
+   "qpu_ms": 7.8,
+   "fps": 55.2
+  },
+  {
+   "name": "vc4det-n",
+   "imgsz": 96,
+   "convs": 8,
+   "launches": 18,
+   "macs_issued": 22929300,
+   "gflop": 0.046,
+   "runs_ms": [
+    27.5,
+    27.7,
+    27.3
+   ],
+   "wall_ms": 27.5,
+   "qpu_ms": 13.7,
+   "fps": 36.3
+  },
+  {
+   "name": "vc4det-s",
+   "imgsz": 96,
+   "convs": 8,
+   "launches": 18,
+   "macs_issued": 80953300,
+   "gflop": 0.162,
+   "runs_ms": [
+    47.2,
+    47.6,
+    47.6
+   ],
+   "wall_ms": 47.6,
+   "qpu_ms": 32.2,
+   "fps": 21.0
+  },
+  {
+   "name": "vc4det-t",
+   "imgsz": 128,
+   "convs": 5,
+   "launches": 12,
+   "macs_issued": 19533000,
+   "gflop": 0.039,
+   "runs_ms": [
+    27.2,
+    27.1,
+    27.1
+   ],
+   "wall_ms": 27.1,
+   "qpu_ms": 14.9,
+   "fps": 36.9
+  },
+  {
+   "name": "vc4det-n",
+   "imgsz": 128,
+   "convs": 8,
+   "launches": 18,
+   "macs_issued": 40763300,
+   "gflop": 0.082,
+   "runs_ms": [
+    40.1,
+    40.0,
+    41.4
+   ],
+   "wall_ms": 40.1,
+   "qpu_ms": 24.1,
+   "fps": 24.9
+  },
+  {
+   "name": "vc4det-s",
+   "imgsz": 128,
+   "convs": 8,
+   "launches": 18,
+   "macs_issued": 143917000,
+   "gflop": 0.288,
+   "runs_ms": [
+    73.5,
+    73.4,
+    73.7
+   ],
+   "wall_ms": 73.5,
+   "qpu_ms": 55.4,
+   "fps": 13.6
+  }
+ ],
+ "epilogue": {
+  "model": "vc4det-n",
+  "imgsz": 96,
+  "all": {
+   "launches": 18,
+   "wall_ms": 27.5,
+   "qpu_ms": 13.7
+  },
+  "none": {
+   "launches": 58,
+   "wall_ms": 45.5,
+   "qpu_ms": 16.0,
+   "runs_ms": [
+    46.7,
+    45.4,
+    43.3
+   ]
+  },
+  "activation_launches_removed": 40
+ },
+ "profile_n_96": [
+  {
+   "node": "/model.0/conv/Conv",
+   "shape": "3->16 3x3 s2 96->48",
+   "launches": 3,
+   "wall_ms": 7.44,
+   "qpu_ms": 4.35
+  },
+  {
+   "node": "/model.1/conv/Conv",
+   "shape": "16->32 3x3 s2 48->24",
+   "launches": 2,
+   "wall_ms": 3.11,
+   "qpu_ms": 1.68
+  },
+  {
+   "node": "/model.2/conv/Conv",
+   "shape": "32->32 3x3 s1 24",
+   "launches": 2,
+   "wall_ms": 4.11,
+   "qpu_ms": 2.86
+  },
+  {
+   "node": "/model.3/conv/Conv",
+   "shape": "32->64 3x3 s2 24->12",
+   "launches": 2,
+   "wall_ms": 2.48,
+   "qpu_ms": 1.27
+  },
+  {
+   "node": "/model.4/conv/Conv",
+   "shape": "64->64 3x3 s1 12",
+   "launches": 2,
+   "wall_ms": 3.23,
+   "qpu_ms": 2.16
+  },
+  {
+   "node": "/model.5/conv/Conv",
+   "shape": "64->32 1x1 12",
+   "launches": 2,
+   "wall_ms": 1.32,
+   "qpu_ms": 0.29
+  },
+  {
+   "node": "/model.6/conv/Conv",
+   "shape": "32->32 3x3 s1 12",
+   "launches": 2,
+   "wall_ms": 1.87,
+   "qpu_ms": 0.85
+  },
+  {
+   "node": "/model.7/Conv",
+   "shape": "32->6 1x1 12",
+   "launches": 3,
+   "wall_ms": 1.55,
+   "qpu_ms": 0.22
+  }
+ ],
+ "budget": {
+  "frame_30fps_ms": 33.3,
+  "frame_60fps_ms": 16.7,
+  "gflop_30": {
+   "arithmetic_13.72": 0.457,
+   "plus_20_launches_0.28": 0.38,
+   "engine_gemm_8.44": 0.234,
+   "measured": 0.064,
+   "measured_fit_convs": 9.8
+  },
+  "gflop_60": {
+   "arithmetic_13.72": 0.229,
+   "plus_15_launches_0.28": 0.171,
+   "engine_gemm_8.44": 0.105,
+   "measured": 0.025,
+   "measured_fit_convs": 4.5
+  }
+ },
+ "training": {
+  "performed": false,
+  "reason": "the graph has no Detect/DFL head (Split and a reg_max softmax are refused by the engine), so Ultralytics' detection loss does not apply; no dataset on the board",
+  "probe": {
+   "model": "vc4det-n",
+   "imgsz": 96,
+   "batch": 4,
+   "threads": 4,
+   "step_ms": 299.3,
+   "coco_steps_per_epoch": 29571,
+   "coco_epoch_hours": 2.46
+  }
+ }
+}

@@ -7,13 +7,15 @@ what it took to make the HF export static, what the engine ran, and the point
 at which the result stops being the model.
 
 **Result in one paragraph.** The graph executes end to end on the QPUs: 378
-nodes, none refused, no CPU fallback, 378/378 on VC4, 1.06 tokens/s with a
-16-token window and 0.42 tokens/s with 32. The tokens are not the model's.
-The last-position logits differ from ONNX Runtime by up to 23 (mean 3.1) at
-every step, all eight greedy steps disagree, and the first transformer block
-is already 7e-2 off. Two engine defects are isolated in §5. Until they are
-fixed this is a launch-and-cost measurement of a transformer on the QPUs, not
-a text-generation result.
+nodes, none refused, no CPU fallback, 378/378 on VC4, 0.42-1.06 tokens/s
+depending on the window. The tokens are the model's: the last-position logits
+match ONNX Runtime to 7.7e-4 at every step, all eight greedy steps agree, and
+the continuation is coherent text. Two engine defects stood in the way, both
+found with a reduced reproduction and fixed: the 8x64 store could not write a
+C row pitch above 16384 floats (the VDW stride is a 16-bit field), and the
+pool released a same-size *view* of a tensor while the tensor itself was still
+live, so a later allocation overwrote the attention input. The parity table,
+the two reproductions and the generated text are below.
 
 ## 1. Model and licence
 
@@ -82,8 +84,13 @@ submit.
 
 | window | nodes | on VC4 | refused | launches / token | ms / token | tokens/s | pool | peak |
 |---|---|---|---|---|---|---|---|---|
-| 16 | 378 | 378 | 0 | 1371 | 940 (min 866) | 1.06 | 29.8 MB | 26.6 MB |
-| 32 | 378 | 378 | 0 | 3464 | 2399 (min 2351) | 0.42 | 33.4 MB | 26.6 MB |
+| 16 | 378 | 378 | 0 | 1374 | 940 (min 866) | 1.06 | 29.8 MB | 26.6 MB |
+| 32 | 378 | 378 | 0 | 3469 | 2399 (min 2351) | 0.42 | 33.4 MB | 26.6 MB |
+
+The launch counts are from the parity re-run after both fixes; the wall times
+are the earlier undisturbed measurement of the same graph. The re-run itself
+was taken while another CPU-bound process shared the board (1647 ms and
+4550 ms per token) and is not comparable.
 
 A cache-free run recomputes the whole window per token, so these are also the
 costs of one forward pass. 25 % of the wall time at 16 tokens and 20 % at 32
@@ -114,31 +121,36 @@ launches.
 ## 4. Parity against ONNX Runtime
 
 Both sides run the same rewritten graph with the same feeds; only the engine
-differs.
+differs. These are the numbers after both defects were fixed.
 
 | window | max abs logit diff per step | mean | greedy argmax agrees |
 |---|---|---|---|
-| 16 | 18.2 - 23.4 | 3.1 | 0 / 8 |
-| 32 | 17.5 - 23.3 | 3.1 | 0 / 8 |
+| 16 | 4.3e-4 - 7.7e-4 | 5.5e-4 | 8 / 8 |
+| 32 | 4.3e-4 - 6.7e-4 | 5.5e-4 | 8 / 8 |
 
-The divergence is not amplification of fp32 rounding (that is 2.9e-6 on this
-graph): the engine is executing something else. Truncating the graph at the
-first block's attention residual, so the tensor is a real graph output and
-nothing later can recycle its buffer, gives:
+What is left is accumulated fp32 rounding, not a different computation: the
+graph rewrite itself differs from the export by 2.9e-6 under ONNX Runtime, the
+two engines accumulate the 8 blocks in different orders, and the reduced
+probes agree to that order:
 
-```
-h.0/attn -> residual (33 nodes)  max 6.96e-02   reference max 0.592
-h.0 block output     (51 nodes)  max 5.25e-02
-```
+| probe (graph truncated at the tensor, run through both) | max abs diff | nodes |
+|---|---|---|
+| `/transformer/h.0/attn/attention/MatMul_1_output_0` (softmax x V) | 5.96e-07 | 26 |
+| same probe, before the liveness fix | 1.22 | 26 |
 
-12 % relative error in the first block, before any later layer can contribute.
+The other nodes measured this way before the fixes (the embeddings, both
+LayerNorms, QK^T, the 2-D matmul inputs and softmax) were within 1e-5; the
+value matmul was the first departure, and it is 5.96e-7 now.
 
-## 5. Two engine defects
+## 5. Two engine defects, found and fixed
 
-### 5.1 A multi-row GEMM is wrong for N > 16384
+Both were reproduced on their own before either was touched - a synthetic GEMM
+and a five-node graph - and the reproductions are now tests: `test_matmul`
+carries the wide shapes and `test_pool_alias.py` the aliasing graph.
 
-The LM head is the only 50,257-wide GEMM. Isolated `MatMul(A, B)` with a
-random `B` on the board:
+### 5.1 The store could not write a C row pitch above 16384 floats
+
+Isolated `MatMul(A, B)` with a random `B` on the board, before the fix:
 
 | M | N | result |
 |---|---|---|
@@ -151,38 +163,93 @@ random `B` on the board:
 | 8 | 32,768 | wrong, 1.0 |
 | 16 | 50,257 | wrong, 0.9 - 3.5 |
 
-Exact for `N <= 16384` at any `M`, and for `M = 1` at any width; wrong as soon
-as a multi-row output spans more than 16384 columns. 16384 x 4 bytes is
-64 KiB, which is where a 16-bit byte offset or a single N-tile would end. The
-wrapper therefore slices the final hidden state to its last row and emits
-`[1, 1, 50257]`; the full-position graph is available with `--logits all` but
-is not correct.
+Exact for `N <= 16384` at any `M` and for `M = 1` at any width, wrong as soon
+as a multi-row result spans more than 16384 columns. Reproduced at
+M=4, N=16385, K=16 with the row pattern the cause predicts: row 0 exact,
+rows 1..3 holding zeros or stale values, e.g.
+`row 1 col 15791: got 0.0, reference 15.678`; at M=8 the wrong rows are
+1, 2, 3, 5, 6 and 7, i.e. every row that is not first in its four-row group.
 
-### 5.2 A live attention operand is replaced by the mask constant
+**Root cause.** The asm10 store moves a 8x64 tile to memory with eight
+VPM->DMA stores of four rows each, and the distance between consecutive
+16-word rows goes into the VDW stride word, which is 16 bits wide
+(`vpmwords.vdw_stride`). The distance for a `[M][N]` result is `(N-16)*4`
+bytes: 65,472 at N=16,384 (fits) and 65,648 at N=16,448 (does not). The
+generator ORs the value into the store's control word (0xC0010000 | stride),
+so the bit above 15 lands in the control field and the stride itself becomes
+0x0070: the four-row store advanced 112 bytes and wrote rows 1..3 inside
+row 0.
+Row 0 was then written correctly by its own column chunks, which is why the
+first row of every tile - and therefore every `M = 1` result - stayed exact.
 
-Truncating the same graph at `/transformer/h.0/attn/attention/MatMul_1_output_0`
-(softmax x V, `[1,16,16,16] x [1,16,16,4]`) returns values at -3.4e38 where the
-reference is in [-0.44, 0.53] — the value of the mask constant, not of any
-attention product:
+**Fix.** Above 16384 columns the kernel writes a compact layout instead of a
+row-major result: one dense 8x64 tile per (row block, column block), rows of
+64 floats, so the store stride is `(64-16)*4 = 192` and the field cannot
+overflow. `unpack_compact()` in `vc4_gemm.c` scatters the tiles into the
+caller's matrix; the tile base is the column-block offset scaled by 8 (the B
+read still uses it as the byte offset of its 64 columns) and the row-block
+stride is `N*32`. The store instruction count is unchanged (791 words against
+788 for the row-major kernel, two of them the scaled C base), and the copy is
+one pass over `M*N` floats on the ARM, paid only by shapes this wide.
 
-```
-MatMul_1 output  got [-3.4028235e38, 0.00]   ref [-0.44, 0.53]
-```
+The asm3 store the conv path uses has the same 16-bit field
+(`emit_store16`, and the col2im store in `build_col2im`, which is on the
+conv-backward path); the widest channel pitch any shipped inference model
+reaches is 640 floats, so nothing there needed to change. A conv whose output
+row pitch exceeded 16384 floats would truncate the same way and is not fixed
+here.
 
-The same operator pair and shape is exact in isolation (1.9e-6), a fresh copy
-of either operand (`Add(x, 0)`) does not change the result, and under the full
-continuation the same node is only ~7e-2 wrong — the outcome depends on the
-pool layout. That is buffer reuse or a missing invalidate between a live
-tensor and a later allocation, not GEMM arithmetic. Every other node measured
-this way (embeddings, LayerNorm, QK^T, softmax) matches to 1e-5; the first
-departure is at the value matmul.
+All six shapes are now exact against the float64 oracle:
 
-Reproduce: take `wrap/ts1m_c16.onnx`, keep only the nodes that are ancestors
-of the target tensor, set it as the single graph output, and run
-`vc4infer.Engine` and ONNX Runtime on that file. The same procedure with the
-target at `/transformer/Add_5_output_0`, `.../q_proj/MatMul_output_0_2d` or
-`.../attention/Cast_2_output_0` (softmax) matches to 1e-5; the value matmul is
-where it breaks. The run records are `docs/results/tiny-llm-*.json`.
+| M | N | K | max abs (fp32) |
+|---|---|---|---|
+| 4 | 16,384 | 16 | 1.5e-05 |
+| 4 | 16,385 | 16 | 9.8e-06 |
+| 4 | 16,448 | 16 | 9.4e-06 |
+| 1 | 50,257 | 16 | 9.0e-06 |
+| 8 | 16,448 | 16 | 1.5e-05 |
+| 16 | 16,448 | 16 | 1.2e-05 |
+
+### 5.2 A live attention operand was replaced by the mask constant
+
+Truncating the graph at `/transformer/h.0/attn/attention/MatMul_1_output_0`
+(softmax x V, `[1,16,16,16] x [1,16,16,4]`) returned values from the mask path
+where the reference is in [-0.44, 0.53] (with the export's own masked value:
+`got [-3.4028235e38, 0.00], ref [-0.44, 0.53]`). The same operator pair and
+shape is exact in isolation (1.9e-6), a fresh copy of either operand
+(`Add(x, 0)`) did not change it, and the outcome depended on the pool layout -
+buffer reuse over a live tensor, not GEMM arithmetic. Every other node
+measured this way (embeddings, LayerNorm, QK^T, softmax) matched to 1e-5; the
+first departure was the value matmul.
+
+**Root cause: a view released its base tensor's block.** `Reshape`, `Flatten`,
+`Squeeze` and `Cast` do not copy; their `Tensor` carries the producer's `Buf`.
+The pool's free list is keyed by `(offset, aligned bytes)` while the runner's
+liveness is per ONNX *name*, so a view whose last consumer had passed released
+the block by offset and size - and a same-size view has the same key as the
+allocation it is a view of. In this graph the first block's `ln_1/Add_1`
+output is reshaped to 2-D for q/k/v; the k projection's 2-D input is that
+view, its last consumer is the k projection MatMul, and at the end of that
+node the block went back to the pool with `ln_1/Add_1` still live. The k
+projection's own output took the block, the q and v projections read the
+overwritten bytes, and the value matmul returned mask values where attention
+weights times V should have been.
+
+Reproduced with five nodes and a 16-byte tensor
+(`infer/tests/test_pool_alias.py`): an input, a same-size `Reshape` of it with
+two consumers, a constant of the same shape, and a use of the input after the
+view's last consumer. Before the fix that test measured `max|diff| 3.18`
+against the ONNX reference evaluator and one allocation overlapping the live
+input; after it, 1.2e-7 and no overlap. The TinyStories probe named above went
+from 1.22 to 5.96e-7.
+
+**Fix.** The runner returns a block to the pool only when no other live tensor
+holds the same buffer offset (`_release_buf`), so ownership of the bytes is
+tracked per buffer instead of per name. It is applied wherever the runner
+releases storage it no longer names: a node's dead inputs, its per-node
+garbage, garbage left by a refused dispatch, and the previous run's outputs.
+A view that dies before its base is simply not freed; the base frees the block
+when its own last consumer passes.
 
 ### 5.3 The Softmax refusal that the mask value triggers
 
@@ -202,37 +269,44 @@ is numerically identical.
 ## 6. Generated text
 
 Greedy, eight tokens, the same 38-token prompt, window at the last N tokens,
-window slid by one per step, positions absolute.
+window slid by one per step, positions absolute. ONNX Runtime on the same
+graph and feeds picks the same eight tokens step by step (parity is 8/8), so
+the two continuations below are the reference's as well.
 
-Window 16, engine: ` to to to to to to to to`
-Window 32, engine: ` M M M M M M M M`
+Window 16: `\n\nOne day, the little girl`
+Window 32: ` One day, Lily's mom told her`
 
-ONNX Runtime on the same graph and feeds: `\n her the the the play play play`
-and ` Oneimiimiimiimiimiimiabel`. Both continuations are poor — a 1 M model
-with greedy decoding on a truncated context is not a story generator — but the
-ORT ones vary and follow the prompt more closely; the engine's collapse to one
-token is the signature of §5.
+Full text at 16 tokens:
+
+> Once upon a time there was a little girl named Lily. She lived with her
+> mother and father in a small house near the woods. Every day she went
+> outside to play with her friends.
+>
+> One day, the little girl
+
+Before the fixes the same prompt produced ` to to to to to to to to` and
+` M M M M M M M M`. The collapse to one token was the two defects, not the
+model: a 1 M-parameter GPT-Neo with greedy decoding is a weak story generator,
+but it continues the prompt.
 
 ## 7. What a next step would be
 
-1. **Fix §5.2 before anything else.** A 7e-2 error in block 0 means the
-   timings above are the cost of a graph that executes, not of the model
-   computing. The reproduction is small (33 nodes, one output) and does not
-   need the LLM: a synthetic `MatMul(softmax(...), V)` after an add of a large
-   constant in a pool of this size should show it.
-2. **Fix §5.1.** With the wide multi-row GEMM correct, the graph can emit all
-   positions, which is a prerequisite for a KV cache; and the LM head becomes
-   16x more useful work per launch instead of one row.
-3. **Then attack the launch count.** Softmax at 32 tokens is 233 launches per
-   node and 976 ms. A causal softmax (mask folded into the max/exp, one
-   kernel) removes both the 906 ms `Where` and most of that. LayerNorm is 22
-   launches for a 16x64 tile; its gamma/beta should be tiled once into a panel,
-   not per launch.
-4. **Only then add a cache.** A fixed-size cache would turn 940 ms per token
+1. **Attack the launch count.** Softmax at 32 tokens is 233 launches per node
+   and 976 ms. A causal softmax (mask folded into the max/exp, one kernel)
+   removes both the 906 ms `Where` and most of that. LayerNorm is 22 launches
+   for a 16x64 tile; its gamma/beta should be tiled once into a panel, not per
+   launch.
+2. **Only then add a cache.** A fixed-size cache would turn 940 ms per token
    into roughly one token's work plus the mask, but at 1300 launches per
-   forward the win is in launches, not FLOPs — the recompute is 2.3x the MACs
-   at 32 tokens but 2.5x the launches at 16. Measure after 1-3.
-5. **Do not read §3 as a throughput claim for LLMs.** It is the cost of this
+   forward the win is in launches, not FLOPs - the recompute is 2.3x the MACs
+   at 32 tokens but 2.5x the launches at 16. Measure after 1.
+3. **Take the wide-matmul copy out if it shows up.** The compact C layout
+   costs one ARM pass over `M*N` floats per matmul above 16384 columns: 0.2 MB
+   for the last-position LM head, 3.2 MB if the graph emits all 16 positions.
+   That is about a millisecond of a 940 ms token, but a store that could write
+   four rows with a 32-bit stride, or a consumer that reads the tile layout
+   directly, would remove it.
+4. **Do not read §3 as a throughput claim for LLMs.** It is the cost of this
    graph on this engine: 1.06 tokens/s at 16 tokens, with 25 % QPU duty. The
    engine has no fused attention, no batched softmax and no cache path; each is
    worth more than a faster GEMM at this size.
@@ -240,7 +314,7 @@ token is the signature of §5.
 ## Reproduce
 
 ```sh
-cd ~/work/vc4-llm
+cd ~/work/vc4-stack
 source ~/work/torch-vc4/.venv/bin/activate
 export VC4INFER_CACHE=$HOME/.cache/vc4infer/kcache
 
@@ -258,6 +332,10 @@ python infer/tools/onnx/make_tinystories.py --src onnx/model.onnx \
   --ctx 16 --out wrap/ts1m_c16.onnx --report wrap/ts1m_c16.json
 python infer/tools/onnx/tinystories_decode.py --model wrap/ts1m_c16.onnx \
   --ctx 16 --tokenizer . --tokens 8 --json dec16.json
+
+# the two reproductions, as tests
+infer/build/test_matmul 5            # 4x16384, 4x16385, 8/16x16448 included
+python3 infer/tests/test_pool_alias.py
 ```
 
 The decode tool needs `onnxruntime` for the reference (`--no-ort` skips it);

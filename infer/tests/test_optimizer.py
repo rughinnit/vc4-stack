@@ -128,6 +128,36 @@ def mk_conv_relu(shape=(1, 16, 8, 8)):
                   [numpy_helper.from_array(w, "W")])
 
 
+def mk_conv_relu_nchw(shape=(1, 16, 8, 8)):
+    """A 1x3 kernel: the executor takes the legacy NCHW path, no epilogue."""
+    rng = np.random.default_rng(10)
+    w = rng.standard_normal((16, 16, 1, 3)).astype(np.float32) * 0.1
+    x = _vi("X", shape)
+    n = [helper.make_node("Conv", ["X", "W"], ["C"], pads=[0, 1, 0, 1]),
+         helper.make_node("Relu", ["C"], ["Y"])]
+    return _model(n, [x], [_vi("Y", shape)],
+                  [numpy_helper.from_array(w, "W")])
+
+
+def mk_conv_clip6(shape=(1, 16, 8, 8)):
+    rng = np.random.default_rng(11)
+    w = rng.standard_normal((16, 16, 3, 3)).astype(np.float32) * 0.1
+    x = _vi("X", shape)
+    n = [helper.make_node("Conv", ["X", "W"], ["C"], pads=[1, 1, 1, 1]),
+         helper.make_node("Clip", ["C"], ["Y"], min=0.0, max=6.0)]
+    return _model(n, [x], [_vi("Y", shape)],
+                  [numpy_helper.from_array(w, "W")])
+
+
+def mk_matmul_clip(shape=((2, 4), (4, 8))):
+    x = _vi("X", (1, 8, 4))
+    w = np.random.default_rng(12).standard_normal((4, 8)).astype(np.float32)
+    n = [helper.make_node("MatMul", ["X", "W"], ["C"]),
+         helper.make_node("Clip", ["C"], ["Y"], min=0.0, max=6.0)]
+    return _model(n, [x], [_vi("Y", (1, 8, 8))],
+                  [numpy_helper.from_array(w, "W")])
+
+
 def mk_canonical(shape=(1, 16, 8, 8)):
     """Dead node, identity, no-op reshape/cast/transpose, Div/Sub by 2."""
     x = _vi("X", shape)
@@ -325,7 +355,8 @@ def test_epilogue():
           % (p0.total, p1.total))
     _same_answer(m, res.model, {"X": np.random.default_rng(5).standard_normal(
         (1, 16, 8, 8)).astype(np.float32)}, "conv-bias", atol=2e-5)
-    # activation: dispatch count falls, launch count does not
+    # activation: the conv's GEMM applies it to the value it stores, so the
+    # elementwise pass over the output is gone as well as the dispatch
     m = mk_conv_relu()
     res = O.optimise(m, passes="epilogue")
     conv = [n for n in res.graph.nodes if n.op_type == "Conv"][0]
@@ -337,10 +368,27 @@ def test_epilogue():
     p1 = O.plan_of(res.graph)
     check(p1.dispatches == p0.dispatches - 1,
           "one dispatch fewer (%d -> %d)" % (p0.dispatches, p1.dispatches))
-    check(p1.total == p0.total,
-          "launch count unchanged: the conv kernel has no epilogue")
+    check(p1.total == p0.total - 1,
+          "the epilogue removes the activation launch (%d -> %d)"
+          % (p0.total, p1.total))
     _same_answer(m, res.model, {"X": np.random.default_rng(6).standard_normal(
         (1, 16, 8, 8)).astype(np.float32)}, "conv-relu")
+
+    # a path with no epilogue keeps both launches and records nothing
+    m = mk_conv_relu_nchw()
+    res = O.optimise(m, passes="epilogue")
+    conv = [n for n in res.graph.nodes if n.op_type == "Conv"][0]
+    check(conv.rule("activation") is None,
+          "a conv the kernel cannot fold is left alone")
+    p0 = O.plan_of(O.Graph.from_model(m))
+    p1 = O.plan_of(res.graph)
+    check(p1.total == p0.total, "no epilogue: launches unchanged")
+    # a MatMul folds relu but not clip(0,6): no register for the bound
+    m = mk_matmul_clip()
+    res = O.optimise(m, passes="epilogue")
+    mm = [n for n in res.graph.nodes if n.op_type == "MatMul"][0]
+    check(mm.rule("activation") is None,
+          "MatMul + Clip(0,6) is not folded (no B register for 6.0)")
 
 
 def test_plan_model():

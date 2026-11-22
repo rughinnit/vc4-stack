@@ -211,9 +211,39 @@ def _softmax_launches(node, shape, layout):
     return (rp // 8 + EW_QPU - 1) // EW_QPU + (1 if rows else 0)
 
 
-def _act_launches(node, shape, lay):
-    """An epilogue activation is still an elementwise launch on this engine."""
-    if not node.rule("activation"):
+def epilogue_ok(graph, node, act):
+    """True when the executor folds `act` into this node's kernel.
+
+    Mirrors the executor exactly, because the plan's launch saving is only
+    real where the kernel applies the activation to the value it stores:
+
+    * ``Conv`` on the NHWC path: the asm3 GEMM has 19 free B registers, so
+      relu and clip(0,6) fold.  The legacy NCHW path has no epilogue.
+    * ``MatMul``: the asm10 8x64 tile has 32 live C vectors over both
+      register files and no free B register for a bound constant, so only
+      relu (a small immediate) folds.
+    * ``Gemm``: the executor materialises C and adds it with a separate
+      launch, so no activation folds there.
+    """
+    if act not in ("relu", "relu6"):
+        return False
+    if node.op_type == "MatMul":
+        return act == "relu"
+    if node.op_type != "Conv":
+        return False
+    ins = [i for i in node.proto.input if i]
+    if len(ins) < 2:
+        return False
+    return conv_nhwc(node, graph.shape(ins[0]), graph.shape(ins[1]),
+                     int(node.attr("group", 1)))
+
+
+def _act_launches(graph, node, shape, lay):
+    """Launches the activation still costs after the epilogue fold."""
+    act = node.rule("activation")
+    if not act:
+        return 0
+    if epilogue_ok(graph, node, act.get("act")):
         return 0
     return elementwise_launches(stored_floats(shape, lay))
 
@@ -247,12 +277,12 @@ def node_launches(graph, node, loc):
             n = 1 + group                   # one GEMM per group
         else:
             n = 2                           # im2col + GEMM
-        return n + _act_launches(node, shape, lay), 0
+        return n + _act_launches(graph, node, shape, lay), 0
     if op in ("MatMul",):
-        return 2 + _act_launches(node, shape, lay), 0
+        return 2 + _act_launches(graph, node, shape, lay), 0
     if op == "Gemm":
         n = 3 if len(ins) > 2 and node.proto.input[2] else 2
-        return n + _act_launches(node, shape, lay), 0
+        return n + _act_launches(graph, node, shape, lay), 0
     if op in ("GlobalAveragePool",):
         return 2, 0
     if op == "Softmax":

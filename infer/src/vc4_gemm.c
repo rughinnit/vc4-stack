@@ -83,36 +83,62 @@ vc4_status vc4__pack_run_q(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen,
 vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                          uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus)
 {
-    return vc4__gemm_run_q(ctx, M, N, K, b_bus, c_bus, panel_bus, 0);
+    return vc4__gemm_run_q(ctx, M, N, K, b_bus, c_bus, panel_bus, 0,
+                           VC4_ACT_NONE);
+}
+
+/* The activation's part of a blob name (empty for none).  A kernel with an
+ * epilogue is a different program, so it must not share the cache entry of
+ * the plain one. */
+static void act_suffix(char *out, size_t n, int act)
+{
+    if (act == VC4_ACT_NONE) {
+        out[0] = '\0';
+        return;
+    }
+    snprintf(out, n, "_a%d", act);
 }
 
 /* The asm10 GEMM's blob name.  Shared with the autotuner, which names the
  * kernel its recorded parameters select. */
 void vc4__matmul_kernel_name(char *out, size_t n, uint32_t M, uint32_t N,
-                             uint32_t K, int nq)
+                             uint32_t K, int nq, int act)
 {
-    snprintf(out, n, "gemm10_%u_%u_%u_q%d", M, N, K, nq);
+    char sfx[8];
+    act_suffix(sfx, sizeof(sfx), act);
+    snprintf(out, n, "gemm10_%u_%u_%u_q%d%s", M, N, K, nq, sfx);
 }
 
 vc4_status vc4__gemm_run_q(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                            uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus,
-                           int gemm_q)
+                           int gemm_q, int act)
 {
     if (M % 8 || N % 64 || K % 16)
         return VC4_ERR_INVAL;
+    if (act != VC4_ACT_NONE && act != VC4_ACT_RELU) {
+        /* Every activation half of the other bodies needs a float constant
+         * in the B file, and the 8x64 tile holds 32 live C vectors over
+         * both files: none is free.  relu's bound is a small immediate. */
+        vc4__set_err(ctx, "matmul: activation %d needs a B-file constant "
+                     "and the asm10 8x64 tile has none free (relu only)",
+                     act);
+        return VC4_ERR_UNSUPPORTED;
+    }
     const uint32_t tr = M / 8;                 /* 8-row row blocks */
     int nq = gemm_q > 0 ? gemm_q : (tr < VC4_MAX_QPU ? (int)tr : VC4_MAX_QPU);
     if (nq < 1 || nq > VC4_MAX_QPU || (uint32_t)nq > tr)
         return VC4_ERR_INVAL;
 
-    char name[80], nm[16], nn[16], nk[16], nkpu[8];
+    char name[80], nm[16], nn[16], nk[16], nkpu[8], nact[8];
     char *argv[] = { (char *)"gemm", (char *)"--M", nm, (char *)"--N", nn,
-                     (char *)"--K", nk, (char *)"--nqpu", nkpu, NULL };
+                     (char *)"--K", nk, (char *)"--nqpu", nkpu,
+                     (char *)"--act", nact, NULL };
     snprintf(nm, sizeof(nm), "%u", M);
     snprintf(nn, sizeof(nn), "%u", N);
     snprintf(nk, sizeof(nk), "%u", K);
     snprintf(nkpu, sizeof(nkpu), "%d", nq);
-    vc4__matmul_kernel_name(name, sizeof(name), M, N, K, nq);
+    snprintf(nact, sizeof(nact), "%d", act);
+    vc4__matmul_kernel_name(name, sizeof(name), M, N, K, nq, act);
 
     vc4_kernel *k = NULL;
     vc4_status st = vc4__kernel(ctx, name, argv, nq, &k);
@@ -145,8 +171,17 @@ static void zero(uint8_t *p, size_t bytes) { memset(p, 0, bytes); }
 
 vc4_status vc4__matmul_tuned(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
                              vc4_buf *C, uint32_t M, uint32_t N, uint32_t K,
-                             vc4_layout layout, const vc4_tune_params *p)
+                             vc4_layout layout, const vc4_tune_params *p,
+                             int act)
 {
+    /* refuse before any work so an unsupported activation cannot leave a
+     * panel behind in scratch */
+    if (act != VC4_ACT_NONE && act != VC4_ACT_RELU) {
+        vc4__set_err(ctx, "matmul: activation %d needs a B-file constant "
+                     "and the asm10 8x64 tile has none free (relu only)",
+                     act);
+        return VC4_ERR_UNSUPPORTED;
+    }
     if (!ctx || !A || !B || !C || !M || !N || !K)
         return VC4_ERR_INVAL;
     if (ctx->dead)
@@ -221,7 +256,7 @@ vc4_status vc4__matmul_tuned(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
         return st;
     }
     st = vc4__gemm_run_q(ctx, Mp, Np, Kp, b_src_bus, c_dst_bus,
-                         ctx->gpu_bus + pb.off, p ? (int)p->gemm_q : 0);
+                         ctx->gpu_bus + pb.off, p ? (int)p->gemm_q : 0, act);
     if (st == VC4_OK && c_tmp) {
         vc4__l2_flush(ctx);
         vc4__invalidate_off(ctx, C->off, (size_t)M * N * 4);
@@ -240,9 +275,9 @@ vc4_status vc4__matmul_tuned(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
  * that no longer describes a legal launch - an older build's QPU count, say -
  * is not fatal: the default runs and is not used to overwrite the record.
  */
-vc4_status vc4_matmul(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
-                      vc4_buf *C, uint32_t M, uint32_t N, uint32_t K,
-                      vc4_layout layout)
+vc4_status vc4_matmul_act(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
+                          vc4_buf *C, uint32_t M, uint32_t N, uint32_t K,
+                          vc4_layout layout, vc4_act act)
 {
     vc4_tune_shape sh;
     vc4_tune_params tp;
@@ -252,13 +287,20 @@ vc4_status vc4_matmul(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
         return VC4_ERR_INVAL;
     vc4__tune_shape_mm(&sh, M, N, K);
     if (vc4__tune_lookup(ctx, VC4_OP_MATMUL, &sh, &tp)) {
-        st = vc4__matmul_tuned(ctx, A, B, C, M, N, K, layout, &tp);
+        st = vc4__matmul_tuned(ctx, A, B, C, M, N, K, layout, &tp, act);
         if (st != VC4_ERR_INVAL)
             return st;
         vc4__set_err(ctx, "matmul: the tuned launch for %ux%ux%u was refused, "
                      "running the default", M, N, K);
     }
-    return vc4__matmul_tuned(ctx, A, B, C, M, N, K, layout, NULL);
+    return vc4__matmul_tuned(ctx, A, B, C, M, N, K, layout, NULL, act);
+}
+
+vc4_status vc4_matmul(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
+                      vc4_buf *C, uint32_t M, uint32_t N, uint32_t K,
+                      vc4_layout layout)
+{
+    return vc4_matmul_act(ctx, A, B, C, M, N, K, layout, VC4_ACT_NONE);
 }
 
 /* ==================================================================
@@ -319,24 +361,27 @@ vc4_status vc4__pack3_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen,
 
 vc4_status vc4__gemm3_run_c(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                             int bmode, uint32_t b_bus, uint32_t c_bus,
-                            uint32_t panel_bus, uint32_t cstride)
+                            uint32_t panel_bus, uint32_t cstride, int act)
 {
     return vc4__gemm3_run_cq(ctx, M, N, K, bmode, b_bus, c_bus, panel_bus,
-                             cstride, 0);
+                             cstride, 0, act);
 }
 
 /* The asm3 GEMM's blob name for the conv path (bmode=1, cstride=N).  A
  * grouped conv passes a wider cstride and gets its own name; that path is not
  * autotuned, so it is not represented here. */
 void vc4__conv_kernel_name(char *out, size_t n, uint32_t M, uint32_t N,
-                           uint32_t K, int nq)
+                           uint32_t K, int nq, int act)
 {
-    snprintf(out, n, "gemm_%u_%u_%u_b1_q%d", M, N, K, nq);
+    char sfx[8];
+    act_suffix(sfx, sizeof(sfx), act);
+    snprintf(out, n, "gemm_%u_%u_%u_b1_q%d%s", M, N, K, nq, sfx);
 }
 
 vc4_status vc4__gemm3_run_cq(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                              int bmode, uint32_t b_bus, uint32_t c_bus,
-                             uint32_t panel_bus, uint32_t cstride, int gemm_q)
+                             uint32_t panel_bus, uint32_t cstride, int gemm_q,
+                             int act)
 {
     if (M % 16 || N % 16 || K % 16)
         return VC4_ERR_INVAL;
@@ -350,22 +395,26 @@ vc4_status vc4__gemm3_run_cq(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
     if (nq < 1 || nq > VC4_MAX_QPU || (uint32_t)nq > tr)
         return VC4_ERR_INVAL;
 
-    char name[96], nm[16], nn[16], nk[16], nb[8], nkpu[8], ncs[16];
+    char name[96], nm[16], nn[16], nk[16], nb[8], nkpu[8], ncs[16], nact[8];
+    char sfx[8];
     char *argv[] = { (char *)"gemm3", (char *)"--M", nm, (char *)"--N", nn,
                      (char *)"--K", nk, (char *)"--nqpu", nkpu,
-                     (char *)"--bmode", nb, (char *)"--cstride", ncs, NULL };
+                     (char *)"--bmode", nb, (char *)"--cstride", ncs,
+                     (char *)"--act", nact, NULL };
     snprintf(nm, sizeof(nm), "%u", M);
     snprintf(nn, sizeof(nn), "%u", N);
     snprintf(nk, sizeof(nk), "%u", K);
     snprintf(nkpu, sizeof(nkpu), "%d", nq);
     snprintf(nb, sizeof(nb), "%d", bmode ? 1 : 0);
     snprintf(ncs, sizeof(ncs), "%u", cstride);
+    snprintf(nact, sizeof(nact), "%d", act);
+    act_suffix(sfx, sizeof(sfx), act);
     if (cstride == N)
-        snprintf(name, sizeof(name), "gemm_%u_%u_%u_b%d_q%d", M, N, K,
-                 bmode ? 1 : 0, nq);
+        snprintf(name, sizeof(name), "gemm_%u_%u_%u_b%d_q%d%s", M, N, K,
+                 bmode ? 1 : 0, nq, sfx);
     else
-        snprintf(name, sizeof(name), "gemm_%u_%u_%u_b%d_q%d_cs%u", M, N, K,
-                 bmode ? 1 : 0, nq, cstride);
+        snprintf(name, sizeof(name), "gemm_%u_%u_%u_b%d_q%d_cs%u%s", M, N, K,
+                 bmode ? 1 : 0, nq, cstride, sfx);
 
     vc4_kernel *k = NULL;
     vc4_status st = vc4__kernel(ctx, name, argv, nq, &k);
@@ -397,7 +446,8 @@ vc4_status vc4__gemm3_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                           int bmode, uint32_t b_bus, uint32_t c_bus,
                           uint32_t panel_bus)
 {
-    return vc4__gemm3_run_c(ctx, M, N, K, bmode, b_bus, c_bus, panel_bus, N);
+    return vc4__gemm3_run_c(ctx, M, N, K, bmode, b_bus, c_bus, panel_bus, N,
+                            VC4_ACT_NONE);
 }
 
 /* zero3-fill helper for padded scratch copies */

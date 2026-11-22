@@ -287,7 +287,64 @@ compositions (`vc4_reduce` + `vc4_affine` per axis) and `CumSum`, and
 `vc4_select3` the `Clip`/`PReLU`/`Where` compositions; those numbers are not
 quoted here because they were not measured in this run.
 
-## 7. Reproducing
+## 7. The activation epilogue in the GEMM store
+
+`conv -> relu` used to be two launches: the GEMM wrote `C`, then an
+elementwise kernel read it back and wrote the activation.  The GEMM now applies
+the activation to the value it stores, so the pair is one launch.  The bodies
+are the *same bodies* the elementwise kernels use (`kops.act_apply` mirrors
+`kgen._ew_compute`), which is why the result is bit-identical to the
+two-launch path and not merely within tolerance.
+
+### 7.1 The budget before writing any code
+
+The code slot is 2,048 instructions (16 KiB, `docs/TRAINING-MEMORY.md`); the
+JIT refuses a larger blob.  Both GEMMs have room to spare in their store
+path, and the two have very different register situations:
+
+| kernel | tile | C vectors live at the store | free B registers | free A registers |
+|---|---|---:|---:|---|
+| `gemm3` (asm3, the conv path) | 16x16 | 16 (A file r0..r15) | 19 (B0..B18) | 7 (the dead addressing state) |
+| `gemm` (asm10, the matmul) | 8x64 | 32 (A r0..r15 **and** B r0..r15) | 1, and it is reloaded per column block | 3 |
+
+The mul ALU writes only the A file or an accumulator, so every temporary an
+activation body needs is an A-file register; a body that consumes a B-file C
+vector must copy the result back with `ws=1`.
+
+### 7.2 Measured word counts
+
+`kgen.py gemm3 --M 25600 --N 16 --K 144 --bmode 1 --nqpu 8 [--act N]` and
+`kgen.py gemm --M 512 --N 512 --K 512 --nqpu 8 [--act N]`:
+
+| activation | `gemm3` words | delta | `gemm` (asm10) words | delta |
+|---|---:|---:|---:|---:|
+| none | 274 | - | 687 | - |
+| relu | 290 | +16 | 722 | +35 |
+
+`relu` is one word per C vector (`FMAX v, v, 0.0f`, the small immediate the ALU
+sign-extends to `+0.0f`), plus 3 words in asm10 for the zero the B-file vectors
+must read from an A register: a B-file operand and a small immediate cannot
+share the raddr_b port in the same word.
+
+The counts are the same for every shape: the tile, not M/N/K, fixes them.
+
+### 7.3 What does not fit where
+
+The body cost is per C vector, so the 8x64 matmul tile pays twice the conv
+tile's price for the same activation, and it starts from a worse register
+position: its 32 C accumulators occupy *both* files completely, leaving one
+reloadable B register and three dead A registers.
+
+A body needs three things: A-file temporaries (3 available in asm10, 7 in
+asm3), a B-file scratch for the `x` copy that keeps the final multiply on one
+A and one B port, and float constants in the file the C vector is *not* in.
+Whether a given activation fits is therefore a question about those three
+pools, not about the instruction slot: at 32 vectors, even the longest body
+fits 2,048 words, but it cannot find the registers to run.
+
+`docs/OPTIMIZER.md` records which activations the two paths accept and why.
+
+## 8. Reproducing
 
 ```
 # model (no GPU): every kernel, including the store address

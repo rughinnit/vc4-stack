@@ -226,7 +226,7 @@ vc4_status vc4__conv2d_tuned(vc4_ctx *ctx,
                                       ctx->gpu_bus + wb.off,
                                       ctx->gpu_bus + cb.off,
                                       ctx->gpu_bus + pb.off, (uint32_t)Cout,
-                                      p ? (int)p->gemm_q : 0);
+                                      p ? (int)p->gemm_q : 0, VC4_ACT_NONE);
     if (st != VC4_OK) {
         vc4__scratch_reset(ctx);
         return st;

@@ -2593,6 +2593,102 @@ def build_copy2d(k, fill=0, units=4, depth=16):
     return p
 
 
+# ---------------------------------------------------------------- epilogue
+# An activation applied to the value a GEMM tile is about to store, so
+# `conv -> relu` is one launch instead of two.
+#
+# The numbers are an ABI: they are `vc4_act` in vc4infer.h and the `--act`
+# argument kgen.py passes.  A body here is the body the elementwise kernel of
+# the same op runs (`kgen._ew_compute`), in the same order and with the same
+# operands, so the fused result is *bit-identical* to the two-launch path
+# rather than merely close.  That is what makes the epilogue checkable at the
+# recorded 5e-4 without re-establishing a tolerance: the arithmetic did not
+# change, only where it happens.
+#
+# `relu` needs no constant at all: max(x, 0.0f) is the small immediate 0,
+# which the ALU sign-extends to +0.0f.
+ACT_NONE, ACT_RELU = 0, 1
+ACT_NAMES = ('none', 'relu')
+
+# The B-file constants each activation reads, in load order, and the body's
+# B-file scratch needs (0 = none).
+_ACT_CONSTS = {
+    ACT_NONE: (),
+    ACT_RELU: (),
+}
+_ACT_SCRATCH = {}
+
+
+def act_consts(act):
+    """Constants an activation needs in the B file, in load order.
+
+    ``ONE`` aliases ``E1`` (same bit pattern), so it costs no register when
+    the polynomial coefficients are loaded.
+    """
+    if act not in _ACT_CONSTS:
+        raise ValueError("kops: unknown activation %r" % (act,))
+    return list(_ACT_CONSTS[act])
+
+
+class Act:
+    """Loaded state of one activation epilogue.
+
+    ``consts`` maps a constant name to its B register, ``scratch_b`` is a
+    B-file register the body may use, ``temps`` are A-file registers that are
+    dead for the whole kernel (the GEMM's addressing state is not).
+    """
+
+    __slots__ = ('act', 'k', 'consts', 'scratch_b', 'temps')
+
+    def __init__(self, act, k, consts, scratch_b, temps):
+        self.act, self.k = act, k
+        self.consts, self.scratch_b, self.temps = consts, scratch_b, temps
+
+
+def act_setup(k, b, act, pool, temps):
+    """Load `act`'s constants from `pool` (free B registers) and return Act.
+
+    The caller owns the pool and must keep those registers out of its own
+    allocation for the life of the kernel: the epilogue runs once per tile, so
+    its constants are loaded once, in the prologue.
+    """
+    if act not in _ACT_CONSTS:
+        raise ValueError("kops: unknown activation %r" % (act,))
+    load = [n for n in act_consts(act)
+            if not (n == 'ONE' and 'E1' in act_consts(act))]
+    nscratch = _ACT_SCRATCH.get(act, 0)
+    if len(pool) < len(load) + nscratch:
+        raise RuntimeError("kops: activation %s needs %d B registers, %d free"
+                           % (ACT_NAMES[act], len(load) + nscratch, len(pool)))
+    pool = list(pool)
+    consts = {}
+    for name in load:
+        reg = pool.pop(0)
+        b.e(k.ldi(STD[name][0] & M32, reg, ws=1), k.nop())
+        consts[name] = 200 + reg
+    if 'ONE' not in consts and 'E1' in consts:
+        consts['ONE'] = consts['E1']
+    bx = 200 + pool.pop(0) if nscratch else None
+    return Act(act, k, consts, bx, list(temps))
+
+
+def act_apply(b, A, regs):
+    """Apply the activation in place to every A-file register in `regs`.
+
+    Words go through the Builder, so the no-forwarding padding is the rule the
+    elementwise kernel's body obeys; `relu` is one word per vector and reads
+    the register it writes in the same word, which needs no padding.
+    """
+    k = A.k
+    if A.act == ACT_NONE:
+        return
+    if A.act == ACT_RELU:
+        for r in regs:
+            b.e(k.add_(k.ADD_FMAX, r, k.areg(r), k.imm(0)))
+        return
+    raise ValueError("kops: activation %s has no body" % (ACT_NAMES[A.act],))
+
+
 def build(k, kind, opts):
     if kind == 'copy2d':
         return build_copy2d(k, int(opts.get('fill', 0)),

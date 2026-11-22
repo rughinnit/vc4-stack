@@ -147,19 +147,20 @@ vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
 /* same, with the GEMM's QPU count explicit (0 = min(M/8, 12)) */
 vc4_status vc4__gemm_run_q(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                            uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus,
-                           int gemm_q);
+                           int gemm_q, int act);
 /* The blob names the generator sees, shared with the autotuner so a record
  * names the kernel it selects instead of recomputing the scheme. */
 void vc4__matmul_kernel_name(char *out, size_t n, uint32_t M, uint32_t N,
-                             uint32_t K, int nq);
+                             uint32_t K, int nq, int act);
 void vc4__conv_kernel_name(char *out, size_t n, uint32_t M, uint32_t N,
-                           uint32_t K, int nq);
+                           uint32_t K, int nq, int act);
 
 /* The matmul with an explicit launch choice (NULL = the executor's default).
  * vc4_matmul is this plus the tuned-record lookup. */
 vc4_status vc4__matmul_tuned(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
                              vc4_buf *C, uint32_t M, uint32_t N, uint32_t K,
-                             vc4_layout layout, const vc4_tune_params *p);
+                             vc4_layout layout, const vc4_tune_params *p,
+                             int act);
 /* Same for conv2d; vc4_conv2d is this plus the lookup. */
 vc4_status vc4__conv2d_tuned(vc4_ctx *ctx,
                              const vc4_buf *in, int Cin, int H, int W,
@@ -296,8 +297,9 @@ vc4_status vc4__gemm3_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
  * the full output channel count so every group writes into one image */
 vc4_status vc4__gemm3_run_c(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                             int bmode, uint32_t b_bus, uint32_t c_bus,
-                            uint32_t panel_bus, uint32_t cstride);
+                            uint32_t panel_bus, uint32_t cstride, int act);
 /* same, with the QPU count explicit (0 = min(M/16, 12)) */
 vc4_status vc4__gemm3_run_cq(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                              int bmode, uint32_t b_bus, uint32_t c_bus,
-                             uint32_t panel_bus, uint32_t cstride, int gemm_q);
+                             uint32_t panel_bus, uint32_t cstride, int gemm_q,
+                             int act);

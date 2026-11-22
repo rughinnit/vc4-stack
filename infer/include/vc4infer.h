@@ -125,6 +125,23 @@ typedef struct {
 
 typedef struct vc4_ctx vc4_ctx;
 
+/*
+ * An activation applied to the value a GEMM/conv tile stores, so `conv ->
+ * relu` is one launch instead of a second pass over the output.  The numbers
+ * are an ABI with the kernel generator (kops.ACT_*, kgen's --act).
+ *
+ * The conv path (the asm3 GEMM) applies it to the 16x16 C tile as it is
+ * stored, so the result is bit-identical to the elementwise kernel of the
+ * same op.  The matmul path (the asm10 8x64 tile) has no B-file register
+ * left for a bound constant, so it offers VC4_ACT_RELU, whose bound is a
+ * small immediate; anything else is VC4_ERR_UNSUPPORTED, never a silently
+ * unfused launch.
+ */
+typedef enum {
+    VC4_ACT_NONE  = 0,     /* store the GEMM result as it is             */
+    VC4_ACT_RELU  = 1,     /* max(x, 0)                                  */
+} vc4_act;
+
 /* ------------------------------------------------------------------ lifecycle */
 /* cache_dir: where generated kernel blobs are cached (NULL = <cwd>/kcache or
  * $VC4INFER_CACHE).  arena_bytes: 0 = VC4_ARENA_DEFAULT (falls back smaller
@@ -162,6 +179,12 @@ uint32_t   vc4_bus_addr(const vc4_ctx *ctx, const vc4_buf *b);
 vc4_status vc4_matmul(vc4_ctx *ctx,
                       const vc4_buf *A, const vc4_buf *B, vc4_buf *C,
                       uint32_t M, uint32_t N, uint32_t K, vc4_layout layout);
+/* The same product with an activation folded into the GEMM's store.
+ * VC4_ACT_NONE is the identical launch to vc4_matmul. */
+vc4_status vc4_matmul_act(vc4_ctx *ctx,
+                          const vc4_buf *A, const vc4_buf *B, vc4_buf *C,
+                          uint32_t M, uint32_t N, uint32_t K,
+                          vc4_layout layout, vc4_act act);
 
 /*
  * out = conv2d(in, wt) + bias  (bias may be NULL), NCHW, f32.
@@ -226,6 +249,21 @@ vc4_status vc4_conv_nhwc_dil(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
                              const vc4_buf *wpanel, int Cout, int KH, int KW,
                              int stride, int pad, int dilation, vc4_buf *out,
                              int *ho, int *wo, int *opitch);
+/* The conv entry points with an activation folded into the GEMM's store;
+ * the signatures above are these with VC4_ACT_NONE.  `act` is applied to
+ * the value being stored, so `conv -> relu` is one launch, and a grouped
+ * conv applies it per group (the C stride is the full channel count). */
+vc4_status vc4_conv_nhwc_act(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                             int Cin, int H, int W, int in_pitch,
+                             const vc4_buf *wpanel, int Cout, int KH, int KW,
+                             int stride, int pad, vc4_act act, vc4_buf *out,
+                             int *ho, int *wo, int *opitch);
+vc4_status vc4_conv_nhwc_dil_act(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                                 int Cin, int H, int W, int in_pitch,
+                                 const vc4_buf *wpanel, int Cout, int KH,
+                                 int KW, int stride, int pad, int dilation,
+                                 vc4_act act, vc4_buf *out, int *ho, int *wo,
+                                 int *opitch);
 /*
  * Grouped conv: `groups` independent convs over channel blocks of Cin/groups
  * and Cout/groups.  wpanel[g] is the packed panel of group g (call
@@ -242,6 +280,13 @@ vc4_status vc4_conv_nhwc_group(vc4_ctx *ctx, const vc4_buf *in, int nimg,
                                int groups, int KH, int KW, int stride, int pad,
                                int dilation, vc4_buf *out, int *ho, int *wo,
                                int *opitch);
+vc4_status vc4_conv_nhwc_group_act(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                                   int Cin, int H, int W, int in_pitch,
+                                   const vc4_buf *const *wpanel, int Cout,
+                                   int groups, int KH, int KW, int stride,
+                                   int pad, int dilation, vc4_act act,
+                                   vc4_buf *out, int *ho, int *wo,
+                                   int *opitch);
 /* depthwise 3x3 pad 1: wt [C][1][3][3] -> WP[tap][C] */
 size_t vc4_depthwise_wpanel_bytes(int C);
 vc4_status vc4_depthwise_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int C,

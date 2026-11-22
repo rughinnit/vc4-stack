@@ -41,7 +41,7 @@ Pass 2: ew
     affine             Add(Mul(x, a), b)             -> one AFFINE launch
 Pass 3: epilogue
     conv-bias          Conv + Add(per-channel constant) -> Conv bias
-    conv-activation    Conv + Relu / Clip[0,6]        -> one dispatch
+    conv-activation    Conv/MatMul + Relu / Clip[0,6] -> the GEMM's store
 """
 from __future__ import annotations
 
@@ -621,14 +621,33 @@ def _fold_conv_bias(graph):
     return st
 
 
-def _fuse_conv_activation(graph):
-    """Conv -> Relu | Clip(0, 6) becomes one dispatch (two launches today).
+def _clip_rule(graph, act):
+    """`relu6` for Clip(0, 6), else None."""
+    lo = act.attr("min", None)
+    hi = act.attr("max", None)
+    # opset 11+ carries them as optional inputs instead of attributes
+    if lo is None and len(act.proto.input) > 1 and act.proto.input[1]:
+        c = graph.const(act.proto.input[1])
+        if c is not None and np.asarray(c).size == 1:
+            lo = float(np.asarray(c).ravel()[0])
+    if hi is None and len(act.proto.input) > 2 and act.proto.input[2]:
+        c = graph.const(act.proto.input[2])
+        if c is not None and np.asarray(c).size == 1:
+            hi = float(np.asarray(c).ravel()[0])
+    return "relu6" if lo in (0.0, 0) and hi in (6.0, 6) else None
 
-    The conv kernel has no epilogue, so this does *not* remove the activation
-    launch; it removes a node dispatch and the intermediate tensor's lifetime.
-    The plan printer reports the launch count unchanged, and docs/OPTIMIZER.md
-    records that the launch saving needs the kernel epilogue.
+
+def _fuse_conv_activation(graph):
+    """Conv/MatMul -> Relu | Clip(0, 6) becomes one launch.
+
+    The GEMM applies the activation to the value it stores, so the second
+    pass over the output disappears.  Only the pairs the kernel can take are
+    marked (`plan.epilogue_ok` is the same predicate the launch model uses):
+    the NHWC conv folds both, a MatMul folds relu (the asm10 tile has no
+    register for a bound constant), a Gemm neither.  A pair outside that set
+    is left alone rather than marked for a launch that would not happen.
     """
+    from .plan import epilogue_ok
     st = RuleStat("conv-activation")
     gouts = graph.graph_outputs()
     consumers = graph.consumers()
@@ -643,22 +662,12 @@ def _fuse_conv_activation(graph):
         if act.op_type == "Relu":
             rule = "relu"
         elif act.op_type == "Clip":
-            lo = act.attr("min", None)
-            hi = act.attr("max", None)
-            # opset 11+ carries them as optional inputs instead of attributes
-            if lo is None and len(act.proto.input) > 1 and act.proto.input[1]:
-                c = graph.const(act.proto.input[1])
-                if c is not None and np.asarray(c).size == 1:
-                    lo = float(np.asarray(c).ravel()[0])
-            if hi is None and len(act.proto.input) > 2 and act.proto.input[2]:
-                c = graph.const(act.proto.input[2])
-                if c is not None and np.asarray(c).size == 1:
-                    hi = float(np.asarray(c).ravel()[0])
-            if lo in (0.0, 0) and hi in (6.0, 6):
-                rule = "relu6"
-        if rule is None:
+            rule = _clip_rule(graph, act)
+        if rule is None or act.fused:
             continue
-        if act.fused:
+        if not epilogue_ok(graph, node, rule):
+            st.notes.append("%s <- %s (%s): the kernel cannot fold it here"
+                            % (node.name, act.name, rule))
             continue
         node.mark("activation", replaces=[act.name], act=rule)
         act.mark("fused", into=node.name, by="activation")

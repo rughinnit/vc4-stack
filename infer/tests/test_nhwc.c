@@ -840,6 +840,138 @@ static int one_up2(vc4_ctx *ctx, int C, int H, int W, int nimg, int reps)
     return clean == reps ? 0 : 1;
 }
 
+/* ------------------------------------------------- conv -> activation
+ * The epilogue is checked twice: against the float64 reference (conv, then the
+ * activation in double) at the conv tolerance, and against the two-launch path
+ * (conv with no activation, then the elementwise kernel of the same op) for
+ * *bit* equality.  The second check is the one that matters here: the body is
+ * the same body, so a difference is an epilogue bug, not rounding.
+ */
+static double act_ref(double x, vc4_act act)
+{
+    if (act == VC4_ACT_RELU)
+        return x > 0.0 ? x : 0.0;
+    return x;
+}
+
+/* the elementwise kernel of the same op, the path the epilogue replaces */
+static vc4_status act_two_launch(vc4_ctx *ctx, vc4_act act, const vc4_buf *a,
+                                 vc4_buf *out, size_t n)
+{
+    if (act == VC4_ACT_RELU)
+        return vc4_elementwise(ctx, VC4_OP_RELU, a, NULL, out, n);
+    return VC4_ERR_UNSUPPORTED;
+}
+
+static int one_conv_act(vc4_ctx *ctx, int Cin, int H, int W, int Cout, int KH,
+                        int KW, int stride, int pad, int nimg, vc4_act act,
+                        const char *name, int reps)
+{
+    const int ho = (H + 2 * pad - KH) / stride + 1;
+    const int wo = (W + 2 * pad - KW) / stride + 1;
+    const int Wg = (wo + 15) & ~15;
+    const size_t nin = (size_t)nimg * H * W * Cin;
+    const size_t nwt = (size_t)Cout * Cin * KH * KW;
+    const size_t nout = (size_t)nimg * ho * Wg * Cout;
+
+    float *in = malloc(nin * 4), *wt = malloc(nwt * 4);
+    float *bi = malloc((size_t)Cout * 4);
+    float *fused = malloc(nout * 4), *twice = malloc(nout * 4);
+    float *tmp = malloc(nout * 4);
+    double *ref = malloc(nout * sizeof(double));
+    int ok = 1;
+    if (!in || !wt || !bi || !fused || !twice || !tmp || !ref)
+        return 1;
+    for (size_t i = 0; i < nin; ++i) in[i] = frand();
+    for (size_t i = 0; i < nwt; ++i) wt[i] = frand() * 0.15f;
+    for (int i = 0; i < Cout; ++i) bi[i] = frand();
+
+    vc4_buf bin = alloc_up(ctx, in, nin, &ok);
+    vc4_buf bwt = alloc_up(ctx, wt, nwt, &ok);
+    vc4_buf bbi = alloc_up(ctx, bi, (size_t)Cout, &ok);
+    vc4_buf bf = alloc_up(ctx, fused, nout, &ok);
+    vc4_buf bt = alloc_up(ctx, twice, nout, &ok);
+    vc4_buf bm = alloc_up(ctx, tmp, nout, &ok);
+    vc4_buf wp;
+    wpanel_alloc(ctx, Cin, Cout, KH, KW, 1, &wp, &ok);
+    if (!ok)
+        return 1;
+    if (vc4_conv_nhwc_pack_w(ctx, &bwt, Cin, Cout, KH, KW, &bbi, &wp) != VC4_OK) {
+        printf("FAIL: pack_w act %d->%d: %s\n", Cin, Cout, vc4_last_error(ctx));
+        return 1;
+    }
+    ref_conv_nhwc(in, Cin, H, W, W, wt, Cout, KH, KW, bi, stride, pad, ref, Wg,
+                  ho, wo, nimg);
+    for (size_t i = 0; i < nout; ++i)
+        ref[i] = act_ref(ref[i], act);
+
+    int clean = 0, exact = 0;
+    for (int rep = 0; rep < reps; ++rep) {
+        int gho = 0, gwo = 0, gp = 0;
+        vc4_stats s0, s1;
+        vc4_get_stats(ctx, &s0);
+        vc4_status st = vc4_conv_nhwc_act(ctx, &bin, nimg, Cin, H, W, W, &wp,
+                                          Cout, KH, KW, stride, pad, act, &bf,
+                                          &gho, &gwo, &gp);
+        vc4_get_stats(ctx, &s1);
+        if (st != VC4_OK) {
+            printf("FAIL: conv_act(%s) %d->%d -> %s (%s)\n", name, Cin, Cout,
+                   vc4_strerror(st), vc4_last_error(ctx));
+            return 1;
+        }
+        const unsigned long long l_fused = s1.launches - s0.launches;
+        /* the two-launch path on the same inputs */
+        vc4_get_stats(ctx, &s0);
+        st = vc4_conv_nhwc(ctx, &bin, nimg, Cin, H, W, W, &wp, Cout, KH, KW,
+                           stride, pad, &bm, &gho, &gwo, &gp);
+        if (st == VC4_OK) {
+            st = act_two_launch(ctx, act, &bm, &bt, nout);
+        }
+        vc4_get_stats(ctx, &s1);
+        if (st != VC4_OK) {
+            printf("FAIL: two-launch conv_act(%s) -> %s (%s)\n", name,
+                   vc4_strerror(st), vc4_last_error(ctx));
+            return 1;
+        }
+        const unsigned long long l_two = s1.launches - s0.launches;
+
+        vc4_download(ctx, &bf, fused, nout * 4);
+        vc4_download(ctx, &bt, twice, nout * 4);
+        size_t diff = 0;
+        double dmax = 0.0;
+        for (size_t i = 0; i < nout; ++i) {
+            double d = (double)fused[i] - (double)twice[i];
+            if (fused[i] != twice[i])
+                ++diff;
+            if (d < 0)
+                d = -d;
+            if (d > dmax)
+                dmax = d;
+        }
+        check_t ck = { 0, 0, 0, 1 };
+        check_plane(&ck, fused, ref, nimg, ho, Wg, Cout, wo, TOL_CONV);
+        printf("  conv+%-5s %d->%d %dx%d k%d s%d p%d n%d rep%d: mism=%ld/%zu "
+               "maxabs=%.3g | vs two launches: %zu differ (max %.3g) | "
+               "launches %llu vs %llu\n", name, Cin, Cout, H, W, KH, stride,
+               pad, nimg, rep, ck.mismatches, nout, ck.max_abs, diff, dmax,
+               l_fused, l_two);
+        if (ck.mismatches == 0)
+            ++clean;
+        if (diff == 0 && dmax == 0.0)
+            ++exact;
+        if (l_fused >= l_two) {
+            printf("FAIL: %s did not save a launch (%llu vs %llu)\n", name,
+                   l_fused, l_two);
+            return 1;
+        }
+    }
+    printf("%s conv+%s %d->%d %dx%d k%d s%d p%d n%d: %d/%d in tolerance, "
+           "%d/%d bit-identical to two launches\n",
+           (clean == reps && exact == reps) ? "PASS" : "FAIL", name, Cin, Cout,
+           H, W, KH, stride, pad, nimg, clean, reps, exact, reps);
+    return (clean == reps && exact == reps) ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     int reps = argc > 1 ? atoi(argv[1]) : 5;
@@ -887,6 +1019,13 @@ int main(int argc, char **argv)
         bad |= one_concat(ctx, 1, 64, cs1, 3, reps);
         bad |= one_concat(ctx, 2, 64, cs2, 2, reps);
     }
+    /* conv -> activation in the GEMM store: one launch, not two */
+    bad |= one_conv_act(ctx, 64, 32, 32, 32, 3, 3, 1, 1, 1, VC4_ACT_RELU,
+                        "relu", reps);
+    bad |= one_conv_act(ctx, 32, 32, 32, 16, 3, 3, 2, 1, 1, VC4_ACT_RELU,
+                        "relu", reps);
+    bad |= one_conv_act(ctx, 32, 24, 40, 16, 1, 1, 1, 0, 2, VC4_ACT_RELU,
+                        "relu", reps);
     vc4_shutdown(ctx);
     gpu_unlock(lock);
     printf("%s\n", bad ? "NHWC OPS FAILED" : "ALL NHWC OPS PASSED");

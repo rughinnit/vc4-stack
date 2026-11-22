@@ -371,7 +371,9 @@ def emit_store16(p, stride_bytes, cstep_reg=B_CSTEP):
         p.emit(add_(ADD_ADD, A_CADR, areg(A_CADR), (REGB, cstep_reg)))
 
 
-def build_gemm(M, N, K, nqpu, bmode=0, depth=3, cstride=None):
+def build_gemm(M, N, K, nqpu, bmode=0, depth=3, cstride=None, act=0):
+    """asm3 16x16-tile GEMM: the conv path, with an optional activation
+    epilogue applied to the C tile as it is stored (`act`, kops.ACT_*)."""
     TR, TC = M // 16, N // 16
     assert M % 16 == 0 and N % 16 == 0 and K % 16 == 0, "shapes must be 16-aligned"
     assert TR >= 1 and TC >= 1 and 1 <= nqpu <= 12
@@ -421,6 +423,15 @@ def build_gemm(M, N, K, nqpu, bmode=0, depth=3, cstride=None):
     b.e(add_or(A_BOFF, imm(0), imm(0)))
     b.e(nop(), nop())
 
+    # The epilogue's constants live in the B registers the GEMM's own state
+    # does not use (B19..B31 are the loop's: stride, counters, VPM rows),
+    # loaded once here rather than per tile.
+    AEP = None
+    if act:
+        import kops
+        AEP = kops.act_setup(sys.modules[__name__], b, act,
+                             list(range(0, 19)), (26, 27))
+
     p._builder = b
     # upper bound on the row blocks this QPU can ever own (compile-time)
     p.emit(ldi((TR + nqpu - 1) // nqpu, A_RBCNT, ws=0))
@@ -460,6 +471,12 @@ def build_gemm(M, N, K, nqpu, bmode=0, depth=3, cstride=None):
     b.e(nop(), nop())
     b.check = False          # verified asm3 k loop: intra-word product read
     emit_kloop(p, depth)
+    if act:
+        # the epilogue is new scheduling, so the no-forwarding checker is
+        # back on for it; the last writes it knows are the tile zeroing in
+        # the column block's prologue, long before the k loop
+        b.check = True
+        kops.act_apply(b, AEP, list(range(16)))
     b.check = False
     emit_store16(p, stride)
     b.check = True           # (the store's ldi->acc5 pattern is asm3's)
@@ -1052,6 +1069,39 @@ def g10_kloop_body(a, label):
             g10_boundary(a, p, counter=(p == 3))
 
 
+def g10_epilogue(a, act):
+    """Activation applied in place to the 32 C vectors before the store.
+
+    The tile is A-file r0..r15 (columns j0/j1) and B-file r0..r15 (j2/j3);
+    the add ALU writes the B file with ws=1 and the A file with ws=0, so an
+    in-place word is `FMAX r, r, 0.0f` either way.  Nothing here depends on
+    a previous epilogue word: every register is read and written in its own
+    word, so there is no GP read-after-write to schedule (the store that
+    follows reads them many words later).
+    """
+    if not act:
+        return
+    import kops
+    if act != kops.ACT_RELU:
+        raise ValueError('kgen: gemm10 has no epilogue body for %s'
+                         % (kops.ACT_NAMES[act],))
+    # A-file C vectors take the small immediate 0 as the bound; a B-file
+    # vector cannot (raddr_b would carry both it and the register), so it
+    # reads the same 0 from an A register.  A20 is the A tile pointer,
+    # dead from the end of the k loop until the next column block resets
+    # it, which is after this store.
+    a.ldi(0, G10_RA_AADR, note='epilogue: 0.0f for the B-file vectors')
+    a.nop(), a.nop()
+    zero_a = areg(G10_RA_AADR)
+    for r in range(G10_NROWS):
+        for j in range(4):
+            f, addr = g10_acc_addr(r, j)
+            bound = imm(0) if f == 0 else zero_a
+            a.word(add=g10_addi(ADD_FMAX, addr, g10_ref(f, addr), bound,
+                                ws=f),
+                   note='epilogue relu r%d j%d' % (r, j))
+
+
 def g10_store(a, stride):
     """VPM->DMA store of the whole 8x64 C tile: 4 column chunks x 2 row halves.
 
@@ -1111,8 +1161,14 @@ def g10_dump_avec(a, base_reg):
     a.nop(), a.nop(), a.nop(), a.nop()
 
 
-def build_gemm10(M, N, K, nqpu=12, probe=None, single=False):
-    """The asm10 GEMM for arbitrary M (8-aligned), N (64-aligned), K (16-aligned)."""
+def build_gemm10(M, N, K, nqpu=12, probe=None, single=False, act=0):
+    """The asm10 GEMM for arbitrary M (8-aligned), N (64-aligned), K (16-aligned).
+
+    `act` is an activation epilogue on the 8x64 C tile before it is stored
+    (`kops.ACT_*`).  Only `relu` is offered here: the tile is 32 live C
+    vectors split over both register files, so no B register is left for a
+    bound constant; max(x, 0.0f) is a small immediate and needs none.
+    """
     assert M % G10_NROWS == 0 and N % G10_NCOLS == 0 and K % 16 == 0, \
         "gemm10 needs M%%8==0, N%%64==0, K%%16==0 (got %d,%d,%d)" % (M, N, K)
     TR, NCB = M // G10_NROWS, N // G10_NCOLS
@@ -1368,6 +1424,7 @@ def build_gemm10(M, N, K, nqpu=12, probe=None, single=False):
             else:
                 a.word(add=g10_or(dst, areg(src), areg(src), ws=0))
             a.nop(), a.nop()
+    g10_epilogue(a, act)
     g10_store(a, stride)
 
     if single:
@@ -3730,10 +3787,10 @@ def main(argv):
         # the asm10 kernel: 8x64 tiles, 3-phase k loop (build_gemm above is the
         # asm3 16x16 generator, kept as 'gemm3' for A/B and reference)
         p = build_gemm10(g('M'), g('N'), g('K'), g('nqpu', 12),
-                         _opt('probe'), bool(g('single', 0)))
+                         _opt('probe'), bool(g('single', 0)), g('act', 0))
     elif kind == 'gemm3':
         p = build_gemm(g('M'), g('N'), g('K'), g('nqpu', 12), g('bmode', 0),
-                       g('depth', 3), g('cstride', None))
+                       g('depth', 3), g('cstride', None), g('act', 0))
     elif kind == 'pack':
         p = build_pack10(g('k'))
     elif kind == 'pack3':

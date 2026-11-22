@@ -1288,7 +1288,8 @@ class Runner:
         return self.upload(p)
 
     # ------------------------------------------------------------ conv (NHWC)
-    def _conv_nhwc(self, node, x, wa, ba, kh, kw, sh, pad, dil=1, groups=1):
+    def _conv_nhwc(self, node, x, wa, ba, kh, kw, sh, pad, dil=1, groups=1,
+                   act=0):
         """NHWC conv, native: batch, dilation and grouped channel blocks.
 
         x is [N][H][pitch][Cin] and wa is the ONNX [Cout][Cin/g][kh][kw].
@@ -1347,7 +1348,7 @@ class Runner:
                 self._free(bb)
             h, w, o = self.eng.conv_nhwc_dil(
                 x.buf, N, Cin, H, W, x.pitch, wp, Cout, kh, kw, sh, pad, dil,
-                out)
+                out, act=act)
             return Tensor(out, (N, Cout, h, w), "nhwc", pitch=o)
 
         # grouped conv: per-group panels, one shared padded input/panel
@@ -1381,16 +1382,26 @@ class Runner:
             panels.append(wp)
         h, w, o = self.eng.conv_nhwc_group(
             x.buf, N, Cin, H, W, x.pitch, panels, Cout, groups, kh, kw, sh,
-            pad, dil, out)
+            pad, dil, out, act=act)
         return Tensor(out, (N, Cout, h, w), "nhwc", pitch=o)
 
-    def _epilogue(self, node, t):
-        """Apply an activation the optimiser attached to this node.
+    # the optimiser's activation name -> the kernel's vc4_act
+    _ACT_OF = {"relu": vc4infer.ACT_RELU}
 
-        The conv and GEMM kernels have no epilogue, so this is still one
-        elementwise launch: the fusion removes a node dispatch and the
-        intermediate tensor's lifetime, not a launch.  ``docs/OPTIMIZER.md``
-        records that distinction; the plan printer reports it the same way.
+    def _act_of(self, node):
+        """The activation the optimiser folded into this node, if any."""
+        f = self._fused.get(self._node_idx, {}).get("activation")
+        return self._ACT_OF.get((f or {}).get("act")) if f else None
+
+    def _epilogue(self, node, t):
+        """Apply an activation here because the kernel could not.
+
+        The conv and GEMM kernels fold the activation into the store when the
+        shape takes the path that has an epilogue (`_conv_nhwc`'s `act`), so
+        this is the fallback: the legacy NCHW conv, or a graph whose activation
+        the kernel refused.  It costs the elementwise launch the fusion was
+        meant to remove, which is why the plan only credits the fold where the
+        executor takes it (`plan.py`, `epilogue_ok`).
         """
         f = self._fused.get(self._node_idx, {}).get("activation")
         if not f or not isinstance(t, Tensor):
@@ -1409,9 +1420,11 @@ class Runner:
         return Tensor(out, t.shape, t.layout, t.pitch)
 
     def _conv(self, node):
-        return self._epilogue(node, self._conv_impl(node))
+        act = self._act_of(node)
+        t, folded = self._conv_impl(node, act)
+        return t if folded else self._epilogue(node, t)
 
-    def _conv_impl(self, node):
+    def _conv_impl(self, node, act=None):
         x = self._float(node.input[0])
         w = self._float(node.input[1])
         b = self._float(node.input[2]) if len(node.input) > 2 and node.input[2] else None
@@ -1474,12 +1487,13 @@ class Runner:
                 wa = dense
                 Cout = cp
             t = self._conv_nhwc(node, xn, wa, ba, kh, kw, sh, int(pads[0]),
-                                dilv, 1 if depthwise else group)
+                                dilv, 1 if depthwise else group,
+                                act if act is not None else 0)
             if t.shape[1] != w.shape[0]:
                 # Cout is padded to 16 for the GEMM; take the real channels
                 # back on the QPUs (the DFL head's 1-channel conv)
                 t = self._slice_ch(t, 0, int(w.shape[0]))
-            return t
+            return t, act is not None
 
         # ---------------- legacy NCHW path (non-square kernels, etc.) -------
         if N != 1:
@@ -1546,7 +1560,7 @@ class Runner:
         if t.shape[1] != Cout:
             a = self.download(t)[:, :Cout]
             t = self.upload(np.ascontiguousarray(a))
-        return t
+        return t, False
 
     def _pad_ch(self, x, cpad):
         a = self.download(x)

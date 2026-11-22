@@ -294,7 +294,7 @@ unknown.
 | | `hardswish` | `Mul(x,HardSigmoid(x))` -> one dispatch | 0 | 0 |
 | | `affine` | `Add(Mul(x,a),b)` -> one `UOP_AFFINE` dispatch | 0 | 0 |
 | epilogue | `conv-bias` | `Conv + Add(per-channel const)` -> the conv bias | 0 | 0 |
-| | `conv-activation` | `Conv + Relu/Clip(0,6)` -> one dispatch | 0 | 0 |
+| | `conv-activation` | `Conv/MatMul` + Relu/Clip(0,6) -> the GEMM's store | 0 | 0 |
 
 "v8n160" is YOLOv8n at 160x160.  The rewrite runs at `Runner.__init__`, before
 the pool plan, so the plan is sized from the graph that will execute.
@@ -336,31 +336,46 @@ Two honest notes on that table:
   With the pass on, the 467 SiLU launch sets are a recorded graph rewrite
   instead of a special case in `Runner._find_silu`.
 
-### What phase B cannot remove on this engine
+### The activation epilogue
 
 The phase B exit criterion is "launches down >= 40%, wall < 420 ms".  The 57
 SiLU pairs are 467 of the 752 modelled launches (62%), and the only way to
 remove them is to run the activation inside the conv that produces the tile.
 (The one remaining Sigmoid, 14 launches, follows the class-score Concat, so no
-conv epilogue reaches it.)  This engine cannot do the epilogue today:
+conv epilogue reaches it.)
 
-- `vc4_conv_nhwc` takes no activation parameter (`infer/include/vc4infer.h`);
-- the bias *is* free: `vc4_nhwc.c` folds it into the GEMM as an extra K term,
-  which is why `conv-bias` saves a launch where a graph has one;
-- the LiteRT delegate's "conv with fused RELU/RELU6" is a composite: after the
-  conv it compacts and then calls `vc4_relu` / `vc4_unary(VC4_UOP_CLIP)` as a
-  second launch (`litert/src/vc4_delegate.c`, `run_conv`).
+That epilogue exists now: `vc4_conv_nhwc_act` / `vc4_matmul_act` take a
+`vc4_act`, the GEMM applies it to the value it stores, and `docs/KERNELS.md`
+sec. 7 has the instruction budget and the measured word counts.  The bias was
+already free (`vc4_nhwc.c` folds it into the GEMM as an extra K term), which is
+why `conv-bias` saved a launch before this change.
 
-So `conv-activation` is implemented as a dispatch fusion (one node less, same
-launch count) and is off by default, because it has no measured gain.  The
-launch gate needs a kernel change: an epilogue in the GEMM store that applies
-`max(0,x)` (and `min(x,6)` for RELU6) before the VPM->DMA store, exposed as a
-flag on `vc4_conv_nhwc` / `vc4_matmul`.  The plan projects the result without
-claiming it: the recorded baseline is 481.7 ms with 802 launches and a 222 ms
-launch path (this document, "Baseline"), i.e. 0.277 ms per launch, so 467
-fewer launches is ~129 ms and an expected ~353 ms.  That would clear the
-420 ms criterion; the extra saving from not reading and writing the activation
-plane twice is not included.
+`conv-activation` marks a pair only where the kernel can take it;
+`plan.epilogue_ok` is the same predicate the launch model uses, so the plan and
+the executor cannot disagree about the saving:
+
+| producer | relu | clip(0,6) | silu |
+|---|---|---|---|
+| `Conv`, NHWC path | fold | not yet | not yet |
+| `Conv`, legacy NCHW path | - | - | - |
+| `MatMul` (asm10) | fold | - | - |
+| `Gemm` | - | - | - |
+
+A pair outside the table is left alone rather than marked for a launch that
+would not happen, and a graph that still has one takes the two-launch
+fallback in `Runner._epilogue`.
+
+The LiteRT delegate's "conv with fused RELU/RELU6" is still a composite: after
+the conv it compacts and then calls `vc4_relu` / `vc4_unary(VC4_UOP_CLIP)` as a
+second launch (`litert/src/vc4_delegate.c`, `run_conv`); it does not use the
+new entry points yet.
+
+The plan projects the result without claiming it until it is measured: the
+recorded baseline is 481.7 ms with 802 launches and a 222 ms launch path (this
+document, "Baseline"), i.e. 0.277 ms per launch, so removing the 467 SiLU
+launches is ~129 ms and an expected ~353 ms.  That would clear the 420 ms
+criterion; the extra saving from not reading and writing the activation plane
+twice is not included.
 
 ### Gates on silicon
 

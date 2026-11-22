@@ -399,3 +399,65 @@ VC4INFER_DAEMON=1 ./training/build/test_grad 1     # or infer/build/test_grad
 `emu_gated.py` lives in the tests tree (it imports `kgen`, `kops` and
 `emu_alu`); `test_gated.c` is built by the suite and `run_tests.sh` runs its
 five subcommands after `test_copyops`.
+## 9. Measurement caveat: the memory path's stall time is intermittent
+
+Any GFLOP/s or kernel-ms figure from this board is only comparable with another
+one taken in the same memory-path state, and that state is not a boot, a clock
+or a temperature.  Measured on 2026-11-23, one private daemon, one client:
+
+| quantity | fast sample | slow sample |
+|---|---|---|
+| 512^3 asm10 GEMM | 26.58 ms, 10.10 GFLOP/s | 34.17 ms, 7.86 GFLOP/s |
+| cycle count per 8x64 tile-k | 3269 | 3269 |
+| `core` / `v3d` / `sdram` clock | 400 / 300 / 166.7 MHz | 400 / 300 / 166.7 MHz |
+| `get_throttled` | 0x0 | 0x0 |
+| temperature | 47-49 C | 47-52 C |
+| 256^3 pack (512 KiB) | 1.17 GB/s | 0.85 GB/s |
+
+The cycle count is `gpu_cycles / ((M/8)*(N/64)*(K/16))`, where `gpu_cycles` is
+V3D `EXECUTION_CYCLES` summed over the QPUs.  It was identical in every run of
+this pass, fast or slow: the program, the QPU issue rate and the instruction
+schedule did not change.  The wall time did, which means the QPU spent the
+difference stalled on memory.  The docs' earlier 13.745 vs 8.12 GFLOP/s for the
+same `gemm6_256.bin` is the same signature.
+
+The state changes within a run, not only between boots.  The autotuner measured
+one launch at 28.581 ms, then the same launch (same `pack_q=4 gemm_q=12`) at
+34.130 ms ten seconds later, with the same cycle count.  Twelve consecutive
+512^3 runs over 15 s, one second apart, sat at 26.58-27.55 ms; the inflated
+observations are isolated minutes apart and do not follow a warm-up ramp.
+
+What it is not:
+
+* **not a clock change visible to the kernel.** `measure_clock core`, `v3d`,
+  `arm` and the `clk_summary` rates for `fw-clk-core`, `fw-clk-v3d` and
+  `sdram` were sampled in both states and did not differ; the firmware config
+  is pinned (`core_freq=400`, `core_freq_min=400`, `gpu_freq=300`,
+  `sdram_freq=450`).  `sdram` reports 166.7 MHz in both, so that field does
+  not discriminate.
+* **not thermal.** Every tabulated run stayed between 46 and 55 C,
+  `throttled=0x0`; the slow observations were not the hot ones.
+* **not the throttle/under-voltage latch.** A boot that showed
+  `throttled=0x50000` (an earlier under-voltage event, nothing current)
+  produced slow readings, but a boot with `0x0` produced both fast and slow
+  readings, so the flag is a coincidence of the slow boot, not the cause.
+* **not a degraded daemon arena.** A 48 MiB arena instead of 64 MiB fails a
+  conv's scratch allocation outright (`out of arena memory`), it does not slow
+  a kernel.
+
+The remaining candidates are DRAM contention from another master (an ARM
+process, the display pipe, a concurrent GPU client) and a firmware
+memory-controller state that no exposed register reports.  I did not reproduce
+it on demand with one client and the board idle, so it is recorded here as
+nondeterministic rather than attributed.
+
+Rules for any later measurement on this board:
+
+1. print `cyc/tile-k` beside every ms; if it moved, a different program ran,
+   if it did not, the difference is stall time;
+2. interleave A/B (default, candidate, default) instead of measuring the
+   baseline once and the candidate after a search;
+3. never compare two absolute ms taken more than a minute apart without an
+   interleaved reference;
+4. record `get_throttled`, the temperature and `core`/`v3d` at the start and
+   end of the run, `tools/thermal-guard.sh --max 75` does the latter.

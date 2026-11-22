@@ -294,15 +294,16 @@ unknown.
 | | `hardswish` | `Mul(x,HardSigmoid(x))` -> one dispatch | 0 | 0 |
 | | `affine` | `Add(Mul(x,a),b)` -> one `UOP_AFFINE` dispatch | 0 | 0 |
 | epilogue | `conv-bias` | `Conv + Add(per-channel const)` -> the conv bias | 0 | 0 |
-| | `conv-activation` | `Conv + Relu/Clip(0,6)` -> one dispatch | 0 | 0 |
+| | `conv-activation` | `Conv/MatMul` + Relu/Clip(0,6)/silu -> the GEMM's store | 0 | -467 |
 
 "v8n160" is YOLOv8n at 160x160.  The rewrite runs at `Runner.__init__`, before
 the pool plan, so the plan is sized from the graph that will execute.
 
-The five ew/epilogue rules have no instance in YOLOv8n that the executor was
-not already handling (see below), which is why their v8n160 launch column is 0.
-The rules are tested on synthetic graphs and, for `conv-bias` and `affine`,
-reduce the plan by one launch there.
+The ew/epilogue rules have no instance in YOLOv8n that the executor was not
+already handling except the SiLU fold: `conv-activation` takes the 57
+conv -> Mul(x, Sigmoid(x)) pairs out of the elementwise model and into the
+producing conv, which is the 467-launch column.  The other rules are tested
+on synthetic graphs and reduce the plan by one launch there.
 
 ### Plan accounting
 
@@ -322,7 +323,7 @@ YOLOv8n-160, modelled:
 | baseline | 263 | 206 | 752 (679 exact + 73 copy) |
 | after canonicalise | 252 | 195 | 752 |
 | after ew | 252 | 195 | 752 |
-| after epilogue | 252 | 195 | 752 |
+| after epilogue | 252 | 138 | 285 (212 exact + 73 copy) |
 
 Two honest notes on that table:
 
@@ -334,33 +335,81 @@ Two honest notes on that table:
   plans 1219 launches; with the pass the plan stays at 752 and the rewrite is
   recorded in the graph, which is what makes it switchable and bisectable.
   With the pass on, the 467 SiLU launch sets are a recorded graph rewrite
-  instead of a special case in `Runner._find_silu`.
+  instead of a special case in `Runner._find_silu`;
+- the epilogue pass then moves those 57 pairs into the conv that produces
+  them.  It needs the ew pass: the pattern it matches is a `Mul` carrying the
+  `silu` record, because that is what names the tensor the activation reads.
+  `VC4_OPT=all,-epilogue` and `VC4_OPT=all,-ew` both stay at 752 launches,
+  which is the bisection switch.
 
-### What phase B cannot remove on this engine
+### The activation epilogue
 
 The phase B exit criterion is "launches down >= 40%, wall < 420 ms".  The 57
 SiLU pairs are 467 of the 752 modelled launches (62%), and the only way to
 remove them is to run the activation inside the conv that produces the tile.
 (The one remaining Sigmoid, 14 launches, follows the class-score Concat, so no
-conv epilogue reaches it.)  This engine cannot do the epilogue today:
+conv epilogue reaches it.)
 
-- `vc4_conv_nhwc` takes no activation parameter (`infer/include/vc4infer.h`);
-- the bias *is* free: `vc4_nhwc.c` folds it into the GEMM as an extra K term,
-  which is why `conv-bias` saves a launch where a graph has one;
-- the LiteRT delegate's "conv with fused RELU/RELU6" is a composite: after the
-  conv it compacts and then calls `vc4_relu` / `vc4_unary(VC4_UOP_CLIP)` as a
-  second launch (`litert/src/vc4_delegate.c`, `run_conv`).
+That epilogue exists now: `vc4_conv_nhwc_act` / `vc4_matmul_act` take a
+`vc4_act`, the GEMM applies it to the value it stores, and `docs/KERNELS.md`
+sec. 7 has the instruction budget and the measured word counts.  The bias was
+already free (`vc4_nhwc.c` folds it into the GEMM as an extra K term), which is
+why `conv-bias` saved a launch before this change.
 
-So `conv-activation` is implemented as a dispatch fusion (one node less, same
-launch count) and is off by default, because it has no measured gain.  The
-launch gate needs a kernel change: an epilogue in the GEMM store that applies
-`max(0,x)` (and `min(x,6)` for RELU6) before the VPM->DMA store, exposed as a
-flag on `vc4_conv_nhwc` / `vc4_matmul`.  The plan projects the result without
-claiming it: the recorded baseline is 481.7 ms with 802 launches and a 222 ms
-launch path (this document, "Baseline"), i.e. 0.277 ms per launch, so 467
-fewer launches is ~129 ms and an expected ~353 ms.  That would clear the
-420 ms criterion; the extra saving from not reading and writing the activation
-plane twice is not included.
+`conv-activation` marks a pair only where the kernel can take it;
+`plan.epilogue_ok` is the same predicate the launch model uses, so the plan and
+the executor cannot disagree about the saving:
+
+| producer | relu | clip(0,6) | silu |
+|---|---|---|---|
+| `Conv`, NHWC path | fold | fold | fold |
+| `Conv`, legacy NCHW path | - | - | - |
+| `MatMul` (asm10) | fold | fold | - |
+| `Gemm` | - | - | - |
+
+A pair outside the table is left alone rather than marked for a launch that
+would not happen, and a graph that still has one takes the two-launch
+fallback in `Runner._epilogue`.
+
+The LiteRT delegate's "conv with fused RELU/RELU6" is still a composite: after
+the conv it compacts and then calls `vc4_relu` / `vc4_unary(VC4_UOP_CLIP)` as a
+second launch (`litert/src/vc4_delegate.c`, `run_conv`); it does not use the
+new entry points yet.
+
+Measured on the board (2026-11-22, on the merged base, `vc4d` on the tv
+socket with a 46 MiB client arena because CMA on the shared board was full,
+peak 65 C): YOLOv8n-160 runs **1003 launches with no pass and 536 with all of
+them**.  The 467 are the SiLU pairs' `Mul` launches: the `Mul` row goes
+468 -> 2, and one of the two is `Div_1`, which `canonicalise` rewrites into
+a `Mul` that costs its launch either way.  The parity gate passes with the
+epilogue on:
+
+| input | over tolerance | max abs | max rel | detections (ref / vc4) | classes | max box diff | max score diff |
+|---|---:|---:|---:|---|---|---:|---:|
+| rng(0) | 0 / 44,100 | 2.04e-2 | 2.24e-4 | 0 / 0 | - | - | - |
+| `bus.jpg` | 0 / 44,100 | 1.34e-2 | 3.21e-4 | 4 / 4 | same | 2.2e-4 px | 8.5e-5 |
+
+and the two graphs are **bit-identical to each other** on both inputs: the
+same model run with every pass and with none returns the same 44,100 values,
+to the last bit, and the tensor before the DFL softmax is identical too
+(33,600 elements, 0 differ).  The rewrites changed where the activation runs
+and nothing else, which is what the word "fused" has to mean.
+
+The *plan* says 752 -> 285, and it is the copy class that makes the run
+1003 rather than 752: the executor's pitched copies (`Concat` 231 launches
+against the modelled 38, `Reshape` 41 against 8, `Softmax` 40 against 23)
+are what `plan.py` calls approximate, and `plan_diff.py --profile` reports
+24 such rows.  It also reports two exact-class rows, both pre-existing and
+both a copy charged to a node the model counts as a bare conv:
+`/model.0/conv/Conv` (the NCHW -> NHWC conversion of the graph input, 2 -> 3)
+and `/model.22/dfl/conv/Conv` (the 1-channel head's `_slice_ch`, 2 -> 4).
+Neither is caused by the epilogue; the first reproduces with `VC4_OPT=none`
+on the pre-merge base.
+
+The wall time is not measured.  The projection is the recorded 0.277 ms per
+launch -- 467 fewer launches is ~129 ms off the 222 ms launch path, an
+expected ~353 ms against the 481.7 ms baseline -- and the extra saving from
+not reading and writing the activation plane twice is not included.
 
 ### Gates on silicon
 
@@ -472,7 +521,7 @@ launch-accounting gate.
 |---|---|
 | general elementwise chain merge (`add -> relu -> add`) | no single kernel expresses a chain: `vc4_elementwise` bodies are fixed (`kops.EWB`), and the three compositions this engine does have (`silu`, `hardswish`, `affine`) are the three rules implemented |
 | merging two independent elementwise launches | they are sequential in the graph; batching them is phase D (daemon round-trips), not a graph rewrite |
-| conv/GEMM activation in one launch | kernel epilogue, see above; implemented as a dispatch fusion only |
 | `MatMul/Gemm + Add` -> `Gemm` with C | `Runner._gemm` materialises C and adds it with a separate `vc4_elementwise` call, so the rewrite saves no launch; not implemented rather than sold as one |
+| silu in the asm10 matmul epilogue | the 8x64 tile has one B register left after the k loop and silu needs twelve (`docs/KERNELS.md` sec. 7.4); the conv GEMM has 19, which is where every YOLOv8n pair lives |
 | weight prepacking, layout assignment, memory planning, autotuning | phases C-E, not part of this merge |
 

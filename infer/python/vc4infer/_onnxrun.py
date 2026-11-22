@@ -1377,7 +1377,7 @@ class Runner:
 
     # ------------------------------------------------------------ conv (NHWC)
     def _conv_nhwc(self, node, x, wa, ba, kh, kw, sh, pad, dil=1, groups=1,
-                   pads=None):
+                   act=0, pads=None):
         """NHWC conv, native: batch, dilation and grouped channel blocks.
 
         x is [N][H][pitch][Cin] and wa is the ONNX [Cout][Cin/g][kh][kw].
@@ -1445,7 +1445,7 @@ class Runner:
                 self._free(bb)
             h, w, o = self.eng.conv_nhwc_pads(
                 x.buf, N, Cin, H, W, x.pitch, wp, Cout, kh, kw, sh, pt, pl,
-                pb, pr, dil, out)
+                pb, pr, dil, out, act=act)
             return Tensor(out, (N, Cout, h, w), "nhwc", pitch=o)
 
         # grouped conv: per-group panels, one shared padded input/panel
@@ -1479,16 +1479,29 @@ class Runner:
             panels.append(wp)
         h, w, o = self.eng.conv_nhwc_group(
             x.buf, N, Cin, H, W, x.pitch, panels, Cout, groups, kh, kw, sh,
-            pad, dil, out)
+            pad, dil, out, act=act)
         return Tensor(out, (N, Cout, h, w), "nhwc", pitch=o)
 
-    def _epilogue(self, node, t):
-        """Apply an activation the optimiser attached to this node.
+    # the optimiser's activation name -> the kernel's vc4_act
+    _ACT_OF = {"relu": vc4infer.ACT_RELU, "relu6": vc4infer.ACT_CLIP6,
+               "silu": vc4infer.ACT_SILU}
 
-        The conv and GEMM kernels have no epilogue, so this is still one
-        elementwise launch: the fusion removes a node dispatch and the
-        intermediate tensor's lifetime, not a launch.  ``docs/OPTIMIZER.md``
-        records that distinction; the plan printer reports it the same way.
+    def _act_of(self, node):
+        """The activation the optimiser folded into this node, if any."""
+        f = self._fused.get(self._node_idx, {}).get("activation")
+        return self._ACT_OF.get((f or {}).get("act")) if f else None
+
+    def _epilogue(self, node, t):
+        """Apply an activation here because the kernel could not.
+
+        The conv and MatMul kernels fold the activation into the store when
+        the shape takes a path that has an epilogue, so this is the fallback:
+        the legacy NCHW conv, the 6x6 decomposition (its four phase sums
+        must be completed first), a Gemm with its `beta*C` term, or a pair the
+        kernel refused.  It costs the elementwise launch the fusion was meant
+        to remove, which is why the plan only credits the fold where the
+        executor takes it (`plan.epilogue_ok`).  It must still *compute* the
+        activation: dropping one here would be a wrong answer, not a slow one.
         """
         f = self._fused.get(self._node_idx, {}).get("activation")
         if not f or not isinstance(t, Tensor):
@@ -1500,6 +1513,8 @@ class Runner:
         elif act == "relu6":
             self.eng.unary(vc4infer.UOP_CLIP, t.buf, out, t.size,
                            0.0, 6.0, 0.0)
+        elif act == "silu":
+            self.eng.elementwise(vc4infer.OP_SILU, t.buf, out, t.size)
         else:
             self.pool.release(out)
             return t
@@ -1555,9 +1570,11 @@ class Runner:
         return acc
 
     def _conv(self, node):
-        return self._epilogue(node, self._conv_impl(node))
+        act = self._act_of(node)
+        t, folded = self._conv_impl(node, act)
+        return t if folded else self._epilogue(node, t)
 
-    def _conv_impl(self, node):
+    def _conv_impl(self, node, act=None):
         x = self._float(node.input[0])
         w = self._float(node.input[1])
         b = self._float(node.input[2]) if len(node.input) > 2 and node.input[2] else None
@@ -1617,7 +1634,7 @@ class Runner:
                 t = self._conv6_stride2(node, xn, wa, ba, int(pads[0]))
                 if t.shape[1] != w.shape[0]:
                     t = self._slice_ch(t, 0, int(w.shape[0]))
-                return t
+                return t, False      # act(sum) is not sum(act(phase))
             if depthwise:
                 # The dedicated depthwise kernel is not shipped (it wedges
                 # the QPU); the verified block-diagonal dense expansion is
@@ -1632,12 +1649,13 @@ class Runner:
                 wa = dense
                 Cout = cp
             t = self._conv_nhwc(node, xn, wa, ba, kh, kw, sh, int(pads[0]),
-                                dilv, 1 if depthwise else group)
+                                dilv, 1 if depthwise else group,
+                                act if act is not None else 0)
             if t.shape[1] != w.shape[0]:
                 # Cout is padded to 16 for the GEMM; take the real channels
                 # back on the QPUs (the DFL head's 1-channel conv)
                 t = self._slice_ch(t, 0, int(w.shape[0]))
-            return t
+            return t, act is not None
 
         # ---------------- legacy NCHW path (non-square kernels, etc.) -------
         if N != 1:
@@ -1704,7 +1722,7 @@ class Runner:
         if t.shape[1] != Cout:
             a = self.download(t)[:, :Cout]
             t = self.upload(np.ascontiguousarray(a))
-        return t
+        return t, False          # the legacy NCHW path has no epilogue
 
     def _pad_ch(self, x, cpad):
         a = self.download(x)
@@ -2779,9 +2797,11 @@ class Runner:
         return out
 
     def _matmul(self, node):
-        return self._epilogue(node, self._matmul_impl(node))
+        act = self._act_of(node)
+        t, folded = self._matmul_impl(node, act)
+        return t if folded else self._epilogue(node, t)
 
-    def _matmul_impl(self, node):
+    def _matmul_impl(self, node, act=None):
         """MatMul of any rank >= 2, as one GEMM per batch index.
 
         ONNX MatMul on rank-4 operands is a batched matmul: ``[B][H][M][K] x
@@ -2814,14 +2834,16 @@ class Runner:
             b = self._tmp(self._to_nchw_buf(b))
         batch = int(np.prod(ba)) if ba else 1
         out = self._alloc(batch * M * N)
+        vact = act if act is not None else vc4infer.ACT_NONE
         if batch == 1:
-            self.eng.matmul(a.buf, b.buf, out, M, N, K)
+            self.eng.matmul(a.buf, b.buf, out, M, N, K, act=vact)
         else:
             for i in range(batch):
                 self.eng.matmul(self._buf_at(a, i * M * K * 4),
                                 self._buf_at(b, i * K * N * 4),
-                                self._buf_at(out, i * M * N * 4), M, N, K)
-        return Tensor(out, ba + (M, N))
+                                self._buf_at(out, i * M * N * 4), M, N, K,
+                                act=vact)
+        return Tensor(out, ba + (M, N)), act is not None
 
     def _gemm(self, node):
         return self._epilogue(node, self._gemm_impl(node))

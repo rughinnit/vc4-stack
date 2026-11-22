@@ -640,7 +640,7 @@ static vc4_status tune_run(vc4_ctx *ctx, vc4_op op, const vc4_tune_shape *s,
     int ho = 0, wo = 0;
     if (op == VC4_OP_MATMUL)
         return vc4__matmul_tuned(ctx, &tb->a, &tb->b, &tb->c, s->m, s->n, s->k,
-                                 VC4_LAYOUT_ROW_MAJOR, p);
+                                 VC4_LAYOUT_ROW_MAJOR, p, VC4_ACT_NONE);
     return vc4__conv2d_tuned(ctx, &tb->in, (int)s->cin, (int)s->h, (int)s->w,
                              &tb->wt, (int)s->cout, (int)s->kh, (int)s->kw,
                              tb->have_bias ? &tb->bias : NULL,
@@ -927,10 +927,10 @@ vc4_status vc4_autotune(vc4_ctx *ctx, vc4_op op, const vc4_tune_shape *shape_in,
 
     if (op == VC4_OP_MATMUL)
         vc4__matmul_kernel_name(kernel, sizeof(kernel), s.m, s.n, s.k,
-                                (int)best.gemm_q);
+                                (int)best.gemm_q, VC4_ACT_NONE);
     else
         vc4__conv_kernel_name(kernel, sizeof(kernel), s.m, s.n, s.k,
-                              (int)best.gemm_q);
+                              (int)best.gemm_q, VC4_ACT_NONE);
 
     /* A cache directory the process cannot write (a read-only install) must
      * not fail an otherwise useful measurement. */

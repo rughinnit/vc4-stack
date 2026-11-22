@@ -162,7 +162,7 @@ static vc4_status nhwc_conv_pass(vc4_ctx *ctx, const nhwc_pad *pd, int nimg,
                                  int dilation, const vc4_buf *wpanel,
                                  int Cout, int cstride, int cout_off,
                                  uint32_t out_bus, int ho, int Wg,
-                                 const vc4_buf *pb)
+                                 const vc4_buf *pb, int act)
 {
     const int nx = Wg / 16;
     const uint32_t M = (uint32_t)ho * (uint32_t)Wg;
@@ -233,7 +233,7 @@ static vc4_status nhwc_conv_pass(vc4_ctx *ctx, const nhwc_pad *pd, int nimg,
      * output channel block starts at cout_off. */
     return vc4__gemm3_run_c(ctx, (uint32_t)nimg * M, (uint32_t)Cout, nk, 1,
                             vc4_bus_addr(ctx, wpanel), out_bus + cout_off * 4u,
-                            ctx->gpu_bus + pb->off, (uint32_t)cstride);
+                            ctx->gpu_bus + pb->off, (uint32_t)cstride, act);
 }
 
 static vc4_status conv_nhwc_common(vc4_ctx *ctx, const vc4_buf *in, int nimg,
@@ -241,8 +241,9 @@ static vc4_status conv_nhwc_common(vc4_ctx *ctx, const vc4_buf *in, int nimg,
                                    const vc4_buf *const *wpanel, int Cout,
                                    int groups, int KH, int KW, int stride,
                                    int padt, int padl, int padb, int padr,
-                                   int dilation, vc4_buf *out, int *ho_out,
-                                   int *wo_out, int *opitch_out)
+                                   int dilation, vc4_act act, vc4_buf *out,
+                                   int *ho_out, int *wo_out,
+                                   int *opitch_out)
 {
     if (!ctx || !in || !wpanel || !wpanel[0] || !out || !ho_out || !wo_out ||
         !opitch_out || nimg < 1 || groups < 1)
@@ -347,7 +348,8 @@ static vc4_status conv_nhwc_common(vc4_ctx *ctx, const vc4_buf *in, int nimg,
         st = nhwc_conv_pass(ctx, &pd, nimg, g * Cin_g, Cin_g, Cin, W, KH, KW,
                             stride, padl, padr, dilation, wpanel[g], Cout_g,
                             Cout,
-                            g * Cout_g, vc4_bus_addr(ctx, out), ho, Wg, &pb);
+                            g * Cout_g, vc4_bus_addr(ctx, out), ho, Wg, &pb,
+                            act);
     vc4__scratch_reset(ctx);
     if (st == VC4_OK) {
         *ho_out = ho;
@@ -357,15 +359,28 @@ static vc4_status conv_nhwc_common(vc4_ctx *ctx, const vc4_buf *in, int nimg,
     return st;
 }
 
+vc4_status vc4_conv_nhwc_dil_act(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                                 int Cin, int H, int W, int in_pitch,
+                                 const vc4_buf *wpanel, int Cout, int KH,
+                                 int KW, int stride, int pad, int dilation,
+                                 vc4_act act, vc4_buf *out, int *ho_out,
+                                 int *wo_out, int *opitch_out)
+{
+    return conv_nhwc_common(ctx, in, nimg, Cin, H, W, in_pitch, &wpanel, Cout,
+                            1, KH, KW, stride, pad, pad, pad, pad, dilation,
+                            act, out, ho_out, wo_out, opitch_out);
+}
+
 vc4_status vc4_conv_nhwc_dil(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
                              int H, int W, int in_pitch,
                              const vc4_buf *wpanel, int Cout, int KH, int KW,
                              int stride, int pad, int dilation, vc4_buf *out,
                              int *ho_out, int *wo_out, int *opitch_out)
 {
-    return conv_nhwc_common(ctx, in, nimg, Cin, H, W, in_pitch, &wpanel, Cout,
-                            1, KH, KW, stride, pad, pad, pad, pad, dilation,
-                            out, ho_out, wo_out, opitch_out);
+    return vc4_conv_nhwc_dil_act(ctx, in, nimg, Cin, H, W, in_pitch, wpanel,
+                                 Cout, KH, KW, stride, pad, dilation,
+                                 VC4_ACT_NONE, out, ho_out, wo_out,
+                                 opitch_out);
 }
 
 /* Asymmetric padding.  A 6x6 stride-2 kernel is four 3x3 stride-2 kernels
@@ -374,6 +389,19 @@ vc4_status vc4_conv_nhwc_dil(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
  * pad+a-1 / pad+b-1 and an upper/left pad of pad-a / pad-b.  Materialising
  * the four shifted copies would cost four activation copies; the pads make
  * the same reads directly. */
+vc4_status vc4_conv_nhwc_pads_act(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                                  int Cin, int H, int W, int in_pitch,
+                                  const vc4_buf *wpanel, int Cout, int KH,
+                                  int KW, int stride, int pt, int pl, int pb,
+                                  int pr, int dilation, vc4_act act,
+                                  vc4_buf *out, int *ho_out, int *wo_out,
+                                  int *opitch_out)
+{
+    return conv_nhwc_common(ctx, in, nimg, Cin, H, W, in_pitch, &wpanel, Cout,
+                            1, KH, KW, stride, pt, pl, pb, pr, dilation, act,
+                            out, ho_out, wo_out, opitch_out);
+}
+
 vc4_status vc4_conv_nhwc_pads(vc4_ctx *ctx, const vc4_buf *in, int nimg,
                               int Cin, int H, int W, int in_pitch,
                               const vc4_buf *wpanel, int Cout, int KH, int KW,
@@ -381,9 +409,21 @@ vc4_status vc4_conv_nhwc_pads(vc4_ctx *ctx, const vc4_buf *in, int nimg,
                               int dilation, vc4_buf *out, int *ho_out,
                               int *wo_out, int *opitch_out)
 {
-    return conv_nhwc_common(ctx, in, nimg, Cin, H, W, in_pitch, &wpanel, Cout,
-                            1, KH, KW, stride, pt, pl, pb, pr, dilation, out,
-                            ho_out, wo_out, opitch_out);
+    return vc4_conv_nhwc_pads_act(ctx, in, nimg, Cin, H, W, in_pitch, wpanel,
+                                  Cout, KH, KW, stride, pt, pl, pb, pr,
+                                  dilation, VC4_ACT_NONE, out, ho_out, wo_out,
+                                  opitch_out);
+}
+
+vc4_status vc4_conv_nhwc_act(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                             int Cin, int H, int W, int in_pitch,
+                             const vc4_buf *wpanel, int Cout, int KH, int KW,
+                             int stride, int pad, vc4_act act, vc4_buf *out,
+                             int *ho_out, int *wo_out, int *opitch_out)
+{
+    return vc4_conv_nhwc_dil_act(ctx, in, nimg, Cin, H, W, in_pitch, wpanel,
+                                 Cout, KH, KW, stride, pad, 1, act, out,
+                                 ho_out, wo_out, opitch_out);
 }
 
 vc4_status vc4_conv_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
@@ -392,9 +432,23 @@ vc4_status vc4_conv_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int Cin,
                          vc4_buf *out, int *ho_out, int *wo_out,
                          int *opitch_out)
 {
-    return vc4_conv_nhwc_dil(ctx, in, nimg, Cin, H, W, in_pitch, wpanel, Cout,
-                             KH, KW, stride, pad, 1, out, ho_out, wo_out,
-                             opitch_out);
+    return vc4_conv_nhwc_act(ctx, in, nimg, Cin, H, W, in_pitch, wpanel, Cout,
+                             KH, KW, stride, pad, VC4_ACT_NONE, out, ho_out,
+                             wo_out, opitch_out);
+}
+
+vc4_status vc4_conv_nhwc_group_act(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                                   int Cin, int H, int W, int in_pitch,
+                                   const vc4_buf *const *wpanel, int Cout,
+                                   int groups, int KH, int KW, int stride,
+                                   int pad, int dilation, vc4_act act,
+                                   vc4_buf *out, int *ho_out, int *wo_out,
+                                   int *opitch_out)
+{
+    return conv_nhwc_common(ctx, in, nimg, Cin, H, W, in_pitch, wpanel, Cout,
+                            groups, KH, KW, stride, pad, pad, pad, pad,
+                            dilation, act, out, ho_out, wo_out,
+                            opitch_out);
 }
 
 vc4_status vc4_conv_nhwc_group(vc4_ctx *ctx, const vc4_buf *in, int nimg,
@@ -404,9 +458,10 @@ vc4_status vc4_conv_nhwc_group(vc4_ctx *ctx, const vc4_buf *in, int nimg,
                                int dilation, vc4_buf *out, int *ho_out,
                                int *wo_out, int *opitch_out)
 {
-    return conv_nhwc_common(ctx, in, nimg, Cin, H, W, in_pitch, wpanel, Cout,
-                            groups, KH, KW, stride, pad, pad, pad, pad,
-                            dilation, out, ho_out, wo_out, opitch_out);
+    return vc4_conv_nhwc_group_act(ctx, in, nimg, Cin, H, W, in_pitch, wpanel,
+                                   Cout, groups, KH, KW, stride, pad,
+                                   dilation, VC4_ACT_NONE, out, ho_out,
+                                   wo_out, opitch_out);
 }
 /* ------------------------------------------------------------- depthwise */
 /*

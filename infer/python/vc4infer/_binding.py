@@ -84,6 +84,9 @@ OP_CMP_EQ, OP_CMP_GT, OP_CMP_GE, OP_CMP_LT, OP_CMP_LE, OP_ISNAN, OP_ISINF = \
 OP_RELU_BWD = 7
 LAYOUT_ROW_MAJOR = 0
 
+# vc4_act: an activation a GEMM/conv applies to the value it stores
+ACT_NONE, ACT_RELU, ACT_CLIP6, ACT_SILU = 0, 1, 2, 3
+
 # vc4_uop (mirrors infer/include/vc4infer.h)
 (UOP_ABS, UOP_NEG, UOP_IDENTITY, UOP_CLIP, UOP_LEAKYRELU, UOP_FLOOR,
  UOP_CEIL, UOP_ROUND, UOP_SIGN, UOP_EXP, UOP_LOG, UOP_SQRT, UOP_RECIPROCAL,
@@ -240,6 +243,12 @@ class Engine:
                                   ctypes.POINTER(ctypes.c_int),
                                   ctypes.POINTER(ctypes.c_int)]
         L.vc4_conv_nhwc_pads.restype = ctypes.c_int
+        L.vc4_conv_nhwc_pads_act.argtypes = [ctypes.c_void_p,
+                                             ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 5 + [ctypes.POINTER(Buf)] + [ctypes.c_int] * 10 + \
+            [ctypes.POINTER(Buf), ctypes.POINTER(ctypes.c_int),
+             ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        L.vc4_conv_nhwc_pads_act.restype = ctypes.c_int
         L.vc4_conv_nhwc_group.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
             [ctypes.c_int] * 5 + [ctypes.POINTER(ctypes.POINTER(Buf))] + \
             [ctypes.c_int] * 7 + [ctypes.POINTER(Buf),
@@ -247,6 +256,33 @@ class Engine:
                                   ctypes.POINTER(ctypes.c_int),
                                   ctypes.POINTER(ctypes.c_int)]
         L.vc4_conv_nhwc_group.restype = ctypes.c_int
+        L.vc4_conv_nhwc_act.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 5 + [ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 5 + [ctypes.c_int, ctypes.POINTER(Buf),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int)]
+        L.vc4_conv_nhwc_act.restype = ctypes.c_int
+        L.vc4_conv_nhwc_dil_act.argtypes = [ctypes.c_void_p,
+                                            ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 5 + [ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 6 + [ctypes.c_int, ctypes.POINTER(Buf),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int)]
+        L.vc4_conv_nhwc_dil_act.restype = ctypes.c_int
+        L.vc4_conv_nhwc_group_act.argtypes = [ctypes.c_void_p,
+                                              ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 5 + [ctypes.POINTER(ctypes.POINTER(Buf))] + \
+            [ctypes.c_int] * 7 + [ctypes.c_int, ctypes.POINTER(Buf),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int)]
+        L.vc4_conv_nhwc_group_act.restype = ctypes.c_int
+        L.vc4_matmul_act.argtypes = [ctypes.c_void_p] + \
+            [ctypes.POINTER(Buf)] * 3 + [ctypes.c_uint32] * 3 + \
+            [ctypes.c_int, ctypes.c_int]
+        L.vc4_matmul_act.restype = ctypes.c_int
         L.vc4_maxpool_nhwc.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
             [ctypes.c_int] * 7 + [ctypes.POINTER(Buf),
                                   ctypes.POINTER(ctypes.c_int),
@@ -408,9 +444,11 @@ class Engine:
         return np.ctypeslib.as_array((ctypes.c_float * count).from_address(p))
 
     # ---- ops
-    def matmul(self, a, b, c, M, N, K, layout=LAYOUT_ROW_MAJOR):
-        self._check(self.lib.vc4_matmul(self.ctx, ctypes.byref(a), ctypes.byref(b),
-                                        ctypes.byref(c), M, N, K, layout), "matmul")
+    def matmul(self, a, b, c, M, N, K, layout=LAYOUT_ROW_MAJOR,
+               act=ACT_NONE):
+        self._check(self.lib.vc4_matmul_act(
+            self.ctx, ctypes.byref(a), ctypes.byref(b), ctypes.byref(c),
+            M, N, K, layout, act), "matmul")
 
     def conv2d(self, x, w, out, Cin, H, W, Cout, KH, KW, bias=None, stride=1, pad=1):
         ho = ctypes.c_int(0)
@@ -538,52 +576,53 @@ class Engine:
             ctypes.byref(wpanel)), "conv_nhwc_pack_w")
 
     def conv_nhwc(self, x, nimg, Cin, H, W, in_pitch, wpanel, Cout, KH, KW,
-                  stride, pad, out):
+                  stride, pad, out, act=ACT_NONE):
         ho = ctypes.c_int(0)
         wo = ctypes.c_int(0)
         op = ctypes.c_int(0)
-        self._check(self.lib.vc4_conv_nhwc(
+        self._check(self.lib.vc4_conv_nhwc_act(
             self.ctx, ctypes.byref(x), nimg, Cin, H, W, in_pitch,
-            ctypes.byref(wpanel), Cout, KH, KW, stride, pad,
+            ctypes.byref(wpanel), Cout, KH, KW, stride, pad, act,
             ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo),
             ctypes.byref(op)), "conv_nhwc")
         return ho.value, wo.value, op.value
 
     def conv_nhwc_dil(self, x, nimg, Cin, H, W, in_pitch, wpanel, Cout, KH, KW,
-                      stride, pad, dil, out):
+                      stride, pad, dil, out, act=ACT_NONE):
         ho = ctypes.c_int(0)
         wo = ctypes.c_int(0)
         op = ctypes.c_int(0)
-        self._check(self.lib.vc4_conv_nhwc_dil(
+        self._check(self.lib.vc4_conv_nhwc_dil_act(
             self.ctx, ctypes.byref(x), nimg, Cin, H, W, in_pitch,
-            ctypes.byref(wpanel), Cout, KH, KW, stride, pad, dil,
+            ctypes.byref(wpanel), Cout, KH, KW, stride, pad, dil, act,
             ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo),
             ctypes.byref(op)), "conv_nhwc_dil")
         return ho.value, wo.value, op.value
 
     def conv_nhwc_pads(self, x, nimg, Cin, H, W, in_pitch, wpanel, Cout, KH,
-                       KW, stride, pt, pl, pb, pr, dil, out):
+                       KW, stride, pt, pl, pb, pr, dil, out, act=ACT_NONE):
         ho = ctypes.c_int(0)
         wo = ctypes.c_int(0)
         op = ctypes.c_int(0)
-        self._check(self.lib.vc4_conv_nhwc_pads(
+        self._check(self.lib.vc4_conv_nhwc_pads_act(
             self.ctx, ctypes.byref(x), nimg, Cin, H, W, in_pitch,
             ctypes.byref(wpanel), Cout, KH, KW, stride, pt, pl, pb, pr, dil,
-            ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo),
+            act, ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo),
             ctypes.byref(op)), "conv_nhwc_pads")
         return ho.value, wo.value, op.value
 
     def conv_nhwc_group(self, x, nimg, Cin, H, W, in_pitch, wpanels, Cout,
-                        groups, KH, KW, stride, pad, dil, out):
+                        groups, KH, KW, stride, pad, dil, out,
+                        act=ACT_NONE):
         ho = ctypes.c_int(0)
         wo = ctypes.c_int(0)
         op = ctypes.c_int(0)
         arr = (ctypes.POINTER(Buf) * len(wpanels))()
         for i, w in enumerate(wpanels):
             arr[i] = ctypes.pointer(w)
-        self._check(self.lib.vc4_conv_nhwc_group(
+        self._check(self.lib.vc4_conv_nhwc_group_act(
             self.ctx, ctypes.byref(x), nimg, Cin, H, W, in_pitch, arr, Cout,
-            groups, KH, KW, stride, pad, dil, ctypes.byref(out),
+            groups, KH, KW, stride, pad, dil, act, ctypes.byref(out),
             ctypes.byref(ho), ctypes.byref(wo), ctypes.byref(op)),
             "conv_nhwc_group")
         return ho.value, wo.value, op.value

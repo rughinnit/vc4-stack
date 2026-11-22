@@ -44,7 +44,7 @@ import vc4infer                                            # noqa: E402
 from vc4infer import optimizer as O                        # noqa: E402
 from vc4infer._onnxrun import Runner                       # noqa: E402
 from vc4infer._binding import (OP_SILU, UOP_AFFINE,         # noqa: E402
-                               UOP_HARDSWISH)
+                               UOP_HARDSWISH, LAYOUT_ROW_MAJOR, ACT_RELU)
 
 MODEL = os.path.join(REPO, "infer", "packaging", "vc4infer", "data", "models",
                      "yolov8n_160.onnx")
@@ -125,6 +125,60 @@ def mk_conv_relu(shape=(1, 16, 8, 8)):
     n = [helper.make_node("Conv", ["X", "W"], ["C"]),
          helper.make_node("Relu", ["C"], ["Y"])]
     return _model(n, [x], [_vi("Y", shape)],
+                  [numpy_helper.from_array(w, "W")])
+
+
+def mk_conv_relu_nchw(shape=(1, 16, 8, 8)):
+    """A 1x3 kernel: the executor takes the legacy NCHW path, no epilogue."""
+    rng = np.random.default_rng(10)
+    w = rng.standard_normal((16, 16, 1, 3)).astype(np.float32) * 0.1
+    x = _vi("X", shape)
+    n = [helper.make_node("Conv", ["X", "W"], ["C"], pads=[0, 1, 0, 1]),
+         helper.make_node("Relu", ["C"], ["Y"])]
+    return _model(n, [x], [_vi("Y", shape)],
+                  [numpy_helper.from_array(w, "W")])
+
+
+def mk_conv_clip6(shape=(1, 16, 8, 8)):
+    """Clip(0,6) with min/max as inputs (the opset 11+ form)."""
+    rng = np.random.default_rng(11)
+    w = rng.standard_normal((16, 16, 3, 3)).astype(np.float32) * 0.1
+    x = _vi("X", shape)
+    n = [helper.make_node("Conv", ["X", "W"], ["C"], pads=[1, 1, 1, 1]),
+         helper.make_node("Clip", ["C", "lo", "hi"], ["Y"])]
+    inits = [numpy_helper.from_array(w, "W"),
+             numpy_helper.from_array(np.asarray(0.0, np.float32), "lo"),
+             numpy_helper.from_array(np.asarray(6.0, np.float32), "hi")]
+    return _model(n, [x], [_vi("Y", shape)], inits)
+
+
+def mk_matmul_clip(shape=((2, 4), (4, 8))):
+    x = _vi("X", (1, 8, 4))
+    w = np.random.default_rng(12).standard_normal((4, 8)).astype(np.float32)
+    n = [helper.make_node("MatMul", ["X", "W"], ["C"]),
+         helper.make_node("Clip", ["C"], ["Y"], min=0.0, max=6.0)]
+    return _model(n, [x], [_vi("Y", (1, 8, 8))],
+                  [numpy_helper.from_array(w, "W")])
+
+
+def mk_conv_silu(shape=(1, 16, 8, 8)):
+    rng = np.random.default_rng(14)
+    w = rng.standard_normal((16, 16, 3, 3)).astype(np.float32) * 0.1
+    x = _vi("X", shape)
+    n = [helper.make_node("Conv", ["X", "W"], ["C"], pads=[1, 1, 1, 1]),
+         helper.make_node("Sigmoid", ["C"], ["S"]),
+         helper.make_node("Mul", ["C", "S"], ["Y"])]
+    return _model(n, [x], [_vi("Y", shape)],
+                  [numpy_helper.from_array(w, "W")])
+
+
+def mk_matmul_relu(shape=((4, 8), (8, 8))):
+    """2-D MatMul -> Relu: the executor folds it into one launch."""
+    x = _vi("X", shape[0])
+    w = np.random.default_rng(16).standard_normal(shape[1]).astype(np.float32)
+    n = [helper.make_node("MatMul", ["X", "W"], ["C"]),
+         helper.make_node("Relu", ["C"], ["Y"])]
+    return _model(n, [x], [_vi("Y", shape[0])],
                   [numpy_helper.from_array(w, "W")])
 
 
@@ -214,6 +268,9 @@ class FakeEngine:
 
     def fill2d(self, *a, **k):
         self._call("fill2d", 0)
+
+    def matmul(self, a, b, c, M, N, K, layout=LAYOUT_ROW_MAJOR, act=0):
+        self._call("matmul", act)
 
 
 # ------------------------------------------------------------------ tests
@@ -325,7 +382,8 @@ def test_epilogue():
           % (p0.total, p1.total))
     _same_answer(m, res.model, {"X": np.random.default_rng(5).standard_normal(
         (1, 16, 8, 8)).astype(np.float32)}, "conv-bias", atol=2e-5)
-    # activation: dispatch count falls, launch count does not
+    # activation: the conv's GEMM applies it to the value it stores, so the
+    # elementwise pass over the output is gone as well as the dispatch
     m = mk_conv_relu()
     res = O.optimise(m, passes="epilogue")
     conv = [n for n in res.graph.nodes if n.op_type == "Conv"][0]
@@ -337,10 +395,71 @@ def test_epilogue():
     p1 = O.plan_of(res.graph)
     check(p1.dispatches == p0.dispatches - 1,
           "one dispatch fewer (%d -> %d)" % (p0.dispatches, p1.dispatches))
-    check(p1.total == p0.total,
-          "launch count unchanged: the conv kernel has no epilogue")
+    check(p1.total == p0.total - 1,
+          "the epilogue removes the activation launch (%d -> %d)"
+          % (p0.total, p1.total))
     _same_answer(m, res.model, {"X": np.random.default_rng(6).standard_normal(
         (1, 16, 8, 8)).astype(np.float32)}, "conv-relu")
+
+    # a path with no epilogue keeps both launches and records nothing
+    m = mk_conv_relu_nchw()
+    res = O.optimise(m, passes="epilogue")
+    conv = [n for n in res.graph.nodes if n.op_type == "Conv"][0]
+    check(conv.rule("activation") is None,
+          "a conv the kernel cannot fold is left alone")
+    p0 = O.plan_of(O.Graph.from_model(m))
+    p1 = O.plan_of(res.graph)
+    check(p1.total == p0.total, "no epilogue: launches unchanged")
+    # a MatMul folds relu and clip(0,6): one free B register is enough for
+    # the bound, not for silu's twelve constants
+    m = mk_matmul_clip()
+    res = O.optimise(m, passes="epilogue")
+    mm = [n for n in res.graph.nodes if n.op_type == "MatMul"][0]
+    check(mm.rule("activation") is not None and
+          mm.rule("activation")["act"] == "relu6",
+          "MatMul + Clip(0,6) folds into the GEMM")
+    check(O.plan_of(res.graph).total ==
+          O.plan_of(O.Graph.from_model(m)).total - 1,
+          "MatMul + clip(0,6) is one launch instead of two")
+    gm = O.Graph.from_model(m)
+    check(not O.epilogue_ok(gm, gm.nodes[0], "silu"),
+          "MatMul + silu is not folded (no room for twelve constants)")
+    # the conv folds clip(0,6) as well, and the launch goes with it
+    m = mk_conv_clip6()
+    res = O.optimise(m, passes="epilogue")
+    conv = [n for n in res.graph.nodes if n.op_type == "Conv"][0]
+    check(conv.rule("activation")["act"] == "relu6",
+          "Clip(0,6) is recorded as relu6")
+    p0 = O.plan_of(O.Graph.from_model(m))
+    p1 = O.plan_of(res.graph)
+    check(p1.total == p0.total - 1,
+          "conv + clip(0,6) is one launch instead of two (%d -> %d)"
+          % (p0.total, p1.total))
+    _same_answer(m, res.model, {"X": np.random.default_rng(13).standard_normal(
+        (1, 16, 8, 8)).astype(np.float32)}, "conv-clip6")
+
+    # conv -> silu: the ew pass collapses the pair, the epilogue pass folds it
+    m = mk_conv_silu()
+    res = O.optimise(m, passes="ew,epilogue")
+    conv = [n for n in res.graph.nodes if n.op_type == "Conv"][0]
+    check(conv.rule("activation") is not None and
+          conv.rule("activation")["act"] == "silu",
+          "Conv -> Mul(x, Sigmoid(x)) folds into the conv as silu")
+    mul = [n for n in res.graph.nodes if n.op_type == "Mul"][0]
+    check(mul.rule("fused") is not None, "the Mul records rule=fused")
+    p0 = O.plan_of(O.Graph.from_model(m))
+    p1 = O.plan_of(res.graph)
+    check(p1.total == p0.total - 1,
+          "conv + silu is one launch instead of two (%d -> %d)"
+          % (p0.total, p1.total))
+    _same_answer(m, res.model, {"X": np.random.default_rng(15).standard_normal(
+        (1, 16, 8, 8)).astype(np.float32)}, "conv-silu", atol=2e-6)
+
+    # the epilogue pass alone cannot see a SiLU the ew pass did not collapse
+    res = O.optimise(m, passes="epilogue")
+    conv = [n for n in res.graph.nodes if n.op_type == "Conv"][0]
+    check(conv.rule("activation") is None,
+          "epilogue without ew: the conv is left alone")
 
 
 def test_plan_model():
@@ -365,14 +484,24 @@ def test_plan_model():
           "(%d mismatches)" % len(exact_bad))
     print("  note: %d copy-class rows differ; the profile predates the QPU "
           "layout copies" % len(copy_bad))
-    # the passes' plan-level effect on the corpus
+    # the passes' plan-level effect on the corpus: 57 conv -> silu pairs,
+    # 467 launches
     res = O.optimise(m, passes="all")
     p1 = O.plan_of(res.graph)
-    check(p1.total == plan.total, "no pass changes the launch count on v8n160")
-    check(p1.dispatches == plan.dispatches - 11,
-          "canonicalise removes 11 metadata node dispatches (%d -> %d)"
+    check(p1.total == 285,
+          "all passes: 752 -> 285 launches (got %d)" % p1.total)
+    check(p1.exact == 212, "the exact classes are 212 of them (got %d)"
+          % p1.exact)
+    check(p1.dispatches == plan.dispatches - 68,
+          "11 metadata + 57 activation dispatches fewer (%d -> %d)"
           % (plan.dispatches, p1.dispatches))
     check(p1.nodes == plan.nodes - 11, "11 nodes fewer in the graph")
+    # and the switches bisect it: without the epilogue, or without the ew
+    # pass that records the SiLU pair, nothing is folded
+    for spec in ("all,-epilogue", "all,-ew"):
+        p = O.plan_of(O.optimise(m, passes=spec).graph)
+        check(p.total == plan.total,
+              "%s keeps the launch count (%d)" % (spec, p.total))
 
 
 def test_dispatch_fake_engine():
@@ -457,6 +586,18 @@ def test_runner_markers():
           % rep["total"])
     check(any(n["fused"] for n in rep["nodes"]),
           "coverage carries the provenance record")
+
+
+def test_dispatch_matmul_fold():
+    print("matmul epilogue dispatch (fake engine)")
+    m = mk_matmul_relu()
+    path = save(m, "mmrelu.onnx")
+    eng = FakeEngine()
+    r = Runner(path, eng, passes="epilogue")
+    x = np.random.default_rng(17).standard_normal((4, 8)).astype(np.float32)
+    r.run({"X": x})
+    check(eng.calls == [("matmul", ACT_RELU)],
+          "one matmul call carrying the activation (%s)" % (eng.calls,))
 
 
 def test_resolve():
@@ -580,6 +721,7 @@ def main():
     test_epilogue()
     test_plan_model()
     test_dispatch_fake_engine()
+    test_dispatch_matmul_fold()
     test_runner_markers()
     test_resolve()
     test_opmatrix_sweep(sweep)

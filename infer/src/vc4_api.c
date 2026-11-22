@@ -78,7 +78,7 @@ static const vc4_op_info OPS[] = {
       "any N>=1, stride>=1, pad>=0; host pads the border with -inf (bytes only)", 1 },
     { "maxpool/NxNsS_bwd", "reduce+eqmask+gather composition", 1,
       "any N/stride/pad; ties share the gradient; input needs 64 B slack", 1 },
-    { "conv2d/nhwc", "qpu im2col_nhwc + qpu gemm3", 1,
+    { "conv2d/nhwc", "qpu im2col_nhwc + qpu gemm3 (relu/clip6/silu epilogue)", 1,
       "f32 NHWC; stride 1/2; KH=KW in {1,3}; Cin,Cout%16==0; stride*Cin*4<=8191", 1 },
     { "conv2d/stride2", "qpu im2col_nhwc (pitch = 2*Cin*4)", 1,
       "NHWC path only (vc4_conv_nhwc); NCHW stride 2 stays unsupported", 0 },

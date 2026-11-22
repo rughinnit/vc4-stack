@@ -2389,6 +2389,168 @@ def build_im2col_nhwc(Cin, KH, KW, stride=1, vpitch=1, dilation=1):
     return p
 
 
+def build_im2col_nhwc_flat(Cin, KH, KW, stride=1, dilation=1):
+    """Flat-panel im2col: 16 flat output pixels per block, four 4-pixel groups.
+
+    The row-padded panel pass (`build_im2col_nhwc`) reads 16 consecutive
+    output pixels of one row per block, so a layer whose output width is not
+    a multiple of 16 pays for the pad pixels in every row: at 160x160 the
+    model's 64 conv layers run 33,952 panel rows for 26,352 real pixels.  This
+    kernel keeps the 16-pixel block but takes its pixels from the *flat*
+    output plane, so the panel has `align16(ho * align4(wo))` rows instead.
+
+    A block is four groups of four consecutive pixels of one padded row.  A
+    group is one VDR of four rows at the pixel pitch (the proven 4-row load
+    shape) and one transposing VDW of 16 k rows x 4 pixel words at a 64-byte
+    k pitch (the panel's own layout with the word count reduced to 4, a shape
+    the C store already uses with 4/16 swapped).  A running group counter
+    walks the row and adds the row adjustment at the wrap; there is no divide.
+
+    KERNEL ABI (u0..u14)
+      u0 src base bus                  u1 panel base bus
+      u2 group advance bytes (4*stride*Cin_pitch*4)
+      u3 panel block advance (64*nk)
+      u4 16-pixel blocks this QPU      u5 source offset of the first group
+      u6 panel offset of the first block
+      u7 VDR pitch (stride*Cin_pitch*4) u8 QPU index
+      u9 padded row pitch bytes        u10 groups per row (Wf/4)
+      u11 row wrap adjustment (RADV - GPR*GADV)
+      u12 pixel step bytes (Cin_pitch*4*dilation)
+      u13 groups this QPU may process (real groups, not pad)
+      u14 groups left in the first row
+      compile-time: Cin, KH, KW, stride, dilation
+
+    The host owns the two derived values: `SOFF` is
+    `y0*stride*row_pitch + x0*stride*C4` for the first group, and
+    `GCNT0 = GPR - x0/4`.  Blocks are contiguous per QPU, so when the real
+    groups run out the kernel ends (the remaining panel rows are pad and the
+    GEMM's C rows for them are outside the logical output).
+    """
+    assert Cin % 16 == 0
+    nseg = KH * KW
+    A = dict(SRCB=16, PB=17, SRC=18, SEG0=19, DSTX=20, DSTB=21, CNT=22,
+             TMP=23, VDRW=24, VDWW=25, VDRS=26, VDWS=27, Q=28, KB=29,
+             GCNT=30, GR=31, GDEST=32, VDRWG=33, VDWWG=34, T=38,
+             GLOOP=39)
+    B = dict(C4=16, PIT=17, DBLK=18, PLANE=19, C64=20, D1K=21, SOFF=22,
+             DOFF=23, GPR=24, ROWADJ=25, GADV=26, T=27, VSTEP=28, WSTEP=29,
+             OSTEP=30)
+
+    b = Builder()
+    p = b.p
+    b.e(add_or(36, imm(1), imm(1)))                     # tmu_noswap
+    b.read_uni(A['SRCB'])                              # u0
+    b.read_uni(A['PB'])                                # u1
+    b.read_uni(B['GADV'], ws=1)                        # u2
+    b.read_uni(B['DBLK'], ws=1)                        # u3
+    b.read_uni(A['CNT'])                               # u4
+    b.read_uni(B['SOFF'], ws=1)                        # u5
+    b.read_uni(B['DOFF'], ws=1)                        # u6
+    b.read_uni(B['PIT'], ws=1)                         # u7
+    b.read_uni(A['Q'])                                 # u8
+    b.read_uni(B['PLANE'], ws=1)                       # u9
+    b.read_uni(B['GPR'], ws=1)                         # u10
+    b.read_uni(B['ROWADJ'], ws=1)                      # u11
+    b.read_uni(B['C4'], ws=1)                          # u12
+    b.read_uni(A['GR'])                                # u13
+    b.read_uni(A['GCNT'])                              # u14
+
+    # setup words.  VDR: four rows per group, 16 channels per row.  VDW: the
+    # panel's transposing store with 16 k rows and 4 pixel words, so the k
+    # pitch is 64 B and the store's own unit is 16 B.
+    p.emit(ldi(V.vdr_basic(0, 1, numrows=4, rowlen=16), A['VDRW']))
+    p.emit(ldi(V.vdw_basic(0, 4, 16, horizontal=0), A['VDWW']))
+    p.emit(ldi(V.vdw_stride(48), A['VDWS']))
+    b.e(ldi(V.vdr_stride(0) & ~0xFFF, A['T']), nop())
+    b.e(add_(ADD_ADD, A['VDRS'], areg(A['T']), breg(B['PIT'])), nop())
+    b.e(add_(ADD_SHL, B['T'], ws=1, a=areg(A['Q']), b=imm(8)), nop(), nop())
+    b.e(add_(ADD_ADD, A['VDRW'], areg(A['VDRW']), breg(B['T'])), nop(), nop())
+    b.e(add_(ADD_SHL, B['T'], ws=1, a=areg(A['Q']), b=imm(11)), nop(), nop())
+    b.e(add_(ADD_ADD, A['VDWW'], areg(A['VDWW']), breg(B['T'])), nop(), nop())
+    b.e(add_or(A['SRC'], areg(A['SRCB']), breg(B['SOFF'])), nop(), nop())
+    b.e(add_or(A['DSTX'], areg(A['PB']), breg(B['DOFF'])), nop(), nop())
+    b.e(ldi(64, B['C64'], ws=1), nop())
+    b.e(ldi(1024, B['D1K'], ws=1), nop())
+    b.e(ldi(64, B['VSTEP'], ws=1), nop())
+    b.e(ldi(512, B['WSTEP'], ws=1), nop())
+    b.e(ldi(16, B['OSTEP'], ws=1), nop(), nop())
+    p.emit(ldi(4, A['GLOOP']))
+    b.e(nop(), nop())
+
+    p.label('blk_top')
+    # the four-group band for this block starts at DSTX
+    b.e(add_or(A['DSTB'], areg(A['DSTX']), areg(A['DSTX'])), nop(), nop())
+    b.e(add_or(32 + 0, imm(0), imm(0)), nop(), nop())
+    b.e(add_or(32 + 1, imm(0), imm(0)), nop(), nop())
+    b.e(add_or(32 + 2, imm(0), imm(0)), nop(), nop())
+    p.emit(ldi(4, A['GLOOP']))
+    b.e(nop(), nop())
+
+    p.label('g_top')
+    # GR == 0: the QPU's real groups are exhausted, and blocks are contiguous
+    b.e(add_(ADD_SUB, A['T'], areg(A['GR']), imm(1), sf=1), nop(), nop())
+    p.branch_to('flat_done', cond=BR_ALL_N_SET)
+    b.e(nop(), nop(), nop())
+
+    b.e(add_or(A['SEG0'], areg(A['SRC']), areg(A['SRC'])), nop())
+    for s in range(nseg):
+        ky, kx = divmod(s, KW)
+        b.e(add_or(A['T'], areg(A['SEG0']), areg(A['SEG0'])), nop())
+        for _ in range(ky * dilation):
+            b.e(add_(ADD_ADD, A['T'], areg(A['T']), breg(B['PLANE'])))
+        for _ in range(kx):
+            b.e(add_(ADD_ADD, A['T'], areg(A['T']), breg(B['C4'])))
+        b.e(add_or(A['TMP'], areg(A['T']), areg(A['T'])), nop(), nop())
+        b.e(add_(ADD_ADD, A['VDRWG'], areg(A['VDRW']), acc(0)), nop(), nop())
+        b.e(add_(ADD_ADD, A['VDWWG'], areg(A['VDWW']), acc(1)), nop(), nop())
+        b.e(add_(ADD_ADD, A['GDEST'], areg(A['DSTB']), acc(2)), nop(), nop())
+        p.emit(ldi(Cin // 16, A['KB']))
+        b.e(nop(), nop())
+        p.label('cib%d' % s)
+        b.e(add_or(W_VPR_SETUP, areg(A['VDRWG']), areg(A['VDRWG'])))
+        b.e(add_or(W_VPR_SETUP, areg(A['VDRS']), areg(A['VDRS'])))
+        b.e(add_or(W_VPR_ADDR, areg(A['TMP']), areg(A['TMP'])))
+        b.e(add_or(W_NOP, areg(50), areg(50)))              # vpr_wait
+        b.e(add_or(W_VPW_SETUP, areg(A['VDWWG']), areg(A['VDWWG']), ws=1))
+        b.e(add_or(W_VPW_SETUP, areg(A['VDWS']), areg(A['VDWS']), ws=1))
+        b.e(add_or(W_VPW_ADDR, areg(A['GDEST']), areg(A['GDEST']), ws=1))
+        b.e(add_or(W_NOP, breg(R_VPW_WAIT), breg(R_VPW_WAIT)))  # vpw_wait
+        b.e(add_(ADD_ADD, A['TMP'], areg(A['TMP']), breg(B['C64'])))
+        b.e(add_(ADD_ADD, A['GDEST'], areg(A['GDEST']), breg(B['D1K'])))
+        b.e(add_(ADD_SUB, A['KB'], areg(A['KB']), imm(1), sf=1))
+        p.branch_to('cib%d' % s, cond=BR_ALL_Z_CLEAR)
+        b.e(nop(), nop(), nop())
+
+    # next group: advance the source, wrap the row counter at its end
+    b.e(add_(ADD_ADD, A['SRC'], areg(A['SRC']), breg(B['GADV'])))
+    b.e(add_(ADD_SUB, A['GCNT'], areg(A['GCNT']), imm(1), sf=1))
+    p.branch_to('g_wrap', cond=BR_ALL_Z_SET)
+    b.e(nop(), nop(), nop())
+    p.branch_to('g_next', cond=BR_ALWAYS)
+    b.e(nop(), nop(), nop())
+    p.label('g_wrap')
+    b.e(add_(ADD_ADD, A['SRC'], areg(A['SRC']), breg(B['ROWADJ'])), nop(), nop())
+    b.e(add_or(A['GCNT'], breg(B['GPR']), breg(B['GPR'])), nop(), nop())
+    p.label('g_next')
+    b.e(add_(ADD_ADD, 32 + 0, acc(0), breg(B['VSTEP'])), nop())
+    b.e(add_(ADD_ADD, 32 + 1, acc(1), breg(B['WSTEP'])), nop())
+    b.e(add_(ADD_ADD, 32 + 2, acc(2), breg(B['OSTEP'])), nop())
+    b.e(add_(ADD_SUB, A['GR'], areg(A['GR']), imm(1), sf=1))
+    b.e(add_(ADD_SUB, A['GLOOP'], areg(A['GLOOP']), imm(1), sf=1))
+    p.branch_to('g_top', cond=BR_ALL_Z_CLEAR)
+    b.e(nop(), nop(), nop())
+
+    b.e(add_(ADD_ADD, A['DSTX'], areg(A['DSTX']), breg(B['DBLK'])))
+    b.e(add_(ADD_SUB, A['CNT'], areg(A['CNT']), imm(1), sf=1))
+    p.branch_to('blk_top', cond=BR_ALL_Z_CLEAR)
+    b.e(nop(), nop(), nop())
+
+    p.label('flat_done')
+    b.e(end_program())
+    b.e(nop(), nop(), nop())
+    return p
+
+
 def build_probe_seq(seq):
     """Diagnostic: one 16-lane vector in, the raw 16-lane result out.
 
@@ -3857,6 +4019,9 @@ def main(argv):
     elif kind == 'im2col_nhwc':
         p = build_im2col_nhwc(g('cin'), g('kh'), g('kw'), g('stride', 1),
                               dilation=g('dil', 1))
+    elif kind == 'im2col_nhwc_flat':
+        p = build_im2col_nhwc_flat(g('cin'), g('kh'), g('kw'), g('stride', 1),
+                                   dilation=g('dil', 1))
     elif kind == 'probe_lane':
         p = build_probe_lane()
     elif kind == 'probe_lane_b':

@@ -30,6 +30,7 @@
 #define NHWC_IM2COL_QPU 4             /* 16 VPM rows per QPU, 64 rows total   */
 
 static uint32_t al16(uint32_t v) { return (v + 15u) & ~15u; }
+static uint32_t al4(uint32_t v) { return (v + 3u) & ~3u; }
 
 /* one QPU task = (image, channel block, contiguous row range).  When there are
  * more (image, block) units than QPUs, splits = 1 and the caller launches in
@@ -157,6 +158,19 @@ vc4_status vc4_conv_nhwc_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int Cin,
     return st;
 }
 
+/* The flat panel is opt-in until it has been gated on silicon: it changes
+ * the panel row count and therefore the GEMM's M, so both paths must be
+ * measurable side by side.  VC4_CONV_FLAT=1 selects it. */
+static int conv_flat_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("VC4_CONV_FLAT");
+        on = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return on;
+}
+
 /*
  * One im2col + GEMM pass.
  *
@@ -173,10 +187,13 @@ static vc4_status nhwc_conv_pass(vc4_ctx *ctx, const nhwc_pad *pd, int nimg,
                                  int dilation, const vc4_buf *wpanel,
                                  int Cout, int cstride, int cout_off,
                                  uint32_t out_bus, int ho, int Wg,
-                                 const vc4_buf *pb, int act)
+                                 const vc4_buf *pb, int act, int flat)
 {
     const int nx = Wg / 16;
-    const uint32_t M = (uint32_t)ho * (uint32_t)Wg;
+    /* Flat: Wg is align4(wo) and 16-pixel blocks run over the flat plane, so
+     * the last block is padded up to 16 rows.  Row-padded: M = ho rows of Wg. */
+    const uint32_t M = flat ? (uint32_t)al16((uint32_t)ho * (uint32_t)Wg)
+                            : (uint32_t)ho * (uint32_t)Wg;
     const uint32_t nk = (uint32_t)(wpanel->bytes / ((size_t)Cout * 4u));
 
     char ncin[16], nkh[8], nkw[8], nst[8], ndl[8], name[96];
@@ -191,13 +208,73 @@ static vc4_status nhwc_conv_pass(vc4_ctx *ctx, const nhwc_pad *pd, int nimg,
     snprintf(name, sizeof(name), "im2col_nhwc2_%d_%d_%d_s%d_d%d", Cin, KH, KW,
              stride, dilation);
 
-    vc4_kernel *k = NULL;
-    vc4_status st = vc4__kernel(ctx, name, argv, NHWC_IM2COL_QPU, &k);
-    if (st != VC4_OK)
-        return st;
     const uint32_t row_pitch = (uint32_t)(W + pl + pr) * Cin_pitch * 4u;
     const uint32_t blk_step = 16u * (uint32_t)stride * Cin_pitch * 4u;
     const uint32_t dst_step = 64u * nk;
+    vc4_kernel *k = NULL;
+    vc4_status st;
+
+    if (flat) {
+        const int GPR = Wg / 4;                       /* groups per output row */
+        const uint32_t blocks = M / 16u;
+        const uint32_t groups = (uint32_t)ho * (uint32_t)GPR;
+        const uint32_t gadv = 4u * (uint32_t)stride * (uint32_t)Cin_pitch * 4u;
+        const uint32_t radv = (uint32_t)stride * row_pitch;
+        const uint32_t rowadj = radv - (uint32_t)GPR * gadv;
+        char fname[96];
+        char *fargv[] = { (char *)"im2col_nhwc_flat", (char *)"--cin", ncin,
+                          (char *)"--kh", nkh, (char *)"--kw", nkw,
+                          (char *)"--stride", nst, (char *)"--dil", ndl,
+                          NULL };
+        snprintf(fname, sizeof(fname), "im2col_nhwc_flat_%d_%d_%d_s%d_d%d",
+                 Cin, KH, KW, stride, dilation);
+        st = vc4__kernel(ctx, fname, fargv, NHWC_IM2COL_QPU, &k);
+        if (st != VC4_OK)
+            return st;
+        for (int n = 0; n < nimg && st == VC4_OK; ++n) {
+            int nq = NHWC_IM2COL_QPU;
+            while (nq > 1 && blocks % (uint32_t)nq)
+                --nq;
+            if ((uint32_t)nq > blocks)
+                nq = (int)blocks;
+            const uint32_t per = blocks / (uint32_t)nq;
+            for (int q = 0; q < nq; ++q) {
+                const uint32_t b0 = (uint32_t)q * per;
+                const uint32_t g0 = 4u * b0;
+                const uint32_t y0 = g0 / (uint32_t)GPR;
+                const uint32_t x0g = g0 % (uint32_t)GPR;
+                const uint32_t gr = 4u * per < groups - g0
+                                    ? 4u * per : groups - g0;
+                uint32_t *u = vc4__uni(ctx, k, q);
+                u[0] = pd->bus + (uint32_t)((size_t)n * pd->img_bytes)
+                       + (uint32_t)cin_off * 4u;
+                u[1] = ctx->gpu_bus + pb->off +
+                       (uint32_t)((size_t)n * M * nk * 4u);
+                u[2] = gadv;
+                u[3] = dst_step;
+                u[4] = per;
+                u[5] = y0 * radv + x0g * 4u * (uint32_t)stride *
+                       (uint32_t)Cin_pitch * 4u;
+                u[6] = b0 * dst_step;
+                u[7] = (uint32_t)stride * (uint32_t)Cin_pitch * 4u;
+                u[8] = (uint32_t)q;
+                u[9] = row_pitch;
+                u[10] = (uint32_t)GPR;
+                u[11] = rowadj;
+                u[12] = (uint32_t)Cin_pitch * 4u * (uint32_t)dilation;
+                u[13] = gr;
+                u[14] = (uint32_t)GPR - x0g;
+            }
+            uint64_t ns = 0;
+            st = vc4__launch(ctx, k, nq, &ns);
+            ctx->st.pack_ns += ns;
+        }
+        if (st != VC4_OK)
+            return st;
+    } else {
+    st = vc4__kernel(ctx, name, argv, NHWC_IM2COL_QPU, &k);
+    if (st != VC4_OK)
+        return st;
     const int chunk = nimg > NHWC_IM2COL_QPU ? NHWC_IM2COL_QPU : nimg;
     for (int base = 0; base < nimg && st == VC4_OK; base += chunk) {
         int nb = nimg - base;
@@ -239,6 +316,7 @@ static vc4_status nhwc_conv_pass(vc4_ctx *ctx, const nhwc_pad *pd, int nimg,
     }
     if (st != VC4_OK)
         return st;
+    }
 
     /* GEMM: N = Cout, K = nk (bias folded), C row stride = cstride and the
      * output channel block starts at cout_off. */
@@ -294,8 +372,10 @@ static vc4_status conv_nhwc_common(vc4_ctx *ctx, const vc4_buf *in, int nimg,
     const int ho = (H + padt + padb - effh) / stride + 1;
     if (wo <= 0 || ho <= 0)
         return VC4_ERR_INVAL;
-    const int Wg = (int)al16((uint32_t)wo);
-    const uint32_t M = (uint32_t)ho * (uint32_t)Wg;
+    const int flat = conv_flat_enabled();
+    const int Wg = flat ? (int)al4((uint32_t)wo) : (int)al16((uint32_t)wo);
+    const uint32_t M = flat ? (uint32_t)al16((uint32_t)ho * (uint32_t)Wg)
+                            : (uint32_t)ho * (uint32_t)Wg;
     const uint32_t K = (uint32_t)Cin_g * (uint32_t)(KH * KW);
     const uint32_t Kp = al16(K);
     if (Kp != K) {
@@ -364,7 +444,7 @@ static vc4_status conv_nhwc_common(vc4_ctx *ctx, const vc4_buf *in, int nimg,
                             stride, padl, padr, dilation, wpanel[g], Cout_g,
                             Cout,
                             g * Cout_g, vc4_bus_addr(ctx, out), ho, Wg, &pb,
-                            act);
+                            act, flat);
     vc4__scratch_reset(ctx);
     if (st == VC4_OK) {
         *ho_out = ho;

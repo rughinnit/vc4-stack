@@ -320,11 +320,27 @@ vector must copy the result back with `ws=1`.
 |---|---:|---:|---:|---:|
 | none | 274 | - | 687 | - |
 | relu | 290 | +16 | 722 | +35 |
+| clip(0,6) | 310 | +36 | 756 | +69 |
+| silu | 1100 | +826 | - | - |
 
 `relu` is one word per C vector (`FMAX v, v, 0.0f`, the small immediate the ALU
 sign-extends to `+0.0f`), plus 3 words in asm10 for the zero the B-file vectors
 must read from an A register: a B-file operand and a small immediate cannot
 share the raddr_b port in the same word.
+
+`clip(0,6)` is that plus one `FMIN` per vector and one constant: 34 words for
+the 16 conv vectors (the min reads the max's result, and a GP read needs three
+words after the write, so three vectors are in flight at once; the single
+leftover vector pays two nops), and 64 for the matmul plus 5 words of loads --
+the matmul needs 6.0f in *both* files, because whichever file a C vector is in
+is the one the constant cannot use.  The B-file copy goes into the column
+block's 4-row step (B30), which the next column block reloads.
+
+`silu` is the elementwise body's 50 words per C vector -- the 2^(-x log2 e)
+reduction with its +/-90 clamp, the degree-5 `2^f` polynomial and the 3x new
+Newton reciprocal -- plus one word to copy x into a B register (the final
+multiply needs one A and one B operand), and the twelve constants cost 24
+words of loads.  It fits the conv GEMM with 948 words to spare.
 
 The counts are the same for every shape: the tile, not M/N/K, fixes them.
 
@@ -341,6 +357,27 @@ A and one B port, and float constants in the file the C vector is *not* in.
 Whether a given activation fits is therefore a question about those three
 pools, not about the instruction slot: at 32 vectors, even the longest body
 fits 2,048 words, but it cannot find the registers to run.
+
+### 7.4 The matmul tile cannot take silu
+
+The asm10 tile's 32 C vectors take A-file r0..r15 and B-file r0..r15, the
+three vector sets take A16..A19/A28/A29 and B16..B19/B28/B29, and the tile
+loop's state takes the rest of both files.  After the k loop exactly one B
+register is dead -- the column block's 4-row step (B30), which the next
+column block reloads -- and three A registers.
+
+`relu` needs neither: its bound is the small immediate 0.  `clip(0,6)` needs
+6.0f in *both* files, because whichever file a C vector lives in is the one
+the constant cannot use; B30 and A23 (the k counter, also reloaded) carry
+them.  `silu` needs twelve, and the instruction slot is not the obstacle:
+32 vectors x 37 words is 1,184, which would fit 2,048.  The register file
+is.  `vc4_matmul_act` therefore returns `VC4_ERR_UNSUPPORTED` for silu
+rather than running an unfused launch, and `kgen.py gemm --act 3` refuses to
+generate it: a kernel that cannot be built must not be silently different.
+
+The conv GEMM has 19 free B registers, which is why the model that needs
+the fusion (YOLOv8n's 57 conv -> silu pairs) is covered and the one that
+does not (a matmul followed by silu) is not.
 
 `docs/OPTIMIZER.md` records which activations the two paths accept and why.
 

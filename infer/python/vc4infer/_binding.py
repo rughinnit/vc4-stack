@@ -85,7 +85,7 @@ OP_RELU_BWD = 7
 LAYOUT_ROW_MAJOR = 0
 
 # vc4_act: an activation a GEMM/conv applies to the value it stores
-ACT_NONE, ACT_RELU = 0, 1
+ACT_NONE, ACT_RELU, ACT_CLIP6, ACT_SILU = 0, 1, 2, 3
 
 # vc4_uop (mirrors infer/include/vc4infer.h)
 (UOP_ABS, UOP_NEG, UOP_IDENTITY, UOP_CLIP, UOP_LEAKYRELU, UOP_FLOOR,

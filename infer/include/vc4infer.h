@@ -132,14 +132,17 @@ typedef struct vc4_ctx vc4_ctx;
  *
  * The conv path (the asm3 GEMM) applies it to the 16x16 C tile as it is
  * stored, so the result is bit-identical to the elementwise kernel of the
- * same op.  The matmul path (the asm10 8x64 tile) has no B-file register
- * left for a bound constant, so it offers VC4_ACT_RELU, whose bound is a
- * small immediate; anything else is VC4_ERR_UNSUPPORTED, never a silently
- * unfused launch.
+ * same op.  The matmul path (the asm10 8x64 tile) keeps 32 C vectors live
+ * over both register files and has one B register left after the k loop,
+ * which is enough for clip(0,6) but not for silu's thirteen constants, so
+ * `vc4_matmul_act` refuses VC4_ACT_SILU.  A value a path cannot express is
+ * VC4_ERR_UNSUPPORTED, never a silently unfused launch.
  */
 typedef enum {
     VC4_ACT_NONE  = 0,     /* store the GEMM result as it is             */
     VC4_ACT_RELU  = 1,     /* max(x, 0)                                  */
+    VC4_ACT_CLIP6 = 2,     /* min(max(x, 0), 6): ONNX Relu/Clip(0,6)     */
+    VC4_ACT_SILU  = 3,     /* x / (1 + exp(-x)): ONNX Mul(x, Sigmoid(x)) */
 } vc4_act;
 
 /* ------------------------------------------------------------------ lifecycle */

@@ -115,12 +115,14 @@ vc4_status vc4__gemm_run_q(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
 {
     if (M % 8 || N % 64 || K % 16)
         return VC4_ERR_INVAL;
-    if (act != VC4_ACT_NONE && act != VC4_ACT_RELU) {
-        /* Every activation half of the other bodies needs a float constant
-         * in the B file, and the 8x64 tile holds 32 live C vectors over
-         * both files: none is free.  relu's bound is a small immediate. */
-        vc4__set_err(ctx, "matmul: activation %d needs a B-file constant "
-                     "and the asm10 8x64 tile has none free (relu only)",
+    if (act != VC4_ACT_NONE && act != VC4_ACT_RELU &&
+        act != VC4_ACT_CLIP6) {
+        /* The 8x64 tile holds 32 live C vectors over both files and leaves
+         * one B register free after the k loop.  relu needs none (a small
+         * immediate) and clip(0,6) needs two, both in registers the next
+         * column block reloads; silu's twelve do not fit. */
+        vc4__set_err(ctx, "matmul: activation %d needs more B registers than "
+                     "the asm10 8x64 tile has free (relu and clip6 only)",
                      act);
         return VC4_ERR_UNSUPPORTED;
     }
@@ -176,9 +178,10 @@ vc4_status vc4__matmul_tuned(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
 {
     /* refuse before any work so an unsupported activation cannot leave a
      * panel behind in scratch */
-    if (act != VC4_ACT_NONE && act != VC4_ACT_RELU) {
-        vc4__set_err(ctx, "matmul: activation %d needs a B-file constant "
-                     "and the asm10 8x64 tile has none free (relu only)",
+    if (act != VC4_ACT_NONE && act != VC4_ACT_RELU &&
+        act != VC4_ACT_CLIP6) {
+        vc4__set_err(ctx, "matmul: activation %d needs more B registers than "
+                     "the asm10 8x64 tile has free (relu and clip6 only)",
                      act);
         return VC4_ERR_UNSUPPORTED;
     }

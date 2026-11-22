@@ -255,6 +255,8 @@ int main(int argc, char **argv)
     rc |= one_shape_act(ctx, 64, 64, 64, reps, 0);
     rc |= one_shape_act(ctx, 20, 36, 44, reps, 0);
     rc |= one_shape_act(ctx, 128, 128, 128, reps, 1);
+    rc |= refuse_act(ctx, VC4_ACT_CLIP6, "clip6");
+    rc |= refuse_act(ctx, VC4_ACT_SILU, "silu");
     rc |= refuse_act(ctx, (vc4_act)7, "act7");
 
     vc4_stats s;

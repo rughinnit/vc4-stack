@@ -26,10 +26,22 @@ import emu_alu                                                  # noqa: E402
 
 NREG = 16              # the asm3 GEMM's C tile: 16 rows x 16 columns
 TEMPS = (26, 27)       # A_AADR / A_BADR, dead between the k loop and the store
-SUPPORTED = (kops.ACT_RELU,)
+SUPPORTED = (kops.ACT_RELU, kops.ACT_CLIP6, kops.ACT_SILU)
+
+
+def _silu(x):
+    """The function the *kernel* computes: 1/(1+2^t) with t clamped to
+    +/-90, so silu(-1e30) is -8e-4 and not -0.0.  The elementwise silu has
+    always had that clamp; an epilogue that differed from it would not be
+    the same op."""
+    t = np.clip(-np.asarray(x, np.float64) * 1.4426950408889634, -90.0, 90.0)
+    return np.asarray(x, np.float64) / (1.0 + np.exp2(t))
+
 
 REF = {
     kops.ACT_RELU: lambda x: np.maximum(x, 0.0),
+    kops.ACT_CLIP6: lambda x: np.minimum(np.maximum(x, 0.0), 6.0),
+    kops.ACT_SILU: _silu,
 }
 
 
@@ -49,7 +61,7 @@ def run(act, x):
     for r in range(NREG):
         m.setf('A', r, xs[r])
     for name, reg in A.consts.items():
-        m.seti('B', reg - 200, kops.STD[name][0])
+        m.seti('B', reg, kops.STD[name][0])
     m.run(0, len(words))
     return np.stack([m.getf('A', r) for r in range(NREG)])
 

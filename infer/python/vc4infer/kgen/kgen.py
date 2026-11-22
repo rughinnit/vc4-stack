@@ -1072,34 +1072,49 @@ def g10_kloop_body(a, label):
 def g10_epilogue(a, act):
     """Activation applied in place to the 32 C vectors before the store.
 
-    The tile is A-file r0..r15 (columns j0/j1) and B-file r0..r15 (j2/j3);
-    the add ALU writes the B file with ws=1 and the A file with ws=0, so an
-    in-place word is `FMAX r, r, 0.0f` either way.  Nothing here depends on
-    a previous epilogue word: every register is read and written in its own
-    word, so there is no GP read-after-write to schedule (the store that
-    follows reads them many words later).
+    The tile is A-file r0..r15 (columns j0/j1) and B-file r0..r15 (j2/j3),
+    so the answer is written back with ws=0 and ws=1 respectively.  A B-file
+    vector cannot take a small immediate as its second operand (raddr_b would
+    carry both the immediate and the register), so anything it needs beyond
+    a register comes from an A register; an A-file vector takes the
+    immediate.
     """
     if not act:
         return
     import kops
-    if act != kops.ACT_RELU:
+    if act not in (kops.ACT_RELU, kops.ACT_CLIP6):
         raise ValueError('kgen: gemm10 has no epilogue body for %s'
                          % (kops.ACT_NAMES[act],))
-    # A-file C vectors take the small immediate 0 as the bound; a B-file
-    # vector cannot (raddr_b would carry both it and the register), so it
-    # reads the same 0 from an A register.  A20 is the A tile pointer,
-    # dead from the end of the k loop until the next column block resets
-    # it, which is after this store.
+    av = [(r, j) for r in range(G10_NROWS) for j in (0, 1)]
+    bv = [(r, j) for r in range(G10_NROWS) for j in (2, 3)]
+    # A20 (the A tile pointer), A23 (the k counter) and B30 (the column
+    # block's 4-row step) are dead from the end of the k loop until the
+    # next column block re-establishes them, which is after this store.
     a.ldi(0, G10_RA_AADR, note='epilogue: 0.0f for the B-file vectors')
+    if act == kops.ACT_CLIP6:
+        # min(max(x,0),6): the upper bound is a real float, loaded into the
+        # B file for the A-file vectors and into the A file for the B-file
+        # ones.  B30 is reloaded by the next column block, so it needs no
+        # restore.
+        a.ldi(0x40C00000, G10_RB_TMP, ws=1, note='epilogue: 6.0f (B)')
+        a.ldi(0x40C00000, G10_RA_KCNT, note='epilogue: 6.0f (A)')
     a.nop(), a.nop()
-    zero_a = areg(G10_RA_AADR)
-    for r in range(G10_NROWS):
-        for j in range(4):
-            f, addr = g10_acc_addr(r, j)
-            bound = imm(0) if f == 0 else zero_a
-            a.word(add=g10_addi(ADD_FMAX, addr, g10_ref(f, addr), bound,
-                                ws=f),
-                   note='epilogue relu r%d j%d' % (r, j))
+    for vec, hi in ((av, breg(G10_RB_TMP)), (bv, areg(G10_RA_KCNT))):
+        for i in range(0, len(vec), 2):
+            grp = vec[i:i + 2]
+            for (r, j) in grp:
+                f, addr = g10_acc_addr(r, j)
+                lo = imm(0) if f == 0 else areg(G10_RA_AADR)
+                a.word(add=g10_addi(ADD_FMAX, addr, g10_ref(f, addr), lo,
+                                    ws=f),
+                       note='epilogue relu r%d j%d' % (r, j))
+            if act != kops.ACT_CLIP6:
+                continue
+            for (r, j) in grp:
+                f, addr = g10_acc_addr(r, j)
+                a.word(add=g10_addi(ADD_FMIN, addr, g10_ref(f, addr), hi,
+                                    ws=f),
+                       note='epilogue clip hi r%d j%d' % (r, j))
 
 
 def g10_store(a, stride):
@@ -1165,9 +1180,9 @@ def build_gemm10(M, N, K, nqpu=12, probe=None, single=False, act=0):
     """The asm10 GEMM for arbitrary M (8-aligned), N (64-aligned), K (16-aligned).
 
     `act` is an activation epilogue on the 8x64 C tile before it is stored
-    (`kops.ACT_*`).  Only `relu` is offered here: the tile is 32 live C
-    vectors split over both register files, so no B register is left for a
-    bound constant; max(x, 0.0f) is a small immediate and needs none.
+    (`kops.ACT_*`).  `relu` and `clip(0,6)` are offered: the bound 6.0 is a
+    real float, and the only B register free after the k loop is the column
+    block's 4-row step, which the next column block reloads anyway.
     """
     assert M % G10_NROWS == 0 and N % G10_NCOLS == 0 and K % 16 == 0, \
         "gemm10 needs M%%8==0, N%%64==0, K%%16==0 (got %d,%d,%d)" % (M, N, K)

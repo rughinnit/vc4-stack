@@ -38,7 +38,8 @@ __version__ = "1.2.10"
 from ._binding import (                                        # noqa: F401
     Engine as _LibraryEngine, Buf, Stats, OpInfo, Error, Unsupported, VC4_OK,
     ERR_UNSUPPORTED, OP_MATMUL, OP_CONV2D, OP_ADD, OP_MUL, OP_RELU,
-    OP_SIGMOID, OP_SILU, LAYOUT_ROW_MAJOR, ACT_NONE, ACT_RELU,
+    OP_SIGMOID, OP_SILU, LAYOUT_ROW_MAJOR, ACT_NONE, ACT_RELU, ACT_CLIP6,
+    ACT_SILU,
 )
 from ._errors import (                                          # noqa: F401
     Vc4InferError, DeviceError, ShapeError, UnsupportedNode,

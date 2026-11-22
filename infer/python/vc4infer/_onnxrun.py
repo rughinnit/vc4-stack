@@ -1386,7 +1386,8 @@ class Runner:
         return Tensor(out, (N, Cout, h, w), "nhwc", pitch=o)
 
     # the optimiser's activation name -> the kernel's vc4_act
-    _ACT_OF = {"relu": vc4infer.ACT_RELU}
+    _ACT_OF = {"relu": vc4infer.ACT_RELU, "relu6": vc4infer.ACT_CLIP6,
+               "silu": vc4infer.ACT_SILU}
 
     def _act_of(self, node):
         """The activation the optimiser folded into this node, if any."""

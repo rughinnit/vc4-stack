@@ -1162,6 +1162,10 @@ STD = {
     'LOG2E': (_fb(1.4426950408889634), 0),
     'NLOG2E': (_fb(-1.4426950408889634), 0),
     'NLOG2E2': (_fb(-2.8853900817779268), 0),
+    # the sigmoid/silu exp argument is clamped to +/-90 before 2^f: the
+    # elementwise body has always done this (kgen._ew_compute), and the
+    # epilogue reuses its words
+    'CLAMP_LO': (_fb(-90.0), 0), 'CLAMP_HI': (_fb(90.0), 0),
     'T44': (_fb(44.0), 0), 'THREEH': (_fb(1.5), 0),
     'RSQRTC': (0x5F3759DF, 0), 'BIG': (_fb(3.0e38), 0),
     'SQRT2': (_fb(1.4142135623730951), 0),
@@ -2606,17 +2610,21 @@ def build_copy2d(k, fill=0, units=4, depth=16):
 # change, only where it happens.
 #
 # `relu` needs no constant at all: max(x, 0.0f) is the small immediate 0,
-# which the ALU sign-extends to +0.0f.
-ACT_NONE, ACT_RELU = 0, 1
-ACT_NAMES = ('none', 'relu')
+# which the ALU sign-extends to +0.0f.  `clip6` needs one real float, and
+# `silu` needs the twelve of the exp/reciprocal body.
+ACT_NONE, ACT_RELU, ACT_CLIP6, ACT_SILU = 0, 1, 2, 3
+ACT_NAMES = ('none', 'relu', 'clip6', 'silu')
 
 # The B-file constants each activation reads, in load order, and the body's
 # B-file scratch needs (0 = none).
 _ACT_CONSTS = {
     ACT_NONE: (),
     ACT_RELU: (),
+    ACT_CLIP6: ('SIX',),
+    ACT_SILU: ('NLOG2E', 'CLAMP_LO', 'CLAMP_HI', 'MAGIC', 'HALF', 'E5',
+               'E4', 'E3', 'E2', 'E1', 'ONE', 'TWO', 'RCPM'),
 }
-_ACT_SCRATCH = {}
+_ACT_SCRATCH = {ACT_SILU: 1}
 
 
 def act_consts(act):
@@ -2633,9 +2641,10 @@ def act_consts(act):
 class Act:
     """Loaded state of one activation epilogue.
 
-    ``consts`` maps a constant name to its B register, ``scratch_b`` is a
-    B-file register the body may use, ``temps`` are A-file registers that are
-    dead for the whole kernel (the GEMM's addressing state is not).
+    ``consts`` maps a constant name to its B register *number* (not the
+    kops 200+n pseudo index: the bodies here emit raw `breg`), ``scratch_b``
+    is a B-file register the body may use, ``temps`` are A-file registers
+    that are dead for the whole kernel (the GEMM's addressing state is not).
     """
 
     __slots__ = ('act', 'k', 'consts', 'scratch_b', 'temps')
@@ -2654,8 +2663,12 @@ def act_setup(k, b, act, pool, temps):
     """
     if act not in _ACT_CONSTS:
         raise ValueError("kops: unknown activation %r" % (act,))
-    load = [n for n in act_consts(act)
-            if not (n == 'ONE' and 'E1' in act_consts(act))]
+    # ONE and E1 are the same register only when their *bit patterns* are
+    # the same: E1 is the 2^f polynomial's x^0 coefficient (0x3F317218),
+    # and it is 1.0f in the few bodies that use it as such.  Aliasing them
+    # unconditionally made the silu body add 0.693 where it meant 1.0.
+    dedup = 'E1' in act_consts(act) and STD['E1'][0] == STD['ONE'][0]
+    load = [n for n in act_consts(act) if not (n == 'ONE' and dedup)]
     nscratch = _ACT_SCRATCH.get(act, 0)
     if len(pool) < len(load) + nscratch:
         raise RuntimeError("kops: activation %s needs %d B registers, %d free"
@@ -2665,11 +2678,56 @@ def act_setup(k, b, act, pool, temps):
     for name in load:
         reg = pool.pop(0)
         b.e(k.ldi(STD[name][0] & M32, reg, ws=1), k.nop())
-        consts[name] = 200 + reg
-    if 'ONE' not in consts and 'E1' in consts:
+        consts[name] = reg
+    if 'ONE' not in consts and dedup:
         consts['ONE'] = consts['E1']
-    bx = 200 + pool.pop(0) if nscratch else None
+    bx = pool.pop(0) if nscratch else None
     return Act(act, k, consts, bx, list(temps))
+
+
+def act_silu_vector(b, k, r, C, t10, t11, bx):
+    """r = r / (1 + exp(-r)) for one 16-lane vector, in place.
+
+    The word sequence is the elementwise silu body (`kgen._ew_compute`,
+    OP_SILU): the 2^(-x log2 e) reduction with the +/-90 clamp, the degree-5
+    2^f minimax polynomial and the 3x Newton reciprocal.  `bx` is a B-file
+    copy of x (the final multiply must read one A and one B register), and
+    `t10`/`t11` are A registers that are dead for the whole kernel.
+    """
+    one = k.breg(C['ONE'])
+
+    def mul(acc, a, bb):
+        b.e(dict(mul_op=k.MUL_FMUL, mul_out=32 + acc, ws=0, mul_a=a,
+                 mul_b=bb))
+    mul(0, k.areg(r), k.breg(C['NLOG2E']))
+    b.e(k.add_(k.ADD_FMAX, 32 + 0, k.acc(0), k.breg(C['CLAMP_LO'])))
+    b.e(k.add_(k.ADD_FMIN, 32 + 0, k.acc(0), k.breg(C['CLAMP_HI'])))
+    b.e(k.add_(k.ADD_FADD, 32 + 1, k.acc(0), k.breg(C['HALF'])))
+    b.e(k.add_(k.ADD_FADD, 32 + 3, k.acc(1), k.breg(C['MAGIC'])))
+    b.e(k.add_(k.ADD_FSUB, 32 + 2, k.acc(3), k.breg(C['MAGIC'])))
+    b.e(k.add_(k.ADD_FTOI, t10, k.acc(3), k.acc(3)))
+    b.e(k.add_(k.ADD_SHL, t10, k.areg(t10), k.imm(8)))
+    b.e(k.add_(k.ADD_SHL, t10, k.areg(t10), k.imm(15)))
+    b.e(k.add_(k.ADD_ADD, t10, k.areg(t10), one))
+    b.e(k.add_(k.ADD_FSUB, 32 + 1, k.acc(0), k.acc(2)))
+    b.e(k.add_or(32 + 3, k.breg(C['E5']), k.breg(C['E5'])))
+    for c in ('E4', 'E3', 'E2', 'E1'):
+        mul(3, k.acc(3), k.acc(1))
+        b.e(k.add_(k.ADD_FADD, 32 + 3, k.acc(3), k.breg(C[c])))
+    mul(3, k.acc(3), k.acc(1))
+    b.e(k.add_(k.ADD_FADD, 32 + 3, k.acc(3), one))
+    mul(3, k.acc(3), k.areg(t10))
+    b.e(k.add_(k.ADD_FADD, 32 + 0, k.acc(3), one))
+    # the reciprocal seed is an *integer* subtract of the magic constant,
+    # not a float one (`ADD_SUB`, as the elementwise body has it)
+    b.e(k.add_(k.ADD_SUB, t11, k.breg(C['RCPM']), k.acc(0)))
+    for _ in range(3):
+        mul(2, k.areg(t11), k.acc(0))
+        b.e(k.add_(k.ADD_FSUB, 32 + 2, k.breg(C['TWO']), k.acc(2)))
+        b.e(dict(mul_op=k.MUL_FMUL, mul_out=t11, ws=1, mul_a=k.areg(t11),
+                 mul_b=k.acc(2)))
+    b.e(dict(mul_op=k.MUL_FMUL, mul_out=r, ws=1, mul_a=k.areg(t11),
+             mul_b=k.breg(bx)))
 
 
 def act_apply(b, A, regs):
@@ -2677,7 +2735,8 @@ def act_apply(b, A, regs):
 
     Words go through the Builder, so the no-forwarding padding is the rule the
     elementwise kernel's body obeys; `relu` is one word per vector and reads
-    the register it writes in the same word, which needs no padding.
+    the register it writes in the same word, which needs no padding, and the
+    `clip6` pairs are interleaved so their one-word dependency never needs one.
     """
     k = A.k
     if A.act == ACT_NONE:
@@ -2685,6 +2744,24 @@ def act_apply(b, A, regs):
     if A.act == ACT_RELU:
         for r in regs:
             b.e(k.add_(k.ADD_FMAX, r, k.areg(r), k.imm(0)))
+        return
+    if A.act == ACT_CLIP6:
+        # The min reads the max's result, and a GP read needs three words
+        # after the write, so three vectors are in flight at once and the
+        # Builder pads nothing.  A tail of one or two pays the padding.
+        six = A.consts['SIX']
+        for i in range(0, len(regs), 3):
+            grp = regs[i:i + 3]
+            for r in grp:
+                b.e(k.add_(k.ADD_FMAX, r, k.areg(r), k.imm(0)))
+            for r in grp:
+                b.e(k.add_(k.ADD_FMIN, r, k.areg(r), k.breg(six)))
+        return
+    if A.act == ACT_SILU:
+        for r in regs:
+            b.e(k.add_or(A.scratch_b, k.areg(r), k.areg(r), ws=1))
+            act_silu_vector(b, k, r, A.consts, A.temps[0], A.temps[1],
+                            A.scratch_b)
         return
     raise ValueError("kops: activation %s has no body" % (ACT_NAMES[A.act],))
 

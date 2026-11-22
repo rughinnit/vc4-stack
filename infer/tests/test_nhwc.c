@@ -851,6 +851,10 @@ static double act_ref(double x, vc4_act act)
 {
     if (act == VC4_ACT_RELU)
         return x > 0.0 ? x : 0.0;
+    if (act == VC4_ACT_CLIP6)
+        return x > 0.0 ? (x < 6.0 ? x : 6.0) : 0.0;
+    if (act == VC4_ACT_SILU)
+        return x / (1.0 + exp(-x));
     return x;
 }
 
@@ -860,6 +864,10 @@ static vc4_status act_two_launch(vc4_ctx *ctx, vc4_act act, const vc4_buf *a,
 {
     if (act == VC4_ACT_RELU)
         return vc4_elementwise(ctx, VC4_OP_RELU, a, NULL, out, n);
+    if (act == VC4_ACT_CLIP6)
+        return vc4_unary(ctx, VC4_UOP_CLIP, a, out, n, 0.0f, 6.0f, 0.0f);
+    if (act == VC4_ACT_SILU)
+        return vc4_silu(ctx, a, out, n);
     return VC4_ERR_UNSUPPORTED;
 }
 
@@ -1026,6 +1034,16 @@ int main(int argc, char **argv)
                         "relu", reps);
     bad |= one_conv_act(ctx, 32, 24, 40, 16, 1, 1, 1, 0, 2, VC4_ACT_RELU,
                         "relu", reps);
+    bad |= one_conv_act(ctx, 64, 32, 32, 32, 3, 3, 1, 1, 1, VC4_ACT_CLIP6,
+                        "clip6", reps);
+    bad |= one_conv_act(ctx, 32, 32, 32, 16, 3, 3, 2, 1, 1, VC4_ACT_CLIP6,
+                        "clip6", reps);
+    /* silu against the double reference is the 1e-6 the elementwise body has;
+       the bit check against the elementwise launch is the exact one */
+    bad |= one_conv_act(ctx, 64, 32, 32, 32, 3, 3, 1, 1, 1, VC4_ACT_SILU,
+                        "silu", reps);
+    bad |= one_conv_act(ctx, 32, 32, 32, 16, 3, 3, 2, 1, 1, VC4_ACT_SILU,
+                        "silu", reps);
     vc4_shutdown(ctx);
     gpu_unlock(lock);
     printf("%s\n", bad ? "NHWC OPS FAILED" : "ALL NHWC OPS PASSED");

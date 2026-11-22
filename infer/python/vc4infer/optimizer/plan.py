@@ -218,17 +218,17 @@ def epilogue_ok(graph, node, act):
     real where the kernel applies the activation to the value it stores:
 
     * ``Conv`` on the NHWC path: the asm3 GEMM has 19 free B registers, so
-      relu and clip(0,6) fold.  The legacy NCHW path has no epilogue.
+      relu, clip(0,6) and silu fold.  The legacy NCHW path has no epilogue.
     * ``MatMul``: the asm10 8x64 tile has 32 live C vectors over both
-      register files and no free B register for a bound constant, so only
-      relu (a small immediate) folds.
+      register files and one free B register after the k loop, so relu (a
+      small immediate) and clip(0,6) fold; silu's twelve constants do not.
     * ``Gemm``: the executor materialises C and adds it with a separate
       launch, so no activation folds there.
     """
-    if act not in ("relu", "relu6"):
+    if act not in ("relu", "relu6", "silu"):
         return False
     if node.op_type == "MatMul":
-        return act == "relu"
+        return act in ("relu", "relu6")
     if node.op_type != "Conv":
         return False
     ins = [i for i in node.proto.input if i]

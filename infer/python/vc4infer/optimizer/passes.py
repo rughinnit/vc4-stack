@@ -41,7 +41,8 @@ Pass 2: ew
     affine             Add(Mul(x, a), b)             -> one AFFINE launch
 Pass 3: epilogue
     conv-bias          Conv + Add(per-channel constant) -> Conv bias
-    conv-activation    Conv/MatMul + Relu / Clip[0,6] -> the GEMM's store
+    conv-activation    Conv/MatMul + Relu / Clip[0,6] / silu -> the GEMM's
+                       store
 """
 from __future__ import annotations
 
@@ -638,14 +639,21 @@ def _clip_rule(graph, act):
 
 
 def _fuse_conv_activation(graph):
-    """Conv/MatMul -> Relu | Clip(0, 6) becomes one launch.
+    """Conv/MatMul -> Relu | Clip(0,6) | SiLU becomes one launch.
 
     The GEMM applies the activation to the value it stores, so the second
     pass over the output disappears.  Only the pairs the kernel can take are
     marked (`plan.epilogue_ok` is the same predicate the launch model uses):
-    the NHWC conv folds both, a MatMul folds relu (the asm10 tile has no
-    register for a bound constant), a Gemm neither.  A pair outside that set
-    is left alone rather than marked for a launch that would not happen.
+    the NHWC conv folds all three, a MatMul relu and clip(0,6) (the asm10
+    tile has one free B register, not twelve), a Gemm none.  A pair outside
+    that set is left alone rather than marked for a launch that would not
+    happen.
+
+    SiLU arrives here already collapsed: the `ew` pass has replaced
+    `Mul(x, Sigmoid(x))` with one node whose `silu` record names x, so the
+    pattern is Conv -> Mul-with-a-silu-record.  The Sigmoid it absorbed is
+    still a graph node marked `fused` (it is what keeps the graph readable),
+    which is why the consumer count filters fused nodes out.
     """
     from .plan import epilogue_ok
     st = RuleStat("conv-activation")
@@ -655,15 +663,27 @@ def _fuse_conv_activation(graph):
         if node.op_type not in ("Conv", "Gemm", "MatMul") or not node.proto.output:
             continue
         out = node.proto.output[0]
-        if out in gouts or len(consumers.get(out, [])) != 1:
+        if out in gouts:
             continue
-        act = consumers[out][0]
+        # a consumer is gone only if it carries the `fused` rule: `Node.fused`
+        # is the whole provenance record, and a SiLU Mul has one
+        live = [c for c in consumers.get(out, []) if not c.rule("fused")]
+        if len(live) != 1:
+            continue
+        act = live[0]
         rule = None
         if act.op_type == "Relu":
             rule = "relu"
         elif act.op_type == "Clip":
             rule = _clip_rule(graph, act)
-        if rule is None or act.fused:
+        elif act.op_type == "Mul":
+            silu = act.rule("silu")
+            if silu and silu.get("input") == out:
+                rule = "silu"
+        # `act.fused` is truthy for any node with a provenance record, and a
+        # SiLU Mul has one (`silu`), so test the fused *rule*: only a node
+        # already absorbed by another node must be skipped here.
+        if rule is None or act.rule("fused"):
             continue
         if not epilogue_ok(graph, node, rule):
             st.notes.append("%s <- %s (%s): the kernel cannot fold it here"

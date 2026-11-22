@@ -87,6 +87,9 @@ TMPDIR=${TMPDIR:-$HOME/scratch/tmp}
 mkdir -p "$TMPDIR"
 TMPDIR="$TMPDIR" python3 tests/test_artifact.py
 
+echo "=== test_model_sums (no GPU: the shipped model manifest, a corrupted copy)"
+TMPDIR="$TMPDIR" python3 tests/test_model_sums.py
+
 echo "=== test_dispatch (no GPU)"
 ./build/test_dispatch
 

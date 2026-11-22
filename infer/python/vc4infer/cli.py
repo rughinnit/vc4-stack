@@ -4,6 +4,7 @@ Thin over the engine: every subcommand opens an :class:`vc4infer.Engine` and
 calls it; the detection decode is :mod:`vc4infer.postprocess`.
 """
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -710,6 +711,89 @@ def cmd_util(args):
     return 0
 
 
+# ---------------------------------------------------------------- model data
+# The package ships SHA256SUMS beside the selftest models.  A file replaced
+# outside dpkg, a partial copy or a truncated download used to surface as an
+# engine error from whichever case read it first -- a non-finite softmax input,
+# in the case that occasioned this check.  The digests name the file instead.
+MODEL_SUMS = "SHA256SUMS"
+MODEL_DATA_MISMATCH = 8        # exit status: the data, not the engine
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _model_sums(models):
+    """The manifest beside the models as (name, sha256) pairs, or None."""
+    path = os.path.join(models, MODEL_SUMS)
+    if not os.path.isfile(path):
+        return None
+    entries = []
+    with open(path) as fh:
+        for n, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2 or len(parts[0]) != 64:
+                _die("%s:%d: not a sha256sum line: %r" % (path, n, line))
+            name = parts[1]
+            if name.startswith("*"):            # sha256sum binary marker
+                name = name[1:]
+            entries.append((name, parts[0].lower()))
+    return entries
+
+
+def _verify_models(models, entries=None):
+    """Problems as (name, expected, actual-or-None); None when no manifest.
+
+    Empty when every listed file is present and carries the recorded digest;
+    ``actual`` is None for a file the manifest lists and the directory lacks.
+    """
+    if entries is None:
+        entries = _model_sums(models)
+    if entries is None:
+        return None
+    problems = []
+    for name, want in entries:
+        path = os.path.join(models, name)
+        if not os.path.isfile(path):
+            problems.append((name, want, None))
+            continue
+        got = _sha256_file(path)
+        if got != want:
+            problems.append((name, want, got))
+    return problems
+
+
+def _report_model_data(models):
+    """Print the model-data verdict; None when it is safe to run cases."""
+    entries = _model_sums(models)
+    problems = _verify_models(models, entries)
+    if problems is None:
+        print("  model data: no %s in %s; integrity check skipped"
+              % (MODEL_SUMS, models))
+        return None
+    if not problems:
+        print("  model data: %d files match %s" % (len(entries), MODEL_SUMS))
+        return None
+    print("MODEL DATA MISMATCH: %d of %d files in %s are not the packaged ones"
+          % (len(problems), len(entries), models))
+    for name, want, got in problems:
+        print("  %-20s expected %s  actual %s"
+              % (name, want, got or "(missing)"))
+    print("  This is the model data, not the engine, so no case was run.  "
+          "Reinstall the package (apt-get install --reinstall vc4infer) or "
+          "regenerate %s with infer/tools/update_model_sums.py."
+          % MODEL_SUMS)
+    return MODEL_DATA_MISMATCH
+
+
 # ------------------------------------------------------------------ selftest
 CASES = [
     ("modelA", "conv/relu/maxpool/gemm/softmax 32x32"),
@@ -766,6 +850,12 @@ def cmd_selftest(args):
     print("  backend: %s" % _backend_str())
     print("  onnx %s, numpy %s, tolerance atol=rtol=5e-4 (over must be 0)"
           % (onnx_ver, np_ver))
+    status = _report_model_data(models)
+    if status:
+        print()
+        print("SELFTEST NOT RUN: the model files are not the packaged ones; "
+              "nothing here says anything about the engine")
+        return status
     print()
     rows, failed = [], 0
     for stem, desc in CASES:

@@ -231,6 +231,7 @@ vc4infer 1.2.10 selftest
   engine:  /usr/lib/aarch64-linux-gnu/libvc4infer.so.1
   backend: vc4d (/run/vc4d.sock, running)
   onnx 1.17.0, numpy 2.2.4, tolerance atol=rtol=5e-4 (over must be 0)
+  model data: 12 files match SHA256SUMS
 
   modelA       PASS 1x10             36 launches    43.2 ms  max abs 4.84e-06  max rel 4.84e-06  0/10 over  [...]
   modelB       PASS 1x16x32x32       13 launches    33.6 ms  max abs 4.41e-06  max rel 4.09e-06  0/16384 over  [...]
@@ -241,7 +242,8 @@ SELFTEST PASSED: 4/4 cases, 0 elements over tolerance
 ```
 
 Exit status 0 on success, 1 when any element is outside tolerance or a model
-fails to run.
+fails to run, and 8 when the model files do not match `SHA256SUMS` (nothing is
+executed in that case, so the result says nothing about the engine).
 
 ## Python API
 
@@ -456,7 +458,7 @@ YOLO_IMGSZ=320 python3 onnx/export_yolo.py    # writes models/yolov8n_320.onnx
     coverage.py  _binding.py  _onnxrun.py  _runtime.py  _errors.py
     contrib/ultralytics.py  kgen/
 /usr/lib/vc4infer/kgen/                         QPU kernel generator for C clients
-/usr/share/vc4infer/models/                     selftest models, inputs, refs
+/usr/share/vc4infer/models/                     selftest models, inputs, refs, SHA256SUMS
 /usr/share/doc/vc4infer/                        this file, PYTHON-API.md, examples/, copyright
 /usr/share/man/man1/vc4infer.1.gz
 ```
@@ -464,6 +466,19 @@ YOLO_IMGSZ=320 python3 onnx/export_yolo.py    # writes models/yolov8n_320.onnx
 The wheel installs the same `vc4infer/` package inside the interpreter's
 `site-packages` and the `vc4infer` CLI entry point is the .deb's
 `/usr/bin/vc4infer` (the wheel's `python3 -m vc4infer.cli` works too).
+
+`/usr/share/vc4infer/models/SHA256SUMS` is the contract between the packaged
+model data and `selftest`: it lists every file of that directory in
+`sha256sum` format, and `selftest` checks the files against it before it runs
+a case, so a replaced or truncated model names itself (`MODEL DATA MISMATCH`,
+one line per file with both digests, exit status 8) instead of surfacing as an
+engine error from whichever op reads the damaged weights first.  The manifest
+is generated, never edited: `python3 infer/tools/update_model_sums.py`
+rewrites it in sorted order from
+`infer/packaging/vc4infer/data/models/` and is the only supported way to
+change it (`--check` reports a stale one without writing); the deb installs
+the file beside the models.  A directory without a manifest — `--models DIR`
+over a user's own models — says so once and runs.
 
 The engine kernels are JIT-compiled on first use into
 `$XDG_CACHE_HOME/vc4infer/kcache` (about a second for a 100-kernel graph,

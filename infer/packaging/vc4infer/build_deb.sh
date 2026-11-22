@@ -36,6 +36,14 @@ pkg=$stage/usr/lib/python3/dist-packages
 [ -f "$root/cli/vc4infer" ] || { echo "missing infer/cli/vc4infer" >&2; exit 1; }
 [ -f "$root/python/vc4infer/cli.py" ] || { echo "missing python/vc4infer package" >&2; exit 1; }
 [ -d "$here/data/models" ] || { echo "missing selftest data" >&2; exit 1; }
+# The manifest is what makes selftest able to name a damaged model file; a deb
+# without it would silently skip the check, so it is a build input, not an
+# optional extra.
+[ -f "$here/data/models/SHA256SUMS" ] || {
+	echo "missing $here/data/models/SHA256SUMS" >&2
+	echo "regenerate it: python3 $root/tools/update_model_sums.py" >&2
+	exit 1
+}
 
 rm -rf "$stage"
 install -d "$stage/DEBIAN" \

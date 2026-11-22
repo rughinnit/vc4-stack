@@ -41,7 +41,7 @@ issues two ALU operations with no memory stall:
 | elementwise and unary | launch-bound | - | one launch per node today |
 | VC4C compiler | **3.09** (10.7%) | 28.8 | register allocation and scheduling; 4.4x behind hand-written code |
 | runtime (`vc4d`) | 0.1 ms per launch, **802 launches = 222 ms** | - | no batching, no persistent queue |
-| graph layer | 481.7 ms for YOLOv8n 160 | 74.8 ms (ncnn) | no fusion, layout propagation or memory reuse yet |
+| graph layer | 481.7 ms for YOLOv8n 160 | 74.8 ms (ncnn) | epilogue fusion implemented (467 launches removed); layout propagation and memory reuse still pending |
 | libraries | shape coverage, no autotuning yet | - | the autotune track has just started |
 
 Why 100% is the wrong frame: this block has no public ISA documentation, so

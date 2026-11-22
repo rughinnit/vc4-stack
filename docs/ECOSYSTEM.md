@@ -28,7 +28,7 @@ directories are not separately versioned.
 | `kernels/` | hand-written QPU kernels: `wider-tile/asm6..asm10`, each with its NOTES/RESULTS and generator, plus the `attempt-asm10` history | [`kernels/wider-tile/`](../kernels/wider-tile) | verified, frozen (results in `kernels/wider-tile/RESULTS*.md`) |
 | `training/` | backward kernels (`vc4_train.c`, `vc4_convbwd.c`) and the MLP/conv trainer with finite-difference checks | [`training/README.md`](../training/README.md) | toy scale; gradients verified |
 | `tools/` | `build-fast.sh` (memory-aware `-j` + ccache), `qpu_disasm.py`, `xcheck/` (four independent encoders), `gput.sh` (locked GPU run + board check) | script headers | in use |
-| `vc4d/` | privileged helper daemon (protocol v2): `/dev/mem` and V3D dispatch in one small root process that drops capabilities, so the engine runs unprivileged | [`vc4d/README.md`](../vc4d/README.md) | stable; 82/82 hostile cases |
+| `vc4d/` | privileged helper daemon (protocol v2): `/dev/mem` and V3D dispatch in one small root process that drops capabilities, so the engine runs unprivileged | [`vc4d/README.md`](../vc4d/README.md) | stable; 90/90 hostile cases |
 | `docs/` | the single source of documentation | [`docs/README.md`](README.md) | — |
 
 `infer/` is one product directory: `src/` and `include/` are the C library,

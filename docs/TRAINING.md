@@ -299,14 +299,6 @@ bwop_run ok
 ```
 
 
-## 8. Measured results
-
-See the "demo" block at the end of this file (filled from the actual run):
-
-```
-(see docs/TRAINING-MEMORY.md for the arena budget)
-```
-
 ## 9. On-board training: which frameworks, what fits, and the workflow
 
 Sections 1-8 describe the training core itself.  This section is the

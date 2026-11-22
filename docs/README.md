@@ -52,7 +52,7 @@ and every path below is relative to the repository root unless it starts with
 | `TRAINING-RESULTS.md` | MLP 64-32-10 at 100% on SGD/Adam, gradchecks, throughput |
 | `CONV-RESULTS.md` | col2im, im2col-row, maxpool fwd/bwd, conv dX/dW, conv-net at 100% |
 | `ENGINE-RESULTS.md` | engine bring-up, 14 root-cause fixes, matmul/conv numbers |
-| `VC4D.md` | privileged helper: protocol, security model, 82/82 hostile cases, 5-13% overhead |
+| `VC4D.md` | privileged helper: protocol, security model, 90/90 hostile cases, 5-13% overhead |
 | `DAEMON.md` | the daemon-backed engine: unprivileged client evidence, lock/arena sizing, measured launch overhead |
 | `VC4MON.md` | read-only V3D sysfs module: 78 registers, no /dev/mem, exact parity with drm/vc4 debugfs, ioread32 vs memcpy_fromio |
 | `V3DLIB.md` | V3DLib build/correctness, KMS and gpu_mem blockers, verdict, how to measure on a dedicated board |

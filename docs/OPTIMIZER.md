@@ -433,10 +433,16 @@ and `/model.22/dfl/conv/Conv` (the 1-channel head's `_slice_ch`, 2 -> 4).
 Neither is caused by the epilogue; the first reproduces with `VC4_OPT=none`
 on the pre-merge base.
 
-The wall time is not measured.  The projection is the recorded 0.277 ms per
-launch -- 467 fewer launches is ~129 ms off the 222 ms launch path, an
-expected ~353 ms against the 481.7 ms baseline -- and the extra saving from
-not reading and writing the activation plane twice is not included.
+Measured after the merge, on the same tree and model: `VC4_OPT=none` gives
+**550.0 ms / 1,003 launches** and `VC4_OPT=all` gives **468-473 ms / 536
+launches**.  The 467 launches cost **79 ms**, or **0.168 ms each** -- the
+marginal price, which is lower than the 0.277 ms average over 802 launches
+used in the earlier projection (that average included host work that does not
+scale with the launch count).  In FPS terms: **1.82 -> 2.13**.
+
+The projection therefore over-stated the gain.  The read/write saving from not
+materialising the activation plane twice is included in the 79 ms; it is not
+separable from the launch cost with this measurement.
 
 ### Gates on silicon
 

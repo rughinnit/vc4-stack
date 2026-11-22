@@ -144,7 +144,7 @@ class _Base:
         Deliberately *not* registered as per-node garbage: it is reused by
         every run of the same Runner, exactly like a packed weight panel.
         """
-        t = self.r._panels.get(key)
+        t = self.r._panel_get(key)
         if t is None:
             t = self.r.upload(np.ascontiguousarray(arr, dtype=np.float32))
             self.r._panels[key] = t

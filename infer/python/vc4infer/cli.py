@@ -17,6 +17,7 @@ from . import __version__, _binding, coverage, postprocess
 from . import _runtime as runtime
 from ._errors import (HostNodeError, HostNotAllowed, NeedsDeviceDispatch,
                       ShapeError, UnsupportedNode)
+from .artifact import ArtifactError
 from .engine import Engine
 
 
@@ -219,7 +220,8 @@ def cmd_run(args):
         _die("no such input: %s" % args.input)
 
     with Engine(args.model, mode=args.mode, host_policy=args.host_policy,
-                cache_dir=args.cache) as eng:
+                cache_dir=args.cache,
+                artifact=False if args.no_artifact else None) as eng:
         spec = eng.inputs[0]
         x, meta, src = load_input(args.input, spec.shape, args.imgsz)
         t0 = time.perf_counter()
@@ -294,11 +296,20 @@ def cmd_run(args):
         return 0
 
     print("model:  %s" % args.model)
+    if getattr(eng, "artifact", None) is not None:
+        a = eng.artifact
+        print("plan:   %s (vc4x, %d prepacked buffers, %d blobs)"
+              % (a.keys.get("abi_tag", "artifact"),
+                 len(a.manifest.get("weights", {}).get("entries", [])),
+                 len(a.manifest.get("kernels", {}).get("entries", []))))
     print("input:  %s  ->  %s" % (src, _shape_str(spec.shape)))
     print("output: %s  %s" % (raw.shape, raw.dtype))
-    print("run:    %.1f ms  (%.0f GPU ms, %d launches; first run in a "
-          "process, so it includes the one-time weight-panel packs)"
-          % (wall_ms, gpu_ms, launches))
+    print("run:    %.1f ms  (%.0f GPU ms, %d launches; %s)"
+          % (wall_ms, gpu_ms, launches,
+             "first run in a process, so it includes the one-time "
+             "weight-panel packs" if getattr(eng, "artifact", None) is None
+             else "first run in a process; the panels were prepacked at "
+                  "build time"))
     print("mode:   %s%s" % (args.mode,
                             "" if args.mode == "strict"
                             else " (host_policy=%s)" % args.host_policy))
@@ -350,7 +361,8 @@ def cmd_bench(args):
     if not os.path.isfile(args.model):
         _die("no such model: %s" % args.model)
     with Engine(args.model, mode=args.mode, host_policy=args.host_policy,
-                cache_dir=args.cache) as eng:
+                cache_dir=args.cache,
+                artifact=False if args.no_artifact else None) as eng:
         feeds = None
         src = None
         if args.input:
@@ -418,10 +430,97 @@ def cmd_bench(args):
     return 0
 
 
+# --------------------------------------------------------------------- build
+def cmd_build(args):
+    """Write a .vc4x engine artifact: optimised graph, packed weights, plan."""
+    runtime.prepare_env()
+    from .artifact import ArtifactError, build
+    if not os.path.isfile(args.model):
+        _die("no such model: %s" % args.model)
+    out = args.out
+    if out is None:
+        base = os.path.splitext(os.path.basename(args.model))[0]
+        out = base + ".vc4x"
+
+    def log(msg):
+        if not args.json:
+            sys.stderr.write("build: %s\n" % msg)
+            sys.stderr.flush()
+
+    try:
+        s = build(args.model, out, opt=args.opt, imgsz=args.imgsz,
+                  opset=args.opset, embed_graph=not args.no_embed_graph,
+                  embed_kernels=not args.no_embed_kernels,
+                  cache_dir=args.cache, arena_mb=args.arena_mb, log=log)
+    except ArtifactError as e:
+        sys.stderr.write("vc4infer: %s\n" % e)
+        return 3
+    if args.json:
+        print(json.dumps(s, indent=1, default=_json_default))
+        return 0
+    print("model:   %s -> %s" % (s["model"], s["path"]))
+    print("artifact %s (%.2f MiB)"
+          % (s["artifact_sha256"][:16], (s["file_bytes"] or 0) / 2 ** 20))
+    print("graph:   %d nodes, opt=%s%s"
+          % (s["nodes"], s["opt"],
+             (" (passes: %s)" % ", ".join(s["passes"])) if s["passes"] else ""))
+    print("weights: %d prepacked buffers, %.2f MiB"
+          % (s["weights"], s["weight_bytes"] / 2 ** 20))
+    print("kernels: %d blobs, %.2f MiB%s"
+          % (s["kernels"], s["kernel_bytes"] / 2 ** 20,
+             "" if s["kernels"] else " (names only)"))
+    print("plan:    pool %.2f MiB, scratch %.2f MiB, arena %.2f MiB"
+          % (s["pool_bytes"] / 2 ** 20, s["scratch_bytes"] / 2 ** 20,
+             (s.get("arena_bytes") or 0) / 2 ** 20))
+    t = s["timings"]
+    print("build:   %.1f s (optimise %.1f s, panels %.1f s, plan %.1f s)"
+          % (t["total_s"], t["optimise_s"], t["panels_s"], t["plan_s"]))
+    print("keys:    generator %s, abi %s, board %s"
+          % (s["generator_digest"][:16], s["abi_tag"], s["board"]))
+    return 0
+
+
+# -------------------------------------------------------------------- verify
+def cmd_verify(args):
+    """Check a .vc4x against this engine, board and generator, byte for byte."""
+    from .artifact import Artifact, ArtifactError
+    runtime.prepare_env()
+    try:
+        art = Artifact.load(args.artifact, verify=True)
+        art.validate(arena=None)
+    except ArtifactError as e:
+        sys.stderr.write("vc4infer: %s\n" % e)
+        return 3
+    s = art.summary()
+    if args.json:
+        print(json.dumps(s, indent=1, default=_json_default))
+        return 0
+    print("artifact %s" % s["path"])
+    print("  format     vc4x layout %s, created %s"
+          % (s["layout_version"], s["created"]))
+    print("  model      %s (%s nodes, opt=%s)"
+          % (s["model"], s["nodes"], s["opt"]))
+    print("  weights    %d prepacked buffers, %.2f MiB"
+          % (s["weights"], s["weight_bytes"] / 2 ** 20))
+    print("  kernels    %d blobs, %.2f MiB" % (s["kernels"],
+                                               s["kernel_bytes"] / 2 ** 20))
+    print("  plan       pool %.2f MiB, scratch %.2f MiB"
+          % (s["pool_bytes"] / 2 ** 20, s["scratch_bytes"] / 2 ** 20))
+    print("  generator  %s" % s["generator_digest"])
+    print("  engine     %s" % s["engine_digest"])
+    print("  board      %s" % s["board"])
+    print("all sections verified; every key matches this engine")
+    return 0
+
+
 # --------------------------------------------------------------------- nodes
 def cmd_nodes(args):
     if not os.path.isfile(args.model):
         _die("no such model: %s" % args.model)
+    from .artifact import is_artifact
+    if is_artifact(args.model):
+        _die("nodes reads an ONNX graph; for a .vc4x use `vc4infer verify`, "
+             "which checks the artifact's graph, plan and keys")
     rep = coverage.analyse(args.model)
     folded = set()
     if args.mode == "hybrid" and args.host_policy == "device":
@@ -542,7 +641,8 @@ def cmd_util(args):
     if not os.path.isfile(args.model):
         _die("no such model: %s" % args.model)
     with Engine(args.model, mode=args.mode, host_policy=args.host_policy,
-                cache_dir=args.cache) as eng:
+                cache_dir=args.cache,
+                artifact=False if args.no_artifact else None) as eng:
         feeds = None
         src = None
         if args.input:
@@ -742,6 +842,9 @@ def build_parser():
                         "host compute, structural allows metadata/control, any "
                         "also runs unwritten numeric ops")
     p.add_argument("--cache", default=None, help="kernel blob cache directory")
+    p.add_argument("--no-artifact", action="store_true",
+                   help="for a .vc4x: plan from the ONNX graph it carries, as "
+                        "the engine does for an .onnx (no frozen plan)")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("bench", help="time a model end to end")
@@ -757,7 +860,39 @@ def build_parser():
     p.add_argument("--host-policy", choices=("device", "structural", "any"),
                    default="device", help="hybrid host policy")
     p.add_argument("--cache", default=None, help="kernel blob cache directory")
+    p.add_argument("--no-artifact", action="store_true",
+                   help="for a .vc4x: plan from its ONNX graph as usual")
     p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser(
+        "build", help="build a .vc4x engine artifact from ONNX or .pt")
+    p.add_argument("model", help="fixed-shape fp32 .onnx, or a .pt to export")
+    p.add_argument("-o", "--out", default=None,
+                   help="output artifact (default <model>.vc4x)")
+    p.add_argument("--opt", default="all",
+                   help="optimiser passes baked into the artifact: all "
+                        "(default), none, or a comma-separated list")
+    p.add_argument("--imgsz", type=int, default=None,
+                   help=".pt export size (default 640); recorded in the "
+                        "artifact")
+    p.add_argument("--opset", type=int, default=17,
+                   help=".pt export opset (default 17); recorded")
+    p.add_argument("--no-embed-graph", action="store_true",
+                   help="reference <out>.onnx instead of embedding the graph")
+    p.add_argument("--no-embed-kernels", action="store_true",
+                   help="record kernel blob names and hashes only; the loader "
+                        "then needs the cache to hold them")
+    p.add_argument("--arena-mb", type=int, default=None,
+                   help="client arena to plan against (default: the daemon's)")
+    p.add_argument("--cache", default=None, help="kernel blob cache directory")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser(
+        "verify", help="check a .vc4x: every section, every key")
+    p.add_argument("artifact")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser("nodes", help="static node coverage and backend report")
     p.add_argument("model")
@@ -783,6 +918,8 @@ def build_parser():
                    default="device", help="hybrid host policy")
     p.add_argument("--json", action="store_true")
     p.add_argument("--cache", default=None, help="kernel blob cache directory")
+    p.add_argument("--no-artifact", action="store_true",
+                   help="for a .vc4x: plan from its ONNX graph as usual")
     p.set_defaults(func=cmd_util)
 
     p = sub.add_parser("selftest", help="run the shipped reference models")
@@ -831,9 +968,11 @@ def main(argv=None):
         return 3
     except ShapeError as e:
         _die(str(e))
+    except ArtifactError as e:
+        sys.stderr.write("vc4infer: %s\n" % e)
+        return 3
     except KeyboardInterrupt:
         return 130
-
 
 if __name__ == "__main__":
     sys.exit(main())

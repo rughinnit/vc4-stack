@@ -6,6 +6,10 @@
 #include <sys/types.h>
 
 #define VC4_MAX_KERNELS   128
+/* Names of every blob this context has loaded, in load order.  The kernel
+ * table above is an LRU of 128 live slots (the code area holds no more); an
+ * engine artifact needs the full set, which is larger for a detector. */
+#define VC4_MAX_SEEN      512
 #define VC4_MAX_QPU       12
 #define VC4_TUNE_MEMO     32
 
@@ -70,6 +74,8 @@ struct vc4_ctx {
 
     vc4_kernel k[VC4_MAX_KERNELS];
     int      nkern;
+    char     seen[VC4_MAX_SEEN][80];   /* every blob loaded, in order */
+    int      nseen;
     uint64_t kern_clock;     /* LRU stamp for the kernel cache (G3) */
     char     cache_dir[256];
     int      allow_jit;

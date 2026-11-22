@@ -137,12 +137,13 @@ def _as_device(device):
 
 
 class Engine:
-    """A loaded ONNX graph plus its engine context.
+    """A loaded ONNX graph or engine artifact plus its engine context.
 
     Parameters
     ----------
     model_path : str
-        Fixed-shape, batch-1, fp32 ONNX file.
+        Fixed-shape, batch-1, fp32 ONNX file, or a ``.vc4x`` engine artifact
+        written by ``vc4infer build``.
     device : Device or str
         ``Device("vc4")`` or ``"vc4"``.  This is the only device.
     mode : {"strict", "hybrid"}
@@ -159,14 +160,28 @@ class Engine:
         Arena size to request from vc4d (default: the daemon's, 64 MiB).
     cache_dir : str, optional
         Kernel blob cache (``~/.cache/vc4infer/kcache`` by default).
+    passes : str or list, optional
+        Optimiser passes for the ONNX path (``$VC4_OPT``).  Ignored for an
+        artifact, whose graph is already optimised.
+    artifact : bool, optional
+        ``None`` (default) uses an artifact when the file is one (magic, not
+        extension); ``False`` forces the ONNX path even for a ``.vc4x``,
+        loading the graph the artifact carries and planning from it as the
+        engine always has.  ``True`` requires an artifact.
 
     The engine owns one arena.  Only one engine should be open at a time; a
     second one cannot map a second 64 MiB arena and raises :class:`DeviceError`.
+
+    Loading an artifact validates the generator digest, kernel ABI tag,
+    artifact layout version, engine digest and board string before the plan is
+    used; a mismatch raises :class:`vc4infer.artifact.ArtifactMismatch` naming
+    the key.  The artifact is hardware- and generator-specific, unlike the ONNX
+    file it came from.
     """
 
     def __init__(self, model_path, device=None, *, mode="strict",
                  host_policy="device", arena_mb=None, cache_dir=None,
-                 passes=None):
+                 passes=None, artifact=None):
         if mode not in ("strict", "hybrid"):
             raise ValueError("mode must be 'strict' or 'hybrid'")
         if host_policy not in ("device", "structural", "any"):
@@ -180,16 +195,50 @@ class Engine:
             raise FileNotFoundError(self.model_path)
         self._lock = threading.Lock()
         self._closed = False
+        # Decide the path before touching the arena.  A rejected artifact
+        # costs nothing and leaves the GPU free.
+        from .artifact import Artifact, ArtifactError, is_artifact
+        self.artifact = None
+        self._art_bytes = None
+        if is_artifact(self.model_path):
+            if artifact is False:
+                # --no-artifact: the graph the artifact carries is a perfectly
+                # good ONNX model; plan from it as the engine always has.
+                self._art_bytes = Artifact.load(
+                    self.model_path).graph_bytes()
+            else:
+                art = Artifact.load(self.model_path)
+                art.validate(arena=None)
+                self.artifact = art
+        elif artifact is True:
+            raise ArtifactError(
+                "%s is not a vc4x engine artifact" % self.model_path)
         try:
             self._eng = _runtime.open_engine(cache_dir=cache_dir,
                                              arena_mb=arena_mb)
         except _runtime.Error as e:
             raise DeviceError(str(e)) from e
         try:
+            if self.artifact is not None:
+                self.artifact.check_arena(int(self._eng.arena_bytes))
+                # The blobs the plan launches travel with it when they were
+                # embedded; writing them into the cache is what turns a first
+                # run from "generate every kernel" into "read every kernel".
+                from .artifact import seed_cache
+                seed_cache(self.artifact,
+                           cache_dir or _runtime.default_cache_dir())
+            model = None
+            if self.artifact is not None:
+                model = self.artifact.model()
+            elif self._art_bytes is not None:
+                import onnx as _onnx
+                model = _onnx.load_from_string(self._art_bytes)
             self._runner = _runtime.Runner(self.model_path, self._eng,
                                            mode=mode,
                                            host_policy=host_policy,
-                                           passes=passes)
+                                           passes=passes,
+                                           model=model,
+                                           artifact=self.artifact)
             # A graph with no fp32 input is legal: a generator such as
             # RandomUniform/RandomNormal, or a constant-folded graph.  It runs
             # with an empty feed (or an integer feed such as a shape).  The old

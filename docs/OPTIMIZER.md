@@ -142,6 +142,29 @@ this hardware the chosen launch is expected to be bit-identical - the QPU count
 moves row blocks between QPUs, not the k order - and the check is there because
 "expected" is not a verification.
 
+### Silicon result and the acceptance margin
+
+Measured through `infer/build/bench_autotune 5` with the ARM capped at 1.0 GHz,
+`throttled=0x0` (2026-11-23; the board's memory path has a second, 2.5x slower
+state that also changes the absolute ms, see `KERNEL-EFF.md`):
+
+| shape | cold search | chosen | default ms | tuned ms | gain |
+|---|---:|---|---:|---:|---:|
+| 128^3 | 5.88 s | pack_q=4 gemm_q=12 | 0.980 | 1.059 | 0.93x |
+| 256^3 | 6.77 s | pack_q=2 gemm_q=12 | 4.833 | 5.870 | 0.82x |
+| 512^3 | 13.62 s | pack_q=4 gemm_q=12 | 31.639 | 31.974 | 0.99x |
+| conv 32x32x32 3x3 | 8.63 s | im2col_q=4 gemm_q=6 | 14.225 | 18.515 | 0.77x |
+
+Two runs of the *same* launch on this board differ by several percent, so a
+record accepted on a 1-4 % search-time difference is a coin flip.  Three of
+the four above made the shape slower.  A candidate now has to beat the default
+by more than `TUNE_ACCEPT_MARGIN` (3 %), and the default is recorded otherwise,
+so a record can never make a shape slower than not tuning it.  For these four
+shapes the honest gain is 1.00x: 12 GEMM QPUs and 4 pack QPUs are the ladder's
+first candidates and the search confirms them rather than improving on them.
+The per-class QPU breakdown, the conv panel/GEMM split and the same table on
+the slow memory state are in [`KERNEL-EFF.md`](KERNEL-EFF.md).
+
 ### The cache
 
 - Path: `<kernel cache>/autotune/<key>.tune`, where the key is the first 8

@@ -35,7 +35,7 @@ HDRS  = $(wildcard src/*.h) $(wildcard include/*.h) \
 
 # every binary run_tests.sh runs is built by `make`: a release is built
 # from a clean tree, and a test the build forgot is a test that never ran.
-TESTS = $(BUILD)/test_matmul $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_onnxops $(BUILD)/test_nhwc $(BUILD)/test_copyops $(BUILD)/test_coherency $(BUILD)/test_gate $(BUILD)/test_gated $(BUILD)/test_daemon_recover $(BUILD)/test_daemon_arena $(BUILD)/test_daemon_reap $(BUILD)/test_direct_lock $(BUILD)/bench_matmul $(BUILD)/test_daemon_kernels $(BUILD)/test_daemon_uni $(BUILD)/test_autotune $(BUILD)/bench_autotune
+TESTS = $(BUILD)/test_matmul $(BUILD)/bench_split $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_onnxops $(BUILD)/test_nhwc $(BUILD)/test_copyops $(BUILD)/test_coherency $(BUILD)/test_gate $(BUILD)/test_gated $(BUILD)/test_daemon_recover $(BUILD)/test_daemon_arena $(BUILD)/test_daemon_reap $(BUILD)/test_direct_lock $(BUILD)/bench_matmul $(BUILD)/test_daemon_kernels $(BUILD)/test_daemon_uni $(BUILD)/test_autotune $(BUILD)/bench_autotune
 TRAIN_TESTS = $(BUILD)/test_train_ops $(BUILD)/test_grad $(BUILD)/test_train $(BUILD)/test_convgrad $(BUILD)/test_convnet $(BUILD)/test_bwd_one
 
 all: $(LIB) $(BUILD)/libvc4infer.so $(BUILD)/libvc4infer.so.1 $(TESTS) $(TRAIN_TESTS)
@@ -78,6 +78,9 @@ $(BUILD)/bench_matmul: tests/bench_matmul.c $(LIB) tests/util.h | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@ $(LDLIBS)
 
 $(BUILD)/bench_autotune: tests/bench_autotune.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@ $(LDLIBS)
+
+$(BUILD)/bench_split: tests/bench_split.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@ $(LDLIBS)
 
 # G11 lives beside the daemon (it is about the daemon/direct interop) but needs

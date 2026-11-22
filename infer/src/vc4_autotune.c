@@ -79,6 +79,14 @@
 #define TUNE_DEFAULT_REPS    5
 #define TUNE_MAX_REPS        9
 #define TUNE_MAX_TOTAL       18
+/* A candidate has to win by more than the measurement spread.  The medians
+ * are single-process timings on a shared board, and two runs of the *same*
+ * launch differ by several percent there: measured on 2026-11-23, a record
+ * accepted on a 1-4 % search-time difference ran 0.77x (a 3x3 conv) and
+ * 0.82x (256^3) against the default once the shape was timed again.  A
+ * candidate below this margin leaves the default in place, so a record can
+ * not make a shape slower than not tuning it. */
+#define TUNE_ACCEPT_MARGIN   0.03
 
 /* Measured descending: on any shape with enough row blocks the widest launch
  * wins, so the first candidate is usually the answer and the budget is spent
@@ -903,6 +911,15 @@ vc4_status vc4_autotune(vc4_ctx *ctx, vc4_op op, const vc4_tune_shape *shape_in,
             best = fine[i];
         }
         ntrial++;
+    }
+
+    /* The default is a candidate too.  Keep it unless the winner clears the
+     * measurement spread (see TUNE_ACCEPT_MARGIN): a tie or a loss is not a
+     * reason to change which launch every later process runs. */
+    if (!vc4__tune_params_same(&best, &def) &&
+        best_ms > default_ms * (1.0 - TUNE_ACCEPT_MARGIN)) {
+        best = def;
+        best_ms = default_ms;
     }
 
     /* Correctness before persistence. */

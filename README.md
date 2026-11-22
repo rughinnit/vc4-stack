@@ -205,6 +205,38 @@ tools/build-fast.sh infer --clean
 BUILD_FAST_TARGET=VC4CC tools/build-fast.sh /home/raspi/work/combined/build
 ```
 
+## Training and model development on the board
+
+Inference is the broad path; training exists but is capacity-bound.  What runs
+where:
+
+| framework | train on the QPUs? | why |
+|---|---|---|
+| PyTorch | **yes** | autograd dispatches backward to the QPUs and the optimiser state lives in the arena; MLP 64.7 steps/s, CNN 0.98-1.37 steps/s |
+| JAX | **yes, within the 25-op subset** | `jax.grad` runs on the device and the update ops are in the subset |
+| TensorFlow | no | host `GradientTape` needs kernels that are not registered yet (18 today) |
+| LiteRT, ggml, ONNX, ONNX Runtime, TVM | no | they are inference runtimes by design |
+
+The constraint is memory: fp32 weights, gradients and Adam moments are **16 bytes
+per parameter** before activations.  A 96 MiB client arena holds roughly 6 M
+parameters with no activations at all, and there are always activations.  Two
+measured cases: a 128-channel 128x128 CNN needs **113 MiB of Adam state alone**
+and does not fit; YOLOv8n's optimiser state is about **51 MB**, which with
+160x160 activations is outside what the arena can serve.  Numbers and conditions:
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) section 5.
+
+The workflow that works:
+
+1. develop and train on a workstation in PyTorch or JAX;
+2. export ONNX, or keep the PyTorch checkpoint and use `torch_vc4` on the board;
+3. deploy on the Pi through the engine, LiteRT or ONNX Runtime;
+4. use on-board training for what fits: small heads, calibration, and the bundled
+   `vc4train` demo (a 64-32-10 MLP), not YOLO-scale training.
+
+Capacity, not missing kernels, sets that boundary: a larger arena would change
+the training case first, and that is a different board (VideoCore VI/VII, which
+this stack does not target).
+
 ## Measured ceilings (stock 300/400 MHz, no overclock)
 
 | workload | GFLOP/s | % of 28.8 structural peak |

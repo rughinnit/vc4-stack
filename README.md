@@ -252,6 +252,34 @@ scratch (VC4C is forked), tensor cores, unified memory, asynchronous copy
 engines, atomics, multi-GPU, or CUDA parity. The structural ceiling is
 28.8 GFLOP/s; a hand-written GEMM reaches 13.7.
 
+## How optimised each layer is
+
+Not one layer is at the structural peak, and the peak itself assumes every slot
+issues two ALU operations with no memory stall:
+
+| layer | current | ceiling | blocker |
+|---|---|---|---|
+| ALU microbenchmark | 28.36 GFLOP/s (**98.5%** of 28.8) | 28.8 | none; the one near-optimal measurement |
+| coalesced memory loop | 16.42 (57%) | 28.8 | L2 and VPM bandwidth |
+| hand-written GEMM | **13.7** stand-alone, **8.5-9.5** through the engine (30-47%) | 28.8 | register pressure, VPM rows, no cross-tile software pipelining |
+| convolution | im2col + GEMM | a direct-conv kernel would skip the materialisation | not written yet |
+| elementwise and unary | launch-bound | - | one launch per node today |
+| VC4C compiler | **3.09** (10.7%) | 28.8 | register allocation and scheduling; 4.4x behind hand-written code |
+| runtime (`vc4d`) | 0.1 ms per launch, **802 launches = 222 ms** | - | no batching, no persistent queue |
+| graph layer | 481.7 ms for YOLOv8n 160 | 74.8 ms (ncnn) | no fusion, layout propagation or memory reuse yet |
+| libraries | shape coverage, no autotuning yet | - | the autotune track has just started |
+
+Why 100% is the wrong frame: this block has no public ISA documentation, so
+every behaviour was established by measurement — the FPU truncates, the VPM and
+DMA row fields disagree, a small immediate in the A slot wedges the QPU. Each
+optimisation has to be discovered and then proven on silicon. That is why the
+ALU microbenchmark reaches 98.5% while a real GEMM reaches 30-47%: the
+arithmetic can be saturated, the memory path cannot.
+
+The gaps are being attacked in this order: graph fusion and layout
+([`docs/OPTIMIZER.md`](docs/OPTIMIZER.md)), per-shape kernel autotuning, launch
+batching or a persistent queue, then VC4C target passes.
+
 ## Training and model development on the board
 
 Inference is the broad path; training exists but is capacity-bound.  What runs

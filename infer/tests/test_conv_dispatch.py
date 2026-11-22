@@ -31,6 +31,7 @@ usage: TMPDIR=$HOME/scratch/tmp python3 tests/test_conv_dispatch.py
 """
 import os
 import sys
+import tempfile
 
 import numpy as np
 import onnx
@@ -46,6 +47,12 @@ from vc4infer._onnxrun import Runner, Tensor               # noqa: E402
 from vc4infer.optimizer.plan import conv_nhwc              # noqa: E402
 
 FAILS = []
+
+
+def tmpdir():
+    base = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    os.makedirs(base, exist_ok=True)
+    return tempfile.mkdtemp(prefix="convd-", dir=base)
 
 
 def check(cond, msg):
@@ -201,6 +208,95 @@ def test_channel_slice():
           "a 1-channel remainder is a 1-lane, 1-word store")
 
 
+class BookkeepingEngine:
+    """The engine slice a pool/global-average graph touches.
+
+    No arithmetic: the point is the pool's byte accounting across runs.  A
+    buffer the node should have released makes ``used_bytes`` grow.
+    """
+
+    class _Stats:
+        launches = 0
+        pack_ns = 0
+        kernel_ns = 0
+        flops = 0
+
+    def __init__(self, arena=8 << 20):
+        self._arena = bytearray(arena)
+        self._next = 64
+        self.stats = self._Stats()
+
+    @property
+    def arena_bytes(self):
+        return len(self._arena)
+
+    def alloc(self, nbytes):
+        n = (int(nbytes) + 63) // 64 * 64
+        if self._next + n > len(self._arena):
+            raise vc4infer.Error("fake arena exhausted")
+        b = vc4infer.Buf(self._next, int(nbytes))
+        self._next += n
+        return b
+
+    def upload(self, arr, buf=None):
+        arr = np.asarray(arr, np.float32)
+        data = arr.ravel().tobytes()
+        if buf is None:
+            buf = self.alloc(len(data))
+        end = int(buf.off) + len(data)
+        self._arena[int(buf.off):end] = data
+        return buf
+
+    def download(self, buf, nbytes):
+        raw = bytes(self._arena[int(buf.off):int(buf.off) + int(nbytes)])
+        return np.frombuffer(raw, dtype=np.float32).copy()
+
+    def fill2d(self, *a, **k):
+        return None
+
+    def maxpooln(self, x, out, C, H, W, n, s, pad):
+        ho = (H + 2 * pad - n) // s + 1
+        wo = (W + 2 * pad - n) // s + 1
+        return ho, wo
+
+    def matmul(self, a, b, c, M, N, K, layout=0):
+        return None
+
+
+def _pool_graph(op):
+    x = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4, 8, 8])
+    y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4, 3, 3])
+    if op == "GlobalAveragePool":
+        y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4, 1, 1])
+        node = helper.make_node(op, ["X"], ["Y"])
+    else:
+        node = helper.make_node(op, ["X"], ["Y"], kernel_shape=[3, 3],
+                                strides=[2, 2], pads=[0, 0, 0, 0])
+    g = helper.make_graph([node], op, [x], [y])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+    m.ir_version = 9
+    return m
+
+
+def test_pool_bytes_are_reused():
+    """A repeated run must not grow the pool: its temporaries are released."""
+    print("pool reuse across runs (no device)")
+    for op in ("GlobalAveragePool", "MaxPool"):
+        m = _pool_graph(op)
+        path = os.path.join(tmpdir(), "%s.onnx" % op)
+        onnx.save(m, path)
+        r = Runner(path, BookkeepingEngine())
+        x = np.zeros((1, 4, 8, 8), np.float32)
+        r.run({"X": x})
+        r.run({"X": x})            # the first run creates the cached panels
+        size, used = r.pool.size, r.pool.used_bytes
+        for _ in range(3):
+            r.run({"X": x})
+        check(r.pool.size == size and r.pool.used_bytes == used,
+              "%s: pool %d B and %d in use after 4 runs"
+              % (op, r.pool.size, r.pool.used_bytes))
+
+
 def main():
     print("conv dispatch classification (no device)")
 
@@ -247,6 +343,7 @@ def main():
           "1->1 stays on the dense path")
 
     test_channel_slice()
+    test_pool_bytes_are_reused()
 
     print("")
     if FAILS:

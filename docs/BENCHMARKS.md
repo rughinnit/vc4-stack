@@ -715,3 +715,31 @@ above, that is a 905 MiB RAM limit, not an engine verdict.
 **What I did not measure.**  Any VC4 execution for YOLO26, COCO mAP for either
 head, and the runtime cost of TopK, GatherElements and the rest of the
 end-to-end tail, which no cell reaches.
+
+## 15. Models beyond YOLO (measured 2026-11-22)
+
+Fifteen graphs outside the YOLO family, same protocol: nine ImageNet backbones
+from the ONNX backend test corpus, the three shipped `modelA/B/C` graphs, and
+three ONNX Model Zoo models (super-resolution, style transfer, int8
+segmentation).  Full tables, exact refusal strings and the corpus caveat are in
+[`MODELS.md`](MODELS.md).  Conditions: engine 1.2.8, managed, 96 MiB client
+arena, ONNX Runtime 1.32.0 on four threads, 3 warm-ups + 5 timed, guard
+`--max 71`; starts 59.1-64.5 C, peaks 60.1-71.4 C, core 400 MHz.
+
+| group | graphs | run on VC4 | headline |
+|---|---:|---:|---|
+| shipped small models | 3 | **3** | 29.8 / 17.2 / 6.2 ms; CPU 2.4 / 1.8 / 0.2 ms (12.4x / 9.7x / 30x); max abs 6.9e-06 / 3.8e-06 / 2.6e-07 |
+| ImageNet corpus, 224x224 | 9 | 0 | 7 stop on the arena (needs 104-603 MiB), 1 on a grouped conv, 1 plans 66/66 and then fails at its 1000-class 1x1 conv |
+| Model Zoo, other tasks | 3 | 0 | super-resolution needs 147 MiB, then a `Cin=1` conv; style transfer needs 540 MiB of 9x9-conv scratch; segmentation is int8 (`QLinearConv`) |
+
+The corpus graphs are topology-only: every weight is a `ConstantOfShape` node
+with the constant value 0.02.  Unmodified, the five small graphs stop at
+`ConstantOfShape` (`no implementation`) and the four large ones earlier at the
+arena; the numbers above are after an exact materialisation (ONNX Runtime output
+bit-identical, max abs 0.0).  `modelA/B/C` are the only non-YOLO models that
+execute on the QPUs.
+
+The 152/152 operator result does not extend to model coverage.  The blockers
+are the arena (104-603 MiB against 96), conv kernels restricted to 1x1/3x3/5x5
+(the corpus stems are 7x7 and 11x11; style transfer is 9x9), grouped-conv
+16-alignment, the weight representation, and int8 - not missing operators.

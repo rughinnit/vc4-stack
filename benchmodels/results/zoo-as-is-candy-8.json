@@ -1,0 +1,10 @@
+{
+  "model": "candy-8.onnx",
+  "file": "benchmodels/zoo/candy-8.onnx",
+  "nodes": 64,
+  "opset": [
+    8
+  ],
+  "refusal": "UnsupportedNode: unsupported graph: graph pool needs at least 25.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 195.1 MiB, but the client arena is 93.0 MiB with 506.0 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 539.6 MiB would do - or lower VC4_POOL_RESERVE_MB",
+  "stage": "engine-open"
+}

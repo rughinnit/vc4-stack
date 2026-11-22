@@ -1,0 +1,12 @@
+{
+  "model": "light_shufflenet.onnx",
+  "file": "/home/raspi/work/torch-vc4/.venv/lib/python3.13/site-packages/onnx/backend/test/data/light/light_shufflenet.onnx",
+  "nodes": 446,
+  "opset": [
+    9
+  ],
+  "plan": {
+    "ok": false,
+    "refusal": "UnsupportedNode: node 'ConstantOfShape_0' (ConstantOfShape): no implementation"
+  }
+}

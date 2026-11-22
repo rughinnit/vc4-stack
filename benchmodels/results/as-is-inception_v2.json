@@ -1,0 +1,12 @@
+{
+  "model": "light_inception_v2.onnx",
+  "file": "/home/raspi/work/torch-vc4/.venv/lib/python3.13/site-packages/onnx/backend/test/data/light/light_inception_v2.onnx",
+  "nodes": 916,
+  "opset": [
+    9
+  ],
+  "plan": {
+    "ok": false,
+    "refusal": "UnsupportedNode: node 'ConstantOfShape_0' (ConstantOfShape): no implementation"
+  }
+}

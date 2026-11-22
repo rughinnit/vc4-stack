@@ -5,6 +5,27 @@ clocks** (core 400 MHz / V3D 300 MHz).  Everything that computes runs on the
 VC4 QPUs.  The ARM cores run the control plane only (allocation, I/O, byte
 movement); there is no CPU arithmetic fallback anywhere in this stack.
 
+## Compatible hardware
+
+Verified on **Raspberry Pi 3 Model B** (BCM2837, VideoCore IV, 12 QPUs, 6 TMUs),
+arm64, Debian 13, kernel 6.18 — that is the board behind every number in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+| board | SoC / GPU | state | note |
+|---|---|---|---|
+| Pi 3 Model B | BCM2837 / VideoCore IV | **tested** | the reference board |
+| Pi 3 B+, 3 A+, CM3, CM3+ | BCM2837(B0) / VideoCore IV | expected, untested | same QPU and `vc4` driver path |
+| Pi Zero 2 W | BCM2710A1 / VideoCore IV | expected, untested | 512 MB limits the arena to the small models |
+| Pi 2 Model B v1.2 | BCM2837 / VideoCore IV | expected, untested | the v1.1 board is 32-bit only |
+| Pi 4, 400, CM4 | VideoCore VI | **not compatible** | different 3D block; the QPU path here does not apply |
+| Pi 5, CM5 | VideoCore VII | **not compatible** | same reason |
+| Pi 1, Zero, CM1, Pi 2 v1.1 | ARMv6/ARMv7 | **not supported** | no 32-bit build is shipped; the packages are arm64 |
+
+Requirements, all of them: a kernel with the `vc4` DRM driver bound to the V3D
+block, CMA large enough for the daemon arena plus the client's (96 MiB
+default), `dma-buf`, systemd for `vc4d`, and 64-bit userspace. No overclock is
+used or needed: core 400 MHz, V3D 300 MHz, both stock.
+
 ## Install
 
 ```sh

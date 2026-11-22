@@ -1513,9 +1513,35 @@ class Runner:
 
     def _free(self, t):
         if isinstance(t, Tensor):
-            self.pool.release(t.buf)
+            self._release_buf(t.buf)
         elif isinstance(t, vc4infer.Buf):
-            self.pool.release(t)
+            self._release_buf(t)
+
+    def _release_buf(self, buf):
+        """Release a block unless another live tensor still shares it.
+
+        Reshape/Flatten/Squeeze/Cast and the 2-D view a batch matmul is split
+        into are views: they carry their producer's Buf, so one (offset, size)
+        names both the base tensor and every view of it.  Releasing a view when
+        its last consumer passes used to free the block under the still-live
+        base tensor, and the next allocation wrote over it -- the attention
+        operand that came back as the mask constant in docs/TINY-LLM.md 5.2.
+        The graph's liveness is per name; ownership of the bytes is per buffer.
+        """
+        if buf is None:
+            return
+        if isinstance(buf, Tensor):         # tolerate a Tensor in place of a Buf
+            buf = buf.buf
+        if getattr(buf, "has_buf", True) is False:
+            return
+        off = int(buf.off)
+        for v in self.values.values():
+            if getattr(v, "has_buf", True) is False:
+                continue
+            b = getattr(v, "buf", None)
+            if b is not None and int(b.off) == off:
+                return
+        self.pool.release(buf)
 
     def upload(self, arr):
         arr = np.ascontiguousarray(arr, dtype=np.float32)
@@ -3652,7 +3678,7 @@ class Runner:
                    if isinstance(v, Tensor))
         for t in self._garbage:
             if isinstance(t, Tensor) and t.buf.off not in live:
-                self.pool.release(t.buf)
+                self._release_buf(t.buf)
         self._garbage = []
 
     def _run_node_hybrid(self, idx, node, tier, reason):
@@ -3737,7 +3763,7 @@ class Runner:
         for name in self._prev_outputs:
             v = self.values.get(name)
             if isinstance(v, Tensor) and v.buf.off not in self._const_offs:
-                self.pool.release(v.buf)
+                self._release_buf(v.buf)
         self._prev_outputs = tuple(o.name for o in self.graph.output)
         self.values = {k: v for k, v in self.values.items()
                        if k in self._consts}
@@ -3857,7 +3883,7 @@ class Runner:
             keep = set(t.buf.off for t in outs if isinstance(t, Tensor))
             for t in self._garbage:
                 if isinstance(t, Tensor) and t.buf.off not in keep:
-                    self.pool.release(t.buf)
+                    self._release_buf(t.buf)
             self._garbage = []
             for name in node.input:
                 if not name or name in self._consts:
@@ -3865,7 +3891,7 @@ class Runner:
                 if self._last_use.get(name, idx) <= idx:
                     v = self.values.pop(name, None)
                     if isinstance(v, Tensor) and v.buf.off not in keep:
-                        self.pool.release(v.buf)
+                        self._release_buf(v.buf)
         self.host_sites = sorted(self._host_site_acc.values(),
                                  key=lambda e: -e["bytes"])
         self.host_bytes = sum(e["bytes"] for e in self.host_sites)

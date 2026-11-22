@@ -158,10 +158,15 @@ vc4_status vc4__pack_run_q(vc4_ctx *ctx, uint32_t src_bus,
 /* 8x64 tiles: M 8-aligned, N 64-aligned, K 16-aligned, B row-major */
 vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                          uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus);
-/* same, with the GEMM's QPU count explicit (0 = min(M/8, 12)) */
+/* same, with the GEMM's QPU count explicit (0 = min(M/8, 12)) and the C
+ * row-block stride in bytes (0 = the row-major 8*N*4; the compact layout of
+ * a wide N uses N*32). */
 vc4_status vc4__gemm_run_q(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                            uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus,
-                           int gemm_q, int act);
+                           int gemm_q, int act, uint32_t c_rb);
+/* 1 when a row-major result of this padded width cannot be stored by the
+ * asm10 8x64 store and the compact tile layout is used instead. */
+int vc4__matmul_compact(uint32_t N);
 /* The blob names the generator sees, shared with the autotuner so a record
  * names the kernel it selects instead of recomputing the scheme. */
 void vc4__matmul_kernel_name(char *out, size_t n, uint32_t M, uint32_t N,

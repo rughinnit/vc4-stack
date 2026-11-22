@@ -1121,7 +1121,11 @@ def g10_store(a, stride):
     """VPM->DMA store of the whole 8x64 C tile: 4 column chunks x 2 row halves.
 
     The VPM row base is 4*qpu, the VDW row field is that * 128 and the memory
-    stride of a 16-word C row is (N-16)*4.
+    stride of a 16-word C row is (N-16)*4.  That stride is a 16-bit VDW field
+    (vpmwords.vdw_stride), so a row pitch above 16384 floats cannot be
+    written: (N-16)*4 overflows into the VDW control bits.  A compact tile
+    layout is used for those shapes instead (build_gemm10's `compact`), which
+    keeps the same store with a 64-float row pitch.
     """
     dma = (2 << 30) | (4 << 23) | (16 << 16) | (1 << 14)
     # r3 = 4*qpu*128 for the VDW row field, RA_TMP = 4*qpu for the vpw row
@@ -1176,13 +1180,22 @@ def g10_dump_avec(a, base_reg):
     a.nop(), a.nop(), a.nop(), a.nop()
 
 
-def build_gemm10(M, N, K, nqpu=12, probe=None, single=False, act=0):
+def build_gemm10(M, N, K, nqpu=12, probe=None, single=False, act=0,
+                 compact=0):
     """The asm10 GEMM for arbitrary M (8-aligned), N (64-aligned), K (16-aligned).
 
     `act` is an activation epilogue on the 8x64 C tile before it is stored
     (`kops.ACT_*`).  `relu` and `clip(0,6)` are offered: the bound 6.0 is a
     real float, and the only B register free after the k loop is the column
     block's 4-row step, which the next column block reloads anyway.
+
+    `compact` writes C as one dense 8x64 tile per (row block, column block)
+    instead of a row-major [M][N] result.  The store's memory stride between
+    C rows is a 16-bit field, so a row pitch above 16384 floats cannot be
+    written; with a compact tile the pitch is 64 floats and (64-16)*4 = 192
+    fits, at the cost of a tile copy into the caller's matrix.  The tile
+    layout is [row block][column block][row][64 floats], and vc4_gemm.c's
+    unpack_compact() reproduces it.
     """
     assert M % G10_NROWS == 0 and N % G10_NCOLS == 0 and K % 16 == 0, \
         "gemm10 needs M%%8==0, N%%64==0, K%%16==0 (got %d,%d,%d)" % (M, N, K)
@@ -1195,9 +1208,18 @@ def build_gemm10(M, N, K, nqpu=12, probe=None, single=False, act=0):
     assert nloop >= 1, "gemm10 needs K >= 16"
     assert REM in (0, 1, 2)
     RBCNT = (TR + NQ - 1) // NQ
-    stride = (N - 16) * 4
+    if compact:
+        # 64-float C rows: 4-row store stride 192, row-half offset 1024,
+        # one 2048-byte tile per column block (the tile base is scaled in
+        # cb_top below), and one tile set per row block per QPU iteration.
+        stride = (G10_NCOLS - 16) * 4
+        c_half = G10_NROWS // 2 * G10_NCOLS * 4
+        cstride = NQ * N * 32
+    else:
+        stride = (N - 16) * 4
+        c_half = 4 * N * 4
+        cstride = NQ * G10_NROWS * N * 4
     astride = NQ * G10_NROWS * K * 4
-    cstride = NQ * G10_NROWS * N * 4
 
     a = G10Asm()
 
@@ -1303,11 +1325,20 @@ def build_gemm10(M, N, K, nqpu=12, probe=None, single=False, act=0):
     a.label('cb_top')
     a.word(add=g10_or(G10_RA_AADR, areg(G10_RA_ARB), areg(G10_RA_ARB)),
            note='A tile base')
-    a.word(add=g10_addi(ADD_ADD, G10_RA_CADR, areg(G10_RA_CBOFF),
-                        (REGB, G10_RB_CARB)), note='C tile base')
+    if compact:
+        # CBOFF is the B column offset (64 columns = 256 B); a compact C tile
+        # is 2048 B, so the tile base is CBOFF*8 + the row-block base
+        a.word(add=g10_addi(ADD_SHL, G10_RA_CADR, areg(G10_RA_CBOFF), imm(3)),
+               note='C tile base = 8 * column-block offset')
+        a.nop(), a.nop()
+        a.word(add=g10_addi(ADD_ADD, G10_RA_CADR, areg(G10_RA_CADR),
+                            (REGB, G10_RB_CARB)))
+    else:
+        a.word(add=g10_addi(ADD_ADD, G10_RA_CADR, areg(G10_RA_CBOFF),
+                            (REGB, G10_RB_CARB)), note='C tile base')
     a.word(add=g10_addi(ADD_ADD, 32 + G10_ACC_BADR, areg(G10_RA_CBOFF),
                         (REGB, G10_RB_BLANE)), note='B tile base')
-    a.ldi(4 * N * 4, G10_RB_TMP, ws=1, note='4 C rows')
+    a.ldi(c_half, G10_RB_TMP, ws=1, note='4 C rows')
     a.nop(), a.nop()
     a.word(add=g10_addi(ADD_ADD, G10_RA_CADR2, areg(G10_RA_CADR),
                         (REGB, G10_RB_TMP)), note='+ 4 C rows')
@@ -3802,7 +3833,8 @@ def main(argv):
         # the asm10 kernel: 8x64 tiles, 3-phase k loop (build_gemm above is the
         # asm3 16x16 generator, kept as 'gemm3' for A/B and reference)
         p = build_gemm10(g('M'), g('N'), g('K'), g('nqpu', 12),
-                         _opt('probe'), bool(g('single', 0)), g('act', 0))
+                         _opt('probe'), bool(g('single', 0)), g('act', 0),
+                         g('compact', 0))
     elif kind == 'gemm3':
         p = build_gemm(g('M'), g('N'), g('K'), g('nqpu', 12), g('bmode', 0),
                        g('depth', 3), g('cstride', None), g('act', 0))

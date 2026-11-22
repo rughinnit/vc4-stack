@@ -271,6 +271,15 @@ int main(int argc, char **argv)
     rc |= one_shape(ctx, 20, 36, 44, reps);
     rc |= one_shape(ctx, 16, 16, 16, reps);
     rc |= one_shape(ctx, 512, 64, 288, reps);
+    /* A C row pitch above 16384 floats cannot be written by the 8x64 store:
+     * its memory-stride field is 16 bits.  Exact at 16384 and above only
+     * since the compact tile layout landed; both sides of the boundary are
+     * covered, and the multi-row case is the one that used to fail (M=1 was
+     * always exact because only row 0 of each tile was copied out). */
+    rc |= one_shape(ctx, 4, 16384, 16, reps);
+    rc |= one_shape(ctx, 4, 16385, 16, reps);
+    rc |= one_shape(ctx, 8, 16448, 16, reps);
+    rc |= one_shape(ctx, 16, 16448, 16, reps);
     /* the relu epilogue: default launch, then the autotuned one */
     rc |= one_shape_act(ctx, 64, 64, 64, reps, 0, VC4_ACT_RELU, "relu");
     rc |= one_shape_act(ctx, 20, 36, 44, reps, 0, VC4_ACT_RELU, "relu");

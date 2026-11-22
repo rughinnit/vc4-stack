@@ -111,6 +111,34 @@ class Stats(ctypes.Structure):
                 ("flops", ctypes.c_uint64)]
 
 
+class TuneShape(ctypes.Structure):
+    """Mirror of vc4_tune_shape: a matmul's m,n,k or a conv's geometry."""
+    _fields_ = [("m", ctypes.c_uint32), ("n", ctypes.c_uint32),
+                ("k", ctypes.c_uint32), ("cin", ctypes.c_uint32),
+                ("cout", ctypes.c_uint32), ("h", ctypes.c_uint32),
+                ("w", ctypes.c_uint32), ("kh", ctypes.c_uint32),
+                ("kw", ctypes.c_uint32), ("pad", ctypes.c_uint32),
+                ("stride", ctypes.c_uint32), ("flags", ctypes.c_uint32)]
+
+
+class TuneParams(ctypes.Structure):
+    _fields_ = [("pack_q", ctypes.c_uint32), ("gemm_q", ctypes.c_uint32),
+                ("im2col_q", ctypes.c_uint32)]
+
+
+class TuneOpts(ctypes.Structure):
+    _fields_ = [("max_candidates", ctypes.c_uint32),
+                ("budget_ms", ctypes.c_uint32), ("reps", ctypes.c_uint32),
+                ("force", ctypes.c_uint32)]
+
+
+class TuneResult(ctypes.Structure):
+    _fields_ = [("params", TuneParams), ("best_ms", ctypes.c_double),
+                ("default_ms", ctypes.c_double), ("max_abs", ctypes.c_double),
+                ("candidates", ctypes.c_uint32), ("over_tol", ctypes.c_uint32),
+                ("from_cache", ctypes.c_int), ("kernel", ctypes.c_char * 80)]
+
+
 class Error(RuntimeError):
     """An engine call failed; ``code`` is the vc4_status value when known."""
 
@@ -269,6 +297,13 @@ class Engine:
         L.vc4_cumsum.restype = ctypes.c_int
         L.vc4_get_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(Stats)]
         L.vc4_get_stats.restype = None
+        L.vc4_autotune.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                   ctypes.POINTER(TuneShape),
+                                   ctypes.POINTER(TuneOpts),
+                                   ctypes.POINTER(TuneResult)]
+        L.vc4_autotune.restype = ctypes.c_int
+        L.vc4_autotune_enabled.argtypes = [ctypes.c_void_p]
+        L.vc4_autotune_enabled.restype = ctypes.c_int
         L.vc4_supported_ops.argtypes = [ctypes.POINTER(ctypes.c_size_t)]
         L.vc4_supported_ops.restype = ctypes.POINTER(OpInfo)
         L.vc4_print_supported_ops.argtypes = [ctypes.c_void_p]
@@ -559,6 +594,38 @@ class Engine:
         s = Stats()
         self.lib.vc4_get_stats(self.ctx, ctypes.byref(s))
         return s
+
+    # ---- autotuning
+    def autotune(self, op, shape, max_candidates=0, budget_ms=0, reps=0,
+                 force=0):
+        """Measure (or read) the launch parameters for one op and shape.
+
+        ``op`` is a VC4_OP_* value, ``shape`` a TuneShape (or a 12-tuple of
+        its fields).  Returns a dict with the chosen pack_q/gemm_q/im2col_q,
+        the two medians, the correctness delta and the blob name.
+        """
+        sh = shape if isinstance(shape, TuneShape) else TuneShape(*shape)
+        o = TuneOpts(int(max_candidates), int(budget_ms), int(reps),
+                     int(force))
+        r = TuneResult()
+        self._check(self.lib.vc4_autotune(self.ctx, int(op),
+                                          ctypes.byref(sh), ctypes.byref(o),
+                                          ctypes.byref(r)), "autotune")
+        return {
+            "pack_q": int(r.params.pack_q),
+            "gemm_q": int(r.params.gemm_q),
+            "im2col_q": int(r.params.im2col_q),
+            "best_ms": float(r.best_ms),
+            "default_ms": float(r.default_ms),
+            "max_abs": float(r.max_abs),
+            "candidates": int(r.candidates),
+            "over_tol": int(r.over_tol),
+            "from_cache": bool(r.from_cache),
+            "kernel": r.kernel.decode(),
+        }
+
+    def autotune_enabled(self):
+        return bool(self.lib.vc4_autotune_enabled(self.ctx))
 
     # ---- registry
     def supported_ops(self):

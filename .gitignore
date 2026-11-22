@@ -19,6 +19,7 @@ venv/
 # Kernel blob cache (regenerable) and generated ONNX models
 infer/kcache/
 infer/tools/onnx/models/
+infer/tools/det/models/
 
 # Generated artefacts.  Tracked evidence blobs stay tracked; use "git add -f"
 # for a new kernel blob that must be kept.

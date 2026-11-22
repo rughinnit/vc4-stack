@@ -231,6 +231,22 @@ because the digest changes.
 - elementwise kernels are not tuned: their group size is fixed by the store
   path, not by the launch.
 
+## Open issues in the optimiser stack
+
+- **The autotuner occasionally refuses its own winner.**  With `act=NONE`
+  kernels, some candidates report `q=2/12/0` and a maximum difference of
+  42.7 on 32 of 16,384 elements, with the same signature across candidate
+  pairs, which points at the reference copy rather than the QPU count.  The
+  guard compares every candidate against the default launch before caching
+  it, so a refused candidate never reaches a measurement; autotuning is off
+  by default and no recorded number uses it.  The cause is open.
+- **asm10's `verify()` does not enforce its documented read-after-write
+  rule.**  It treats every write as an accumulator write (`if out <= 37`
+  shadows the GP branches).  Correcting the condition in a scratch copy makes
+  both the plain and the epilogue kernels generate cleanly at four shapes, so
+  the schedule matches the documented spacing; the shipped checker just does
+  not prove it.
+
 ## Non-goals
 
 - no fp16 or int8 path in this work; the engine is fp32 and the board has no

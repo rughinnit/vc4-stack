@@ -783,6 +783,7 @@ you see either message, run the two `make` commands above.
 | 3 | `UnsupportedNode` / arena exhausted | `vc4infer nodes model.onnx -v` |
 | 4 | `HostNotAllowed` / `NeedsDeviceDispatch` / host debt under `device` | `vc4infer nodes --mode hybrid --host-policy device` |
 | 6 | `NeedsDeviceDispatch` (control flow) | the node name in the message |
+| 8 | `MODEL DATA MISMATCH`: a shipped model file is not the packaged one | `cd /usr/share/vc4infer/models && sha256sum -c SHA256SUMS`, then reinstall |
 | 1/255 | daemon down, socket missing, permission | `systemctl status vc4d`, `id` |
 
 `vc4infer --version` prints the live backend and socket; if it says `vc4d is

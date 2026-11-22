@@ -35,6 +35,7 @@ Every node is also classified into exactly one execution tier:
 host-control | host-unwritten | unsupported-graph`` report used by
 ``Engine.node_backends`` and ``vc4infer nodes``.
 """
+import copy
 import json
 import os
 import onnx
@@ -827,10 +828,22 @@ def _tier(node, status, reason, dtypes, model):
             "numeric op with no VC4 kernel: %s" % reason)
 
 
-def analyse_model(model):
-    """Analyse an in-memory ModelProto and return the coverage report."""
+def analyse_model(model, shapes=None):
+    """Analyse an in-memory ModelProto and return the coverage report.
+
+    ``shapes`` lets a caller pass the map from ``refine_shapes`` (the runner
+    computes it once and reuses it for the pool estimate).  Without it the
+    map is recovered here: ONNX shape inference cannot see through a Slice
+    whose ends come from ``Shape(x)/2``, and v9 writes every C3k2 branch that
+    way, so a plain inference leaves every later tensor with unknown H/W and
+    the plan-time ``Shape`` folding fails.
+    """
     g = model.graph
-    shapes, dtypes = _shape_map(model)
+    if shapes is None:
+        shapes = refine_shapes(model)
+    else:
+        shapes = dict(shapes)
+    _shapes, dtypes = _shape_map(model)
     inits, init_types = _init_shapes(model)
     dtypes.update(init_types)
 
@@ -1084,3 +1097,79 @@ def fold_metadata(model, rep):
         folded.add(idx)
     return folded, known
 
+
+
+def refine_shapes(model, max_iter=16):
+    """Static shapes, recovering the ones ONNX inference cannot see.
+
+    A v9 C3k2 branch is ``Slice(x, starts=0, ends=Shape(x)[1]/2, axes=1)``
+    followed by more convs and more of the same.  ``ends`` is a runtime
+    value, so ``onnx.shape_inference`` gives the Slice output four symbolic
+    dims and every later tensor inherits them; the plan-time ``Shape``
+    folding then refuses the graph even though the input size is static.
+
+    The values are not runtime-dependent: they are Shape/Gather/Div/Mul on
+    integer metadata.  This function folds that chain with ``fold_metadata``,
+    replaces the Slice parameters it resolved, re-runs shape inference, and
+    repeats until no new parameter resolves (one Slice per C3k2 block, so a
+    handful of iterations).  It only changes a private copy of the graph;
+    the executor still runs the original nodes, whose values the plan-time
+    folder resolves.
+    """
+    shapes, dtypes = _shape_map(model)
+    if not any(n.op_type == "Slice" for n in model.graph.node):
+        return shapes
+
+    def meta(node):
+        if node.op_type in META_OPS:
+            return True
+        ins = [i for i in node.input if i]
+        return bool(ins) and all(
+            dtypes.get(i) is not None and not _is_float(dtypes[i])
+            for i in ins)
+
+    work = copy.deepcopy(model)
+    replaced = {}
+    for _ in range(max_iter):
+        fake = {"shapes": shapes,
+                "nodes": [{"tier": "host-meta" if meta(n) else "vc4"}
+                          for n in work.graph.node]}
+        try:
+            _folded, known = fold_metadata(work, fake)
+        except Exception:                                  # noqa: BLE001
+            break
+        extra = []
+        changed = False
+        for node in work.graph.node:
+            if node.op_type != "Slice":
+                continue
+            for k in range(1, min(5, len(node.input))):
+                name = node.input[k]
+                if not name or name not in known:
+                    continue
+                new = replaced.get(name)
+                if new is None:
+                    new = name + "__folded"
+                    replaced[name] = new
+                    extra.append(numpy_helper.from_array(
+                        np.asarray(known[name]), name=new))
+                node.input[k] = new
+                changed = True
+        if not changed:
+            break
+        work.graph.initializer.extend(extra)
+        try:
+            inf = onnx.shape_inference.infer_shapes(
+                work, strict_mode=False, data_prop=False)
+        except Exception:                                  # noqa: BLE001
+            break
+        newshapes = dict(shapes)
+        for v in list(inf.graph.value_info) + list(inf.graph.output):
+            dims = [int(d.dim_value) if d.HasField("dim_value") else -1
+                    for d in v.type.tensor_type.shape.dim]
+            if dims and all(d > 0 for d in dims):
+                newshapes[v.name] = dims
+        if newshapes == shapes:
+            break
+        shapes = newshapes
+    return shapes

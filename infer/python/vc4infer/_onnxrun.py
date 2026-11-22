@@ -697,6 +697,10 @@ class Runner:
         # The engine's own scratch (the conv padded image + im2col panel,
         # elementwise workspaces) still has to fit beside the pool, so it is
         # estimated too; VC4_POOL_RESERVE_MB overrides that estimate.
+        # Static shapes with the Slice-parameter chains resolved; the plan
+        # needs them for the pool estimate, and coverage uses the same map so
+        # a Shape node after a sliced C3k2 branch still folds.
+        self.shapes = coverage.refine_shapes(self.model)
         need, self.pool_plan = self._plan_pool_bytes()
         pool = getattr(eng, "_vc4_pool", None)
         if pool is None or pool.size < need:
@@ -839,7 +843,8 @@ class Runner:
     def coverage_report(self):
         """Cached static analysis (tiers included) of this model."""
         if self._coverage_report is None:
-            self._coverage_report = coverage.analyse_model(self.model)
+            self._coverage_report = coverage.analyse_model(
+                self.model, shapes=getattr(self, "shapes", None))
         return self._coverage_report
 
     def backend_plan(self):
@@ -1295,10 +1300,10 @@ class Runner:
             return t
         out = self._alloc_t((n, cp, h, w), "nhwc", w)
         if t.layout == "nhwc":
-            # same layout, different channel padding: not reachable from the
-            # conv path (it always pads to 16 before the first call)
-            raise UnsupportedNode("to_nhwc: NHWC re-pad C%d -> %d"
-                                  % (c, cp))
+            # A conv output trimmed to a real Cout (24, 40, ...) can feed the
+            # next conv, which wants Cin padded to 16: move each 16-channel
+            # block and let the partial-store lane mask zero the pad.
+            return self._repad_nhwc(t, cp)
         units = 4 if w % 4 == 0 else (2 if w % 2 == 0 else 1)
         # One call moves one 16-channel block of every pixel: the 16 lanes are
         # the channels (source lane stride H*W*4, NCHW planes), a row is a
@@ -1313,6 +1318,28 @@ class Runner:
                         self._buf_at(out, i * h * w * cp * 4 + k0 * 4),
                         h, w, w * 4, w * cp * 4, 4, cp * 4, h * w * 4,
                         nlane=nlan, units=units)
+        return out
+
+    def _repad_nhwc(self, t, cp):
+        """NHWC [n][h][pitch][c] -> [n][h][w][cp], zeroing the pad channels."""
+        n, c, h, w = t.shape
+        out = self._alloc_t((n, cp, h, w), "nhwc", w)
+        # single-vector stores: a partial block (depth < 16) is only defined
+        # for units == 1, and a re-pad is rare enough not to matter
+        units = 1
+        for i in range(n):
+            for k0 in range(0, c, 16):
+                nl = min(16, c - k0)
+                self._x(self._buf_at(t, (i * h * t.pitch * c + k0) * 4),
+                        self._buf_at(out, (i * h * w * cp + k0) * 4),
+                        h, w, t.pitch * c * 4, w * cp * 4, c * 4, cp * 4, 4,
+                        nl, 1, 64, 64, units, nl)
+            if cp > c:
+                # zero the pad channels; nlane=0 turns every lane into fill
+                off = (i * h * w * cp + c) * 4
+                self._x(self._buf_at(out, off), self._buf_at(out, off),
+                        h, w, w * cp * 4, w * cp * 4, cp * 4, cp * 4, 4,
+                        0, 1, 64, 64, units, cp - c)
         return out
 
     def _prepad(self, x, pads, value=0.0):
@@ -2035,18 +2062,22 @@ class Runner:
                 coff = 0
                 for t in ts:
                     cs = t.shape[1]
-                    if cs % 16 == 0:
-                        units = 4 if w % 4 == 0 else \
-                            (2 if w % 2 == 0 else 1)
-                        nb, dp, nl = cs // 16, 16, 16
-                    else:
-                        units, nb, dp, nl = 1, 1, cs, cs
-                    for i in range(n):
-                        self._x(
-                            self._buf_at(t, i * h * t.pitch * cs * 4),
-                            self._buf_at(out, (i * h * w * ct + coff) * 4),
-                            h, w, t.pitch * cs * 4, w * ct * 4, cs * 4,
-                            ct * 4, 4, nl, nb, 64, 64, units, dp)
+                    # a source wider than one 16-word store takes one call
+                    # per 16-channel block; the last block may be partial and
+                    # must be stored at depth=nl (24 channels again)
+                    units = (4 if w % 4 == 0 else
+                             (2 if w % 2 == 0 else 1)) \
+                        if (cs % 16 == 0 and ct % 16 == 0) else 1
+                    for kb in range(0, cs, 16):
+                        nl = min(16, cs - kb)
+                        for i in range(n):
+                            self._x(
+                                self._buf_at(
+                                    t, (i * h * t.pitch * cs + kb) * 4),
+                                self._buf_at(
+                                    out, (i * h * w * ct + coff + kb) * 4),
+                                h, w, t.pitch * cs * 4, w * ct * 4, cs * 4,
+                                ct * 4, 4, nl, 1, 64, 64, units, nl)
                     coff += cs
                 return out
             a = np.concatenate([self.nchw(t) for t in ts], axis=1)
@@ -2432,6 +2463,12 @@ class Runner:
         trailing axes are all full, so every output row is a contiguous run of
         the source.  That is every Slice in YOLOv8n and costs one launch.
 
+        A conv output is NHWC with a row pitch of ``align16(wo)`` pixels, not
+        compact NCHW.  A channel range there is a channel-strided copy that
+        keeps the pitch (every v9 C3k2 branch slices a conv output in half);
+        every other range uses the storage-coordinate gather.  The output is
+        compact NCHW in all cases.
+
         Every other form -- several axes, an interior axis with sliced trailing
         axes, or any step other than 1 including a negative one -- becomes one
         ``vc4_gather`` over an index table: the table is built per output
@@ -2469,9 +2506,6 @@ class Runner:
                                   "%d/%d/%d/%d" % (node.name, len(starts),
                                                     len(ends), len(axes),
                                                     len(steps)))
-        if x.layout != "nchw":
-            raise UnsupportedNode("Slice %s: needs the compact NCHW source"
-                                  % node.name)
         shp = [int(d) for d in x.shape]
         rank = len(shp)
         norm = []
@@ -2505,23 +2539,33 @@ class Runner:
         if not cut:
             return x
         if len(cut) == 1 and cut[0][3] == 1:
-            # affine: one sliced axis, contiguous output rows
             ax, st, en, _ = cut[0]
-            inner = int(np.prod(shp[ax + 1:]))
-            out_shape = list(shp)
-            out_shape[ax] = en - st
-            out = self._alloc_t(out_shape)
-            rows = int(np.prod(shp[:ax])) if ax else 1
-            run = (en - st) * inner
-            if run > 0:
-                self._runs(self._buf_at(x, st * inner * 4), out.buf, rows,
-                           run, shp[ax] * inner * 4, run * 4)
-            return out
-        # general: one index table, one gather launch
+            if x.layout == "nhwc":
+                # a conv output: a channel range is a channel-strided copy
+                # that keeps the source pitch (v9 slices every C3k2 branch
+                # this way); any other single axis takes the gather below.
+                if ax == 1:
+                    return self._slice_ch(x, st, en - st)
+            else:
+                # affine: one sliced axis, contiguous output rows
+                inner = int(np.prod(shp[ax + 1:]))
+                out_shape = list(shp)
+                out_shape[ax] = en - st
+                out = self._alloc_t(out_shape)
+                rows = int(np.prod(shp[:ax])) if ax else 1
+                run = (en - st) * inner
+                if run > 0:
+                    self._runs(self._buf_at(x, st * inner * 4), out.buf, rows,
+                               run, shp[ax] * inner * 4, run * 4)
+                return out
+        # general: one index table, one gather launch.  The table is built in
+        # the source's *storage* coordinates, so a pitched NHWC conv output
+        # is read at the right words and the padding is never addressed.
         rngs = [np.arange(d, dtype=np.int64) for d in shp]
         for ax, st, en, sp in norm:
             rngs[ax] = np.arange(st, en, sp, dtype=np.int64)
-        tab, out_shape = _flat_index(shp, list(range(rank)), rngs)
+        tab, out_shape = _storage_index(x.shape, x.layout, x.pitch,
+                                        list(range(rank)), rngs)
         return self._gather_flat(x, tab, out_shape)
 
     def _softmax(self, node):
@@ -2800,7 +2844,10 @@ class Runner:
         for i in range(n):
             sb = self._buf_at(x, i * h * x.pitch * c * 4)
             db = self._buf_at(out, i * hw * c * 4)
-            if x.pitch == w:
+            # the compact path stores 16-word vectors per channel plane, so
+            # it needs c % 16 == 0; a trimmed conv output (4, 24) with
+            # pitch == w still takes the one-word-per-channel path below
+            if x.pitch == w and c % 16 == 0:
                 nv = hw // 16
                 rem = hw % 16
                 if nv >= 4:
@@ -2833,20 +2880,37 @@ class Runner:
         return out
 
     def _slice_ch(self, x, c0, cn):
-        """x's channels [c0, c0+cn) as a new NHWC tensor, on the QPUs."""
+        """x's channels [c0, c0+cn) as a new NHWC tensor, on the QPUs.
+
+        One copy2d covers a channel count that is a multiple of 16 (nblk
+        blocks of 16 lanes).  Any other count takes one call per 16-lane
+        block, the last one partial: a QPU store writes at most 16 words, so
+        a 24-channel conv output cannot be trimmed in a single call.
+        """
         n, c, h, w = x.shape
         out = self._alloc_t((n, cn, h, w), "nhwc", w)
-        units = 4 if w % 4 == 0 else (2 if w % 2 == 0 else 1)
+        # units > 1 needs the pixel stride to be a multiple of 64 B
+        # (cn % 16 == 0); 24 channels is 96 B and takes single-vector stores
+        units = (4 if w % 4 == 0 else (2 if w % 2 == 0 else 1)) \
+            if cn % 16 == 0 else 1
         if cn % 16 == 0:
-            nb, dp, nl = cn // 16, 16, 16
-        else:
-            units, nb, dp, nl = 1, 1, cn, cn
-        for i in range(n):
-            self._x(self._buf_at(x, (i * h * x.pitch * c + c0) * 4),
-                    out.buf if n == 1 else self._buf_at(out, i * h * w * cn
-                                                       * 4),
-                    h, w, x.pitch * c * 4, w * cn * 4, c * 4, cn * 4, 4, nl,
-                    nb, 64, 64, units, dp)
+            for i in range(n):
+                self._x(self._buf_at(x, (i * h * x.pitch * c + c0) * 4),
+                        out.buf if n == 1 else
+                        self._buf_at(out, i * h * w * cn * 4),
+                        h, w, x.pitch * c * 4, w * cn * 4, c * 4, cn * 4, 4,
+                        16, cn // 16, 64, 64, units, 16)
+            return out
+        # A destination pixel is cn words wide, so a partial block must be
+        # stored at depth=nl: a 16-word store would spill into the next pixel
+        # (24 channels: the last block is 8 words, the pixel is 24).
+        for k0 in range(0, cn, 16):
+            nl = min(16, cn - k0)
+            for i in range(n):
+                self._x(self._buf_at(x, (i * h * x.pitch * c + c0 + k0) * 4),
+                        self._buf_at(out, (i * h * w * cn + k0) * 4),
+                        h, w, x.pitch * c * 4, w * cn * 4, c * 4, cn * 4, 4,
+                        nl, 1, 64, 64, units, nl)
         return out
 
     def _flatten(self, node):

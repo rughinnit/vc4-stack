@@ -19,17 +19,17 @@ arm64, Debian 13, kernel 6.18 — that is the board behind every number in
 | Pi 2 Model B v1.2 | BCM2837 / VideoCore IV | expected, untested | the v1.1 board is 32-bit only |
 | Pi 4, 400, CM4 | VideoCore VI | **not compatible** | different 3D block; the QPU path here does not apply |
 | Pi 5, CM5 | VideoCore VII | **not compatible** | same reason |
-| Pi 1, Zero, CM1, Pi 2 v1.1 | ARMv6/ARMv7 | **unverified** | no armhf build is shipped, and the maintainers do not have a 32-bit VideoCore IV board available for testing, so compatibility is unknown rather than measured |
+| Pi 1, Zero, CM1, Pi 2 v1.1 | ARMv6/ARMv7 | **unverified** | no armhf build is shipped, and I do not have a 32-bit VideoCore IV board to test on, so compatibility is unknown rather than measured |
 
 Requirements, all of them: a kernel with the `vc4` DRM driver bound to the V3D
 block, CMA large enough for the daemon arena plus the client's (96 MiB
 default), `dma-buf`, systemd for `vc4d`, and 64-bit userspace. No overclock is
 used or needed: core 400 MHz, V3D 300 MHz, both stock.
 
-The maintainers do not have a 32-bit VideoCore IV board (Pi 1, Zero,
-CM1, Pi 2 v1.1) available for testing, so those boards are
-**unmeasured**, not disproved: a claim would need an armhf build and a
-probe of the V3D identification and QPU geometry on the board itself.
+I do not have a 32-bit VideoCore IV board (Pi 1, Zero, CM1, Pi 2 v1.1)
+to test on, so those boards are **unmeasured**, not disproved: a claim
+would need an armhf build and a probe of the V3D identification and QPU
+geometry on the board itself.
 
 ## Install
 

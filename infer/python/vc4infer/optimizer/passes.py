@@ -31,6 +31,7 @@ plan printer reports node count, dispatch count and the op histogram.
 
 Pass 1: canonicalise
     constant-fold      fold a node whose inputs are all plan-time constants
+                       (including ConstantOfShape used as a weight source)
     dead-node          drop nodes whose outputs nothing reads
     identity           remove no-op Reshape/Cast/Transpose/Identity/...
     div-const          Div(x, k) -> Mul(x, 1/k), the executor's own lowering
@@ -61,11 +62,20 @@ from .ir import Graph
 # and a numpy fold would move the last bits for no gain.  Add/Sub/Mul/Neg/Abs
 # are exact IEEE fp32 in both places.
 FOLD_OPS = frozenset((
-    "Shape", "Size", "Constant", "Identity", "Cast", "Reshape", "Flatten",
-    "Squeeze", "Unsqueeze", "Transpose", "Concat", "Gather", "Slice",
-    "Add", "Sub", "Mul", "Neg", "Abs",
+    "Shape", "Size", "Constant", "ConstantOfShape", "Identity", "Cast",
+    "Reshape", "Flatten", "Squeeze", "Unsqueeze", "Transpose", "Concat",
+    "Gather", "Slice", "Add", "Sub", "Mul", "Neg", "Abs",
 ))
 MAX_FOLD_BYTES = 32 << 20
+
+# The nodes the plan-time fold owns.  They produce a tensor from constants
+# alone, so they are weight sources rather than runtime work, and the executor
+# has no dispatch for ConstantOfShape: a graph that keeps one is refused in
+# strict mode.  The budget is larger than one pass's because every weight of a
+# corpus graph arrives through these nodes; it is still bounded, because an
+# unfurled 400 MiB tensor would be copied twice on a 1 GiB board.
+PLAN_FOLD_OPS = frozenset(("ConstantOfShape",))
+PLAN_FOLD_BYTES = 64 << 20
 
 
 # ----------------------------------------------------------------- records
@@ -172,6 +182,62 @@ class _Ctx:
         return True
 
 
+def fold_plan_constants(model):
+    """Materialise constant metadata nodes before the plan is built.
+
+    A ``ConstantOfShape`` whose shape input is a plan-time constant computes a
+    tensor: it is a weight source, not a per-run activation.  Strict mode has
+    no dispatch for the node, and the arena has to count the bytes it carries
+    like any other initialiser, so the fold runs at load time and rewrites the
+    node into an initialiser.  The value is the node's own ``value`` attribute,
+    so the replacement is exact.
+
+    The shape tensors that only fed those nodes are dropped, and a graph input
+    that existed only to declare an initialiser goes with them: the ONNX test
+    corpus is IR v3, where every initialiser must also be a graph input, and
+    the runner admits fp32 inputs only.
+
+    A constant fill larger than the plan-time budget raises
+    :class:`UnsupportedNode` with the tensor's shape, its byte count and the
+    limit it missed; an unfurled tensor of that size would be copied twice on
+    a 1 GiB board.
+
+    Returns ``(model, folded_node_names)``.  The input model object is
+    returned unchanged when there is nothing to fold.
+    """
+    from .._errors import UnsupportedNode
+
+    if not any(n.op_type in PLAN_FOLD_OPS for n in model.graph.node):
+        return model, []
+    graph = Graph.from_model(model)
+    declared = set(graph.initializers)
+    refused = []
+    # An initialiser may be a graph output, so a constant fill that *is* the
+    # output folds too; the value is in the initialiser table either way.
+    st = _fold_constants(graph, ops=PLAN_FOLD_OPS, budget=PLAN_FOLD_BYTES,
+                         limit=MAX_FOLD_BYTES, refused=refused,
+                         keep_outputs=False)
+    if refused:
+        name, shape, nbytes, why = refused[0]
+        raise UnsupportedNode(
+            name, "ConstantOfShape",
+            "constant fill %s needs %d bytes (%.1f MiB) of weights, %s"
+            % ("x".join(str(d) for d in shape), nbytes, nbytes / 2.0 ** 20,
+               why))
+    if not st.matched:
+        return model, []
+    graph.drop_unused_initializers()
+    used = {o.name for o in graph.outputs}
+    for n in graph.nodes:
+        used.update(i for i in n.proto.input if i)
+    graph.inputs = [vi for vi in graph.inputs
+                    if vi.name not in declared or vi.name in used]
+    graph.meta["ir_version"] = max(int(graph.meta.get("ir_version") or 0), 4)
+    graph.reindex()
+    graph.refresh()
+    return graph.to_model(), list(st.removed)
+
+
 # --------------------------------------------------------------- canonical
 class Canonicalise(Pass):
     key = "canonicalise"
@@ -191,20 +257,21 @@ class Canonicalise(Pass):
         return out
 
 
-def _fold_constants(graph):
+def _fold_constants(graph, ops=FOLD_OPS, budget=MAX_FOLD_BYTES,
+                    limit=MAX_FOLD_BYTES, refused=None, keep_outputs=True):
     st = RuleStat("constant-fold")
     before = len(graph.nodes)
     folded = {}
-    budget = MAX_FOLD_BYTES
     keep = []
     for node in graph.nodes:
         op = node.op_type
         outs = [o for o in node.proto.output if o]
-        if (op not in FOLD_OPS or not outs or len(outs) != 1 or
+        if (op not in ops or not outs or len(outs) != 1 or
                 any(a.type in (onnx.AttributeProto.GRAPH,
                                onnx.AttributeProto.GRAPHS)
                     for a in node.proto.attribute) or
-                outs[0] in graph.graph_outputs() or op == "Constant"):
+                (keep_outputs and outs[0] in graph.graph_outputs()) or
+                op == "Constant"):
             keep.append(node)
             continue
         ins = [i for i in node.proto.input if i]
@@ -223,7 +290,12 @@ def _fold_constants(graph):
             continue
         if arr.dtype == np.float64:
             arr = arr.astype(np.float32)
-        if arr.nbytes > budget:
+        if arr.nbytes > limit or arr.nbytes > budget:
+            if refused is not None:
+                why = ("over the %d MiB single-tensor limit" % (limit >> 20)
+                       if arr.nbytes > limit else
+                       "over the remaining %d MiB fold budget" % (budget >> 20))
+                refused.append((node.name, list(arr.shape), arr.nbytes, why))
             keep.append(node)
             continue
         budget -= arr.nbytes

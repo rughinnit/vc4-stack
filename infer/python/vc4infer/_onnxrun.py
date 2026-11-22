@@ -692,6 +692,13 @@ class Runner:
             self.optimise_report = optimizer.optimise(self.model, passes=spec)
             if self.optimise_report.changed:
                 self.model = self.optimise_report.model
+        # ConstantOfShape with a constant shape computes a tensor, not a
+        # per-run activation.  Fold it before the pool is sized so the weights
+        # it carries are counted like any other initialiser; strict mode has no
+        # dispatch for the node, and a fill too large to fold is refused with
+        # its byte count (optimizer.passes.fold_plan_constants).
+        from .optimizer import fold_plan_constants
+        self.model, self.plan_folds = fold_plan_constants(self.model)
         self.graph = self.model.graph
         self.values = {}
         self.host = {}          # host copy of every initializer / Constant

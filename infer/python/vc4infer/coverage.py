@@ -93,6 +93,8 @@ OPS = {
     "Identity": "view (no copy)",
     "Constant": "initialiser",
     "Shape": "folded at plan time (no runtime work)",
+    "ConstantOfShape": "constant fill folded at plan time (weights, not "
+                       "activation work)",
     "Gather": "folded at plan time when it indexes shapes",
     "Exp": "QPU unary (UOP_EXP, |x|<=88, max rel 5.7e-6)",
     "Log": "QPU unary (UOP_LOG, 2^-126<=x<inf, max rel 4.8e-7; refused outside)",
@@ -352,6 +354,17 @@ def _rank(shapes, name):
 
 def _is_float(elem):
     return elem in _FLOAT_TYPES
+
+
+def _check_constantofshape(node, shapes, inits):
+    """A constant fill is foldable iff its shape input is a plan-time value."""
+    name = node.input[0] if node.input else ""
+    shape = inits.get(name)
+    if not shape:
+        return ("unsupported",
+                "shape input %r is not a plan-time constant" % (name or "<none>",))
+    return ("supported", "constant fill %s folded at plan time"
+            % "x".join(str(int(d)) for d in shape))
 
 
 def _check_conv(node, shapes, inits):
@@ -680,6 +693,7 @@ _CHECKS = {
     "CumSum": _check_cumsum,
     "ArgMax": _check_eargmax,
     "ArgMin": _check_eargmax,
+    "ConstantOfShape": _check_constantofshape,
     "Conv": _check_conv,
     "Clip": _check_clip,
     "MaxPool": _check_maxpool,

@@ -1,4 +1,22 @@
-# vc4-stack — VideoCore IV compute stack
+# vc4-stack — ONNX, PyTorch, JAX and TensorFlow on the Raspberry Pi GPU
+
+Runs neural networks on the **VideoCore IV** QPUs of a Raspberry Pi 3B — the GPU
+that shipped with the board in 2016 — with the ARM cores doing only control and
+byte movement.  There is no CPU arithmetic fallback: an operator either executes
+on the QPUs or is refused by name.
+
+| measured on the board | |
+|---|---|
+| ONNX operators, expressible set | **152/152**, 0 refused, 0 mismatched |
+| YOLOv8n 160x160, every op on the QPUs | **481.7 ms / 2.08 FPS** (ncnn on the four A53 cores: 74.8 ms) |
+| GEMM, hand-written QPU kernel | **13.7 GFLOP/s** at 256 cubed |
+| PyTorch backend | 244 completeness checks, autograd for its whole op table |
+| JAX (PJRT) | 25 VHLO operations, `jax.grad` stays on the device |
+| LiteRT (external delegate) | 44 checks on silicon, claimed nodes on the QPUs |
+
+Every number is measured on the board at stock clocks; the conditions are in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), and what is still open is in
+[`docs/STATUS.md`](docs/STATUS.md).
 
 Target: Raspberry Pi 3B, Broadcom VideoCore IV (V3D), Debian 13 arm64, **stock
 clocks** (core 400 MHz / V3D 300 MHz).  Everything that computes runs on the

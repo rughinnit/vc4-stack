@@ -608,7 +608,8 @@ def _attr(node, name, default=None):
 
 
 class Runner:
-    def __init__(self, model_path, eng, mode="strict", host_policy="device"):
+    def __init__(self, model_path, eng, mode="strict", host_policy="device",
+                 passes=None):
         if mode not in ("strict", "hybrid"):
             raise ValueError("mode must be 'strict' or 'hybrid'")
         if host_policy not in ("device", "structural", "any"):
@@ -619,6 +620,18 @@ class Runner:
         self.mode = mode
         self.host_policy = host_policy
         self.model = onnx.load(model_path)
+        # Graph optimisation (docs/OPTIMIZER.md).  Every pass is off by
+        # default: `passes` / $VC4_OPT selects them, and an empty spec leaves
+        # the model, the node indices and the SiLU rewrite exactly as they
+        # were.  The rewrite runs before the pool plan, so the plan is sized
+        # from the graph that will actually execute.
+        self.optimise_report = None
+        spec = passes if passes is not None else os.environ.get("VC4_OPT", "")
+        if str(spec or "").strip() not in ("", "none"):
+            from . import optimizer
+            self.optimise_report = optimizer.optimise(self.model, passes=spec)
+            if self.optimise_report.changed:
+                self.model = self.optimise_report.model
         self.graph = self.model.graph
         self.values = {}
         self.host = {}          # host copy of every initializer / Constant
@@ -675,6 +688,81 @@ class Runner:
             else:
                 raise UnsupportedNode("graph input %s: only fp32 inputs" % inp.name)
         self._find_silu()
+        self._collect_fused()
+
+    # ---------------------------------------------------- optimiser markers
+    def _collect_fused(self):
+        """Read the optimiser's provenance records into dispatch tables.
+
+        A node marked ``fused`` is skipped (its work happens in ``into``); a
+        node that carries a rewrite rule (``silu``, ``hardswish``, ``affine``,
+        ``activation``) finds what to compute here instead of re-deriving it.
+        A model with no markers yields empty tables and the executor behaves
+        exactly as it did before the optimiser existed.
+
+        The record lives on one ``doc_string`` line (see
+        ``vc4infer.optimizer.ir``); a malformed line is ignored rather than
+        failing a run, because a run must never depend on debug metadata.
+        """
+        self._fused = {}
+        self._fused_skip = {}
+        try:
+            from .optimizer.ir import Node as _IRNode
+        except Exception:                       # pragma: no cover
+            self._skip = set(getattr(self, "_silu_skip", None) or set())
+            self._skip_reason = {}
+            return
+        for i, n in enumerate(self.graph.node):
+            try:
+                rec = _IRNode(n, i).fused
+            except Exception:                   # pragma: no cover
+                continue
+            if not rec:
+                continue
+            rules = rec.get("rules") or {}
+            if rules:
+                self._fused[i] = rules
+            if "fused" in rules:
+                self._fused_skip[i] = rules["fused"].get("by", "fused")
+        self._skip = set(getattr(self, "_silu_skip", None) or set())
+        self._skip_reason = {}
+        for i in self._skip:
+            self._skip_reason[i] = "fused into the consumer Mul as one SiLU launch"
+        for i, by in self._fused_skip.items():
+            self._skip.add(i)
+            self._skip_reason[i] = "fused into %s (%s)" % (
+                (self._fused.get(i) or {}).get("fused", {}).get("into", "?"),
+                by)
+        # A fused *activation* still owns its output name: downstream nodes and
+        # a graph output read the activation's result, not the conv's.  The
+        # conv returns the activated buffer, so at the skipped node's turn the
+        # name is moved onto that buffer (one owner, so the pool cannot free a
+        # reused block twice).
+        self._alias = {}
+        by_name = {}
+        for i, n in enumerate(self.graph.node):
+            # the pass records Node.name, which falls back to "<Op>_<index>"
+            by_name[n.name or ("%s_%s" % (n.op_type, i))] = i
+        for i, by in self._fused_skip.items():
+            if by != "activation":
+                continue
+            into = (self._fused.get(i) or {}).get("fused", {}).get("into")
+            j = by_name.get(into)
+            if j is None:
+                continue
+            dst = self.graph.node[i].output[0] if self.graph.node[i].output else ""
+            src = self.graph.node[j].output[0] if self.graph.node[j].output else ""
+            if dst and src:
+                self._alias[i] = (dst, src)
+
+    def _apply_alias(self, idx):
+        """Move a fused activation's output name onto the producing buffer."""
+        pair = self._alias.get(idx)
+        if not pair:
+            return
+        dst, src = pair
+        if src in self.values and dst not in self.values:
+            self.values[dst] = self.values.pop(src)
 
     # ------------------------------------------------------ host-tier policy
     def _fold_metadata(self):
@@ -940,8 +1028,31 @@ class Runner:
         self._silu_skip = set()             # indices never dispatched
         self._silu_src = {}                 # Mul index -> x tensor name
         self._node_idx = None
+        # A recorded rewrite wins over the implicit scan below: the optimiser
+        # pass states which Mul is the SiLU and which Sigmoid it absorbed, and
+        # that record survives VC4_NO_SILU_FUSE (which only disables the
+        # executor's own habit, so the pass can be measured against it).
+        try:
+            from .optimizer.ir import Node as _IRNode
+            producer = {}
+            for i, n in enumerate(self.graph.node):
+                for o in n.output:
+                    if o:
+                        producer[o] = i
+            for i, n in enumerate(self.graph.node):
+                rec = _IRNode(n, i).fused or {}
+                f = (rec.get("rules") or {}).get("silu")
+                if not f or not f.get("input"):
+                    continue
+                self._silu_src[i] = f["input"]
+                for nm in f.get("replaces") or []:
+                    j = producer.get(nm)
+                    if j is not None:
+                        self._silu_skip.add(j)
+        except Exception:                   # pragma: no cover
+            pass
         if os.environ.get("VC4_NO_SILU_FUSE"):
-            return                          # A/B switch (no rewrite)
+            return                          # A/B switch (no implicit rewrite)
         producer = {}
         for i, n in enumerate(self.graph.node):
             for o in n.output:
@@ -1273,7 +1384,34 @@ class Runner:
             pad, dil, out)
         return Tensor(out, (N, Cout, h, w), "nhwc", pitch=o)
 
+    def _epilogue(self, node, t):
+        """Apply an activation the optimiser attached to this node.
+
+        The conv and GEMM kernels have no epilogue, so this is still one
+        elementwise launch: the fusion removes a node dispatch and the
+        intermediate tensor's lifetime, not a launch.  ``docs/OPTIMIZER.md``
+        records that distinction; the plan printer reports it the same way.
+        """
+        f = self._fused.get(self._node_idx, {}).get("activation")
+        if not f or not isinstance(t, Tensor):
+            return t
+        act = f.get("act")
+        out = self.pool.alloc(t.size * 4 + 64)
+        if act == "relu":
+            self.eng.elementwise(vc4infer.OP_RELU, t.buf, out, t.size)
+        elif act == "relu6":
+            self.eng.unary(vc4infer.UOP_CLIP, t.buf, out, t.size,
+                           0.0, 6.0, 0.0)
+        else:
+            self.pool.release(out)
+            return t
+        self._tmp(t)
+        return Tensor(out, t.shape, t.layout, t.pitch)
+
     def _conv(self, node):
+        return self._epilogue(node, self._conv_impl(node))
+
+    def _conv_impl(self, node):
         x = self._float(node.input[0])
         w = self._float(node.input[1])
         b = self._float(node.input[2]) if len(node.input) > 2 and node.input[2] else None
@@ -2426,6 +2564,9 @@ class Runner:
         return out
 
     def _matmul(self, node):
+        return self._epilogue(node, self._matmul_impl(node))
+
+    def _matmul_impl(self, node):
         a = self._float(node.input[0])
         b = self._float(node.input[1])
         if len(a.shape) != 2 or len(b.shape) != 2:
@@ -2441,6 +2582,9 @@ class Runner:
         return Tensor(out, (M, N))
 
     def _gemm(self, node):
+        return self._epilogue(node, self._gemm_impl(node))
+
+    def _gemm_impl(self, node):
         a = self._float(node.input[0])
         b = self._float(node.input[1])
         alpha = float(_attr(node, "alpha", 1.0))
@@ -2688,6 +2832,14 @@ class Runner:
         return op(np.asarray(a), np.asarray(b)).astype(np.int64)
 
     def _add(self, node):
+        f = self._fused.get(self._node_idx, {}).get("affine")
+        if f:                                  # Add(Mul(x,a),b) -> AFFINE(x)
+            # UOP_AFFINE is a*p0 + p1 with the same two roundings the two
+            # kernels did (mul, then add), so the bytes agree.  Checked before
+            # the host binop: the Mul this replaces is skipped, so its output
+            # name has no value and must never be looked up.
+            return self._uop_on(self._float(f["input"]), vc4infer.UOP_AFFINE,
+                                float(f["alpha"]), float(f["beta"]))
         r = self._host_binop(node, np.add)
         if r is not None:
             return r
@@ -2697,6 +2849,10 @@ class Runner:
         src = self._silu_src.get(self._node_idx)
         if src is not None:                    # Mul(x, Sigmoid(x)) -> SiLU(x)
             return self._silu(self._float(src))
+        f = self._fused.get(self._node_idx, {}).get("hardswish")
+        if f:                                  # Mul(x, HardSigmoid(x))
+            return self._uop_on(self._float(f["input"]),
+                                vc4infer.UOP_HARDSWISH)
         r = self._host_binop(node, np.multiply)
         if r is not None:
             return r
@@ -2921,16 +3077,18 @@ class Runner:
             self._plan()
         self.profile = []
         self.backend_report = []
-        skip = getattr(self, "_silu_skip", None) or set()
+        skip = self._skip
         hybrid = self.mode == "hybrid"
         plan = self.backend_plan() if hybrid else None
         for idx, node in enumerate(self.graph.node):
             name = self._node_name(idx, node)
             if idx in skip or (plan is not None and
                               plan[idx]["backend"] == "folded"):
+                if idx in skip:
+                    self._apply_alias(idx)
                 if hybrid:
                     backend = "vc4" if idx in skip else "folded"
-                    reason = ("fused into the consumer Mul as one SiLU launch"
+                    reason = (self._skip_reason.get(idx)
                               if idx in skip else plan[idx]["reason"])
                     self.backend_report.append({
                         "index": idx, "name": name, "op": node.op_type,

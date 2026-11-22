@@ -165,7 +165,8 @@ class Engine:
     """
 
     def __init__(self, model_path, device=None, *, mode="strict",
-                 host_policy="device", arena_mb=None, cache_dir=None):
+                 host_policy="device", arena_mb=None, cache_dir=None,
+                 passes=None):
         if mode not in ("strict", "hybrid"):
             raise ValueError("mode must be 'strict' or 'hybrid'")
         if host_policy not in ("device", "structural", "any"):
@@ -187,7 +188,8 @@ class Engine:
         try:
             self._runner = _runtime.Runner(self.model_path, self._eng,
                                            mode=mode,
-                                           host_policy=host_policy)
+                                           host_policy=host_policy,
+                                           passes=passes)
             # A graph with no fp32 input is legal: a generator such as
             # RandomUniform/RandomNormal, or a constant-folded graph.  It runs
             # with an empty feed (or an integer feed such as a shape).  The old
@@ -287,6 +289,16 @@ class Engine:
         status = {"supported": True, "unsupported": False, "unknown": None}
         return [NodeInfo(n["name"], n["op"], status[n["status"]],
                          n["reason"]) for n in self._coverage()["nodes"]]
+
+    @property
+    def optimise_report(self):
+        """The optimiser passes that ran and what each one changed.
+
+        ``None`` when no pass was enabled.  Each ``PassResult`` carries the
+        before/after node count, the fused count and one ``RuleStat`` per rule
+        (`docs/OPTIMIZER.md`).
+        """
+        return self._runner.optimise_report
 
     def node_backends(self):
         """Where each node runs, as ``[(name, op, backend, reason)]``.

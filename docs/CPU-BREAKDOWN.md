@@ -127,6 +127,66 @@ C binding calls per frame fall from 403 to 232, and `op host code` - the row
 that held the attribute walk and the dispatch table - falls from 0.0851 s to
 0.0454 s.
 
+### 3.3 Layout assignment
+
+The executor chose a tensor's layout per node.  A 1-channel conv output came
+back packed NHWC with `pitch == W`, which is the same byte order as NCHW, but
+the `Reshape` that read it did not know that and converted the plane: 33
+`copy2d_x` launches of four rows by 16 words each, on the DFL head of
+YOLOv8n-160.  The layout pass names that tensor NCHW at its producer and the
+executor relabels the buffer; no byte moves.
+
+The pass removes one copy row and 33 launches; the other rows are copies of
+real data (a concat or a split is not a relabel):
+
+| copy row | before | after | what it is |
+|---|---:|---:|---|
+| `/model.22/dfl/Reshape_1` (from `dfl/conv`) | 33 | 0 | NHWC->NCHW of a 1x1x4x525 plane, identical bytes |
+| 13 C2f/SPPF `Concat` | 38 | 38 | channel concat, a real copy |
+| 8 `Split` | 16 | 16 | channel split, a real copy |
+| 3 SPPF `MaxPool` | 6 | 6 | border fill + interior copy |
+| 2 `Resize` | 2 | 2 | nearest upsample |
+| 6 box-head `Reshape` | 8 | 8 | NHWC->NCHW before the anchor concat |
+| `dfl/Transpose` | 1 | 1 | permute before the class softmax |
+| 2 `Slice` | 2 | 2 | box-coordinate slices |
+| **total** | **106** | **73** | 36 copy nodes -> 35 |
+
+The number of calls removed scales with the anchor count, because the plane
+is 4x525 at 160 but 4x336 at 128 and 4x189 at 96: `ceil(anchors/16)` is 33,
+21 and 12.  The A/B on the rebased tree (`920a683` plus this pass), three
+interleaved rounds per size, median of 8 timed runs after 2 warm-ups, one
+client, `tools/thermal-guard.sh --max 75`, ARM min/max 1.0 GHz, client and
+daemon CPU from `/proc/<pid>/stat`:
+
+| imgsz | launches | wall ms | client CPU-s | daemon CPU-s | total CPU-s |
+|---:|---|---:|---:|---:|---:|
+| 96 before | 291 | 358.8 | 0.176 | 0.047 | 0.224 |
+| 96 after | 279 | 358.7 | 0.176 | 0.046 | 0.222 |
+| 128 before | 297 | 388.8 | 0.179 | 0.051 | 0.229 |
+| 128 after | 276 | 387.4 | 0.180 | 0.050 | 0.230 |
+| 160 before | 365 | 470.5 | 0.199 | 0.065 | 0.264 |
+| 160 after | 332 | 465.9 | 0.198 | 0.064 | 0.260 |
+
+The output is **bit-identical** in every size and round (`np.array_equal`);
+the pass changes a label and the recorded plan, no arithmetic.  At 96 and 128
+the wall and CPU difference is inside the run-to-run spread (wall +/-1 ms,
+total CPU +/-0.002 s); at 160 it is outside it: **wall -4.6 ms (-1.0 %),
+total CPU -0.004 s (-1.4 %), of which daemon CPU is -1.9 %**.  Client CPU
+barely moves because the removed calls are small device copies with almost no
+Python work on either side of them: the win is the daemon round trips.
+
+The remaining 73 copy launches are not relabels.  A channel concat or split
+moves each input into a new contiguous buffer, and the box-head `Reshape`
+reorders pixel-major conv output into the `[1,64,525]` the anchor concat is
+written on.  Removing those needs a consumer that reads several source
+buffers (concat) or an anchor-major head rewrite, not a layout choice.
+
+Include the pass in `all`: it removes launches at every size, its output is
+bit-identical, and the 160 frame is 1.0 % faster in wall and 1.4 % cheaper in
+CPU.  The gain is small because the removed calls are the cheapest in the
+frame; the case for it is that the cost is zero and the decision is now
+recorded instead of being re-derived per node.
+
 ## 4. Result at the three sizes
 
 Same protocol as the cost page: one GPU client, fan fitted,
@@ -167,8 +227,9 @@ dominated by four costs:
 * **daemon, 0.065 s.**  Most of it is the poll loop: `vc4d` reads `SRQCS` and
   sleeps 10 us per iteration while the kernel runs.  On the previous build the
   loop measured about 88 us of daemon CPU per launch; with the short copy
-  launches gone, the 365 that remain are the long kernels, so the average cost
-  per remaining launch is higher (0.065 s / 365 = 178 us).  A coarser poll
+  launches gone, the 365 that remained at that measurement are the long
+  kernels, so the average cost per remaining launch is higher (0.065 s / 365 =
+  178 us).  The layout pass takes 33 of them (sec. 3.3).  A coarser poll
   interval would cut this and add latency; it is a trade, not a free win.
 * **C op setup, 0.055 s.**  The padded image is 0.021 s of it (24.8 MB zeroed,
   6.6 MB copied) and the GEMM alignment copies are most of the rest.  Zeroing
@@ -182,8 +243,8 @@ dominated by four costs:
 A C-side execution plan that walked the node list and called the existing C op
 entry points would remove the last two rows together; that is the larger
 rewrite this measurement does not attempt.  Reducing the launch count further
-(Softmax still issues 40 launches, Reshape 41, Add 38) would attack the first
-two.
+(Softmax still issues 40 launches, Add 38; the Reshape row was 41 before the
+layout pass and is 8 after it, sec. 3.3) would attack the first two.
 
 At these numbers the QPU path now spends less CPU per delivered frame than
 ncnn at 4 threads with passive waiting at 128 and 160, and is about level with

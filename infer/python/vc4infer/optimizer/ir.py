@@ -302,6 +302,8 @@ class Graph:
             model.producer_name = self.meta["producer_name"]
         if self.meta.get("producer_version"):
             model.producer_version = self.meta["producer_version"]
+        if self.meta.get("doc_string"):
+            model.doc_string = self.meta["doc_string"]
         model.graph.CopyFrom(graph)
         for fn in (self.meta.get("functions") or []):
             try:
@@ -363,7 +365,8 @@ class Graph:
     def summary(self):
         """One-line plan description used by the printer and its diffs."""
         return {"nodes": len(self.nodes), "ops": self.histogram(),
-                "fused": sum(1 for n in self.nodes if n.fused)}
+                "fused": sum(1 for n in self.nodes if n.fused),
+                "layout": bool(self.meta.get("layout"))}
 
     def value_names(self):
         names = set(self.initializers)

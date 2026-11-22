@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.join(REPO, "infer", "python"))
 
 import vc4infer                                            # noqa: E402
 from vc4infer import optimizer as O                        # noqa: E402
+from vc4infer.optimizer.plan import layout_record          # noqa: E402
 from vc4infer._onnxrun import Runner                       # noqa: E402
 from vc4infer._binding import (OP_SILU, UOP_AFFINE,         # noqa: E402
                                UOP_HARDSWISH, LAYOUT_ROW_MAJOR, ACT_RELU)
@@ -489,23 +490,31 @@ def test_plan_model():
     print("  note: %d copy-class rows differ; the profile predates the QPU "
           "layout copies" % len(copy_bad))
     # the passes' plan-level effect on the corpus: 57 conv -> silu pairs,
-    # 467 launches
+    # 467 launches, and the one 1-channel head conversion (33 calls)
     res = O.optimise(m, passes="all")
     p1 = O.plan_of(res.graph)
     check(p1.total == 285,
-          "all passes: 752 -> 285 launches (got %d)" % p1.total)
+          "all passes: 785 -> 285 launches (got %d)" % p1.total)
     check(p1.exact == 212, "the exact classes are 212 of them (got %d)"
           % p1.exact)
     check(p1.dispatches == plan.dispatches - 68,
           "11 metadata + 57 activation dispatches fewer (%d -> %d)"
           % (plan.dispatches, p1.dispatches))
     check(p1.nodes == plan.nodes - 11, "11 nodes fewer in the graph")
+    # the layout pass on its own is the 33-call conversion of the DFL head's
+    # 1-channel conv output; it changes no node and no arithmetic
+    only_layout = O.plan_of(O.optimise(m, passes="layout").graph)
+    check(only_layout.total == plan.total - 33,
+          "layout: 33 copy launches fewer (%d -> %d)"
+          % (plan.total, only_layout.total))
+    check(only_layout.nodes == plan.nodes, "layout changes no node")
+    check(only_layout.exact == plan.exact, "layout changes no exact launch")
     # and the switches bisect it: without the epilogue, or without the ew
     # pass that records the SiLU pair, nothing is folded
     for spec in ("all,-epilogue", "all,-ew"):
         p = O.plan_of(O.optimise(m, passes=spec).graph)
-        check(p.total == plan.total,
-              "%s keeps the launch count (%d)" % (spec, p.total))
+        check(p.total == only_layout.total,
+              "%s keeps the elementwise launch count (%d)" % (spec, p.total))
 
 
 def test_dispatch_fake_engine():
@@ -608,9 +617,10 @@ def test_resolve():
     print("pass switches")
     check([p.key for p in O.resolve_passes("")] == [], "default is no passes")
     check([p.key for p in O.resolve_passes("all")] ==
-          ["canonicalise", "ew", "epilogue"], "all = pipeline order")
+          ["canonicalise", "ew", "epilogue", "layout"],
+          "all = pipeline order")
     check([p.key for p in O.resolve_passes("all,-ew")] ==
-          ["canonicalise", "epilogue"], "-ew disables one")
+          ["canonicalise", "epilogue", "layout"], "-ew disables one")
     check([p.key for p in O.resolve_passes("epilogue,canonicalise")] ==
           ["canonicalise", "epilogue"], "explicit list keeps pipeline order")
     try:
@@ -835,6 +845,71 @@ def test_opmatrix_sweep(directory):
           "reference implementation" % (checked, failed, slow, gap))
 
 
+def mk_conv_1ch(shape=(1, 16, 8, 8)):
+    """Conv to one channel, then a Reshape: NHWC and NCHW are the same bytes."""
+    rng = np.random.default_rng(18)
+    w = rng.standard_normal((1, 16, 1, 1)).astype(np.float32) * 0.1
+    x = _vi("X", shape)
+    n = [helper.make_node("Conv", ["X", "W"], ["C"]),
+         helper.make_node("Reshape", ["C", "shp"], ["Y"])]
+    inits = [numpy_helper.from_array(w, "W"),
+             numpy_helper.from_array(np.asarray([1, -1], np.int64), "shp")]
+    return _model(n, [x], [_vi("Y", (1, 64))], inits)
+
+
+def test_layout():
+    print("pass 4: layout assignment")
+    m = mk_conv_1ch()
+    m.doc_string = "a model doc string the IR must keep"
+    p0 = O.plan_of(O.Graph.from_model(m))
+    res = O.optimise(m, passes="layout")
+    onnx.checker.check_model(res.model)
+    check(m.doc_string in res.model.doc_string,
+          "the model doc_string survives the rewrite")
+    rec = layout_record(res.model.doc_string)
+    check(rec.get("C") == "nchw",
+          "the 1-channel conv output is recorded nchw (%s)" % rec.get("C"))
+    check(rec.get("Y") == "nchw", "the reshaped output is nchw")
+    check(rec.get("X") == "nchw", "the graph input stays NCHW at the boundary")
+    p1 = O.plan_of(res.graph)
+    check(p1.total == p0.total - 1,
+          "the Reshape conversion is gone (%d -> %d)" % (p0.total, p1.total))
+    check(p1.nodes == p0.nodes, "no node was added or removed")
+    _same_answer(m, res.model, {"X": np.random.default_rng(19)
+                                .standard_normal((1, 16, 8, 8))
+                                .astype(np.float32)}, "layout")
+    # an elementwise chain keeps the packed form: Relu after the conv must not
+    # force a conversion, but the Reshape after it must
+    m = mk_conv_1ch()
+    g = O.Graph.from_model(m)
+    for n in g.nodes:
+        if n.op_type == "Reshape":
+            n.set_inputs(["R", "shp"])
+    g.nodes.insert(1, O.Node(helper.make_node("Relu", ["C"], ["R"]), 1))
+    g.reindex()
+    g.refresh()
+    res2 = O.optimise(g.to_model(), passes="layout")
+    rec = layout_record(res2.model.doc_string)
+    check(rec.get("R") == "nchw",
+          "a layout-neutral op between conv and Reshape is relabelled too")
+    # the executor relabels only a 1-channel plane whose pitch is its width
+    r = object.__new__(Runner)
+    r._layout_nchw = {"C"}
+    node = helper.make_node("Relu", ["X"], ["C"], name="relu")
+
+    class _Buf:
+        off = 0
+        bytes = 1 << 20
+
+    from vc4infer._onnxrun import Tensor as _T
+    flat = _T(_Buf(), (1, 1, 4, 525), "nhwc", 525)
+    pitched = _T(_Buf(), (1, 1, 4, 525), "nhwc", 528)
+    got = r._relabel_outputs(node, [flat])
+    check(got[0].layout == "nchw", "pitch == W is relabelled")
+    got = r._relabel_outputs(node, [pitched])
+    check(got[0].layout == "nhwc", "a pitched plane is left NHWC")
+
+
 def main():
     print("vc4infer optimiser tests (no device)")
     sweep = None
@@ -844,6 +919,7 @@ def main():
     test_canonicalise()
     test_ew()
     test_epilogue()
+    test_layout()
     test_plan_model()
     test_dispatch_fake_engine()
     test_dispatch_matmul_fold()

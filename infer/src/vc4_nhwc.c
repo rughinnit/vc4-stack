@@ -58,9 +58,13 @@ static int nhwc_pad_image(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
     float *p = vc4__scratch_alloc(ctx, per * (size_t)nimg + NHWC_SLACK, NULL);
     if (!p)
         return 0;
+    int prof = vc4_prof_enabled();
+    uint64_t pz0 = prof ? vc4_prof_now() : 0;
     memset((uint8_t *)p, 0, per * (size_t)nimg + NHWC_SLACK);
+    uint64_t pz1 = prof ? vc4_prof_now() : 0;
     if (nimg)
         vc4__invalidate_off(ctx, in->off, (size_t)nimg * H * in_pitch * C * 4u);
+    uint64_t pc0 = prof ? vc4_prof_now() : 0;
     for (int n = 0; n < nimg; ++n) {
         const uint8_t *src = ctx->arena + in->off +
                              (size_t)n * H * in_pitch * C * 4u;
@@ -68,6 +72,13 @@ static int nhwc_pad_image(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
         for (int y = 0; y < H; ++y)
             memcpy(dst + ((size_t)(y + pt) * wp + pl) * C * 4u,
                    src + (size_t)y * in_pitch * C * 4u, (size_t)W * C * 4u);
+    }
+    if (prof) {
+        uint64_t pc1 = vc4_prof_now();
+        vc4_prof_add(0, pz1 - pz0);
+        vc4_prof_add(1, pc1 - pc0);
+        vc4_prof_bytes(0, per * (size_t)nimg + NHWC_SLACK);
+        vc4_prof_bytes(1, (uint64_t)nimg * H * W * C * 4u);
     }
     pd->bus = ctx->gpu_bus + (uint32_t)((uint8_t *)p - ctx->arena);
     pd->img_bytes = per;
@@ -335,12 +346,16 @@ static vc4_status conv_nhwc_common(vc4_ctx *ctx, const vc4_buf *in, int nimg,
         return VC4_ERR_NOMEM;
     }
     if (nk > Kp) {
+        int pf = vc4_prof_enabled();
+        uint64_t pf0 = pf ? vc4_prof_now() : 0;
         const uint32_t blocks = (uint32_t)nimg * (M / 16u);
         for (uint32_t rb = 0; rb < blocks; ++rb) {
             float *blk = panel + ((size_t)rb * nk + Kp) * 16u;
             for (int l = 0; l < 16; ++l)
                 blk[l] = 1.0f;
         }
+        if (pf)
+            vc4_prof_add(3, vc4_prof_now() - pf0);
     }
 
     vc4_status st = VC4_OK;

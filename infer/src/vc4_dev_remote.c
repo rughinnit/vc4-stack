@@ -47,6 +47,136 @@
 #include <time.h>
 #include <unistd.h>
 
+/* ---- optional launch-path profiler (VC4INFER_PROF=1) ------------------
+ * CPU time in each phase of the remote backend, accumulated and exposed two
+ * ways: as a JSON line at shutdown, and through vc4_prof_ptr() for
+ * tools/cost/breakdown.py.  Off unless the variable is set; every timestamp
+ * is a predictable branch when it is not. */
+struct vc4_prof {
+    int      on;
+    uint64_t pre, mark, clean, mask, rt, tail;
+    uint64_t up_clean, up_copy, down_clean, down_copy, load, flush;
+    uint64_t pad_zero, pad_copy, civac_off, panel_zero;
+    uint64_t pad_zero_bytes, pad_copy_bytes, civac_off_bytes;
+    uint64_t n_launch, n_upload, n_download, n_load, n_flush;
+    uint64_t clean_bytes, up_bytes, down_bytes;
+};
+static struct vc4_prof g_prof;
+
+static void prof_init(void)
+{
+    const char *e = getenv("VC4INFER_PROF");
+    g_prof.on = e && *e && *e != '0';
+}
+static inline int prof_on(void)
+{
+    return __builtin_expect(g_prof.on, 0);
+}
+static inline uint64_t cpu_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static inline uint64_t mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+/* PROF_T: thread CPU (a phase that may block); PROF_W: monotonic (userspace
+ * only).  The latter is vDSO and costs ~20 ns against ~1.5 us for the former. */
+#define PROF_T(x) uint64_t x = prof_on() ? cpu_ns() : 0
+#define PROF_W(x) uint64_t x = prof_on() ? mono_ns() : 0
+#define PROF_ADD(f, a, b) do { if (prof_on()) g_prof.f += (b) - (a); } while (0)
+
+const void *vc4_prof_ptr(void)
+{
+    return &g_prof;
+}
+
+int vc4_prof_enabled(void)
+{
+    return g_prof.on;
+}
+
+uint64_t vc4_prof_now(void)
+{
+    return mono_ns();
+}
+
+/* 0 pad zero, 1 pad copy, 2 invalidate_off, 3 panel zero */
+void vc4_prof_add(int which, uint64_t ns)
+{
+    if (!g_prof.on)
+        return;
+    switch (which) {
+    case 0: g_prof.pad_zero += ns; break;
+    case 1: g_prof.pad_copy += ns; break;
+    case 2: g_prof.civac_off += ns; break;
+    case 3: g_prof.panel_zero += ns; break;
+    }
+}
+
+/* which: 0 pad zero, 1 pad copy, 2 invalidate_off */
+void vc4_prof_bytes(int which, uint64_t n)
+{
+    if (!g_prof.on)
+        return;
+    if (which == 0) g_prof.pad_zero_bytes += n;
+    else if (which == 1) g_prof.pad_copy_bytes += n;
+    else if (which == 2) g_prof.civac_off_bytes += n;
+}
+
+void vc4_prof_reset(void)
+{
+    int on = g_prof.on;
+    memset(&g_prof, 0, sizeof(g_prof));
+    g_prof.on = on;
+}
+
+void vc4_prof_report(void)
+{
+    if (!g_prof.n_launch && !g_prof.n_upload && !g_prof.n_download)
+        return;
+    fprintf(stderr,
+            "VC4PROF {\"pre_ns\":%llu,\"mark_ns\":%llu,\"clean_ns\":%llu,"
+            "\"mask_ns\":%llu,\"rt_ns\":%llu,\"tail_ns\":%llu,"
+            "\"up_clean_ns\":%llu,\"up_copy_ns\":%llu,"
+            "\"down_clean_ns\":%llu,\"down_copy_ns\":%llu,"
+            "\"load_ns\":%llu,\"flush_ns\":%llu,"
+            "\"pad_zero_ns\":%llu,\"pad_copy_ns\":%llu,"
+            "\"civac_off_ns\":%llu,\"panel_zero_ns\":%llu,"
+            "\"pad_zero_bytes\":%llu,\"pad_copy_bytes\":%llu,"
+            "\"civac_off_bytes\":%llu,"
+            "\"n_launch\":%llu,\"n_upload\":%llu,\"n_download\":%llu,"
+            "\"n_load\":%llu,\"n_flush\":%llu,"
+            "\"clean_bytes\":%llu,\"up_bytes\":%llu,\"down_bytes\":%llu}\n",
+            (unsigned long long)g_prof.pre, (unsigned long long)g_prof.mark,
+            (unsigned long long)g_prof.clean, (unsigned long long)g_prof.mask,
+            (unsigned long long)g_prof.rt, (unsigned long long)g_prof.tail,
+            (unsigned long long)g_prof.up_clean,
+            (unsigned long long)g_prof.up_copy,
+            (unsigned long long)g_prof.down_clean,
+            (unsigned long long)g_prof.down_copy,
+            (unsigned long long)g_prof.load, (unsigned long long)g_prof.flush,
+            (unsigned long long)g_prof.pad_zero,
+            (unsigned long long)g_prof.pad_copy,
+            (unsigned long long)g_prof.civac_off,
+            (unsigned long long)g_prof.panel_zero,
+            (unsigned long long)g_prof.pad_zero_bytes,
+            (unsigned long long)g_prof.pad_copy_bytes,
+            (unsigned long long)g_prof.civac_off_bytes,
+            (unsigned long long)g_prof.n_launch,
+            (unsigned long long)g_prof.n_upload,
+            (unsigned long long)g_prof.n_download,
+            (unsigned long long)g_prof.n_load,
+            (unsigned long long)g_prof.n_flush,
+            (unsigned long long)g_prof.clean_bytes,
+            (unsigned long long)g_prof.up_bytes,
+            (unsigned long long)g_prof.down_bytes);
+}
+
 #define REMOTE_SOCKET      "/run/vc4d.sock"
 #define REMOTE_TIMEOUT_MS  10000u     /* vc4d's default --max-timeout-ms */
 #define REMOTE_MIN_ARENA   (8u << 20)
@@ -112,8 +242,14 @@ void vc4__invalidate(void *p, size_t n)
  * scratch, split-K C rows). */
 void vc4__invalidate_off(vc4_ctx *ctx, uint32_t off, size_t n)
 {
-    if (ctx && ctx->arena)
+    if (ctx && ctx->arena) {
+        uint64_t t = g_prof.on ? mono_ns() : 0;
         cache_civac(ctx->arena + off, n);
+        if (g_prof.on) {
+            g_prof.civac_off += mono_ns() - t;
+            g_prof.civac_off_bytes += n;
+        }
+    }
 }
 
 /* Remember a CPU-written [off, off+bytes) interval; merged on insertion so a
@@ -166,8 +302,11 @@ static void remote_clean(vc4_ctx *ctx)
     struct vc4_remote *r = ctx ? ctx->remote : NULL;
     if (!r)
         return;
-    for (int i = 0; i < r->ndirty; ++i)
+    for (int i = 0; i < r->ndirty; ++i) {
+        if (prof_on())
+            g_prof.clean_bytes += (r->dirty[i].len + 63u) / 64u;
         cache_civac(ctx->arena + r->dirty[i].off, r->dirty[i].len);
+    }
     r->ndirty = 0;
 }
 
@@ -241,6 +380,7 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
     ctx->dmabuf_fd = -1;
     ctx->remote = r;
 
+    prof_init();
     int rc = vc4c_connect(&r->conn, remote_socket());
     if (rc != 0) {
         vc4__set_err(ctx, "connect %s: %s (is vc4d running?)",
@@ -379,6 +519,7 @@ void vc4__remote_shutdown(vc4_ctx *ctx)
         free(r);
         ctx->remote = NULL;
     }
+    vc4_prof_report();
     free(ctx);
 }
 
@@ -402,6 +543,7 @@ vc4_status vc4__remote_load(vc4_ctx *ctx, const char *name,
     /* A free cache entry, or the least recently used one (G3).  Its uniform
      * block and its daemon program slot are both indexed by the entry, so the
      * new kernel simply takes them over. */
+    PROF_T(t_load);
     vc4_kernel *k = vc4__kern_slot(ctx);
     if (!k) {
         vc4__set_err(ctx, "remote kernel cache: no slot (all %d in use)",
@@ -451,6 +593,10 @@ vc4_status vc4__remote_load(vc4_ctx *ctx, const char *name,
     snprintf(k->name, sizeof(k->name), "%s", name);
     r->nprog = ctx->nkern;
     *out = k;
+    if (prof_on()) {
+        g_prof.load += mono_ns() - t_load;
+        g_prof.n_load++;
+    }
     return VC4_OK;
 }
 
@@ -497,6 +643,7 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
     struct vc4_remote *r = ctx ? ctx->remote : NULL;
     if (!ctx || !k || !r)
         return VC4_ERR_INVAL;
+    PROF_W(t0);
     if (ctx->dead) {
         vc4__set_err(ctx, "context is dead after a previous timeout; reboot the board");
         return VC4_ERR_TIMEOUT;
@@ -512,6 +659,7 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
         return VC4_ERR_INVAL;
     }
     ((vc4_kernel *)k)->used_at = ++ctx->kern_clock;
+    PROF_W(t1);
 
     vc4c_result res;
     memset(&res, 0, sizeof(res));
@@ -529,7 +677,11 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
                     ctx->scratch - r->scratch_clean);
         r->scratch_clean = ctx->scratch;
     }
+    PROF_W(t2);
+    PROF_ADD(mark, t1, t2);
     remote_clean(ctx);
+    PROF_W(t3);
+    PROF_ADD(clean, t2, t3);
     if (getenv("VC4INFER_DEBUG")) {
         const uint32_t *u = (const uint32_t *)(ctx->arena + k->uni_off);
         fprintf(stderr, "[vc4] launch %s nqpu=%d uni=%08x %08x %08x %08x"
@@ -539,7 +691,11 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
     }
     int rc;
     for (unsigned attempt = 0;; ++attempt) {
+        PROF_W(tm0);
         uint32_t mask = r->have_uni_mask ? remote_uni_mask(ctx, k, nqpu) : 0;
+        PROF_W(tm1);
+        PROF_ADD(mask, tm0, tm1);
+        PROF_T(tr0);
         if (r->have_uni_mask)
             rc = vc4c_launch_wait_u(r->conn, &r->prog[idx], (unsigned)nqpu,
                                     &r->region, k->uni_off, remote_timeout_ms(),
@@ -548,6 +704,8 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
             rc = vc4c_launch_wait(r->conn, &r->prog[idx], (unsigned)nqpu,
                                   &r->region, k->uni_off, remote_timeout_ms(),
                                   &res);
+        PROF_T(tr1);
+        PROF_ADD(rt, tr0, tr1);
         /* The daemon evicted this program slot for a newer one (G3).  The code
          * is in the cache, so put it back and launch again.  Attempts are
          * bounded so a daemon that answers E_NOENT for a different reason
@@ -576,6 +734,11 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
         return st;
     }
 
+    PROF_W(t4);
+    if (prof_on()) {
+        g_prof.pre += t1 - t0;
+        g_prof.n_launch++;
+    }
     if (wall_ns)
         *wall_ns = res.wall_ns;
     ctx->st.gpu_cycles += res.cycles;
@@ -588,6 +751,8 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
         if (!getenv("VC4INFER_IGNORE_ERRSTAT"))
             return VC4_ERR_GPU;
     }
+    if (prof_on())
+        g_prof.tail += mono_ns() - t4;
     return VC4_OK;
 }
 
@@ -600,8 +765,17 @@ vc4_status vc4__remote_upload(vc4_ctx *ctx, vc4_buf *b, const void *src,
         return VC4_ERR_INVAL;
     /* no stale line of ours may survive into the range we are writing: the
      * clean before the next launch writes whole lines back */
+    PROF_W(u0);
     cache_civac(ctx->arena + b->off, bytes);
+    PROF_W(u1);
     memcpy(ctx->arena + b->off, src, bytes);
+    PROF_W(u2);
+    PROF_ADD(up_clean, u0, u1);
+    PROF_ADD(up_copy, u1, u2);
+    if (prof_on()) {
+        g_prof.n_upload++;
+        g_prof.up_bytes += bytes;
+    }
     if (ctx->dirty_top < (size_t)b->off + bytes)
         ctx->dirty_top = (size_t)b->off + bytes;
     remote_mark(ctx, b->off, bytes);
@@ -618,8 +792,17 @@ vc4_status vc4__remote_download(vc4_ctx *ctx, const vc4_buf *b, void *dst,
         return VC4_ERR_INVAL;
     /* Drop the CPU's stale (clean) copies of this range before reading the
      * GPU's result out of DRAM. */
+    PROF_W(d0);
     cache_civac(ctx->arena + b->off, bytes);
+    PROF_W(d1);
     memcpy(dst, ctx->arena + b->off, bytes);
+    PROF_W(d2);
+    PROF_ADD(down_clean, d0, d1);
+    PROF_ADD(down_copy, d1, d2);
+    if (prof_on()) {
+        g_prof.n_download++;
+        g_prof.down_bytes += bytes;
+    }
     return VC4_OK;
 }
 
@@ -630,7 +813,13 @@ void vc4__remote_l2_flush(vc4_ctx *ctx)
     /* Every path that calls this right after a launch reads a scratch buffer
      * (c_tmp, cmat, o_tmp, DXp, dWp).  Invalidate those clean lines so the
      * CPU sees what the QPUs wrote. */
-    if (ctx->scratch > ctx->arena_top)
+    if (ctx->scratch > ctx->arena_top) {
+        PROF_W(f0);
         cache_civac(ctx->arena + ctx->arena_top,
                     ctx->scratch - ctx->arena_top);
+        PROF_W(f1);
+        PROF_ADD(flush, f0, f1);
+        if (prof_on())
+            g_prof.n_flush++;
+    }
 }

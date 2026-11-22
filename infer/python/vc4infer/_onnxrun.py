@@ -811,21 +811,49 @@ def _storage_index(shape, layout, pitch, axes, rngs):
     return tab.ravel(), out_shape
 
 
+_ATTR_CACHE = {}
+
+
 def _attr(node, name, default=None):
+    """One attribute of a node, parsed once per (node, name, default).
+
+    The executor reads the same handful of attributes on every node of every
+    frame; walking the protobuf's attribute list each time was ~6 % of the
+    client's CPU on YOLOv8n.  The cache is cleared when a Runner is built, so
+    it can never answer for a node of a graph that is no longer loaded.
+    """
+    # Key on the node's declared identity, not id(): protobuf materialises a
+    # fresh Python wrapper on every access, so id() is not stable and can be
+    # recycled by another node's wrapper (measured: modelA's Gemm read a
+    # Flatten's cached "axis" and failed with K mismatch).
+    key = None
+    if node.name:
+        key = (node.name, node.op_type, tuple(node.input), name)
+        hit = _ATTR_CACHE.get(key)
+        if hit is not None and hit[1] == default:
+            val = hit[0]
+            return list(val) if type(val) is list else val
     for a in node.attribute:
         if a.name == name:
             if a.type == onnx.AttributeProto.INT:
-                return a.i
-            if a.type == onnx.AttributeProto.FLOAT:
-                return a.f
-            if a.type == onnx.AttributeProto.STRING:
-                return a.s.decode()
-            if a.type == onnx.AttributeProto.INTS:
-                return list(a.ints)
-            if a.type == onnx.AttributeProto.FLOATS:
-                return list(a.floats)
-            if a.type == onnx.AttributeProto.TENSOR:
-                return numpy_helper.to_array(a.t)
+                val = a.i
+            elif a.type == onnx.AttributeProto.FLOAT:
+                val = a.f
+            elif a.type == onnx.AttributeProto.STRING:
+                val = a.s.decode()
+            elif a.type == onnx.AttributeProto.INTS:
+                val = list(a.ints)
+            elif a.type == onnx.AttributeProto.FLOATS:
+                val = list(a.floats)
+            elif a.type == onnx.AttributeProto.TENSOR:
+                val = numpy_helper.to_array(a.t)
+            else:
+                val = default
+            if key is not None:
+                _ATTR_CACHE[key] = (val, default)
+            return val
+    if key is not None:
+        _ATTR_CACHE[key] = (default, default)
     return default
 
 
@@ -963,6 +991,13 @@ class Runner:
         self._garbage = []      # per-node temporaries
         self._consts = set(i.name for i in self.graph.initializer)
         self._last_use = {}
+        # A compiled plan for the loop below: the handler for each operator,
+        # the node names and the parsed attributes are decided once per load
+        # instead of once per node per frame.
+        _ATTR_CACHE.clear()
+        self._op_table = self._build_op_table()
+        self._names = [node.name or "%s_%d" % (node.op_type, i)
+                       for i, node in enumerate(self.graph.node)]
 
         dropped = artifact.dropped if artifact is not None else {}
         for init in self.graph.initializer:
@@ -2507,22 +2542,31 @@ class Runner:
                 coff = 0
                 for t in ts:
                     cs = t.shape[1]
-                    # a source wider than one 16-word store takes one call
-                    # per 16-channel block; the last block may be partial and
-                    # must be stored at depth=nl (24 channels again)
+                    # one call moves every full 16-channel block: the block
+                    # step is 16 words on both sides, which is what the
+                    # kernel's nblk/sbstep/dbstep fields are for.  A partial
+                    # last block is one more call at lane=depth=tail, because
+                    # a 16-word store would spill into the next pixel.
                     units = (4 if w % 4 == 0 else
                              (2 if w % 2 == 0 else 1)) \
                         if (cs % 16 == 0 and ct % 16 == 0) else 1
-                    for kb in range(0, cs, 16):
-                        nl = min(16, cs - kb)
-                        for i in range(n):
+                    nb, tail = divmod(cs, 16)
+                    for i in range(n):
+                        so = i * h * t.pitch * cs * 4
+                        do = i * h * w * ct * 4 + coff * 4
+                        if nb:
                             self._x(
-                                self._buf_at(
-                                    t, (i * h * t.pitch * cs + kb) * 4),
-                                self._buf_at(
-                                    out, (i * h * w * ct + coff + kb) * 4),
+                                self._buf_at(t, so),
+                                self._buf_at(out, do),
                                 h, w, t.pitch * cs * 4, w * ct * 4, cs * 4,
-                                ct * 4, 4, nl, 1, 64, 64, units, nl)
+                                ct * 4, 4, 16, nb, 64, 64, units, 16)
+                        if tail:
+                            kb = nb * 16
+                            self._x(
+                                self._buf_at(t, so + kb * 4),
+                                self._buf_at(out, do + kb * 4),
+                                h, w, t.pitch * cs * 4, w * ct * 4, cs * 4,
+                                ct * 4, 4, tail, 1, 64, 64, 1, tail)
                     coff += cs
                 return out
             a = np.concatenate([self.nchw(t) for t in ts], axis=1)
@@ -3514,8 +3558,14 @@ class Runner:
         return self._bin(a, t, vc4infer.OP_ADD)
 
     # ---------------------------------------------------------------- execute
-    def _dispatch(self, node):
-        op = node.op_type
+    def _build_op_table(self):
+        """op_type -> bound handler, built once per Runner.
+
+        The old ``_dispatch`` rebuilt this dictionary (and its closures) for
+        every node of every frame.  The family tables are merged with the same
+        rule: a family handler replaces a main-table one only when the main
+        table has none or the family declares an override.
+        """
         d = {
             "Conv": self._conv,
             "Relu": self._relu,
@@ -3572,12 +3622,16 @@ class Runner:
         if not _UNARY_NV4_VERIFIED:
             for name in _UNARY_NV4_STAGED:
                 d.pop(name, None)
-        fn = d.get(op)
         # the family tables also own a few operators of the main table
         # (docs/OPS-NORM.md: Softmax > 16 classes)
-        h = _extra_handlers().get(op)
-        if h is not None and (fn is None or op in _EXTRA_OVERRIDES):
-            fn = functools.partial(h, self)
+        for op, h in _extra_handlers().items():
+            if op not in d or op in _EXTRA_OVERRIDES:
+                d[op] = functools.partial(h, self)
+        return d
+
+    def _dispatch(self, node):
+        op = node.op_type
+        fn = self._op_table.get(op)
         if fn is None:
             raise UnsupportedNode(node.name, op, "unsupported op %s" % op)
         try:
@@ -3714,9 +3768,13 @@ class Runner:
         self.backend_report = []
         skip = self._skip
         hybrid = self.mode == "hybrid"
+        # eng.stats costs a ctypes call and a C struct copy; the loop only
+        # needs it for the per-node profile and the hybrid plan report.
+        track = profile or hybrid
+        names = self._names
         plan = self.backend_plan() if hybrid else None
         for idx, node in enumerate(self.graph.node):
-            name = self._node_name(idx, node)
+            name = names[idx]
             if idx in skip or (plan is not None and
                               plan[idx]["backend"] == "folded"):
                 if idx in skip:
@@ -3742,7 +3800,7 @@ class Runner:
             tier = plan[idx]["backend"] if hybrid else None
             reason = plan[idx]["reason"] if hybrid else ""
             t0 = time.perf_counter()
-            s0 = self.eng.stats
+            s0 = self.eng.stats if track else None
             self._node_ctx = (idx, name, node.op_type)
             self._count_host = True
             try:
@@ -3756,10 +3814,11 @@ class Runner:
                 self._count_host = False
                 if self._labels:
                     self._alloc_scope = None
-            s1 = self.eng.stats
+            s1 = self.eng.stats if track else None
             dt = (time.perf_counter() - t0) * 1e3
             if profile:
-                gpu = (s1.pack_ns - s0.pack_ns + s1.kernel_ns - s0.kernel_ns) / 1e6
+                gpu = ((s1.pack_ns - s0.pack_ns +
+                        s1.kernel_ns - s0.kernel_ns) / 1e6) if track else 0.0
                 entry = {
                     "index": idx,
                     "name": name,

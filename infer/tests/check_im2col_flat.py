@@ -23,11 +23,21 @@ outputs, stride 2, 5x5 and dilation 2:
    pixel `4*g + i` of the block.  That is the same content the row-padded
    kernel (one 16-row VDR per block) puts there.
 
+   The group addresses are accumulated the way the kernel does it (a per-tap
+   step, and a 64-byte advance per channel block that the next tap's step
+   carries back), so a wrong step constant is a wrong address.
+
 3. **The values.**  The 16 x 16 transposing store is applied to the modelled
    VPM rows (memory row = channel, memory word = pixel) and the resulting
    panel is compared with the row-padded panel for every real output pixel:
    both must carry the same K values per pixel.  The ratio of the two panel
    row counts is printed; it is the row padding the flat block removes.
+
+4. **The blob's VPM words.**  The control words are generator constants, not
+   model ones, so the literals in the emitted blob are checked too: the store
+   must be the row kernel's own 16 x 16 transposing word with a zero stride,
+   the load must be four VPM rows, the channel-block back-step must be there,
+   and neither refused shape (a 4-word store, a 48-byte store gap) may appear.
 
 The generator is also called for each shape to check the blob fits the
 2048-word code slot and to report the instruction count against the row
@@ -77,6 +87,56 @@ def check_control_words():
         assert V.dec_vdw(w + (q << 11))["row"] == 16 * q
     print("control words: VDR 4 rows x 16 words at row 16q+4g, "
           "VDW 16 rows x 16 words transposing, 0 stride (the row kernel's)")
+
+
+def blob_immediates(words_):
+    """Every 32-bit literal the blob loads (the VPM control words among them)."""
+    return {w & 0xFFFFFFFF for w in words_ if ((w >> 60) & 0xF) == 14}
+
+
+def check_blob_words():
+    """The blob must carry the row kernel's store and only the 4-row load.
+
+    The control-word constants are built in the generator, not in the model,
+    so pin the ones that failed on silicon: the transposing 16 x 16 store with
+    a zero stride must be the same literal the row kernel loads, the load must
+    be four VPM rows at 16 words, and neither refused field combination (a
+    4-word-wide store, or a 48-byte store gap) may appear.
+    """
+    import vpmwords as V
+    import tempfile
+
+    def immediates(kind, cin, kh, kw):
+        fd, path = tempfile.mkstemp(prefix="check_words_", suffix=".bin")
+        os.close(fd)
+        try:
+            return blob_immediates(kind(cin, kh, kw).write(path))
+        finally:
+            os.unlink(path)
+
+    store = V.vdw_basic(0, 16, 16, horizontal=0)
+    for cin, kh, kw in ((16, 3, 3), (16, 5, 5), (64, 3, 3)):
+        flat = immediates(kgen.build_im2col_nhwc_flat2, cin, kh, kw)
+        row = immediates(kgen.build_im2col_nhwc, cin, kh, kw)
+        assert store in flat and store in row, \
+            "store word %#x: flat2 %s, row %s" % (
+                store, store in flat, store in row)
+        assert V.vdw_stride(0) in flat and V.vdw_stride(0) in row
+        assert V.vdr_basic(0, 1, numrows=4, rowlen=16) in flat, \
+            "the flat load must be four VPM rows"
+        assert (V.vdr_stride(0) & ~0xFFF) in flat
+        for refused in (V.vdw_basic(0, 16, 4, horizontal=0), V.vdw_stride(48)):
+            assert refused not in flat, \
+                "refused VPM word %#x in the blob" % refused
+        if cin // 16 > 1:
+            # the channel loop leaves the group address one block on, so the
+            # tap step has to carry Cin*4 back; the constant is a literal
+            assert cin * 4 in flat, \
+                "no %d-byte channel-block back-step literal (Cin %d)" % (
+                    cin * 4, cin)
+    print("blob words: store %#x is the row kernel's 16 x 16 transposing "
+          "store with a zero stride, the load is four VPM rows, and neither "
+          "refused shape (4-word store, 48 B gap) appears" % store)
 
 
 def al(n, a):
@@ -171,21 +231,37 @@ def flat_panel(img, W, H, Cin, KH, KW, stride, pad, dil, g, nq):
     Every VDR row is read from the padded image at the byte address the
     kernel computes, so the 16 x 16 tile below is the VPM content, and the
     store is the hardware's transpose: memory row = channel, words = pixels.
+
+    The four group addresses are *accumulated* the way the kernel does it -- a
+    per-tap step (the pixel step within a kernel row, the dilated row step
+    less the KW-1 pixels already covered at a new one) and a 64-byte advance
+    per channel block that the next tap's step has to carry back -- so a wrong
+    step constant or a missing back-step shows up as a wrong address, not as
+    the same wrong offset on both sides.
     """
     p = padded(img, pad)
     buf = p.astype(np.float32).tobytes()
     nlim = len(buf)
     panel = np.full((g["M"], g["K"]), np.nan, dtype=np.float32)
+    ncb = Cin // 16
+    adj = Cin * 4 if ncb > 1 else 0
+    stx = g["C4d"] - adj
+    sty = dil * g["row_pitch"] - (KW - 1) * g["C4d"] - adj
     for q, blocks in walk(nq, g):
         for (b, gidx0, src) in blocks:
+            qs = list(src)
             for s in range(KH * KW):
                 ky, kx = divmod(s, KW)
-                tap = ky * dil * g["row_pitch"] + kx * g["C4d"]
-                for cb in range(Cin // 16):
+                if s:
+                    step = stx if kx else sty
+                    qs = [(v + step) & MASK for v in qs]
+                for cb in range(ncb):
                     vpm = np.full((16, 16), np.nan, dtype=np.float32)
                     vrow = set()
                     for k in range(4):
-                        base = (src[k] + tap + cb * 64) & MASK
+                        base = qs[k]
+                        if ncb > 1:      # the channel loop's own advance
+                            qs[k] = (qs[k] + 64) & MASK
                         for i in range(4):
                             a = (base + i * g["pitch"]) & MASK
                             row = 16 * q + 4 * k + i
@@ -287,6 +363,7 @@ SHAPES = [
 def main():
     bad = 0
     check_control_words()
+    check_blob_words()
     print("%-24s %7s %7s %6s %7s %7s %+7s" %
           ("shape", "M flat", "M row", "ratio", "w flat2", "w row", "delta"))
     tot = 0

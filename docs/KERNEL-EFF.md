@@ -310,7 +310,16 @@ tap, channel block) and for two QPU splits plus one QPU:
   row-padded kernel's single 16-row VDR puts there;
 * applying the 16 x 16 transposing store to those rows (memory row = channel,
   words = pixels) gives, for every real output pixel, the same K values as the
-  row-padded panel.
+  row-padded panel;
+* the blob's own VPM literals: the store is the row kernel's 16 x 16
+  transposing word with a zero stride, the load is four VPM rows, the
+  channel-block back-step is present and neither refused shape appears.  The
+  control words are generator constants, not model ones, so this is the part
+  the model cannot see.
+
+The group addresses are accumulated as the kernel accumulates them, and four
+mutations of the generator each fail the check: the 4-word store, the 48-byte
+store gap, a 16-row load and the missing channel-block back-step.
 
 15 shapes, 0 failures, the 13 of the first form plus 20x20 and 60x60:
 

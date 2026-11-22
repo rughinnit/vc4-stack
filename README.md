@@ -73,12 +73,12 @@ channel.
 | repository | role |
 |---|---|
 | **`vc4-stack`** (this repo) | **main**: inference engine, QPU kernels, training, PyTorch backend (`torch/`), docs, measurements |
-| `vc4-apt` | the only install source: signed apt repo + pip index (`apt install vc4-toolkit`) |
-| `torch-vc4` | **mirror** of `torch/`; the source of truth is this repository |
-| `vc4top` | GPU monitor TUI + the `vc4mon` DKMS module |
-| `VC4C` | OpenCL C → QPU compiler (fork; performance branches) |
-| `VC4CL` | OpenCL runtime (fork; Debian 13 + unprivileged fixes) |
-| `VC4CLStdLib` | GPU-side OpenCL standard library (fork) |
+| [`vc4-apt`](https://github.com/rughinnit/vc4-apt) | the only install source: signed apt repo + pip index (`apt install vc4-toolkit`) |
+| [`torch-vc4`](https://github.com/rughinnit/torch-vc4) | **mirror** of `torch/`; the source of truth is this repository |
+| [`vc4top`](https://github.com/rughinnit/vc4top) | GPU monitor TUI + the `vc4mon` DKMS module |
+| [`VC4C`](https://github.com/rughinnit/VC4C) | OpenCL C → QPU compiler (fork; performance branches) |
+| [`VC4CL`](https://github.com/rughinnit/VC4CL) | OpenCL runtime (fork; Debian 13 + unprivileged fixes) |
+| [`VC4CLStdLib`](https://github.com/rughinnit/VC4CLStdLib) | GPU-side OpenCL standard library (fork) |
 
 Every measured number — GEMM, YOLOv8n, per-op vs CPU, training, builds,
 clocks, completeness — is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), and

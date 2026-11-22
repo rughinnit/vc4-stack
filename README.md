@@ -5,6 +5,11 @@ that shipped with the board in 2016 — with the ARM cores doing only control an
 byte movement.  There is no CPU arithmetic fallback: an operator either executes
 on the QPUs or is refused by name.
 
+**A vertically integrated compute and inference stack for the Raspberry Pi's
+VideoCore IV** — runtime, kernels, graph optimiser, framework adapters and
+packages — built and measured on the board, where the vendor shipped only an
+OpenGL driver.
+
 | measured on the board | |
 |---|---|
 | ONNX operators, expressible set | **152/152**, 0 refused, 0 mismatched |

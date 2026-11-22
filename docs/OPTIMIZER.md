@@ -205,10 +205,20 @@ VC4INFER_CACHE=$HOME/scratch/kcache-autotune-api PYTHONPATH=infer/python \
 
 ### Cost of a cold search
 
-Pending with the table above.  On this board the cost is dominated by blob
-generation, which happens once per (shape, generator): seven distinct GEMM QPU
-counts for a 512x512x512 matmul, each a `python3 kgen.py` fork.  The
-measurement itself is 6 runs of the op per candidate.
+The QPU half is pending with the table above.  The half that can be measured
+without the QPU - blob generation, which happens once per (shape, generator) -
+is the dominant term:
+
+| `kgen.py gemm --M 512 --N 512 --K 512 --nqpu` | 12 | 8 | 6 | 4 | 3 | 2 | 1 |
+|---|---|---|---|---|---|---|---|
+| generation, s | 0.92 | 1.04 | 0.89 | 0.79 | 0.78 | 0.77 | 0.88 |
+
+Measured with the board at a load average of ~3.9 (other work), so these are
+pessimistic.  A 512^3 cold search generates seven distinct GEMM blobs (one per
+QPU count; the packer variants reuse one), i.e. roughly 6 s of generation, and
+then runs 6 op executions per candidate - 10 coarse candidates and up to 4 fine
+ones within the 14-set cap.  A generator edit re-pays this once per shape,
+because the digest changes.
 
 ### Not covered
 

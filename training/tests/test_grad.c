@@ -20,6 +20,7 @@
  * usage: test_grad [reps] [--dump DIR]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 #include <math.h>
@@ -1361,6 +1362,9 @@ static void run_affine_k(const char *name, ref_fwd fwd,
  * ================================================================== */
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int reps = 1;
     for (int i = 1; i < argc; ++i)
         if (argv[i][0] != '-')

@@ -1,5 +1,6 @@
 /* diag_im2col.c - verify the im2col panel for 1x1 and 3x3 (CPU oracle). */
 #include "vc4_int.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 static int one(vc4_ctx *ctx, int Cin, int H, int W, int KH, int KW, int pad)
@@ -78,6 +79,9 @@ static int one(vc4_ctx *ctx, int Cin, int H, int W, int KH, int KW, int pad)
 
 int main(void)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int lock=gpu_lock(); if(lock<0)return 2;
     vc4_ctx *ctx=NULL;
     if(vc4_init(&ctx,NULL,0)!=VC4_OK){printf("init fail\n");return 2;}

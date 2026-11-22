@@ -19,6 +19,13 @@ the oracle.  A case that raises UnsupportedNode is reported as ``refused`` and
 counts as a failure here: this file is the *positive* evidence for the
 operators docs/OPS-REDUCE.md claims, not a coverage sweep.
 """
+
+# A GPU client: refuse unless VC4_REQUIRE_GPU=1 (tests/gpu_gate.py).
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from gpu_gate import require_gpu as _require_gpu
+_require_gpu(__file__)
 import argparse
 import os
 import sys

@@ -1,5 +1,6 @@
 /* diag_col2im.c - bring-up checks for the new backward kernels (CPU oracle) */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 #include <math.h>
 
@@ -176,6 +177,9 @@ static int t_im2col(vc4_ctx *ctx)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     const char *only = argc > 1 ? argv[1] : "all";
     setvbuf(stdout, NULL, _IONBF, 0);
     int lock = gpu_lock();

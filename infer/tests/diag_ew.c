@@ -9,6 +9,7 @@
  * the kernel read/wrote the intended addresses (QRUN_DUMP style).
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 static void dump_words(const char *tag, const float *p, size_t n)
@@ -21,6 +22,9 @@ static void dump_words(const char *tag, const float *p, size_t n)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int sel = argc > 1 ? atoi(argv[1]) : 2;
     static const vc4_op OPMAP[5] = { VC4_OP_ADD, VC4_OP_MUL, VC4_OP_RELU,
                                      VC4_OP_SIGMOID, VC4_OP_SILU };

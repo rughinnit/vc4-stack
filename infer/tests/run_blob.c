@@ -7,10 +7,14 @@
  * Takes the GPU lock itself.
  */
 #include "vc4_int.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 10) {
         fprintf(stderr, "usage: %s blob nqpu n u0..u5 [nout]\n", argv[0]);

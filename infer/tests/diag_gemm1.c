@@ -1,9 +1,13 @@
 /* diag_gemm1.c - bmode=1 (packed B) GEMM with CPU-built panels. */
 #include "vc4_int.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int lock = gpu_lock(); if (lock < 0) return 2;
     vc4_ctx *ctx = NULL;
     if (vc4_init(&ctx, NULL, 0) != VC4_OK) { printf("init fail\n"); return 2; }

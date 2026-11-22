@@ -22,6 +22,7 @@
  * can be attributed.  usage: test_gated gather|blit|reduce|cumsum|sel3
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 static int g_fail;
@@ -409,6 +410,9 @@ static void t_sel3(void)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     if (argc != 2) {
         printf("usage: test_gated gather|blit|reduce|cumsum|sel3\n");
         return 2;

@@ -6,6 +6,7 @@
  * usage: test_conv [reps]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 #define TOL 1e-4
@@ -96,6 +97,9 @@ static int one_conv(vc4_ctx *ctx, int Cin, int H, int W, int Cout,
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int reps = argc > 1 ? atoi(argv[1]) : 5;
     int lock = gpu_lock();
     if (lock < 0)

@@ -21,6 +21,7 @@
  * border.
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 static int g_fail;
@@ -535,6 +536,9 @@ static void case_bulk(vc4_ctx *ctx, uint32_t units)
 
 int main(void)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     vc4_ctx *ctx = NULL;
     const int lock = gpu_lock();
     if (lock < 0)

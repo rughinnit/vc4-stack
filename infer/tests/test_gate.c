@@ -10,6 +10,7 @@
  * usage: test_gate
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 static int errors;
@@ -44,6 +45,9 @@ static void expect_arg_refusal(vc4_ctx *ctx, const char *what, vc4_status st,
 
 int main(void)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     vc4_ctx *ctx = NULL;
     if (vc4_init(&ctx, NULL, 0) != VC4_OK) {
         printf("FAIL: vc4_init\n");

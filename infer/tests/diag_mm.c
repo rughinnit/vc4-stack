@@ -1,6 +1,7 @@
 /* diag_mm.c - arbitrary-shape matmul check vs a double oracle.
  * usage: diag_mm M N K [reps] */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 static int one(vc4_ctx *ctx, int M, int N, int K)
@@ -36,6 +37,9 @@ static int one(vc4_ctx *ctx, int M, int N, int K)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int lock = gpu_lock(); if (lock < 0) return 2;
     vc4_ctx *ctx = NULL;
     if (vc4_init(&ctx, NULL, 0) != VC4_OK) { printf("init fail\n"); return 2; }

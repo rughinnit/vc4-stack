@@ -190,8 +190,9 @@ same targets `packaging/` runs:
 make -C infer -j4                            # libvc4infer.a/.so + all tests
 python3 infer/tools/check_math.py            # GPU-free: kernel formulas vs Python
 
-infer/run_tests.sh                           # full serialised suite (root, /dev/mem)
-REPS=5 VC4INFER_DAEMON=1 infer/run_tests.sh  # same, unprivileged through vc4d
+infer/run_tests.sh                           # CPU-only run; GPU tests say SKIP
+VC4_REQUIRE_GPU=1 infer/run_tests.sh         # full suite (root, /dev/mem)
+VC4_REQUIRE_GPU=1 REPS=5 VC4INFER_DAEMON=1 infer/run_tests.sh  # unprivileged
 
 infer/cli/vc4infer nodes infer/packaging/vc4infer/data/models/modelA.onnx
 infer/packaging/vc4infer/build_deb.sh        # -> dist/vc4infer_<ver>_arm64.deb
@@ -199,6 +200,12 @@ infer/packaging/build_wheel.sh               # -> dist/vc4infer-<ver>-py3-none-a
 
 make -C torch                                # -> dist/torch_vc4-<ver>-cp313-...whl
 ```
+
+The suite takes the QPUs only when `VC4_REQUIRE_GPU=1` is set.  Every test
+that constructs an engine or calls libvc4infer refuses otherwise, prints what
+it would have run, and exits 77; `run_tests.sh` reports those as SKIPPED and
+lists them at the end.  Two VideoCore IV clients do not share the board
+safely, so a test run is never allowed to assume it owns it.
 
 `make -C torch` (equivalently `packaging/build_torch_wheel.sh`) builds the
 PyTorch backend wheel into the same shared `dist/` from `torch/`, against this

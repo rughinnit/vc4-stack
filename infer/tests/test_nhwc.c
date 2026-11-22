@@ -13,6 +13,7 @@
  * usage: test_nhwc [reps]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 static const float TOL_CONV = 3e-4f;   /* fp32 k=576 truncating-add floor */
@@ -982,6 +983,9 @@ static int one_conv_act(vc4_ctx *ctx, int Cin, int H, int W, int Cout, int KH,
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int reps = argc > 1 ? atoi(argv[1]) : 5;
     int lock = gpu_lock();
     vc4_ctx *ctx = NULL;

@@ -2,11 +2,15 @@
  * vc4_matmul does it.  usage: diag_2launch M N K [checkpanel]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 #include "../src/vc4_int.h"
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int M = argc > 1 ? atoi(argv[1]) : 16;
     int N = argc > 2 ? atoi(argv[2]) : 64;
     int K = argc > 3 ? atoi(argv[3]) : 16;

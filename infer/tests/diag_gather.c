@@ -1,9 +1,13 @@
 /* diag_gather.c - identity table, print every element. */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     size_t n = argc > 1 ? (size_t)atoi(argv[1]) : 16;
     float fill = argc > 2 ? (float)atof(argv[2]) : 0.0f;
     vc4_ctx *c = NULL;

@@ -6,6 +6,7 @@
  * usage: test_matmul [reps]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 #define TOL 1e-4        /* relative, as in asm3 check_gemm */
@@ -246,6 +247,9 @@ static int refuse_act(vc4_ctx *ctx, vc4_act act, const char *name)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int reps = argc > 1 ? atoi(argv[1]) : 5;
 
     int lock = gpu_lock();

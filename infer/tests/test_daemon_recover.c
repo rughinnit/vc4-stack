@@ -23,6 +23,7 @@
  */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include "gpu_gate.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -91,6 +92,9 @@ static int stats_dead(unsigned *dead)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     if (argc > 1)
         sock = argv[1];
 

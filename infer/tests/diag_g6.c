@@ -2,11 +2,15 @@
  * usage: diag_g6 [N] [nqpu]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 #include "../src/vc4_int.h"
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int N = argc > 1 ? atoi(argv[1]) : 64;
     int nq = argc > 2 ? atoi(argv[2]) : 12;
     int lock = gpu_lock();

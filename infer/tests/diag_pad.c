@@ -2,6 +2,7 @@
  * usage: diag_pad            (VC4INFER_DAEMON=1 for the daemon path)
  */
 #include <stdio.h>
+#include "gpu_gate.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -9,6 +10,9 @@
 
 int main(void)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     vc4_ctx *ctx = NULL;
     vc4_status st = vc4_init(&ctx, NULL, 0);
     if (st != VC4_OK) {

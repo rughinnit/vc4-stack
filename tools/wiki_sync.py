@@ -82,11 +82,13 @@ def main():
             continue
         body = open(src, encoding="utf-8").read()
         body = rewrite_links(body, names)
+        # the commit is on the index only: putting it on every page would
+        # rewrite the whole wiki on every commit
         header = (
-            "<!-- Generated from %s at %s. Edit the repository, not this page. -->\n\n"
-            "> Generated from [`%s`](https://github.com/rughinnit/vc4-stack/blob/main/%s) "
-            "at `%s`. Edit the repository, not this page.\n\n"
-            % (path, commit, path, path, commit))
+            "<!-- Generated from %s. Edit the repository, not this page. -->\n\n"
+            "> Generated from [`%s`](https://github.com/rughinnit/vc4-stack/blob/main/%s). "
+            "Edit the repository, not this page.\n\n"
+            % (path, path, path))
         with open(os.path.join(work, page + ".md"), "w", encoding="utf-8") as fh:
             fh.write(header + body)
         written += 1

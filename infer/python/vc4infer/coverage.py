@@ -512,11 +512,11 @@ def _check_concat(node, shapes, inits):
 def _check_split(node, shapes, inits):
     axis = int(_attr(node, "axis", 0))
     rank = _rank(shapes, node.input[0])
-    if rank is not None and rank != 4:
-        return "unknown", "rank %d (Split is channel-axis 4-D)" % rank
-    if axis != 1:
-        return "unsupported", "axis %d (channel axis 1)" % axis
-    return "supported", "axis 1"
+    if not rank:
+        return "unknown", "input rank unknown"
+    if not -rank <= axis < rank:
+        return "unsupported", "axis %d of rank %d" % (axis, rank)
+    return "supported", "axis %d of rank %d" % (axis % rank, rank)
 
 
 def _check_clip(node, shapes, inits):

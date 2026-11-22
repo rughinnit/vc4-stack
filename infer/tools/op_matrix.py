@@ -664,6 +664,12 @@ def rec_split(op, rng, o):
         sp(op, "explicit_sizes", ["input", "split"],
            {"input": arr(rng, (1, 8, 4, 4), -1, 1)}, {"split": i64(2, 6)},
            attrs={"axis": 1}, n_out=2),
+        # v10/v11/v26 attention splits a rank-4 [B][heads][C][HW] tensor on
+        # axis 2 into q, k and v.  The batch and head extents are 1 or 4.
+        sp(op, "attention_axis2_rank4", ["input", "split"],
+           {"input": arr(rng, (4, 2, 96, 25), -1, 1)},
+           {"split": i64(32, 32, 32)}, attrs={"axis": 2}, n_out=3,
+           note="v10/v11/v26/v12 attention: q, k, v on axis 2"),
     ]
 
 

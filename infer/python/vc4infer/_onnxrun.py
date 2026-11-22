@@ -589,6 +589,41 @@ def _flat_index(shape, axes, rngs):
     return tab.ravel(), out_shape
 
 
+def _storage_index(shape, layout, pitch, axes, rngs):
+    """Flat *storage* word index per flat destination element.
+
+    ``_flat_index`` assumes a compact NCHW buffer, which is right for every
+    tensor the engine uploads and wrong for a conv output: NHWC storage has
+    the channel innermost and a row pitch of ``align16(wo)`` pixels.  A
+    gather table for any op that reads a pitched NHWC tensor (Slice off a
+    conv output, a Split on a non-channel axis) has to be built in storage
+    coordinates or it reads the padding and neighbouring pixels as data.
+
+    ``axes[k]``/``rngs[k]`` mean the same as in ``_flat_index``; the layout
+    only changes the strides.  Integer index arithmetic on metadata, never on
+    tensor values.
+    """
+    shape = [int(d) for d in shape]
+    rank = len(shape)
+    if layout == "nhwc":
+        if rank != 4:
+            raise ValueError("NHWC storage of rank %d" % rank)
+        n, c, h, w = shape
+        stride = [h * int(pitch) * c, 1, int(pitch) * c, c]
+    else:
+        stride = [1] * rank
+        for k in range(rank - 2, -1, -1):
+            stride[k] = stride[k + 1] * shape[k + 1]
+    out_shape = [int(len(r)) for r in rngs]
+    tab = np.zeros(out_shape, np.int64)
+    for k, (ax, r) in enumerate(zip(axes, rngs)):
+        if len(r) > 0 and stride[int(ax)]:
+            b = np.asarray(r, np.int64).reshape(
+                [(-1 if a == k else 1) for a in range(rank)])
+            tab += b * stride[int(ax)]
+    return tab.ravel(), out_shape
+
+
 def _attr(node, name, default=None):
     for a in node.attribute:
         if a.name == name:
@@ -2049,12 +2084,24 @@ class Runner:
                               % (node.name, axis, rank))
 
     def _split(self, node):
+        """Split along any axis, into any number of outputs.
+
+        The channel-axis form on a 4-D tensor keeps its dedicated copy: a
+        channel-strided copy2d for NHWC (the layout a conv produces) and
+        whole-plane runs for NCHW, both one launch per image.  Every other
+        axis, and any rank, is one ``vc4_gather`` per output over an index
+        table; the table is built in the *source storage* coordinates so a
+        pitched NHWC tensor (a conv output) is read at the right words.  This
+        is the form the v10/v11/v12/YOLO26 attention blocks use: a rank-4
+        ``[B][heads][C][HW]`` tensor split on axis 2 into query, key and
+        value.  No new kernel, no host arithmetic on tensor values.
+        """
         x = self._float(node.input[0])
         axis = int(_attr(node, "axis", 0))
         rank = len(x.shape)
         if axis < 0:
             axis += rank
-        if rank != 4 or axis != 1:
+        if not 0 <= axis < rank:
             raise UnsupportedNode("Split %s: axis %d of rank %d"
                                   % (node.name, axis, rank))
         nout = len([o for o in node.output if o])
@@ -2063,33 +2110,46 @@ class Runner:
             v = self.host.get(node.input[1], self.values.get(node.input[1]))
             sizes = [int(s) for s in np.asarray(v).ravel()]
         if sizes is None:
-            if x.shape[1] % nout:
-                raise UnsupportedNode("Split %s: %d channels into %d"
-                                      % (node.name, x.shape[1], nout))
-            sizes = [x.shape[1] // nout] * nout
-        if sum(sizes) != x.shape[1]:
-            raise UnsupportedNode("Split %s: sizes %s vs C=%d"
-                                  % (node.name, sizes, x.shape[1]))
-        n, c, h, w = x.shape
+            sizes = _attr(node, "split", None)
+            sizes = [int(s) for s in sizes] if sizes else None
+        if sizes is None:
+            num = int(_attr(node, "num_outputs", 0)) or nout
+            if x.shape[axis] % num:
+                raise UnsupportedNode("Split %s: axis %d extent %d into %d"
+                                      % (node.name, axis, x.shape[axis], num))
+            sizes = [x.shape[axis] // num] * num
+        if len(sizes) != nout:
+            raise UnsupportedNode("Split %s: %d sizes for %d outputs"
+                                  % (node.name, len(sizes), nout))
+        if sum(sizes) != x.shape[axis] or any(s < 0 for s in sizes):
+            raise UnsupportedNode("Split %s: sizes %s vs axis %d extent %d"
+                                  % (node.name, sizes, axis, x.shape[axis]))
         outs = []
-        if x.layout == "nhwc":
-            # channel-strided copy on the QPUs, keeping the source pitch
-            off = 0
-            for sz in sizes:
-                out = self._alloc_t((n, sz, h, w), "nhwc", x.pitch)
-                if sz % 16 == 0:
-                    units = 4 if w % 4 == 0 else (2 if w % 2 == 0 else 1)
-                    nb, dp, nl = sz // 16, 16, 16
-                else:
-                    units, nb, dp, nl = 1, 1, sz, sz
-                for i in range(n):
-                    self._x(self._buf_at(x, (i * h * x.pitch * c + off) * 4),
+        if rank == 4 and axis == 1:
+            n, c, h, w = x.shape
+            # the channel-strided copy moves 16-lane blocks; a size that is
+            # not a multiple of 16 takes the gather (still one launch)
+            if x.layout == "nhwc" and all(sz % 16 == 0 for sz in sizes):
+                # channel-strided copy on the QPUs, keeping the source pitch
+                off = 0
+                for sz in sizes:
+                    out = self._alloc_t((n, sz, h, w), "nhwc", x.pitch)
+                    if sz % 16 == 0:
+                        units = 4 if w % 4 == 0 else (2 if w % 2 == 0 else 1)
+                        nb, dp, nl = sz // 16, 16, 16
+                    else:
+                        units, nb, dp, nl = 1, 1, sz, sz
+                    for i in range(n):
+                        self._x(self._buf_at(
+                            x, (i * h * x.pitch * c + off) * 4),
                             self._buf_at(out, i * h * x.pitch * sz * 4),
                             h, w, x.pitch * c * 4, x.pitch * sz * 4,
                             c * 4, sz * 4, 4, nl, nb, 64, 64, units, dp)
-                outs.append(out)
-                off += sz
-        else:
+                    outs.append(out)
+                    off += sz
+                return outs
+            if x.layout == "nhwc":
+                return self._split_gather(x, axis, sizes)
             cl = int(np.prod(x.shape[2:]))
             off = 0
             for sz in sizes:
@@ -2100,6 +2160,21 @@ class Runner:
                                cl * 4, cl * 4)
                 outs.append(out)
                 off += sz
+            return outs
+        return self._split_gather(x, axis, sizes)
+
+    def _split_gather(self, x, axis, sizes):
+        """Any axis, any rank: one gather table per output."""
+        rank = len(x.shape)
+        outs = []
+        off = 0
+        for sz in sizes:
+            rngs = [np.arange(int(d), dtype=np.int64) for d in x.shape]
+            rngs[axis] = np.arange(off, off + sz, dtype=np.int64)
+            tab, out_shape = _storage_index(x.shape, x.layout, x.pitch,
+                                            list(range(rank)), rngs)
+            outs.append(self._gather_flat(x, tab, out_shape))
+            off += sz
         return outs
 
     # Resize-19 attribute domain.  The coordinate mapping is one source

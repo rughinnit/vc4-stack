@@ -321,19 +321,55 @@ time scales with M, that is 210 ms -> 167 ms, about 43 ms of the 274 ms
 total.  The panel pass also does four VDR/VDW commands per block instead of
 one, so the real gain will be lower; that is what the silicon gate measures.
 
-### Silicon gate (pending)
+### Silicon gate: the 4-word transposing store is not legal
 
-With the board handed back:
+Run on the rebased tree (origin/main 54ddbd0) with the packaged vc4d, one
+client, 45-48 C, `throttled=0x0`.  The blob identity was checked before the
+result was believed: a fresh cache directory holds
+`im2col_nhwc2_16_5_5_s1_d1.bin` (995 words) for the default path and
+`im2col_nhwc_flat_16_5_5_s1_d1.bin` (1,048 words) for the flag, and
+`loaded_kernels()` names the flat blob only when `VC4_CONV_FLAT=1`.  The flat
+path also changes the GEMM's name (`gemm_80_16_416_b1_q5` becomes
+`gemm_48_16_416_b1_q3`), so a cached program cannot be mistaken for the new
+one.
 
-1. `VC4_CONV_FLAT=1` and `test_nhwc` (31 shapes, including stride-2,
-   dilation, 5x5, grouped and the three epilogues): every shape must be
-   clean, and the 4/16 VDW is new so the first run is a tiny-grid probe
-   (one 5x5 image, `test_conv`'s 16x16 case).
-2. YOLOv8n-160 parity at 5e-4 with `VC4_CONV_FLAT=1`, then the conv QPU ms
-   and the launch count from `profile_classes.py --conv` against the same
-   boot without the flag.
-3. Only then flip the default; until then the env flag keeps both paths
-   measurable and the shipped path unchanged.
+The first probe was a 16-channel, 5x5 image with a 5x5 kernel and pad 2: one
+image, three 16-pixel blocks, 48 GEMM rows against 80.  Two store field
+combinations were tried:
+
+| VDW fields (VPM block) | result |
+|---|---|
+| 16 rows x 4 words, transposing, 48 B gap | runs, no error, **max abs error 84.1** against the direct convolution (values of magnitude 20): the panel is transposed wrongly, the pixels land in the wrong words |
+| 4 rows x 16 words, transposing, 48 B gap (the C store's own field values) | **launch error `V3D_ERR_STAT=0x10`**; SRQCS `qerr=0`, state LIVE, no timeout, no context reset, no reboot |
+
+The conclusion is that the VPM-to-DMA store transposes a 16x16 block: the
+panel's own store is 16/16 with a zero stride, the C store is 4/16 with
+`horizontal=1`, and a 4-word-wide transposing store is either mis-laid-out or
+rejected.  Every field combination that transposes at this width is outside
+the shapes already proven on silicon.
+
+The next design keeps only proven fields: four 4-row VDRs write VPM rows
+0..15 (one per group), then the panel's own 16x16 transposing store writes
+the block, so the store word is exactly the one the current im2col uses.  It
+costs four VDR setups and one extra wait per (tap, channel block) and no new
+VDW shape.  That is the next kernel; `check_im2col_flat.py` already models
+the group addresses it needs.
+
+**State of this pass:** the flag defaults off and the default path is
+unchanged.  On this boot the default path measured **267.3 ms QPU, 831
+launches, conv 205.9 ms**, parity **0/44,100 over 5e-4** (max abs 0.0204),
+and `test_nhwc`, `test_conv`, `test_matmul`, `test_ew` all pass.  No timeout,
+context reset or reboot occurred; the only error signature is the launch
+error above, which the daemon reported per launch and recovered from without
+a reset.
+
+**M and launches.** The flat block reduces the GEMM's M (the probe: 80 rows
+to 48, the model's 64 conv layers: 33,952 to 26,992, ratio 0.795) and does
+not add a launch per conv: the im2col is still one launch per conv and the
+GEMM one, with the im2col's QPU count the largest divisor of the block count
+up to four.  The probe measured 3 launches either way (weight pack, im2col,
+GEMM).  What rises is the im2col's instruction count per block (454 against
+365 for 3x3) at 0.795 of the blocks.
 
 ## 8. What is not in this pass
 

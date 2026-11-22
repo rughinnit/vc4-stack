@@ -2400,11 +2400,19 @@ def build_im2col_nhwc_flat(Cin, KH, KW, stride=1, dilation=1):
     output plane, so the panel has `align16(ho * align4(wo))` rows instead.
 
     A block is four groups of four consecutive pixels of one padded row.  A
-    group is one VDR of four rows at the pixel pitch (the proven 4-row load
-    shape) and one transposing VDW of 16 k rows x 4 pixel words at a 64-byte
-    k pitch (the panel's own layout with the word count reduced to 4, a shape
-    the C store already uses with 4/16 swapped).  A running group counter
-    walks the row and adds the row adjustment at the wrap; there is no divide.
+    group is one VDR of four rows at the pixel pitch, and the block was meant
+    to be one transposing VDW of 16 k rows x 4 pixel words at a 64-byte k
+    pitch.  A running group counter walks the row and adds the row adjustment
+    at the wrap; there is no divide.
+
+    SILICON STATUS (2026-11-23): the 4-word transposing store is not legal.
+    With 4 rows x 16 words it writes the wrong layout (max abs error 84 on a
+    5x5 probe), and with the C store's own 4/16 fields it raises
+    V3D_ERR_STAT=0x10 on launch.  The VPM-to-DMA store transposes a 16x16
+    block; the next build must keep the panel's 16/16 store and feed it from
+    four 4-row VDRs into VPM rows 0..15.  The generator is kept with the
+    group-addressing code because that part is what the next build reuses;
+    VC4_CONV_FLAT=1 selects it, and the default path does not use it.
 
     KERNEL ABI (u0..u14)
       u0 src base bus                  u1 panel base bus
@@ -2459,7 +2467,10 @@ def build_im2col_nhwc_flat(Cin, KH, KW, stride=1, dilation=1):
     # panel's transposing store with 16 k rows and 4 pixel words, so the k
     # pitch is 64 B and the store's own unit is 16 B.
     p.emit(ldi(V.vdr_basic(0, 1, numrows=4, rowlen=16), A['VDRW']))
-    p.emit(ldi(V.vdw_basic(0, 4, 16, horizontal=0), A['VDWW']))
+    # the fields are the VPM block the store reads: 4 rows (pixels) x 16
+    # words (channels); horizontal=0 transposes it to 16 k rows x 4
+    # pixels.  vdw_basic() names its arguments the other way round.
+    p.emit(ldi(V.vdw_basic(0, 16, 4, horizontal=0), A['VDWW']))
     p.emit(ldi(V.vdw_stride(48), A['VDWS']))
     b.e(ldi(V.vdr_stride(0) & ~0xFFF, A['T']), nop())
     b.e(add_(ADD_ADD, A['VDRS'], areg(A['T']), breg(B['PIT'])), nop())

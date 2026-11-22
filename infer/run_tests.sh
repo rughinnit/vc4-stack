@@ -80,6 +80,13 @@ make check-math
 echo "=== test_dispatch (no GPU)"
 ./build/test_dispatch
 
+echo "=== test_autotune (no GPU: search space, legality, cache invalidation)"
+AUTOTUNE_TMP=${TMPDIR:-$HOME/scratch/tmp}
+mkdir -p "$AUTOTUNE_TMP"
+TMPDIR="$AUTOTUNE_TMP" ./build/test_autotune
+echo "=== test_autotune_space (no GPU: the space the generator can build)"
+TMPDIR="$AUTOTUNE_TMP" python3 tests/test_autotune_space.py
+
 # --- daemon regressions -----------------------------------------------------
 # G1/G9/G11 need a daemon they can provoke (timeout, departed client, lock
 # contention) without disturbing the one everything else talks to, so they run

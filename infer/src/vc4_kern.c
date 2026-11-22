@@ -180,22 +180,60 @@ static void sha_file(sha256_ctx *c, const char *path, const char *tag)
     fclose(f);
 }
 
-/* sha256(kgen.py, kops.py beside it, ABI tag, argv) */
-static void kernel_digest(char *const gen_argv[], uint8_t out[32])
+/* sha256 of the generator itself: kgen.py, kops.py beside it, the ABI tag.
+ * This is the prefix of every blob's stamp and the invalidation key of the
+ * autotune records (vc4_autotune.c), so one generator change discards both. */
+static void generator_hash(sha256_ctx *c)
 {
-    sha256_ctx c;
-    sha_init(&c);
     const char *kg = generator_path();
     char kops[512];
     const char *slash = strrchr(kg, '/');
     size_t dlen = slash ? (size_t)(slash - kg) : 0;
-    sha_file(&c, kg, "kgen:");
+    sha_file(c, kg, "kgen:");
     if (dlen + 16 < sizeof(kops)) {
         memcpy(kops, kg, dlen);
         snprintf(kops + dlen, sizeof(kops) - dlen, "/kops.py");
-        sha_file(&c, kops, "kops:");
+        sha_file(c, kops, "kops:");
     }
-    sha_update(&c, VC4_ABI_TAG, strlen(VC4_ABI_TAG));
+    sha_update(c, VC4_ABI_TAG, strlen(VC4_ABI_TAG));
+}
+
+static void digest_hex(const uint8_t h[32], char out[65])
+{
+    static const char *digits = "0123456789abcdef";
+    for (int i = 0; i < 32; ++i) {
+        out[2 * i] = digits[h[i] >> 4];
+        out[2 * i + 1] = digits[h[i] & 15];
+    }
+    out[64] = 0;
+}
+
+void vc4__generator_digest(char out[65])
+{
+    sha256_ctx c;
+    uint8_t h[32];
+    sha_init(&c);
+    generator_hash(&c);
+    sha_final(&c, h);
+    digest_hex(h, out);
+}
+
+void vc4__sha256_hex(const void *data, size_t len, char out[65])
+{
+    sha256_ctx c;
+    uint8_t h[32];
+    sha_init(&c);
+    sha_update(&c, data, len);
+    sha_final(&c, h);
+    digest_hex(h, out);
+}
+
+/* sha256(generator hash, argv) */
+static void kernel_digest(char *const gen_argv[], uint8_t out[32])
+{
+    sha256_ctx c;
+    sha_init(&c);
+    generator_hash(&c);
     for (int i = 0; gen_argv[i]; ++i) {
         sha_update(&c, gen_argv[i], strlen(gen_argv[i]));
         sha_update(&c, "\0", 1);

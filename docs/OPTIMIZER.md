@@ -379,8 +379,10 @@ new entry points yet.
 Measured on the board (2026-11-22, on the merged base, `vc4d` on the tv
 socket with a 46 MiB client arena because CMA on the shared board was full,
 peak 65 C): YOLOv8n-160 runs **1003 launches with no pass and 536 with all of
-them**, and every one of the 467 is a `Mul` (468 -> 2; the remaining `Div_1`
-is the other 1).  The parity gate passes with the epilogue on:
+them**.  The 467 are the SiLU pairs' `Mul` launches: the `Mul` row goes
+468 -> 2, and one of the two is `Div_1`, which `canonicalise` rewrites into
+a `Mul` that costs its launch either way.  The parity gate passes with the
+epilogue on:
 
 | input | over tolerance | max abs | max rel | detections (ref / vc4) | classes | max box diff | max score diff |
 |---|---:|---:|---:|---|---|---:|---:|

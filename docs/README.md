@@ -13,6 +13,7 @@ and every path below is relative to the repository root unless it starts with
 
 | document | contents |
 |---|---|
+| [wiki](https://github.com/rughinnit/vc4-stack/wiki) | the same pages, generated from this directory by `tools/wiki_sync.py`; edit here, never there |
 | [`TUTORIAL.md`](TUTORIAL.md) | **start here**: prerequisites, install (apt/pip/source), verify, YOLO three ways, PyTorch backend, ONNX export, measured performance |
 | [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | every failure mode we hit: symptom, cause, fix (JIT status=2, policy errors, GPU wedge, flock, coherency, arena/CMA, FPU, `/tmp`) |
 | [`API.md`](API.md) | reference for `vc4infer` (`Engine`/`Device`/`Detector`/`postprocess`/Ultralytics, errors, `host_policy`) and `torch_vc4` (op table, autograd, accuracy) |

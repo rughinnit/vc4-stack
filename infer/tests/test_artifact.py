@@ -350,6 +350,46 @@ def test_dropped(tmp):
 
 
 # -------------------------------------------------------------- exec state
+def test_seed_cache(tmp):
+    """The embedded blobs must land with the stamp the cache compares."""
+    p = os.path.join(tmp, "kern.vc4x")
+    stamp = "0123456789abcdef" * 4
+    blob = b"\x00\x01\x02\x03" * 4
+    make_container(p, sections=[("graph", b"onnx-bytes"),
+                                ("kernels", blob)])
+    tamper(p, lambda m: m.update({"kernels": {
+        "embedded": True, "section": "kernels", "bytes": len(blob),
+        "entries": [{"name": "gemm_test", "offset": 0, "bytes": len(blob),
+                     "sha256": hashlib.sha256(blob).hexdigest(),
+                     "stamp": stamp}]}}))
+    a = art.Artifact.load(p)
+    cache = os.path.join(tmp, "kc")
+    written, present = art.seed_cache(a, cache)
+    check((written, present) == (1, 0), "seed: the first call writes the blob",
+          (written, present))
+    check(os.path.isfile(os.path.join(cache, "gemm_test.bin")),
+          "seed: the blob file is there")
+    with open(os.path.join(cache, "gemm_test.bin.stamp"), encoding="ascii") as f:
+        check(f.read().strip() == stamp,
+              "seed: the stamp is the blob's own cache digest, not the "
+              "generator digest")
+    written, present = art.seed_cache(a, cache)
+    check((written, present) == (0, 1),
+          "seed: the second call leaves a valid entry alone", (written, present))
+    stub = os.path.join(tmp, "nostamp.vc4x")
+    make_container(stub, sections=[("graph", b"onnx-bytes"),
+                                   ("kernels", blob)])
+    tamper(stub, lambda m: m.update({"kernels": {
+        "embedded": True, "section": "kernels", "bytes": len(blob),
+        "entries": [{"name": "gemm_nostamp", "offset": 0, "bytes": len(blob),
+                     "sha256": hashlib.sha256(blob).hexdigest(),
+                     "stamp": None}]}}))
+    a2 = art.Artifact.load(stub)
+    art.seed_cache(a2, cache)
+    check(not os.path.exists(os.path.join(cache, "gemm_nostamp.bin.stamp")),
+          "seed: a blob with no recorded stamp gets no false stamp")
+
+
 def test_exec_state(tmp):
     raw = {
         "silu_skip": [3], "silu_src": {"7": "x"},
@@ -375,7 +415,7 @@ def main():
     try:
         for fn in (test_roundtrip, test_container_damage, test_section_hash,
                    test_keys, test_referenced_graph, test_pinned_pool,
-                   test_dropped, test_exec_state):
+                   test_dropped, test_seed_cache, test_exec_state):
             print("-- %s" % fn.__name__)
             fn(tmp)
     finally:

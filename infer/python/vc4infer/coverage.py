@@ -56,7 +56,7 @@ OPS = {
     "Det": "QPU permutation gathers + QPU mul/add chain (Leibniz expansion)",
     "Einsum": "QPU copy2d permutations + QPU gemm contraction (lowered, not a kernel)",
     "DeformConv": "QPU offset coordinates + 4-tap bilinear im2col + QPU gemm",
-    "Conv": "QPU conv: NHWC 1x1/3x3/5x5 s1/s2, dilation 1..8, groups",
+    "Conv": "QPU conv: NHWC 1x1/3x3/5x5 s1/s2, 6x6 s2 as four dilated phases, dilation 1..8, groups",
     "Relu": "QPU elementwise",
     "Abs": "QPU unary (vc4_unary UOP_ABS, exact)",
     "Neg": "QPU unary (UOP_NEG, exact)",
@@ -388,8 +388,10 @@ def _check_conv(node, shapes, inits):
     native_group = (grouped and Cin % group == 0 and Cout % group == 0
                     and (Cin // group) % 16 == 0
                     and (Cout // group) % 16 == 0)
-    nhwc = (kh in (1, 3, 5) and kw in (1, 3, 5) and symm
-            and (group == 1 or native_group or depthwise))
+    six = (kh == 6 and kw == 6 and sh == 2 and dilv == 1 and group == 1
+           and symm)
+    nhwc = (six or (kh in (1, 3, 5) and kw in (1, 3, 5) and symm
+                    and (group == 1 or native_group or depthwise)))
     if nhwc:
         if depthwise and Cout != Cin:
             return "unsupported", ("depthwise Cout %d != Cin %d (channel "

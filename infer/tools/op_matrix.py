@@ -435,6 +435,9 @@ def rec_conv(op, rng, o):
         mk("5x5_pad2", 16, 16, 5, 1, 2, 1, 1),
         mk("batch2", 16, 16, 3, 1, 1, 1, 1, n=2),
         mk("no_bias", 16, 16, 3, 1, 1, 1, 1, bias=False),
+        mk("6x6_stride2_stem", 3, 16, 6, 2, 2, 1, 1, hw=16,
+           note="YOLOv5 stem, 3 real input channels: four 3x3 dilation-2 "
+                "stride-2 phases"),
         mk("nonsquare_kernel_3x1", 16, 16, 3, 1, 0, 1, 1, w=1,
            edge=True, note="NCHW fallback only, documented"),
     ]

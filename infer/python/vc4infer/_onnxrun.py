@@ -382,6 +382,27 @@ def estimate_scratch_bytes(model, shapes=None):
         cout = int(ws[0])
         kh, kw = (int(ks[0]), int(ks[1])) if ks else (int(ws[2]), int(ws[3]))
         cpad, opad = _align16(cin), _align16(cout)
+        if (kh == 6 and kw == 6 and st[0] == st[1] == 2 and gp == 1
+                and dl[0] == dl[1] == 1
+                and pd[0] == pd[1] == pd[2] == pd[3]):
+            # the 6x6 path is four 3x3 dilation-2 phases, one panel at a time
+            best = 0
+            for a in (0, 1):
+                for b in (0, 1):
+                    pt, pl = pd[0] - a, pd[1] - b
+                    pb, pr = pd[0] + a - 1, pd[1] + b - 1
+                    if min(pt, pl, pb, pr) < 0:
+                        continue
+                    hh, ww = h + pt + pb, w + pl + pr
+                    ho = (hh - 5) // 2 + 1
+                    wo = (ww - 5) // 2 + 1
+                    if ho <= 0 or wo <= 0:
+                        continue
+                    nk = _align16(cpad * 9) + 16
+                    best = max(best, nb * cpad * hh * ww * 4 + 64 +
+                               nb * ho * _align16(wo) * nk * 4)
+            conv = max(conv, best)
+            continue
         ho = (h + 2 * pd[0] - (dl[0] * (kh - 1) + 1)) // st[0] + 1
         wo = (w + 2 * pd[1] - (dl[1] * (kw - 1) + 1)) // st[1] + 1
         if ho <= 0 or wo <= 0:
@@ -1016,8 +1037,9 @@ class Runner:
         "graph pool exhausted ... of 8388608 B" (which looks like a model
         problem) and "needs 30.2 MiB, arena is 24.0 MiB".
         """
-        from . import coverage as _cov
-        shapes, _types = _cov._shape_map(self.model)
+        shapes = getattr(self, "shapes", None)
+        if shapes is None:
+            shapes = coverage.refine_shapes(self.model)
         peak = estimate_pool_bytes(self.model, shapes)
         floor = estimate_pool_floor(self.model, shapes)
         scratch = estimate_scratch_bytes(self.model, shapes)
@@ -1350,7 +1372,8 @@ class Runner:
         return self.upload(p)
 
     # ------------------------------------------------------------ conv (NHWC)
-    def _conv_nhwc(self, node, x, wa, ba, kh, kw, sh, pad, dil=1, groups=1):
+    def _conv_nhwc(self, node, x, wa, ba, kh, kw, sh, pad, dil=1, groups=1,
+                   pads=None):
         """NHWC conv, native: batch, dilation and grouped channel blocks.
 
         x is [N][H][pitch][Cin] and wa is the ONNX [Cout][Cin/g][kh][kw].
@@ -1359,16 +1382,24 @@ class Runner:
         each group's GEMM writes straight into its channel range of the single
         output (the GEMM C stride is Cout).  No host interleave, no wasted
         MACs.
+
+        ``pads`` overrides ``pad`` with (top, left, bottom, right); it is used
+        by the 6x6 decomposition, whose phases read the same input shifted by
+        one row/column.  Grouped convs stay symmetric.
         """
         N = x.shape[0]
         Cin = x.shape[1]
         H, W = x.shape[2], x.shape[3]
         Cout = wa.shape[0]
+        pt, pl, pb, pr = pads if pads is not None else (pad,) * 4
+        if groups > 1 and (pt, pl, pb, pr) != (pad,) * 4:
+            raise UnsupportedNode("Conv %s: asymmetric pads on a grouped conv"
+                                  % node.name)
         if sh * Cin * 4 > 8191:
             raise UnsupportedNode("Conv %s: stride*Cin*4 = %d B > 8191 B"
                                   % (node.name, sh * Cin * 4))
-        ho = (H + 2 * pad - dil * (kh - 1) - 1) // sh + 1
-        wo = (W + 2 * pad - dil * (kw - 1) - 1) // sh + 1
+        ho = (H + pt + pb - dil * (kh - 1) - 1) // sh + 1
+        wo = (W + pl + pr - dil * (kw - 1) - 1) // sh + 1
         if ho <= 0 or wo <= 0:
             raise UnsupportedNode("Conv %s: empty %dx%d output" % (node.name,
                                                                     ho, wo))
@@ -1395,7 +1426,8 @@ class Runner:
                 b2 = np.zeros(Cout, np.float32)
                 b2[:ba.size] = ba
                 ba = b2
-            key = ("panel", node.name, Cin, Cout, kh, kw, dil)
+            key = ("panel", node.name, Cin, Cout, kh, kw, dil,
+                   (pt, pl, pb, pr) if pads is not None else None)
             wp = self._panels.get(key)
             if wp is None:
                 wt = self.upload(np.ascontiguousarray(wa, np.float32))
@@ -1407,9 +1439,9 @@ class Runner:
                 self._panels[key] = wp
                 self._free(wt)
                 self._free(bb)
-            h, w, o = self.eng.conv_nhwc_dil(
-                x.buf, N, Cin, H, W, x.pitch, wp, Cout, kh, kw, sh, pad, dil,
-                out)
+            h, w, o = self.eng.conv_nhwc_pads(
+                x.buf, N, Cin, H, W, x.pitch, wp, Cout, kh, kw, sh, pt, pl,
+                pb, pr, dil, out)
             return Tensor(out, (N, Cout, h, w), "nhwc", pitch=o)
 
         # grouped conv: per-group panels, one shared padded input/panel
@@ -1470,6 +1502,54 @@ class Runner:
         self._tmp(t)
         return Tensor(out, t.shape, t.layout, t.pitch)
 
+    def _conv6_stride2(self, node, xn, wa, ba, pad):
+        """6x6 stride-2 conv as four 3x3 stride-2, dilation-2 convs.
+
+        Split the 6x6 taps by (ky%2, kx%2): phase (a,b) holds taps
+        ky=a+2i, kx=b+2j for i,j in 0..2, which is a 3x3 kernel of dilation
+        2.  A stride-2 conv with dilation 2 computes output y from input
+        rows 2y + 2i - P, so phase (a,b) needs P = pad - a on the top and
+        pad - b on the left, and pad + a - 1 / pad + b - 1 on the bottom and
+        right to keep the output count of the 6x6 kernel.  The four outputs
+        are summed; the bias goes on one phase only.
+
+        The reads are the same MACs as the 6x6 kernel -- 4 x 9 taps -- but
+        one phase's im2col panel exists at a time.  YOLOv5's stem is
+        [1][3][640][640] -> [1][16][320][320]; its direct panel would be
+        60 MiB at 320x320 and 242 MiB at 640x640, a phase's is 16 MiB and
+        65 MiB, which is what keeps 320x320 inside a 64 MiB client arena.
+        """
+        wa = np.asarray(wa, np.float32)
+        if wa.shape[2:] != (6, 6):
+            raise UnsupportedNode("Conv %s: 6x6 decomposition needs a 6x6 "
+                                  "weight (%s)" % (node.name, wa.shape))
+        if pad < 1:
+            raise UnsupportedNode("Conv %s: 6x6 decomposition needs pad >= 1"
+                                  % node.name)
+        acc = None
+        zero_bias = np.zeros_like(ba)
+        for a in (0, 1):
+            for b in (0, 1):
+                wab = np.ascontiguousarray(
+                    wa[:, :, a::2, b::2][:, :, :3, :3])
+                bias = ba if (a == 0 and b == 0) else zero_bias
+                phase_pads = (pad - a, pad - b, pad + a - 1, pad + b - 1)
+                t = self._conv_nhwc(node, xn, wab, bias, 3, 3, 2, pad,
+                                    dil=2, groups=1, pads=phase_pads)
+                self._tmp(t)        # the kept one is filtered out on release
+                if acc is None:
+                    acc = t
+                else:
+                    if t.shape != acc.shape:
+                        raise UnsupportedNode(
+                            "Conv %s: 6x6 phase output %s != %s"
+                            % (node.name, t.shape, acc.shape))
+                    out = self._alloc_t(acc.shape, "nhwc", acc.pitch)
+                    self.eng.elementwise(vc4infer.OP_ADD, acc.buf, out.buf,
+                                         acc.size, b=t.buf)
+                    acc = out
+        return acc
+
     def _conv(self, node):
         return self._epilogue(node, self._conv_impl(node))
 
@@ -1515,13 +1595,25 @@ class Runner:
                                   % (node.name, Cout, Cin))
         native_group = (grouped and (Cin // group) % 16 == 0
                         and (Cout // group) % 16 == 0)
-        nhwc_ok = (kh in (1, 3, 5) and kw in (1, 3, 5) and sh in (1, 2)
-                   and list(pads) == [pads[0]] * 4 and 1 <= dilv <= 8
-                   and (group == 1 or native_group or depthwise))
+        six = (kh == 6 and kw == 6 and sh == 2 and dilv == 1 and group == 1
+               and list(pads) == [pads[0]] * 4)
+        nhwc_ok = six or (kh in (1, 3, 5) and kw in (1, 3, 5) and sh in (1, 2)
+                          and list(pads) == [pads[0]] * 4 and 1 <= dilv <= 8
+                          and (group == 1 or native_group or depthwise))
         if nhwc_ok:
             xn = self.to_nhwc(x, _align16(Cin))
             if xn is not x:
                 self._tmp(xn)
+            if six:
+                # 6x6 stride 2 is four 3x3 stride-2 kernels of dilation 2,
+                # one per (ky%2, kx%2) phase, on the input shifted by the
+                # phase.  Same MAC count, but one phase's im2col panel at a
+                # time: at 320x320 the direct 6x6 panel is 60 MiB, a phase's
+                # is 16 MiB.
+                t = self._conv6_stride2(node, xn, wa, ba, int(pads[0]))
+                if t.shape[1] != w.shape[0]:
+                    t = self._slice_ch(t, 0, int(w.shape[0]))
+                return t
             if depthwise:
                 # The dedicated depthwise kernel is not shipped (it wedges
                 # the QPU); the verified block-diagonal dense expansion is

@@ -91,21 +91,21 @@ def main(argv=None):
     acc = OrderedDict()
     walls = []
     t_pack = t_kern = 0.0
-    rows.clear()
     for _ in range(max(1, args.reps)):
+        rows.clear()                    # one row per call, last run kept
         t0 = time.perf_counter()
         eng.run(feed, profile=True)
         walls.append((time.perf_counter() - t0) * 1e3)
         for p in eng.last_profile:
             e = acc.setdefault(p["op"], {"gpu": 0.0, "launch": 0, "nodes": 0})
             e["gpu"] += p["gpu_ms"] / max(1, args.reps)
-            e["launch"] = max(e["launch"], p["launches"])
+            e["launch"] += p["launches"] / max(1, args.reps)
             e["nodes"] += 1 / max(1, args.reps)
-        t_pack += sum(r["panel_ms"] for r in rows) / max(1, args.reps)
-        t_kern += sum(r["gemm_ms"] for r in rows) / max(1, args.reps)
+        t_pack = sum(r["panel_ms"] for r in rows)
+        t_kern = sum(r["gemm_ms"] for r in rows)
 
     gpu = sum(e["gpu"] for e in acc.values())
-    launches = sum(e["launch"] for e in acc.values())
+    launches = int(sum(e["launch"] for e in acc.values()))
     walls.sort()
     wall = walls[len(walls) // 2]
 

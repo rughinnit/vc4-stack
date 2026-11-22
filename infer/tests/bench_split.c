@@ -51,7 +51,7 @@ static int one(vc4_ctx *ctx, int M, int N, int K, int reps)
     vc4_buf A, B, C, P;
     double pack[32], gemm[32], wall[32];
 
-    if (reps < 1 || reps > 32)
+    if (reps < 1 || reps > 4096)
         reps = 5;
     if (vc4_alloc(ctx, (size_t)Mp * Kp * 4u, &A) != VC4_OK ||
         vc4_alloc(ctx, (size_t)Kp * Np * 4u, &B) != VC4_OK ||
@@ -78,6 +78,7 @@ static int one(vc4_ctx *ctx, int M, int N, int K, int reps)
                         VC4_ACT_NONE) != VC4_OK)
         return -1;
 
+    uint64_t cyc0 = ctx->st.gpu_cycles;
     for (int r = 0; r < reps; ++r) {
         uint64_t p0 = ctx->st.pack_ns, k0 = ctx->st.kernel_ns;
         double t0 = now_ms();
@@ -94,13 +95,29 @@ static int one(vc4_ctx *ctx, int M, int N, int K, int reps)
         gemm[r] = (double)(ctx->st.kernel_ns - k0) / 1e6;
         wall[r] = t2 - t0;
         (void)t1;
+        /* Per-rep rows exist to line a measurement up with a board state
+         * sampled from another shell: a median hides a state that changes
+         * between reps. */
+        if (getenv("VC4_BENCH_VERBOSE"))
+            printf("  rep%d  pack %.3f  gemm %.3f  wall %.3f\n", r, pack[r],
+                   gemm[r], wall[r]);
     }
     double flops = 2.0 * (double)Mp * (double)Np * (double)Kp;
     double pm = median(pack, reps), gm = median(gemm, reps);
+    /* The cycle counter is V3D EXECUTION_CYCLES summed over the QPUs, so
+     * dividing by the tile-k count gives per-QPU cycles per 8x64 tile and one
+     * k block.  That number is the schedule's cost and must not move when the
+     * memory path changes: it is the check that a GFLOP/s difference is a
+     * board state and not a different program. */
+    const double tilek = (double)(Mp / 8u) * (double)(Np / 64u) *
+                         (double)(Kp / 16u);
+    double cyc = (double)(ctx->st.gpu_cycles - cyc0) / (double)reps;
     printf("%4dx%4dx%4d  padded %ux%ux%u  pack %.3f ms (%4.1f%%)  "
-           "gemm %.3f ms  %.2f GFLOP/s gemm-only  %.2f total  wall %.3f ms\n",
+           "gemm %.3f ms  %.2f GFLOP/s gemm-only  %.2f total  wall %.3f ms"
+           "  %.0f cyc/tile-k\n",
            M, N, K, Mp, Np, Kp, pm, 100.0 * pm / (pm + gm), gm,
-           flops / (gm * 1e6), flops / ((gm + pm) * 1e6), median(wall, reps));
+           flops / (gm * 1e6), flops / ((gm + pm) * 1e6), median(wall, reps),
+           cyc / tilek);
     vc4__scratch_reset(ctx);
     return 0;
 }

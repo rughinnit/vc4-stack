@@ -440,6 +440,10 @@ def rec_conv(op, rng, o):
                 "stride-2 phases"),
         mk("dense_cin1_5x5", 1, 64, 5, 1, 2, 1, 1,
            note="dense 1->64: group == Cin == 1 is not depthwise"),
+        mk("1x1_cout1000", 512, 1000, 1, 1, 0, 1, 1, hw=13,
+           note="Cout is not 16-aligned: the padded output is sliced back"),
+        mk("1x1_cout1008", 512, 1008, 1, 1, 0, 1, 1, hw=13,
+           note="the same conv with an aligned Cout needs no slice"),
         mk("nonsquare_kernel_3x1", 16, 16, 3, 1, 0, 1, 1, w=1,
            edge=True, note="NCHW fallback only, documented"),
     ]

@@ -3008,10 +3008,16 @@ class Runner:
     def _slice_ch(self, x, c0, cn):
         """x's channels [c0, c0+cn) as a new NHWC tensor, on the QPUs.
 
-        One copy2d covers a channel count that is a multiple of 16 (nblk
-        blocks of 16 lanes).  Any other count takes one call per 16-lane
-        block, the last one partial: a QPU store writes at most 16 words, so
-        a 24-channel conv output cannot be trimmed in a single call.
+        A copy2d_x store is at most 16 lanes wide and 16 words deep.  One call
+        covers all of the whole 16-lane blocks (`cn/16` blocks at 64-byte
+        steps), and a remainder of 1-15 channels is one more call with
+        ``nlane == depth ==`` the remainder.  The old single call passed the
+        whole count as both, which is `copy2d_x: invalid argument` as soon as
+        it exceeds 16: a 1x1 conv to 1000 channels pads Cout to 1008 and then
+        slices the real 1000 back, and 62*16 + 8 is not one store.  A
+        remainder smaller than a block must be stored at depth=nl as well: a
+        16-word store would spill into the next pixel (24 channels: the last
+        block is 8 words, the pixel is 24).
         """
         n, c, h, w = x.shape
         out = self._alloc_t((n, cn, h, w), "nhwc", w)
@@ -3019,24 +3025,20 @@ class Runner:
         # (cn % 16 == 0); 24 channels is 96 B and takes single-vector stores
         units = (4 if w % 4 == 0 else (2 if w % 2 == 0 else 1)) \
             if cn % 16 == 0 else 1
-        if cn % 16 == 0:
-            for i in range(n):
-                self._x(self._buf_at(x, (i * h * x.pitch * c + c0) * 4),
-                        out.buf if n == 1 else
-                        self._buf_at(out, i * h * w * cn * 4),
+        blocks, tail = divmod(cn, 16)
+        for i in range(n):
+            so = i * h * x.pitch * c * 4
+            do = i * h * w * cn * 4 if n > 1 else 0
+            if blocks:
+                self._x(self._buf_at(x, so + c0 * 4),
+                        self._buf_at(out, do),
                         h, w, x.pitch * c * 4, w * cn * 4, c * 4, cn * 4, 4,
-                        16, cn // 16, 64, 64, units, 16)
-            return out
-        # A destination pixel is cn words wide, so a partial block must be
-        # stored at depth=nl: a 16-word store would spill into the next pixel
-        # (24 channels: the last block is 8 words, the pixel is 24).
-        for k0 in range(0, cn, 16):
-            nl = min(16, cn - k0)
-            for i in range(n):
-                self._x(self._buf_at(x, (i * h * x.pitch * c + c0 + k0) * 4),
-                        self._buf_at(out, (i * h * w * cn + k0) * 4),
+                        16, blocks, 64, 64, units, 16)
+            if tail:
+                self._x(self._buf_at(x, so + (c0 + blocks * 16) * 4),
+                        self._buf_at(out, do + blocks * 16 * 4),
                         h, w, x.pitch * c * 4, w * cn * 4, c * 4, cn * 4, 4,
-                        nl, 1, 64, 64, units, nl)
+                        tail, 1, 64, 64, 1, tail)
         return out
 
     def _flatten(self, node):

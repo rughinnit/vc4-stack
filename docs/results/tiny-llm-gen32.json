@@ -1,0 +1,91 @@
+{
+ "model": "/home/raspi/scratch/refs/tinystories/wrap/ts1m_c32.onnx",
+ "ctx": 32,
+ "prompt": "Once upon a time there was a little girl named Lily. She lived with her mother and father in a small house near the woods. Every day she went outside to play with her friends.",
+ "prompt_tokens": 38,
+ "generated_ids": [
+  337,
+  337,
+  337,
+  337,
+  337,
+  337,
+  337,
+  337
+ ],
+ "generated_text": " M M M M M M M M",
+ "text": "Once upon a time there was a little girl named Lily. She lived with her mother and father in a small house near the woods. Every day she went outside to play with her friends. M M M M M M M M",
+ "tokens_per_s": 0.4167825994107099,
+ "mean_ms_per_token": 2399.332413142734,
+ "min_ms_per_token": 2351.2617670003237,
+ "first_ms": 3276.556053000604,
+ "launches_per_token": 3464,
+ "nodes": 378,
+ "node_backends": {
+  "vc4": 378
+ },
+ "memory": {
+  "arena_bytes": 67108864,
+  "arena_mb": 64.0,
+  "pool_bytes": 35067584,
+  "pool_mb": 33.44305419921875,
+  "pool_segments": 1,
+  "peak_bytes": 27857472,
+  "peak_mb": 26.56695556640625,
+  "estimate_bytes": 35067584,
+  "scratch_bytes": 867328,
+  "device": "vc4"
+ },
+ "steps": [
+  {
+   "step": 0,
+   "wall_ms": 3276.556053000604,
+   "launches": 3465,
+   "token": 337
+  },
+  {
+   "step": 1,
+   "wall_ms": 2354.498193000836,
+   "launches": 3466,
+   "token": 337
+  },
+  {
+   "step": 2,
+   "wall_ms": 2524.8219710010744,
+   "launches": 3465,
+   "token": 337
+  },
+  {
+   "step": 3,
+   "wall_ms": 2415.228522999314,
+   "launches": 3466,
+   "token": 337
+  },
+  {
+   "step": 4,
+   "wall_ms": 2365.5131079995044,
+   "launches": 3464,
+   "token": 337
+  },
+  {
+   "step": 5,
+   "wall_ms": 2351.2617670003237,
+   "launches": 3465,
+   "token": 337
+  },
+  {
+   "step": 6,
+   "wall_ms": 2370.882465998875,
+   "launches": 3462,
+   "token": 337
+  },
+  {
+   "step": 7,
+   "wall_ms": 2413.120863999211,
+   "launches": 3464,
+   "token": 337
+  }
+ ],
+ "parity_all": true,
+ "ort_mean_ms": null
+}

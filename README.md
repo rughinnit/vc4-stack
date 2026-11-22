@@ -98,6 +98,9 @@ the operator; it does not run on the ARM instead.
 - [`docs/ACCURACY-FPS.md`](docs/ACCURACY-FPS.md) — YOLOv8n at 96/128/160 with
   COCO weights: 2.83 / 2.60 / 2.14 FPS, the detections that survive each size,
   and the launch and FLOP budget behind the curve.
+- [`docs/TINY-LLM.md`](docs/TINY-LLM.md) — TinyStories-1M end to end: 378 static
+  nodes, none refused, 1.06 tokens/s at 16 tokens, and the two engine defects
+  that keep its output from matching ONNX Runtime.
 
 Accuracy is in [`docs/ACCURACY.md`](docs/ACCURACY.md) (identical detections to
 0.00 px against the CPU); the ncnn head-to-head (6.4×, same detections) in

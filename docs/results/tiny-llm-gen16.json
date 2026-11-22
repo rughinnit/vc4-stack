@@ -1,0 +1,91 @@
+{
+ "model": "/home/raspi/scratch/refs/tinystories/wrap/ts1m_c16.onnx",
+ "ctx": 16,
+ "prompt": "Once upon a time there was a little girl named Lily. She lived with her mother and father in a small house near the woods. Every day she went outside to play with her friends.",
+ "prompt_tokens": 38,
+ "generated_ids": [
+  284,
+  284,
+  284,
+  284,
+  284,
+  284,
+  284,
+  284
+ ],
+ "generated_text": " to to to to to to to to",
+ "text": "Once upon a time there was a little girl named Lily. She lived with her mother and father in a small house near the woods. Every day she went outside to play with her friends. to to to to to to to to",
+ "tokens_per_s": 1.0636579227448335,
+ "mean_ms_per_token": 940.1518839999231,
+ "min_ms_per_token": 866.1158189988782,
+ "first_ms": 1324.6367989995633,
+ "launches_per_token": 1371,
+ "nodes": 378,
+ "node_backends": {
+  "vc4": 378
+ },
+ "memory": {
+  "arena_bytes": 67108864,
+  "arena_mb": 64.0,
+  "pool_bytes": 31282752,
+  "pool_mb": 29.83355712890625,
+  "pool_segments": 1,
+  "peak_bytes": 27857472,
+  "peak_mb": 26.56695556640625,
+  "estimate_bytes": 31282752,
+  "scratch_bytes": 867328,
+  "device": "vc4"
+ },
+ "steps": [
+  {
+   "step": 0,
+   "wall_ms": 1324.6367989995633,
+   "launches": 1374,
+   "token": 284
+  },
+  {
+   "step": 1,
+   "wall_ms": 871.9608480005263,
+   "launches": 1376,
+   "token": 284
+  },
+  {
+   "step": 2,
+   "wall_ms": 866.1158189988782,
+   "launches": 1373,
+   "token": 284
+  },
+  {
+   "step": 3,
+   "wall_ms": 867.1131499995681,
+   "launches": 1375,
+   "token": 284
+  },
+  {
+   "step": 4,
+   "wall_ms": 959.7578000011708,
+   "launches": 1372,
+   "token": 284
+  },
+  {
+   "step": 5,
+   "wall_ms": 1014.2875840010674,
+   "launches": 1373,
+   "token": 284
+  },
+  {
+   "step": 6,
+   "wall_ms": 997.3764479982492,
+   "launches": 1371,
+   "token": 284
+  },
+  {
+   "step": 7,
+   "wall_ms": 1004.4515390000015,
+   "launches": 1371,
+   "token": 284
+  }
+ ],
+ "parity_all": true,
+ "ort_mean_ms": null
+}

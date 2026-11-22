@@ -1,0 +1,196 @@
+{
+ "16": {
+  "mean_ms": 873.3606329997201,
+  "launches": 1374,
+  "gpu_ms": 221.197439,
+  "qpu_duty": 25.327159324809056,
+  "nodes_total": 378,
+  "nodes_vc4": 378,
+  "nodes_folded": 0,
+  "nodes_host_meta": 0,
+  "nodes_unwritten": 0,
+  "nodes_unsupported": 0,
+  "pool_mb": 29.83355712890625,
+  "peak_mb": 27.01092529296875,
+  "arena_mb": 64.0,
+  "estimate_bytes": 31282752,
+  "scratch_bytes": 867328,
+  "by_op": {
+   "Where": {
+    "nodes": 8,
+    "launches": 72,
+    "wall_ms": 238.9839569977994,
+    "gpu_ms": 27.361559000000003
+   },
+   "MatMul": {
+    "nodes": 65,
+    "launches": 610,
+    "wall_ms": 211.68300149565766,
+    "gpu_ms": 95.6096005
+   },
+   "LayerNormalization": {
+    "nodes": 17,
+    "launches": 374,
+    "wall_ms": 145.9836145022564,
+    "gpu_ms": 73.349608
+   },
+   "Reshape": {
+    "nodes": 130,
+    "launches": 0,
+    "wall_ms": 50.05914499361097,
+    "gpu_ms": 0.0
+   },
+   "Add": {
+    "nodes": 57,
+    "launches": 81,
+    "wall_ms": 44.32095199899777,
+    "gpu_ms": 6.3766155
+   },
+   "Transpose": {
+    "nodes": 40,
+    "launches": 40,
+    "wall_ms": 38.15056400253525,
+    "gpu_ms": 3.244051
+   },
+   "Mul": {
+    "nodes": 32,
+    "launches": 64,
+    "wall_ms": 28.935449004166003,
+    "gpu_ms": 4.930162
+   },
+   "Softmax": {
+    "nodes": 8,
+    "launches": 24,
+    "wall_ms": 14.897863000442157,
+    "gpu_ms": 1.9119234999999999
+   },
+   "Pow": {
+    "nodes": 8,
+    "launches": 32,
+    "wall_ms": 13.026747002186312,
+    "gpu_ms": 2.4145605
+   },
+   "Tanh": {
+    "nodes": 8,
+    "launches": 48,
+    "wall_ms": 12.080563498784613,
+    "gpu_ms": 3.5771305000000004
+   },
+   "Cast": {
+    "nodes": 2,
+    "launches": 16,
+    "wall_ms": 8.588515000155894,
+    "gpu_ms": 1.220353
+   },
+   "Gather": {
+    "nodes": 2,
+    "launches": 12,
+    "wall_ms": 4.77974499881384,
+    "gpu_ms": 0.9177455
+   },
+   "Slice": {
+    "nodes": 1,
+    "launches": 1,
+    "wall_ms": 1.1523840003064834,
+    "gpu_ms": 0.0805215
+   }
+  }
+ },
+ "32": {
+  "mean_ms": 2807.8169684995373,
+  "launches": 3466,
+  "gpu_ms": 564.488147,
+  "qpu_duty": 20.104164670735482,
+  "nodes_total": 378,
+  "nodes_vc4": 378,
+  "nodes_folded": 0,
+  "nodes_host_meta": 0,
+  "nodes_unwritten": 0,
+  "nodes_unsupported": 0,
+  "pool_mb": 33.44305419921875,
+  "peak_mb": 27.92864990234375,
+  "arena_mb": 64.0,
+  "estimate_bytes": 35067584,
+  "scratch_bytes": 867328,
+  "by_op": {
+   "Softmax": {
+    "nodes": 8,
+    "launches": 1864,
+    "wall_ms": 975.5398494990004,
+    "gpu_ms": 194.80634550000002
+   },
+   "Where": {
+    "nodes": 8,
+    "launches": 200,
+    "wall_ms": 905.5649040010394,
+    "gpu_ms": 104.42251999999999
+   },
+   "LayerNormalization": {
+    "nodes": 17,
+    "launches": 374,
+    "wall_ms": 254.3424480018075,
+    "gpu_ms": 128.4238035
+   },
+   "MatMul": {
+    "nodes": 65,
+    "launches": 610,
+    "wall_ms": 251.8835614882846,
+    "gpu_ms": 100.421083
+   },
+   "Reshape": {
+    "nodes": 130,
+    "launches": 0,
+    "wall_ms": 65.40971500453452,
+    "gpu_ms": 0.0
+   },
+   "Add": {
+    "nodes": 57,
+    "launches": 105,
+    "wall_ms": 65.22947900339204,
+    "gpu_ms": 8.709108500000001
+   },
+   "Transpose": {
+    "nodes": 40,
+    "launches": 40,
+    "wall_ms": 51.95641850514221,
+    "gpu_ms": 5.359565500000001
+   },
+   "Mul": {
+    "nodes": 32,
+    "launches": 96,
+    "wall_ms": 44.750758003829105,
+    "gpu_ms": 7.697740000000001
+   },
+   "Tanh": {
+    "nodes": 8,
+    "launches": 88,
+    "wall_ms": 22.165663500345545,
+    "gpu_ms": 6.611924500000001
+   },
+   "Pow": {
+    "nodes": 8,
+    "launches": 48,
+    "wall_ms": 20.48439499685628,
+    "gpu_ms": 3.7272299999999996
+   },
+   "Cast": {
+    "nodes": 2,
+    "launches": 16,
+    "wall_ms": 12.004873501609836,
+    "gpu_ms": 1.3073864999999998
+   },
+   "Gather": {
+    "nodes": 2,
+    "launches": 24,
+    "wall_ms": 8.544835000975581,
+    "gpu_ms": 1.829082
+   },
+   "Slice": {
+    "nodes": 1,
+    "launches": 1,
+    "wall_ms": 1.2520450000010896,
+    "gpu_ms": 0.084975
+   }
+  }
+ }
+}

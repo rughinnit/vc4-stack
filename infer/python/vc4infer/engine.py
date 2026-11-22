@@ -278,6 +278,67 @@ class Engine:
         return {name: np.asarray(arr)
                 for name, arr in zip([o.name for o in self.outputs], outs)}
 
+    # -------------------------------------------------------------- autotune
+    def autotune(self, op, shape, *, force=False, reps=5, max_candidates=14,
+                 budget_ms=30000):
+        """Measure, cache and return the best launch for one op and shape.
+
+        ``op`` is ``"matmul"`` or ``"conv2d"``.  For a matmul ``shape`` is
+        ``(M, N, K)``; for a conv a dict with ``cin, cout, h, w, kh, kw`` and
+        optionally ``pad`` (0), ``stride`` (1) and ``bias`` (True).
+
+        Returns ``{params, best_ms, default_ms, gain, max_abs, candidates,
+        from_cache, kernel, op, shape}``.  ``params`` holds the QPU counts the
+        kernels will be generated and launched with; ``max_abs`` is the
+        largest element difference against the default launch's output (the
+        chosen parameters are not recorded if any element is outside the
+        recorded 5e-4 tolerance).
+
+        An existing record is returned immediately unless ``force``.  A cold
+        call measures at most ``max_candidates`` parameter sets within
+        ``budget_ms`` of wall clock, blob generation included.  After it
+        succeeds this engine consults the record for that shape.
+        """
+        if op in ("matmul", "gemm", "matmul/f32"):
+            if isinstance(shape, dict):
+                m, n, k = shape["m"], shape["n"], shape["k"]
+            else:
+                m, n, k = shape
+            fields = (int(m), int(n), int(k), 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            opcode, label = 0, "matmul"
+        elif op in ("conv2d", "conv", "conv2d/3x3", "conv2d/1x1"):
+            d = dict(shape)
+            vals = [d["cin"], d["cout"], d["h"], d["w"], d["kh"], d["kw"]]
+            if any(int(v) <= 0 for v in vals):
+                raise ShapeError("conv2d shape fields must be positive: %r"
+                                 % (shape,))
+            pad, stride = int(d.get("pad", 0)), int(d.get("stride", 1))
+            bias = 1 if d.get("bias", True) else 0
+            fields = (0, 0, 0, int(d["cin"]), int(d["cout"]), int(d["h"]),
+                      int(d["w"]), int(d["kh"]), int(d["kw"]), pad, stride,
+                      bias)
+            opcode, label = 1, "conv2d"
+        else:
+            raise ValueError("autotune: op must be 'matmul' or 'conv2d', "
+                             "not %r" % (op,))
+
+        from ._binding import TuneShape          # only needed for this call
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("engine is closed")
+            r = self._eng.autotune(opcode, TuneShape(*fields),
+                                   max_candidates=max_candidates,
+                                   budget_ms=budget_ms, reps=reps,
+                                   force=1 if force else 0)
+        r["op"] = label
+        r["shape"] = (tuple(fields[:3]) if label == "matmul"
+                      else {k: fields[i + 3] for i, k in
+                            enumerate(("cin", "cout", "h", "w", "kh", "kw",
+                                       "pad", "stride", "bias"))})
+        r["gain"] = (r["default_ms"] / r["best_ms"]
+                     if r["best_ms"] > 0 else None)
+        return r
+
     # --------------------------------------------------------------- reports
     def _coverage(self):
         if self._plan_cache is None:

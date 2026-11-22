@@ -7,6 +7,7 @@
 
 #define VC4_MAX_KERNELS   128
 #define VC4_MAX_QPU       12
+#define VC4_TUNE_MEMO     32
 
 /* arena layout (one dma-buf):
  *   0x000000  arena signature (unique per process, used for the phys scan)
@@ -39,6 +40,15 @@ typedef struct {
     uint64_t used_at;
 } vc4_kernel;
 
+/* One entry of the autotune lookup memo (vc4_autotune.c): a graph runs the
+ * same shape repeatedly, and a record that is parsed once per launch would be
+ * pure overhead. */
+typedef struct {
+    uint64_t        key;
+    vc4_tune_params p;
+    int             valid;
+} vc4_tune_memo;
+
 struct vc4_ctx {
     int      mem_fd;
     int      dmabuf_fd;
@@ -63,6 +73,12 @@ struct vc4_ctx {
     uint64_t kern_clock;     /* LRU stamp for the kernel cache (G3) */
     char     cache_dir[256];
     int      allow_jit;
+
+    /* autotuning: 1 after an explicit vc4_autotune() (the env switch is read
+     * on demand), plus the memo of the last lookups */
+    int            autotune;
+    vc4_tune_memo  tune_memo[VC4_TUNE_MEMO];
+    char           tune_digest[65];   /* generator digest, computed once */
 
     vc4_stats st;
 };
@@ -120,9 +136,37 @@ vc4_kernel *vc4__kern_slot(vc4_ctx *ctx);
 /* one work unit = 8 rows x rowlen floats; grid-strided over 4 QPUs */
 vc4_status vc4__pack_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen_floats,
                          uint32_t dst_bus, uint32_t rowblocks);
+/* same, with the packer's QPU count explicit (0 = the default: min(units,4)).
+ * The packer has no in-kernel guard, so q must divide rowblocks. */
+vc4_status vc4__pack_run_q(vc4_ctx *ctx, uint32_t src_bus,
+                           uint32_t rowlen_floats, uint32_t dst_bus,
+                           uint32_t rowblocks, int q);
 /* 8x64 tiles: M 8-aligned, N 64-aligned, K 16-aligned, B row-major */
 vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                          uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus);
+/* same, with the GEMM's QPU count explicit (0 = min(M/8, 12)) */
+vc4_status vc4__gemm_run_q(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
+                           uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus,
+                           int gemm_q);
+/* The blob names the generator sees, shared with the autotuner so a record
+ * names the kernel it selects instead of recomputing the scheme. */
+void vc4__matmul_kernel_name(char *out, size_t n, uint32_t M, uint32_t N,
+                             uint32_t K, int nq);
+void vc4__conv_kernel_name(char *out, size_t n, uint32_t M, uint32_t N,
+                           uint32_t K, int nq);
+
+/* The matmul with an explicit launch choice (NULL = the executor's default).
+ * vc4_matmul is this plus the tuned-record lookup. */
+vc4_status vc4__matmul_tuned(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
+                             vc4_buf *C, uint32_t M, uint32_t N, uint32_t K,
+                             vc4_layout layout, const vc4_tune_params *p);
+/* Same for conv2d; vc4_conv2d is this plus the lookup. */
+vc4_status vc4__conv2d_tuned(vc4_ctx *ctx,
+                             const vc4_buf *in, int Cin, int H, int W,
+                             const vc4_buf *wt, int Cout, int KH, int KW,
+                             const vc4_buf *bias, int stride, int pad,
+                             vc4_buf *out, int *HO, int *WO,
+                             const vc4_tune_params *p);
 
 /* ---- vc4_ew.c ----------------------------------------------------------- */
 vc4_status vc4__ew_run(vc4_ctx *ctx, vc4_op op, uint64_t n,
@@ -179,6 +223,57 @@ vc4_status vc4__ewb(vc4_ctx *ctx, const char *opname, int heavy,
 size_t vc4__ws_begin(vc4_ctx *ctx);
 void   vc4__ws_end(vc4_ctx *ctx, size_t base);
 
+/* ---- vc4_autotune.c ----------------------------------------------------- */
+/* A measured parameter set and its median time: one cache record. */
+typedef struct {
+    vc4_tune_params p;
+    double          ms;
+} vc4_tune_trial;
+
+/* The canonical shape descriptors, used by the executor and by the tuner so
+ * both key the same layer the same way. */
+void vc4__tune_shape_mm(vc4_tune_shape *s, uint32_t M, uint32_t N, uint32_t K);
+void vc4__tune_shape_conv(vc4_tune_shape *s, uint32_t Cin, uint32_t Cout,
+                          uint32_t H, uint32_t W, uint32_t KH, uint32_t KW,
+                          uint32_t pad, uint32_t stride, int bias);
+/* 1 when the parameter set is a launch the kernels can run for this shape:
+ * QPU counts within the 12-QPU ceiling and the row-block count, the auxiliary
+ * kernel's work divisibly partitioned, and the unused op field zero. */
+int  vc4__tune_params_legal(vc4_op op, const vc4_tune_shape *s,
+                            const vc4_tune_params *p);
+int  vc4__tune_params_same(const vc4_tune_params *a, const vc4_tune_params *b);
+/* The coarse candidate list in measurement order (default first). */
+int  vc4__tune_space(vc4_op op, const vc4_tune_shape *s, vc4_tune_params *out,
+                     int max);
+/* The fine pass around a coarse winner, deduplicated against `seen`. */
+int  vc4__tune_refine(vc4_op op, const vc4_tune_shape *s,
+                      const vc4_tune_params *best, const vc4_tune_params *seen,
+                      int nseen, vc4_tune_params *out, int max);
+/* <cache>/autotune/<16 hex>.tune plus the 64-bit key the memo uses. */
+void vc4__tune_key(const char *cache_dir, vc4_op op, const vc4_tune_shape *s,
+                   const char *digest, uint64_t *key, char *path, size_t pn);
+/* 0 = a valid record for exactly this op, shape and generator; -1 = miss
+ * (absent, stale, truncated, foreign or an illegal parameter set). */
+int  vc4__tune_cache_read(const char *path, vc4_op op, const vc4_tune_shape *s,
+                          const char *digest, vc4_tune_params *best,
+                          char *kernel, size_t kn, double *best_ms,
+                          double *default_ms);
+vc4_status vc4__tune_cache_write(const char *path, vc4_op op,
+                                 const vc4_tune_shape *s, const char *digest,
+                                 const vc4_tune_trial *trials, int n,
+                                 const vc4_tune_params *best,
+                                 const char *kernel, double best_ms,
+                                 double default_ms);
+/* Consult the record (memo first).  1 = hit, 0 = miss or autotuning off. */
+int  vc4__tune_lookup(vc4_ctx *ctx, vc4_op op, const vc4_tune_shape *s,
+                      vc4_tune_params *out);
+
+/* ---- vc4_kern.c: digests ------------------------------------------------ */
+/* sha256 of the generator (kgen.py, kops.py beside it, the ABI tag), the same
+ * digest the blob cache stamps into every .bin, as 64 lowercase hex chars. */
+void vc4__generator_digest(char out[65]);
+void vc4__sha256_hex(const void *data, size_t len, char out[65]);
+
 /* ---- helpers ------------------------------------------------------------ */
 static inline uint32_t vc4__align8(uint32_t v)  { return (v + 7u) & ~7u; }
 static inline uint32_t vc4__align16(uint32_t v) { return (v + 15u) & ~15u; }
@@ -202,3 +297,7 @@ vc4_status vc4__gemm3_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
 vc4_status vc4__gemm3_run_c(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                             int bmode, uint32_t b_bus, uint32_t c_bus,
                             uint32_t panel_bus, uint32_t cstride);
+/* same, with the QPU count explicit (0 = min(M/16, 12)) */
+vc4_status vc4__gemm3_run_cq(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
+                             int bmode, uint32_t b_bus, uint32_t c_bus,
+                             uint32_t panel_bus, uint32_t cstride, int gemm_q);

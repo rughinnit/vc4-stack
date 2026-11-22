@@ -26,12 +26,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-vc4_status vc4_conv2d(vc4_ctx *ctx,
-                      const vc4_buf *in, int Cin, int H, int W,
-                      const vc4_buf *wt, int Cout, int KH, int KW,
-                      const vc4_buf *bias,
-                      int stride, int pad,
-                      vc4_buf *out, int *HO, int *WO)
+vc4_status vc4__conv2d_tuned(vc4_ctx *ctx,
+                             const vc4_buf *in, int Cin, int H, int W,
+                             const vc4_buf *wt, int Cout, int KH, int KW,
+                             const vc4_buf *bias, int stride, int pad,
+                             vc4_buf *out, int *HO, int *WO,
+                             const vc4_tune_params *p)
 {
     if (!ctx || !in || !wt || !out || !HO || !WO)
         return VC4_ERR_INVAL;
@@ -120,7 +120,13 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
             return st;
         }
         const uint32_t tr = M / 16u;
-        int pnq = (tr % 4 == 0) ? 4 : (tr % 2 == 0) ? 2 : 1;
+        int pnq = p && p->im2col_q ? (int)p->im2col_q
+                                   : (tr % 4 == 0) ? 4
+                                     : (tr % 2 == 0) ? 2 : 1;
+        if (pnq < 1 || pnq > 4 || (uint32_t)pnq > tr || tr % (uint32_t)pnq) {
+            vc4__scratch_reset(ctx);
+            return VC4_ERR_INVAL;
+        }
         const uint32_t per = tr / (uint32_t)pnq;
         for (int i = 0; i < pnq; ++i) {
             uint32_t *u = vc4__uni(ctx, k, i);
@@ -216,9 +222,11 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
         vc4__scratch_reset(ctx);
         return VC4_ERR_NOMEM;
     }
-    vc4_status st = vc4__gemm3_run(ctx, M, (uint32_t)Cout, nk, 1,
-                                  ctx->gpu_bus + wb.off, ctx->gpu_bus + cb.off,
-                                  ctx->gpu_bus + pb.off);
+    vc4_status st = vc4__gemm3_run_cq(ctx, M, (uint32_t)Cout, nk, 1,
+                                      ctx->gpu_bus + wb.off,
+                                      ctx->gpu_bus + cb.off,
+                                      ctx->gpu_bus + pb.off, (uint32_t)Cout,
+                                      p ? (int)p->gemm_q : 0);
     if (st != VC4_OK) {
         vc4__scratch_reset(ctx);
         return st;
@@ -241,4 +249,42 @@ vc4_status vc4_conv2d(vc4_ctx *ctx,
     *WO = wo;
     vc4__scratch_reset(ctx);
     return VC4_OK;
+}
+
+/*
+ * The public conv2d: the tuned im2col/GEMM QPU counts for this layer when a
+ * record exists, else the defaults the engine has always used.  Argument and
+ * geometry checks live in vc4__conv2d_tuned, so an invalid call is handed
+ * straight to it.
+ */
+vc4_status vc4_conv2d(vc4_ctx *ctx,
+                      const vc4_buf *in, int Cin, int H, int W,
+                      const vc4_buf *wt, int Cout, int KH, int KW,
+                      const vc4_buf *bias,
+                      int stride, int pad,
+                      vc4_buf *out, int *HO, int *WO)
+{
+    vc4_tune_shape sh;
+    vc4_tune_params tp;
+    vc4_status st;
+
+    if (!ctx || !in || !wt || !out || !HO || !WO)
+        return VC4_ERR_INVAL;
+    if (Cin <= 0 || Cout <= 0 || H <= 0 || W <= 0 || KH <= 0 || KW <= 0 ||
+        pad < 0 || stride < 1)
+        return vc4__conv2d_tuned(ctx, in, Cin, H, W, wt, Cout, KH, KW, bias,
+                                 stride, pad, out, HO, WO, NULL);
+    vc4__tune_shape_conv(&sh, (uint32_t)Cin, (uint32_t)Cout, (uint32_t)H,
+                         (uint32_t)W, (uint32_t)KH, (uint32_t)KW,
+                         (uint32_t)pad, (uint32_t)stride, bias != NULL);
+    if (vc4__tune_lookup(ctx, VC4_OP_CONV2D, &sh, &tp)) {
+        st = vc4__conv2d_tuned(ctx, in, Cin, H, W, wt, Cout, KH, KW, bias,
+                               stride, pad, out, HO, WO, &tp);
+        if (st != VC4_ERR_INVAL)
+            return st;
+        vc4__set_err(ctx, "conv2d: the tuned launch for %dx%dx%d was refused, "
+                     "running the default", Cin, H, W);
+    }
+    return vc4__conv2d_tuned(ctx, in, Cin, H, W, wt, Cout, KH, KW, bias,
+                             stride, pad, out, HO, WO, NULL);
 }

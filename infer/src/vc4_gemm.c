@@ -35,12 +35,22 @@
 vc4_status vc4__pack_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen,
                          uint32_t dst_bus, uint32_t rowblocks)
 {
+    return vc4__pack_run_q(ctx, src_bus, rowlen, dst_bus, rowblocks, 0);
+}
+
+vc4_status vc4__pack_run_q(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen,
+                           uint32_t dst_bus, uint32_t rowblocks, int q)
+{
     if (rowlen % 16 || rowblocks < 1)
         return VC4_ERR_INVAL;
     const uint32_t K = rowlen;
     const uint32_t unitb = 32u * K;          /* bytes per 8-row work unit */
     const uint32_t units = rowblocks;
-    int pnq = units < 4u ? (int)units : 4;   /* every QPU must get >= 1 unit */
+    /* the packer is a plain grid-stride loop with no in-kernel guard, so its
+     * QPU count must divide the work exactly */
+    int pnq = q > 0 ? q : (units < 4u ? (int)units : 4);
+    if (pnq < 1 || pnq > 4 || (uint32_t)pnq > units || units % (uint32_t)pnq)
+        return VC4_ERR_INVAL;
 
     char nk[16];
     char pname[48], *pargv[] = { (char *)"pack", (char *)"--k", nk, NULL };
@@ -73,10 +83,27 @@ vc4_status vc4__pack_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen,
 vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                          uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus)
 {
+    return vc4__gemm_run_q(ctx, M, N, K, b_bus, c_bus, panel_bus, 0);
+}
+
+/* The asm10 GEMM's blob name.  Shared with the autotuner, which names the
+ * kernel its recorded parameters select. */
+void vc4__matmul_kernel_name(char *out, size_t n, uint32_t M, uint32_t N,
+                             uint32_t K, int nq)
+{
+    snprintf(out, n, "gemm10_%u_%u_%u_q%d", M, N, K, nq);
+}
+
+vc4_status vc4__gemm_run_q(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
+                           uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus,
+                           int gemm_q)
+{
     if (M % 8 || N % 64 || K % 16)
         return VC4_ERR_INVAL;
     const uint32_t tr = M / 8;                 /* 8-row row blocks */
-    int nq = tr < VC4_MAX_QPU ? (int)tr : VC4_MAX_QPU;
+    int nq = gemm_q > 0 ? gemm_q : (tr < VC4_MAX_QPU ? (int)tr : VC4_MAX_QPU);
+    if (nq < 1 || nq > VC4_MAX_QPU || (uint32_t)nq > tr)
+        return VC4_ERR_INVAL;
 
     char name[80], nm[16], nn[16], nk[16], nkpu[8];
     char *argv[] = { (char *)"gemm", (char *)"--M", nm, (char *)"--N", nn,
@@ -85,7 +112,7 @@ vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
     snprintf(nn, sizeof(nn), "%u", N);
     snprintf(nk, sizeof(nk), "%u", K);
     snprintf(nkpu, sizeof(nkpu), "%d", nq);
-    snprintf(name, sizeof(name), "gemm10_%u_%u_%u_q%d", M, N, K, nq);
+    vc4__matmul_kernel_name(name, sizeof(name), M, N, K, nq);
 
     vc4_kernel *k = NULL;
     vc4_status st = vc4__kernel(ctx, name, argv, nq, &k);
@@ -116,9 +143,9 @@ vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
 /* zero-fill helper for padded scratch copies */
 static void zero(uint8_t *p, size_t bytes) { memset(p, 0, bytes); }
 
-vc4_status vc4_matmul(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
-                      vc4_buf *C, uint32_t M, uint32_t N, uint32_t K,
-                      vc4_layout layout)
+vc4_status vc4__matmul_tuned(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
+                             vc4_buf *C, uint32_t M, uint32_t N, uint32_t K,
+                             vc4_layout layout, const vc4_tune_params *p)
 {
     if (!ctx || !A || !B || !C || !M || !N || !K)
         return VC4_ERR_INVAL;
@@ -187,14 +214,14 @@ vc4_status vc4_matmul(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
         c_dst_bus = ctx->gpu_bus + (uint32_t)((uint8_t *)c_tmp - ctx->arena);
     }
 
-    vc4_status st = vc4__pack_run(ctx, a_src_bus, Kp, ctx->gpu_bus + pb.off,
-                                  Mp / 8);
+    vc4_status st = vc4__pack_run_q(ctx, a_src_bus, Kp, ctx->gpu_bus + pb.off,
+                                    Mp / 8, p ? (int)p->pack_q : 0);
     if (st != VC4_OK) {
         vc4__scratch_reset(ctx);
         return st;
     }
-    st = vc4__gemm_run(ctx, Mp, Np, Kp, b_src_bus, c_dst_bus,
-                       ctx->gpu_bus + pb.off);
+    st = vc4__gemm_run_q(ctx, Mp, Np, Kp, b_src_bus, c_dst_bus,
+                         ctx->gpu_bus + pb.off, p ? (int)p->gemm_q : 0);
     if (st == VC4_OK && c_tmp) {
         vc4__l2_flush(ctx);
         vc4__invalidate_off(ctx, C->off, (size_t)M * N * 4);
@@ -205,6 +232,33 @@ vc4_status vc4_matmul(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
     }
     vc4__scratch_reset(ctx);
     return st;
+}
+
+/*
+ * The public matmul: the tuned launch for this shape when a record exists
+ * (VC4INFER_AUTOTUNE=1 or a vc4_autotune call), else the default.  A record
+ * that no longer describes a legal launch - an older build's QPU count, say -
+ * is not fatal: the default runs and is not used to overwrite the record.
+ */
+vc4_status vc4_matmul(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
+                      vc4_buf *C, uint32_t M, uint32_t N, uint32_t K,
+                      vc4_layout layout)
+{
+    vc4_tune_shape sh;
+    vc4_tune_params tp;
+    vc4_status st;
+
+    if (!ctx || !A || !B || !C || !M || !N || !K)
+        return VC4_ERR_INVAL;
+    vc4__tune_shape_mm(&sh, M, N, K);
+    if (vc4__tune_lookup(ctx, VC4_OP_MATMUL, &sh, &tp)) {
+        st = vc4__matmul_tuned(ctx, A, B, C, M, N, K, layout, &tp);
+        if (st != VC4_ERR_INVAL)
+            return st;
+        vc4__set_err(ctx, "matmul: the tuned launch for %ux%ux%u was refused, "
+                     "running the default", M, N, K);
+    }
+    return vc4__matmul_tuned(ctx, A, B, C, M, N, K, layout, NULL);
 }
 
 /* ==================================================================
@@ -267,6 +321,23 @@ vc4_status vc4__gemm3_run_c(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                             int bmode, uint32_t b_bus, uint32_t c_bus,
                             uint32_t panel_bus, uint32_t cstride)
 {
+    return vc4__gemm3_run_cq(ctx, M, N, K, bmode, b_bus, c_bus, panel_bus,
+                             cstride, 0);
+}
+
+/* The asm3 GEMM's blob name for the conv path (bmode=1, cstride=N).  A
+ * grouped conv passes a wider cstride and gets its own name; that path is not
+ * autotuned, so it is not represented here. */
+void vc4__conv_kernel_name(char *out, size_t n, uint32_t M, uint32_t N,
+                           uint32_t K, int nq)
+{
+    snprintf(out, n, "gemm_%u_%u_%u_b1_q%d", M, N, K, nq);
+}
+
+vc4_status vc4__gemm3_run_cq(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
+                             int bmode, uint32_t b_bus, uint32_t c_bus,
+                             uint32_t panel_bus, uint32_t cstride, int gemm_q)
+{
     if (M % 16 || N % 16 || K % 16)
         return VC4_ERR_INVAL;
     if (cstride == 0)
@@ -274,7 +345,10 @@ vc4_status vc4__gemm3_run_c(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
     if (cstride < N || cstride % 16)
         return VC4_ERR_INVAL;
     const uint32_t tr = M / 16;
-    int nq = tr < VC4_MAX_QPU ? (int)tr : VC4_MAX_QPU;
+    int nq = gemm_q > 0 ? gemm_q
+                        : (tr < VC4_MAX_QPU ? (int)tr : VC4_MAX_QPU);
+    if (nq < 1 || nq > VC4_MAX_QPU || (uint32_t)nq > tr)
+        return VC4_ERR_INVAL;
 
     char name[96], nm[16], nn[16], nk[16], nb[8], nkpu[8], ncs[16];
     char *argv[] = { (char *)"gemm3", (char *)"--M", nm, (char *)"--N", nn,

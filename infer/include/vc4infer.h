@@ -704,6 +704,74 @@ vc4_status vc4_gather_bwd(vc4_ctx *ctx, const vc4_buf *g, vc4_buf *dx,
 vc4_status vc4_scatter_bwd(vc4_ctx *ctx, const vc4_buf *g, vc4_buf *dx,
                            const int32_t *idx, size_t n, size_t n_out);
 
+/* -------------------------------------------------------------- autotuning */
+/*
+ * Per-shape kernel autotuning.
+ *
+ * The generated GEMMs bake their QPU count into the blob's row-block loop and
+ * the host chooses the packer's QPU count per launch.  vc4_autotune measures
+ * the legal combinations for one op and shape, records the winner under the
+ * kernel cache directory, and (once enabled) every later launch of that shape
+ * uses it.  It is off unless VC4INFER_AUTOTUNE=1 or vc4_autotune() was called
+ * on the context, so existing timings stay reproducible.
+ */
+typedef struct {
+    /* matmul: m,n,k of A[M][K] * B[K][N].  conv2d: the layer geometry below;
+     * m, n and k are derived from it (n = Cout, k includes the bias block). */
+    uint32_t m, n, k;
+    uint32_t cin, cout, h, w, kh, kw;
+    uint32_t pad, stride;
+    uint32_t flags;             /* VC4_TUNE_F_*                            */
+} vc4_tune_shape;
+
+#define VC4_TUNE_F_BIAS 1u      /* conv2d: bias folded in as an extra k block */
+
+typedef struct {
+    uint32_t pack_q;            /* matmul: QPUs for the A-panel packer      */
+    uint32_t gemm_q;            /* QPUs for the GEMM                        */
+    uint32_t im2col_q;          /* conv2d: QPUs for the im2col gather       */
+} vc4_tune_params;
+
+typedef struct {
+    uint32_t max_candidates;    /* 0 = 14; hard cap on measured sets        */
+    uint32_t budget_ms;         /* 0 = 30000; wall clock for the whole call */
+    uint32_t reps;              /* 0 = 5; timed runs per candidate          */
+    uint32_t force;             /* 1 = re-measure even if a record exists   */
+} vc4_tune_opts;
+
+typedef struct {
+    vc4_tune_params params;     /* the chosen launch                        */
+    double   best_ms;           /* its median time                          */
+    double   default_ms;        /* the executor's default, same protocol    */
+    double   max_abs;           /* |chosen - default| max (0 = bit equal)   */
+    uint32_t candidates;        /* parameter sets measured (incl. default)  */
+    uint32_t over_tol;          /* elements outside atol=rtol=5e-4          */
+    int      from_cache;        /* 1 = read from a record, not measured     */
+    char     kernel[80];        /* blob the chosen parameters select        */
+} vc4_tune_result;
+
+/*
+ * Measure (or read) the best launch parameters for one op and shape.
+ *
+ * op is VC4_OP_MATMUL or VC4_OP_CONV2D.  shape is normalised internally the
+ * same way the executor does, so the record is keyed by the shape the kernel
+ * actually runs.  opts may be NULL (defaults, overridable with
+ * VC4INFER_AUTOTUNE_{MAX,BUDGET_MS,REPS}); out may be NULL.
+ *
+ * A valid record is returned immediately (from_cache = 1) unless opts->force.
+ * A new measurement is only written if the chosen parameters produce the same
+ * output as the default within the recorded tolerance; otherwise the call
+ * fails and nothing is cached.
+ *
+ * On success autotuning is enabled for the context, so subsequent ops of that
+ * shape consult the record.
+ */
+vc4_status vc4_autotune(vc4_ctx *ctx, vc4_op op, const vc4_tune_shape *shape,
+                        const vc4_tune_opts *opts, vc4_tune_result *out);
+/* 1 when this context consults tuned records (set by a successful
+ * vc4_autotune, or by VC4INFER_AUTOTUNE=1 in the environment). */
+int vc4_autotune_enabled(vc4_ctx *ctx);
+
 /* ---------------------------------------------------------------- registry */
 typedef struct {
     const char *name;       /* "matmul", "conv2d/3x3", "sigmoid", ...        */

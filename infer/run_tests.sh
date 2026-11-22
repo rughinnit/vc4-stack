@@ -80,6 +80,13 @@ make check-math
 echo "=== test_dispatch (no GPU)"
 ./build/test_dispatch
 
+echo "=== test_autotune (no GPU: search space, legality, cache invalidation)"
+AUTOTUNE_TMP=${TMPDIR:-$HOME/scratch/tmp}
+mkdir -p "$AUTOTUNE_TMP"
+TMPDIR="$AUTOTUNE_TMP" ./build/test_autotune
+echo "=== test_autotune_space (no GPU: the space the generator can build)"
+TMPDIR="$AUTOTUNE_TMP" python3 tests/test_autotune_space.py
+
 # --- daemon regressions -----------------------------------------------------
 # G1/G9/G11 need a daemon they can provoke (timeout, departed client, lock
 # contention) without disturbing the one everything else talks to, so they run
@@ -187,6 +194,11 @@ fi
 
 echo "=== test_gate (formerly gated entry points are open; argument checks fire)"
 $RUN ./build/test_gate
+
+echo "=== test_autotune_api (Engine.autotune: cold, then the record)"
+AUTOTUNE_CACHE=${TMPDIR:-$HOME/scratch/tmp}/kcache-autotune-api
+VC4INFER_CACHE="$AUTOTUNE_CACHE" \
+    PYTHONPATH=$PYTHONPATH:. timeout -k 5 900 python3 tests/test_autotune_api.py
 
 for t in test_ew test_matmul test_conv; do
     echo "=== $t  (reps=$REPS)"

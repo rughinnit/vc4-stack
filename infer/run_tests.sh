@@ -79,6 +79,11 @@ make check-math
 echo "=== check_epilogue_emu (no GPU: the GEMM activation bodies)"
 python3 tests/check_epilogue_emu.py
 
+echo "=== test_artifact (no GPU: .vc4x container, keys, pinned arena plan)"
+TMPDIR=${TMPDIR:-$HOME/scratch/tmp}
+mkdir -p "$TMPDIR"
+TMPDIR="$TMPDIR" python3 tests/test_artifact.py
+
 echo "=== test_dispatch (no GPU)"
 ./build/test_dispatch
 

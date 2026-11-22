@@ -74,6 +74,7 @@ import functools
 import os
 import sys
 import time
+from bisect import insort
 
 import numpy as np
 import onnx
@@ -109,6 +110,7 @@ from . import coverage
 from . import _binding as vc4infer                      # noqa: E402
 from ._errors import (HostNodeError, HostNotAllowed, NeedsDeviceDispatch,
                       UnsupportedNode)                    # noqa: E402
+from .artifact import ArtifactError, ArtifactPlanError        # noqa: E402
 
 # The 13 nv4 ops were element-verified on 2026-11-20: 0 mismatches over
 # 105,264 kernels elements (five shapes each) and 0 over 10,478 graph
@@ -451,14 +453,30 @@ class Pool:
 
     MIN_SEG = 1 << 20
 
-    def __init__(self, eng, nbytes, reserve=0):
+    def __init__(self, eng, nbytes, reserve=0, pin=None, segment_bytes=None,
+                 labeler=None, record=None):
         self.eng = eng
         self.reserve = reserve
         self.segs = []                  # [[base, size, bump], ...]
         self.free = []                  # [(off, size)] engine-global offsets
         self.live = {}                  # off -> aligned bytes, the owner
         self.high = 0                   # high-water of used_bytes
-        if not self._add_segment(max(int(nbytes), self.MIN_SEG)):
+        # An engine artifact substitutes a recorded plan for this allocator:
+        # `pin` is key -> (segment, offset inside it, aligned bytes) and every
+        # allocation must find its key.  `record` collects the same triples
+        # during a build.  `labeler` names the allocation being made.
+        self.pin = dict(pin) if pin is not None else None
+        self.labeler = labeler
+        self.record = record
+        self.pinned_live = []           # pinned: sorted [(off, end, key)]
+        self.live_bytes = 0
+        if self.pin is not None:
+            sizes = [int(v) for v in (segment_bytes or [])]
+            if not sizes:
+                sizes = [max(int(nbytes), self.MIN_SEG)]
+            for sz in sizes:
+                self._add_segment_exact(sz)
+        elif not self._add_segment(max(int(nbytes), self.MIN_SEG)):
             raise self._exhausted(int(nbytes))
 
     # -- segments ----------------------------------------------------------
@@ -473,6 +491,19 @@ class Pool:
             except vc4infer.Error:
                 n //= 2
         return 0
+
+    def _add_segment_exact(self, want):
+        """A pinned plan's segment: the size is part of the plan, not a hint."""
+        n = _align(int(want))
+        try:
+            b = self.eng.alloc(n)
+        except vc4infer.Error as e:
+            raise UnsupportedNode(
+                "the artifact's arena plan needs a %d B pool segment and the "
+                "client arena (%s) could not give it: %s"
+                % (n, _mib(self.eng.arena_bytes), e)) from e
+        self.segs.append([int(b.off), n, 0])
+        return n
 
     def _exhausted(self, n):
         return UnsupportedNode(
@@ -500,6 +531,9 @@ class Pool:
     # -- allocation --------------------------------------------------------
     def alloc(self, nbytes):
         n = _align(nbytes)
+        key = self.labeler() if self.labeler is not None else None
+        if self.pin is not None:
+            return self._alloc_pinned(key, n, int(nbytes))
         for i, (off, sz) in enumerate(self.free):
             if sz >= n:
                 if sz == n:
@@ -507,6 +541,7 @@ class Pool:
                 else:
                     self.free[i] = (off + n, sz - n)
                 self.live[off] = n
+                self._record(key, off, n, int(nbytes))
                 return vc4infer.Buf(off, int(nbytes))
         seg = self._ensure(n)
         off = seg[0] + seg[2]
@@ -515,13 +550,77 @@ class Pool:
         used = self.used_bytes
         if used > self.high:
             self.high = used
+        self._record(key, off, n, int(nbytes))
         return vc4infer.Buf(off, int(nbytes))
+
+    def _record(self, key, off, n, requested):
+        if self.record is None:
+            return
+        for i, seg in enumerate(self.segs):
+            if seg[0] <= off < seg[0] + seg[1]:
+                self.record.append({"key": key, "seg": i,
+                                    "offset": off - seg[0], "bytes": n,
+                                    "requested": requested})
+                return
+
+    def _alloc_pinned(self, key, n, requested):
+        """Hand out the recorded offset for this allocation, or refuse.
+
+        The refusal is the point: a plan that no longer describes what the
+        graph allocates would otherwise run kernels against overlapping
+        buffers, which is a wrong answer, not a slow one.
+        """
+        entry = self.pin.get(key)
+        if entry is None:
+            raise ArtifactPlanError(
+                "arena plan: allocation %r (%d B) is not in the artifact; the "
+                "graph allocates a buffer the plan does not describe (rebuild "
+                "the artifact, or load the ONNX graph with --no-artifact)"
+                % (key, n))
+        seg_i, rel, size = entry
+        if int(size) != n:
+            raise ArtifactPlanError(
+                "arena plan: allocation %r is %d B in the plan and %d B now"
+                % (key, int(size), n))
+        if seg_i < 0 or seg_i >= len(self.segs):
+            raise ArtifactPlanError(
+                "arena plan: allocation %r names pool segment %d of %d"
+                % (key, seg_i, len(self.segs)))
+        seg = self.segs[seg_i]
+        off = seg[0] + int(rel)
+        end = off + n
+        if off < seg[0] or end > seg[0] + seg[1]:
+            raise ArtifactPlanError(
+                "arena plan: allocation %r at segment %d + %d B (%d B) runs "
+                "past the %d B segment" % (key, seg_i, int(rel), n, seg[1]))
+        for lo, hi, other in self.pinned_live:
+            if off < hi and lo < end:
+                raise ArtifactPlanError(
+                    "arena plan: allocation %r at offset %d (%d B) overlaps "
+                    "%r, which the plan keeps live there; the graph's "
+                    "lifetimes no longer match the recording"
+                    % (key, off, n, other))
+        insort(self.pinned_live, (off, end, key))
+        self.live_bytes += n
+        if self.live_bytes > self.high:
+            self.high = self.live_bytes
+        return vc4infer.Buf(off, requested)
 
     def release(self, b):
         if b is None:
             return
         off = int(b.off)
         n = _align(int(b.bytes))
+        if self.pin is not None:
+            # Reuse is part of the recording (two tensors with disjoint
+            # lifetimes may share an offset); dropping the range from the
+            # pinned live set is all this allocator has to do.
+            for i, (lo, hi, _key) in enumerate(self.pinned_live):
+                if lo == off and hi == off + n:
+                    self.pinned_live.pop(i)
+                    self.live_bytes -= n
+                    break
+            return
         if self.live.get(off) != n:
             # a view into someone else's block, or a second release of one:
             # freeing it again would hand the same bytes to two allocations
@@ -540,10 +639,28 @@ class Pool:
         self.free = merged
 
     def reset(self):
+        if self.pin is not None:
+            self.pinned_live = []
+            self.live_bytes = 0
+            self.high = 0
+            return
         for seg in self.segs:
             seg[2] = 0
         self.free = []
         self.live = {}
+        self.high = 0
+
+    def begin_run(self):
+        """Pinned pools check overlap per run, not across runs.
+
+        The plan fixes offsets for the whole graph, and the bits of it that
+        outlive a run (constants, packed panels) are never handed to anything
+        else, so a stale entry from the previous run is not a conflict.
+        """
+        if self.pin is None:
+            return
+        self.pinned_live = []
+        self.live_bytes = 0
         self.high = 0
 
     @property
@@ -556,6 +673,8 @@ class Pool:
 
     @property
     def used_bytes(self):
+        if self.pin is not None:
+            return self.live_bytes
         used = sum(seg[2] for seg in self.segs)
         return used - sum(sz for _, sz in self.free)
 
@@ -568,6 +687,7 @@ class Tensor:
     may exceed W (the conv's compact output grid).
     """
     __slots__ = ("buf", "shape", "layout", "pitch")
+    has_buf = True          # False for the artifact's panel-only stand-ins
 
     def __init__(self, buf, shape, layout="nchw", pitch=None):
         self.buf = buf
@@ -592,6 +712,42 @@ class Tensor:
         return "Tensor(%s,%s%s)" % (self.shape, self.layout,
                                     ",pitch=%d" % self.pitch
                                     if self.layout == "nhwc" else "")
+
+
+class _PanelWeight(Tensor):
+    """A conv initializer whose bytes live only in the artifact's panel.
+
+    ``_conv_impl`` reads the weight from the host copy (``_hostconst``) to
+    build or describe the kernel operand; the raw arena tensor is never read
+    once the panel is prepacked.  This stands in for it so the shape is
+    available and any attempt to touch arena bytes fails loudly instead of
+    reading an unrelated buffer.
+    """
+
+    __slots__ = ()
+    has_buf = False
+
+    def __init__(self, shape):
+        self.shape = tuple(int(s) for s in shape)
+        self.layout = "nchw"
+        self.pitch = 0
+
+    @property
+    def buf(self):
+        raise ArtifactPlanError(
+            "the raw weight %s was not uploaded: the artifact carries its "
+            "packed panel; this path asked for the unpacked tensor"
+            % (self.shape,))
+
+    @buf.setter
+    def buf(self, value):
+        raise ArtifactPlanError(
+            "the raw weight %s was not uploaded: the artifact carries its "
+            "packed panel" % (self.shape,))
+
+    def __repr__(self):
+        return "PanelWeight(%s)" % (self.shape,)
+
 
 
 def _flat_index(shape, axes, rngs):
@@ -675,7 +831,7 @@ def _attr(node, name, default=None):
 
 class Runner:
     def __init__(self, model_path, eng, mode="strict", host_policy="device",
-                 passes=None):
+                 passes=None, model=None, artifact=None, record=None):
         if mode not in ("strict", "hybrid"):
             raise ValueError("mode must be 'strict' or 'hybrid'")
         if host_policy not in ("device", "structural", "any"):
@@ -685,28 +841,43 @@ class Runner:
         self.eng = eng
         self.mode = mode
         self.host_policy = host_policy
-        self.model = onnx.load(model_path)
+        # An artifact supplies the graph it was built from; any call site that
+        # has already parsed it (a build does) can pass `model` instead.
+        self.artifact = artifact
+        self.model = model if model is not None else onnx.load(model_path)
         # Graph optimisation (docs/OPTIMIZER.md).  Every pass is off by
         # default: `passes` / $VC4_OPT selects them, and an empty spec leaves
         # the model, the node indices and the SiLU rewrite exactly as they
         # were.  The rewrite runs before the pool plan, so the plan is sized
         # from the graph that will actually execute.
+        #
+        # An artifact's graph is already optimised and its pass report is
+        # recorded, so no pass runs on that path: re-running one would rewrite
+        # an already-rewritten graph and move the plan the artifact froze.
         self.optimise_report = None
-        spec = passes if passes is not None else os.environ.get("VC4_OPT", "")
-        if str(spec or "").strip() not in ("", "none"):
-            from . import optimizer
-            self.optimise_report = optimizer.optimise(self.model, passes=spec)
-            if self.optimise_report.changed:
-                self.model = self.optimise_report.model
-        # ConstantOfShape with a constant shape computes a tensor, not a
-        # per-run activation.  Fold it before the pool is sized so the weights
-        # it carries are counted like any other initialiser; strict mode has no
-        # dispatch for the node, and a fill too large to fold is refused with
-        # its byte count (optimizer.passes.fold_plan_constants).
-        from .optimizer import fold_plan_constants
-        self.model, self.plan_folds = fold_plan_constants(
-            self.model, budget=int(eng.arena_bytes),
-            limit=int(eng.arena_bytes))
+        if artifact is not None:
+            # The artifact's graph was optimised and plan-folded at build time;
+            # re-running either would move the plan it froze.
+            self.optimise_report = artifact.optimise_report
+            self.plan_folds = list(artifact.plan_folds)
+        else:
+            spec = (passes if passes is not None
+                    else os.environ.get("VC4_OPT", ""))
+            if str(spec or "").strip() not in ("", "none"):
+                from . import optimizer
+                self.optimise_report = optimizer.optimise(self.model,
+                                                         passes=spec)
+                if self.optimise_report.changed:
+                    self.model = self.optimise_report.model
+            # ConstantOfShape with a constant shape computes a tensor, not a
+            # per-run activation.  Fold it before the pool is sized so the
+            # weights it carries are counted like any other initialiser; strict
+            # mode has no dispatch for the node, and a fill too large to fold is
+            # refused with its byte count (optimizer.passes.fold_plan_constants).
+            from .optimizer import fold_plan_constants
+            self.model, self.plan_folds = fold_plan_constants(
+                self.model, budget=int(eng.arena_bytes),
+                limit=int(eng.arena_bytes))
         self.graph = self.model.graph
         self.values = {}
         self.host = {}          # host copy of every initializer / Constant
@@ -727,6 +898,15 @@ class Runner:
         self._coverage_report = None
         self._backends = None
         self._panels = {}       # packed NHWC weight panels, by node name
+        # Allocation keys for an engine artifact's arena plan.  Every pool
+        # allocation is labelled with the thing that asked for it (a
+        # constant, an input, one allocation inside one node), so a build can
+        # record "this key lives at this offset" and a load can put it back
+        # there.  The label is derived from the graph, not from time, so two
+        # runs of the same graph produce the same keys.
+        self._alloc_scope = None
+        self._alloc_seq = {}
+        self._art_panels = {}   # canonical panel key -> preloaded Tensor/Buf
         # One pool per engine: libvc4infer cannot free, and running several
         # Runner objects on one Engine at the same time is not supported.
         #
@@ -740,22 +920,60 @@ class Runner:
         # Static shapes with the Slice-parameter chains resolved; the plan
         # needs them for the pool estimate, and coverage uses the same map so
         # a Shape node after a sliced C3k2 branch still folds.
-        self.shapes = coverage.refine_shapes(self.model)
-        need, self.pool_plan = self._plan_pool_bytes()
-        pool = getattr(eng, "_vc4_pool", None)
-        if pool is None or pool.size < need:
-            pool = Pool(eng, need)
+        if artifact is not None:
+            # The estimate and the shape map were computed and recorded by the
+            # build: loading must not repeat either.  A build's pass B has no
+            # plan yet and passes `allocations=None`, so it plans and records
+            # through the ordinary allocator instead of pinning.
+            self.shapes = artifact.shapes
+            if getattr(eng, "_vc4_pool", None) is not None:
+                raise UnsupportedNode(
+                    "an engine artifact needs a fresh engine: this one already "
+                    "has a pool (one Runner per Engine)")
+            labeler = (self._next_alloc_key
+                       if (artifact.allocations is not None or
+                           record is not None) else None)
+            if artifact.allocations is not None:
+                self.pool_plan = artifact.pool_plan
+                pool = Pool(eng, artifact.pool_bytes,
+                            pin=artifact.allocations,
+                            segment_bytes=artifact.segment_bytes,
+                            labeler=labeler, record=record)
+            else:
+                need, self.pool_plan = self._plan_pool_bytes()
+                pool = Pool(eng, need, labeler=labeler, record=record)
             eng._vc4_pool = pool
         else:
-            pool.reset()
+            self.shapes = coverage.refine_shapes(self.model)
+            need, self.pool_plan = self._plan_pool_bytes()
+            pool = getattr(eng, "_vc4_pool", None)
+            if pool is None or pool.size < need:
+                pool = Pool(eng, need,
+                            labeler=(self._next_alloc_key
+                                     if record is not None else None),
+                            record=record)
+                eng._vc4_pool = pool
+            else:
+                pool.reset()
+                pool.labeler = (self._next_alloc_key
+                                if record is not None else None)
+                pool.record = record
         self.pool = pool
+        self._labels = pool.labeler is not None
         self._garbage = []      # per-node temporaries
         self._consts = set(i.name for i in self.graph.initializer)
         self._last_use = {}
 
+        dropped = artifact.dropped if artifact is not None else {}
         for init in self.graph.initializer:
-            self.values[init.name] = self._constant(init.name,
-                                                    numpy_helper.to_array(init))
+            arr = numpy_helper.to_array(init)
+            if init.name in dropped:
+                # The panel is in the artifact; only the host copy (used to
+                # describe the conv) is needed, not a second arena copy.
+                self.host[init.name] = np.asarray(arr, np.float32)
+                self.values[init.name] = _PanelWeight(dropped[init.name])
+                continue
+            self.values[init.name] = self._constant(init.name, arr)
         for inp in self.graph.input:
             if inp.name in self.values:
                 continue
@@ -766,14 +984,92 @@ class Runner:
                 self.float_inputs.append((inp.name, dims))
             else:
                 raise UnsupportedNode("graph input %s: only fp32 inputs" % inp.name)
-        self._find_silu()
-        self._collect_fused()
+        if artifact is not None:
+            self._load_panels(artifact)
+        state = artifact.exec_state if artifact is not None else None
+        if state is not None:
+            self._apply_exec_state(state)
+        else:
+            self._find_silu()
+            self._collect_fused()
         # a graph output is held in `values` after a run; the next run filters
         # `values` down to constants, so release it first (never a buffer an
         # initialiser owns: an Identity of a constant shares that block)
         self._const_offs = {v.buf.off for k, v in self.values.items()
-                            if k in self._consts and isinstance(v, Tensor)}
+                            if k in self._consts and isinstance(v, Tensor)
+                            and getattr(v, "has_buf", True)}
         self._prev_outputs = ()
+
+    def _apply_exec_state(self, st):
+        """Restore the rewrite tables a build recorded, instead of rescanning.
+
+        Accepts both a loaded artifact's tables (int keys, tuples) and a
+        build's freshly captured JSON-shaped ones (string keys, lists).
+        """
+        def idx_map(d, conv):
+            return {int(k): conv(v) for k, v in (d or {}).items()}
+        self._silu_skip = set(int(v) for v in st.get("silu_skip", []))
+        self._silu_src = idx_map(st.get("silu_src"), lambda v: v)
+        self._skip = set(int(v) for v in st.get("skip", []))
+        self._skip_reason = idx_map(st.get("skip_reason"), lambda v: v)
+        self._fused = idx_map(st.get("fused"), lambda v: v)
+        self._fused_skip = idx_map(st.get("fused_skip"), lambda v: v)
+        self._alias = idx_map(st.get("alias"), lambda v: tuple(v))
+        self._node_idx = None
+
+    # ------------------------------------------------------- allocation keys
+    def _next_alloc_key(self):
+        """The key of the allocation being made, for a recorded arena plan."""
+        scope = self._alloc_scope or "misc"
+        n = self._alloc_seq.get(scope, 0)
+        self._alloc_seq[scope] = n + 1
+        return "%s#%d" % (scope, n)
+
+    def _load_panels(self, artifact):
+        """Upload the artifact's prepacked panels at their recorded offsets.
+
+        These are the executor's ``_panels`` entries after a warm run: the
+        conv kernels' k-major weight panels, the broadcast expansions and the
+        GEMM operand copies.  They are plan-time data, so nothing here depends
+        on an input tensor, and uploading them at load is what removes the
+        first-run packing work.
+        """
+        from .artifact import panel_key
+        for i, p in enumerate(artifact.panels):
+            data = p.data
+            if data is None or len(data) != p.bytes:
+                raise ArtifactError(
+                    "artifact panel %r has %d B of data, expected %d"
+                    % (p.key, 0 if data is None else len(data), p.bytes))
+            self._alloc_scope = "panel:%d" % i
+            try:
+                buf = self.pool.alloc(p.alloc_bytes)
+            finally:
+                self._alloc_scope = None
+            if buf.bytes < p.bytes:
+                raise ArtifactError(
+                    "artifact panel %r does not fit its arena slot (%d B in "
+                    "%d B)" % (p.key, p.bytes, buf.bytes))
+            self.eng.upload(np.frombuffer(data, dtype=np.float32), buf)
+            if p.format == "tensor":
+                t = Tensor(buf, tuple(p.shape), p.layout, p.pitch)
+            else:
+                t = buf
+            self._art_panels[p.panel] = t
+
+    def _panel_get(self, key):
+        """The executor's packed-panel lookup, with the artifact's panels."""
+        t = self._panels.get(key)
+        if t is not None:
+            return t
+        if self._art_panels:
+            from .artifact import panel_key
+            t = self._art_panels.get(panel_key(key))
+            if t is not None:
+                self._panels[key] = t
+                return t
+        return None
+
 
     # ---------------------------------------------------- optimiser markers
     def _collect_fused(self):
@@ -1233,7 +1529,14 @@ class Runner:
         arr = np.asarray(arr)
         self.host[name] = arr
         if arr.dtype in (np.float32, np.float64):
-            return self.upload(arr.astype(np.float32))
+            if not self._labels:
+                return self.upload(arr.astype(np.float32))
+            prev = self._alloc_scope
+            self._alloc_scope = "const:" + name
+            try:
+                return self.upload(arr.astype(np.float32))
+            finally:
+                self._alloc_scope = prev
         return arr                      # shape / index tensors stay on the host
 
     def _get(self, name):
@@ -1453,7 +1756,7 @@ class Runner:
                 ba = b2
             key = ("panel", node.name, Cin, Cout, kh, kw, dil,
                    (pt, pl, pb, pr) if pads is not None else None)
-            wp = self._panels.get(key)
+            wp = self._panel_get(key)
             if wp is None:
                 wt = self.upload(np.ascontiguousarray(wa, np.float32))
                 bb = self.upload(np.ascontiguousarray(ba, np.float32))
@@ -1485,7 +1788,7 @@ class Runner:
         panels = []
         for g in range(groups):
             key = ("panelg", node.name, g, cg, og, kh, kw, dil)
-            wp = self._panels.get(key)
+            wp = self._panel_get(key)
             if wp is None:
                 wg = np.ascontiguousarray(wa[g * og:(g + 1) * og], np.float32)
                 bg = np.ascontiguousarray(ba[g * og:(g + 1) * og], np.float32)
@@ -1832,7 +2135,7 @@ class Runner:
             raise UnsupportedNode("broadcast operand %s is not a constant"
                                   % name)
         key = ("expand", name, tuple(ref.shape), layout)
-        t = self._panels.get(key)
+        t = self._panel_get(key)
         if t is not None:
             return t
         b = np.ascontiguousarray(
@@ -2892,7 +3195,7 @@ class Runner:
         if tb:
             N, K2 = b.shape
             key = ("gemmT", node.name)
-            ba = self._panels.get(key)
+            ba = self._panel_get(key)
             if ba is None:
                 src = self._hostconst(node.input[1])
                 src = (np.asarray(src, np.float32) if src is not None
@@ -2907,7 +3210,7 @@ class Runner:
         if K != K2:
             raise UnsupportedNode("Gemm %s: K mismatch" % node.name)
         keyb = ("gemmB", node.name)
-        bb = self._panels.get(keyb)
+        bb = self._panel_get(keyb)
         if bb is None:
             bb = self.upload(np.ascontiguousarray(ba))
             self._panels[keyb] = bb
@@ -2916,7 +3219,7 @@ class Runner:
         t = Tensor(out, (M, N))
         if beta == 1.0 and len(node.input) > 2 and node.input[2]:
             keyc = ("gemmC", node.name)
-            cb = self._panels.get(keyc)
+            cb = self._panel_get(keyc)
             if cb is None:
                 c = self._float(node.input[2])
                 ca = self._hostconst(node.input[2])
@@ -3376,6 +3679,7 @@ class Runner:
 
     def run(self, feeds, profile=False):
         self.check_policy()
+        self.pool.begin_run()
         for name in self._prev_outputs:
             v = self.values.get(name)
             if isinstance(v, Tensor) and v.buf.off not in self._const_offs:
@@ -3390,8 +3694,20 @@ class Runner:
         self.host_sites = []
         self.boundary_uploads = 0
         self.boundary_downloads = 0
-        for name, arr in feeds.items():
-            self.values[name] = self.upload(arr)
+        # Allocation keys are per run: a node that allocates in the same order
+        # on every run must produce the same key on every run, which is what
+        # lets a recorded plan pin its buffers to fixed offsets.
+        self._alloc_seq = {}
+        if self._labels:
+            for name, arr in feeds.items():
+                self._alloc_scope = "in:" + name
+                try:
+                    self.values[name] = self.upload(arr)
+                finally:
+                    self._alloc_scope = None
+        else:
+            for name, arr in feeds.items():
+                self.values[name] = self.upload(arr)
         if not self._last_use:
             self._plan()
         self.profile = []
@@ -3421,6 +3737,8 @@ class Runner:
                             "flops": 0, "macs": 0})
                 continue
             self._node_idx = idx
+            if self._labels:
+                self._alloc_scope = "n%d:%s" % (idx, node.op_type)
             tier = plan[idx]["backend"] if hybrid else None
             reason = plan[idx]["reason"] if hybrid else ""
             t0 = time.perf_counter()
@@ -3436,6 +3754,8 @@ class Runner:
                     backend, assigned = None, False
             finally:
                 self._count_host = False
+                if self._labels:
+                    self._alloc_scope = None
             s1 = self.eng.stats
             dt = (time.perf_counter() - t0) * 1e3
             if profile:

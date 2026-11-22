@@ -218,6 +218,35 @@ void vc4__generator_digest(char out[65])
     digest_hex(h, out);
 }
 
+/* The ABI tag is part of the generator digest above; it is exposed so an
+ * engine artifact can stamp and check it without duplicating the string in
+ * Python (a copy there would silently disagree on the next ABI bump). */
+const char *vc4_kernel_abi_tag(void)
+{
+    return VC4_ABI_TAG;
+}
+
+void vc4_generator_digest(char out[65])
+{
+    vc4__generator_digest(out);
+}
+
+int vc4_loaded_kernels(const vc4_ctx *ctx, char *buf, size_t bytes)
+{
+    if (!ctx || (!buf && bytes))
+        return -1;
+    size_t used = 0;
+    for (int i = 0; i < ctx->nseen; ++i) {
+        const char *name = ctx->seen[i];
+        size_t len = strlen(name);
+        if (used + len + 1 > bytes)
+            return -1;
+        memcpy(buf + used, name, len + 1);
+        used += len + 1;
+    }
+    return ctx->nseen;
+}
+
 void vc4__sha256_hex(const void *data, size_t len, char out[65])
 {
     sha256_ctx c;
@@ -428,9 +457,22 @@ vc4_status vc4__kernel_load_file(vc4_ctx *ctx, const char *name,
     return VC4_OK;
 }
 
+/* Remember every distinct blob name, for the engine artifact's kernel list. */
+static void note_seen(vc4_ctx *ctx, const char *name)
+{
+    if (ctx->nseen >= VC4_MAX_SEEN)
+        return;
+    for (int i = 0; i < ctx->nseen; ++i)
+        if (strcmp(ctx->seen[i], name) == 0)
+            return;
+    snprintf(ctx->seen[ctx->nseen], sizeof(ctx->seen[0]), "%s", name);
+    ctx->nseen++;
+}
+
 vc4_status vc4__kernel(vc4_ctx *ctx, const char *name, char *const gen_argv[],
                        int nqpu, vc4_kernel **out)
 {
+    note_seen(ctx, name);
     for (int i = 0; i < ctx->nkern; ++i) {
         if (strcmp(ctx->k[i].name, name) == 0) {
             if (nqpu > (int)ctx->k[i].nqpu) {

@@ -153,6 +153,16 @@ vc4_status vc4_init(vc4_ctx **out, const char *cache_dir, size_t arena_bytes);
 void       vc4_shutdown(vc4_ctx *ctx);
 const char *vc4_strerror(vc4_status st);
 
+/* Kernel identity, for an engine artifact that must not run a plan built by a
+ * different generator.  The digest is the one the blob cache stamps into every
+ * .bin; the ABI tag is the string it hashes last. */
+const char *vc4_kernel_abi_tag(void);
+/* The generator digest: sha256(kgen.py, kops.py beside it, ABI tag), hex. */
+void        vc4_generator_digest(char out[65]);
+/* Names (NUL-separated, unique) of the kernel blobs this context has loaded,
+ * written into buf.  Returns the count, or -1 when buf is too small. */
+int vc4_loaded_kernels(const vc4_ctx *ctx, char *buf, size_t bytes);
+
 /* -------------------------------------------------------------------- arena */
 size_t vc4_arena_bytes(const vc4_ctx *ctx);
 size_t vc4_arena_used(const vc4_ctx *ctx);

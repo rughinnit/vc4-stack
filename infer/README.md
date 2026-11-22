@@ -42,6 +42,28 @@ The tests take `/tmp/vc4-gpu.lock` themselves and print a board state after
 each stage.  **One GPU user at a time**: two concurrent workloads (or a wild
 kernel) can hang the V3D hard enough to require a power cycle.
 
+## Engine artifacts: `vc4infer build`
+
+`vc4infer build model.onnx -o model.vc4x` writes the model after the
+optimiser: the rewritten graph with its provenance records, conv weight panels
+already packed into the arena layout, the arena plan with fixed offsets, and
+the kernel blobs the plan launches.  `Engine("model.vc4x")` loads that plan
+instead of planning and packing, and refuses a file whose kernel generator,
+ABI, engine version or board was not the one it was built with.  The artifact
+is hardware-specific; the ONNX file is not.
+
+```sh
+vc4infer build yolov8n_160.onnx -o yolov8n_160.vc4x   # 12.4 s, 25.1 MiB
+vc4infer verify yolov8n_160.vc4x                      # hashes + every key
+vc4infer bench  yolov8n_160.vc4x
+```
+
+On YOLOv8n at 160 the outputs are bit-identical to the ONNX path and the
+steady-state launch count is the same 536; load falls from 3.21 s to 0.48 s and
+the first run from 1.78 s to 1.46 s.  `--no-artifact` plans from the ONNX graph
+the artifact carries.  Format, keys and measurements:
+[`../docs/ENGINE-ARTIFACT.md`](../docs/ENGINE-ARTIFACT.md).
+
 ## Unprivileged mode: `VC4INFER_DAEMON=1`
 
 By default the library maps `/dev/mem` itself and must run as root.  With

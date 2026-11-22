@@ -69,18 +69,19 @@ Only `"vc4"` exists.  `Device("cpu")` raises `DeviceError` listing
 
 ```python
 Engine(model_path, device=None, *, mode="strict", host_policy="device",
-       arena_mb=None, cache_dir=None, passes=None)
+       arena_mb=None, cache_dir=None, passes=None, artifact=None)
 ```
 
 | parameter | meaning |
 |---|---|
-| `model_path` | fixed-shape, batch-1, fp32 ONNX file.  Parsed once; the file must exist. |
+| `model_path` | fixed-shape, batch-1, fp32 ONNX file, or a `.vc4x` engine artifact (detected by magic).  Parsed once; the file must exist. |
 | `device` | `Device("vc4")` or `"vc4"`; `None` means `Device("vc4")`. |
 | `mode` | `"strict"` (default) or `"hybrid"`. |
 | `host_policy` | hybrid only: `"device"` (default), `"structural"`, `"any"`. |
 | `arena_mb` | arena size to request from `vc4d` (default: the daemon's, normally 64 MiB). |
 | `cache_dir` | kernel blob cache (default `~/.cache/vc4infer/kcache`). |
-| `passes` | optimiser passes (`docs/OPTIMIZER.md`): `None` reads `$VC4_OPT`, the empty string runs none.  Grammar: `canonicalise`, `ew`, `epilogue`, `all`, and `-name` to disable one after `all`.  Every pass is off by default. |
+| `passes` | optimiser passes (`docs/OPTIMIZER.md`): `None` reads `$VC4_OPT`, the empty string runs none.  Grammar: `canonicalise`, `ew`, `epilogue`, `all`, and `-name` to disable one after `all`.  Every pass is off by default.  Ignored for an artifact, whose graph is already rewritten. |
+| `artifact` | `None` (default) uses an artifact when the file is one; `False` forces the ONNX path, loading the graph the artifact carries and planning from it as usual (the CLI's `--no-artifact`); `True` requires an artifact. |
 
 The constructor opens one arena and uploads the weights.  Only one engine
 should be open at a time; a second one cannot map a second 64 MiB arena and
@@ -139,6 +140,26 @@ shape-inferred `value_info`; they catch an unsupported op before touching the
 GPU.  `run()` is authoritative for a concrete input: a shape-dependent
 constraint can still raise there.  `vc4infer nodes` is the CLI form and prints
 the same verdicts.
+
+### Engine artifacts
+
+```python
+import vc4infer
+from vc4infer import artifact
+
+a = vc4infer.Artifact.load("yolov8n_160.vc4x")   # header + manifest
+a.validate(arena=96 << 20)                       # every key, named refusal
+a.summary()                                      # JSON-able: model, plan, keys
+a.verify()                                       # read + hash every section
+eng = vc4infer.Engine("yolov8n_160.vc4x")        # frozen plan, no packing
+eng2 = vc4infer.Engine("yolov8n_160.vc4x", artifact=False)   # plan from ONNX
+```
+
+`Engine` validates the artifact's keys *before* opening the arena; a mismatch
+raises `ArtifactMismatch` (an `ArtifactError`) with `.key`, `.artifact` and
+`.engine`.  A frozen plan whose lifetimes no longer match raises
+`ArtifactPlanError`.  `vc4infer build` is the builder; the format, the keys and
+the measurements are in `docs/ENGINE-ARTIFACT.md`.
 
 ## 1.4 Error types
 

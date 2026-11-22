@@ -47,6 +47,8 @@ from ._errors import (                                          # noqa: F401
 )
 from . import coverage                                          # noqa: F401
 from .device import Device, devices                             # noqa: F401
+from .artifact import (Artifact, ArtifactError, ArtifactMismatch,       # noqa: F401
+                       ArtifactPlanError)
 from .engine import Engine, Plan, TensorSpec, NodeInfo, NodeBackend  # noqa: F401
 from . import postprocess                                       # noqa: F401
 from . import yolo                                              # noqa: F401
@@ -55,6 +57,7 @@ __all__ = [
     "__version__",
     "devices", "Device",
     "Engine", "Plan", "TensorSpec", "NodeInfo", "NodeBackend",
+    "Artifact", "ArtifactError", "ArtifactMismatch", "ArtifactPlanError",
     "postprocess", "yolo", "coverage", "ort",
     "Vc4InferError", "DeviceError", "ShapeError", "UnsupportedNode",
     "HostNotAllowed", "HostNodeError", "NeedsDeviceDispatch",

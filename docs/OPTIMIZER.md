@@ -550,5 +550,30 @@ launch-accounting gate.
 | merging two independent elementwise launches | they are sequential in the graph; batching them is phase D (daemon round-trips), not a graph rewrite |
 | `MatMul/Gemm + Add` -> `Gemm` with C | `Runner._gemm` materialises C and adds it with a separate `vc4_elementwise` call, so the rewrite saves no launch; not implemented rather than sold as one |
 | silu in the asm10 matmul epilogue | the 8x64 tile has one B register left after the k loop and silu needs twelve (`docs/KERNELS.md` sec. 7.4); the conv GEMM has 19, which is where every YOLOv8n pair lives |
-| weight prepacking, layout assignment, memory planning, autotuning | phases C-E, not part of this merge |
+| layout assignment, autotuning | phases C-E; not part of this merge |
+| weight prepacking and the arena plan | delivered as the engine artifact (`docs/ENGINE-ARTIFACT.md`): packed panels, fixed offsets and the kernel list are built once and loaded, which removes the packing work from every process start |
+
+## Passes 5 and 6: the engine artifact
+
+Passes 5 and 6 are not graph rewrites and do not change what a node computes:
+they decide where the bytes live and when they are packed.  They are delivered
+as the `.vc4x` engine artifact (`vc4infer build`), because the result is only
+useful if it can be written once and loaded:
+
+- **weight prepacking**: each conv's k-major B panel is built on the device at
+  build time and stored; the loader uploads it into its recorded slot.  The
+  pack launch and the host permutation run once per build, not once per
+  process;
+- **memory planning**: one keyed allocation table replaces the per-run bump
+  allocator and free list.  Every constant, panel, input and node buffer has a
+  recorded offset and size; the loader pins them and refuses a plan whose
+  lifetimes no longer match.
+
+Measured on YOLOv8n at 160 (bit-exact outputs, same 536 steady-state launches):
+load 3.21 s -> 0.48 s, first run 1.78 s -> 1.46 s, steady state unchanged.
+`docs/ENGINE-ARTIFACT.md` has the format, the key checks and the full table.
+
+The artifact is additional to the pass pipeline in this document: the graph it
+contains is the graph these passes produced.  Layout assignment and autotuning
+remain phases C-E.
 

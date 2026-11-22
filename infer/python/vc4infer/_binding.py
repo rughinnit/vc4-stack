@@ -59,6 +59,49 @@ def _find_lib():
 
 _LIB = _find_lib()
 
+_LIB_HANDLE = None
+
+
+def library():
+    """The shared library, opened once, for calls that need no context.
+
+    The kernel identity (ABI tag, generator digest) and the loaded-kernel list
+    have to be readable before an Engine exists: an artifact is validated
+    against them before it touches the arena.
+    """
+    global _LIB_HANDLE
+    if _LIB_HANDLE is None:
+        _LIB_HANDLE = ctypes.CDLL(_LIB)
+    return _LIB_HANDLE
+
+
+def generator_digest():
+    """sha256(kgen.py, kops.py beside it, ABI tag) as the blob cache computes it.
+
+    ``None`` when the installed library predates ``vc4_generator_digest``; the
+    caller can then fall back to hashing the generator sources itself, which is
+    what the cache does (see ``vc4infer.artifact``).
+    """
+    lib = library()
+    fn = getattr(lib, "vc4_generator_digest", None)
+    if fn is None:
+        return None
+    fn.argtypes = [ctypes.c_char_p]
+    fn.restype = None
+    buf = ctypes.create_string_buffer(65)
+    fn(buf)
+    return buf.value.decode()
+
+
+def kernel_abi_tag():
+    """The ABI tag the generator digest hashes, or ``None`` without the symbol."""
+    lib = library()
+    fn = getattr(lib, "vc4_kernel_abi_tag", None)
+    if fn is None:
+        return None
+    fn.restype = ctypes.c_char_p
+    return fn().decode()
+
 VC4_OK = 0
 ERR_INVAL, ERR_NOMEM, ERR_IO, ERR_TIMEOUT = -1, -2, -3, -4
 ERR_UNSUPPORTED = -5
@@ -400,6 +443,25 @@ class Engine:
     @property
     def arena_bytes(self):
         return self.lib.vc4_arena_bytes(self.ctx)
+
+    def loaded_kernels(self):
+        """Names of the blobs this context has loaded (see the C API)."""
+        fn = getattr(self.lib, "vc4_loaded_kernels", None)
+        if fn is None:
+            return []
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+        fn.restype = ctypes.c_int
+        buf = ctypes.create_string_buffer(1 << 17)
+        n = fn(self.ctx, buf, len(buf))
+        if n <= 0:
+            return []
+        raw = buf.raw
+        out, i = [], 0
+        for _ in range(n):
+            j = raw.index(b"\0", i)
+            out.append(raw[i:j].decode())
+            i = j + 1
+        return out
 
     def alloc(self, nbytes):
         b = Buf()

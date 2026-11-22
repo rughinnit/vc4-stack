@@ -158,13 +158,14 @@ vc4_status vc4_conv_nhwc_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int Cin,
     return st;
 }
 
-/* The flat panel is refused, not merely defaulted off.  Its block schedule is
- * sound (13 shapes match the row-padded panel on the host, check_im2col_flat)
- * but the panel write needs a 4-word transposing VPM store, and that shape
- * either lands the data transposed into the wrong words or is rejected with
- * V3D_ERR_STAT=0x00000010 -- see docs/KERNEL-EFF.md sec. 7.  The code below is
- * kept for the next attempt, which keeps the 16x16 store and fills its rows
- * from four 4-row VDRs; returning 0 here keeps a wrong panel unreachable. */
+/* The flat panel is refused, not merely defaulted off.  Its second form keeps
+ * the row kernel's 16x16 transposing store and fills the 16 VPM rows from
+ * four 4-row VDRs, so the only new shape is a load, and its block schedule
+ * and VPM rows are proved against the row-padded panel on the host for 15
+ * shapes (check_im2col_flat).  The store sequence itself has not run on
+ * silicon yet; the first attempt's 4-word store is what failed there
+ * (V3D_ERR_STAT=0x10, docs/KERNEL-EFF.md sec. 7).  Returning 0 here keeps a
+ * panel no QPU has written unreachable until the silicon gate passes. */
 static int conv_flat_enabled(void)
 {
     static int on = -1;
@@ -172,9 +173,9 @@ static int conv_flat_enabled(void)
         const char *e = getenv("VC4_CONV_FLAT");
         if (e && *e && strcmp(e, "0") != 0)
             fprintf(stderr, "vc4infer: VC4_CONV_FLAT refused: the flat panel's "
-                            "4-word transposing store is not a shape the QPU "
-                            "accepts; using the row-padded path "
-                            "(docs/KERNEL-EFF.md sec. 7)\n");
+                            "4-row VDR fills have only a host-side proof; the "
+                            "silicon gate has not run, so the row-padded path "
+                            "is used (docs/KERNEL-EFF.md sec. 7)\n");
         on = 0;
     }
     return on;
@@ -231,11 +232,11 @@ static vc4_status nhwc_conv_pass(vc4_ctx *ctx, const nhwc_pad *pd, int nimg,
         const uint32_t radv = (uint32_t)stride * row_pitch;
         const uint32_t rowadj = radv - (uint32_t)GPR * gadv;
         char fname[96];
-        char *fargv[] = { (char *)"im2col_nhwc_flat", (char *)"--cin", ncin,
+        char *fargv[] = { (char *)"im2col_nhwc_flat2", (char *)"--cin", ncin,
                           (char *)"--kh", nkh, (char *)"--kw", nkw,
                           (char *)"--stride", nst, (char *)"--dil", ndl,
                           NULL };
-        snprintf(fname, sizeof(fname), "im2col_nhwc_flat_%d_%d_%d_s%d_d%d",
+        snprintf(fname, sizeof(fname), "im2col_nhwc_flat2_%d_%d_%d_s%d_d%d",
                  Cin, KH, KW, stride, dilation);
         st = vc4__kernel(ctx, fname, fargv, NHWC_IM2COL_QPU, &k);
         if (st != VC4_OK)
@@ -252,6 +253,8 @@ static vc4_status nhwc_conv_pass(vc4_ctx *ctx, const nhwc_pad *pd, int nimg,
                 const uint32_t g0 = 4u * b0;
                 const uint32_t y0 = g0 / (uint32_t)GPR;
                 const uint32_t x0g = g0 % (uint32_t)GPR;
+                /* groups this QPU may process: the kernel ends when its
+                 * blocks leave none, so the last block may carry pad groups */
                 const uint32_t gr = 4u * per < groups - g0
                                     ? 4u * per : groups - g0;
                 uint32_t *u = vc4__uni(ctx, k, q);
@@ -261,9 +264,8 @@ static vc4_status nhwc_conv_pass(vc4_ctx *ctx, const nhwc_pad *pd, int nimg,
                        (uint32_t)((size_t)n * M * nk * 4u);
                 u[2] = gadv;
                 u[3] = dst_step;
-                u[4] = per;
-                u[5] = y0 * radv + x0g * 4u * (uint32_t)stride *
-                       (uint32_t)Cin_pitch * 4u;
+                u[4] = gr;
+                u[5] = y0 * radv + x0g * gadv;
                 u[6] = b0 * dst_step;
                 u[7] = (uint32_t)stride * (uint32_t)Cin_pitch * 4u;
                 u[8] = (uint32_t)q;
@@ -271,8 +273,7 @@ static vc4_status nhwc_conv_pass(vc4_ctx *ctx, const nhwc_pad *pd, int nimg,
                 u[10] = (uint32_t)GPR;
                 u[11] = rowadj;
                 u[12] = (uint32_t)Cin_pitch * 4u * (uint32_t)dilation;
-                u[13] = gr;
-                u[14] = (uint32_t)GPR - x0g;
+                u[13] = (uint32_t)GPR - x0g;
             }
             uint64_t ns = 0;
             st = vc4__launch(ctx, k, nq, &ns);

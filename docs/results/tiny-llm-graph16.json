@@ -1,0 +1,51 @@
+{
+ "source_nodes": 800,
+ "cache_nodes_removed": 17,
+ "layernorms_fused": 17,
+ "shape_metadata_folded": 308,
+ "matmuls_made_2d": 49,
+ "pruned_nodes": 53,
+ "nodes": 378,
+ "metadata_nodes": 0,
+ "compute_nodes": 378,
+ "ctx": 16,
+ "logits": "last",
+ "inputs": [
+  "input_ids",
+  "position_ids"
+ ],
+ "outputs": [
+  "logits"
+ ],
+ "initializer_bytes": 27849752,
+ "symbolic_dims": [],
+ "ops": {
+  "Add": 103,
+  "Cast": 2,
+  "Concat": 51,
+  "ConstantOfShape": 1,
+  "Div": 17,
+  "Equal": 3,
+  "Expand": 6,
+  "Gather": 81,
+  "Greater": 1,
+  "MatMul": 65,
+  "Mul": 50,
+  "Pow": 25,
+  "Range": 5,
+  "ReduceMean": 34,
+  "Reshape": 35,
+  "ScatterND": 1,
+  "Shape": 54,
+  "Slice": 42,
+  "Softmax": 8,
+  "Sqrt": 17,
+  "Squeeze": 16,
+  "Sub": 25,
+  "Tanh": 8,
+  "Transpose": 41,
+  "Trilu": 1,
+  "Unsqueeze": 97,
+  "Where": 11
+ }
+}

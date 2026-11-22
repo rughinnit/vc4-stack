@@ -1,0 +1,123 @@
+{
+ "model": "/home/raspi/scratch/refs/tinystories/wrap/ts1m_c16.onnx",
+ "ctx": 16,
+ "prompt": "Once upon a time there was a little girl named Lily. She lived with her mother and father in a small house near the woods. Every day she went outside to play with her friends.",
+ "prompt_tokens": 38,
+ "generated_ids": [
+  284,
+  284,
+  284,
+  284,
+  284,
+  284,
+  284,
+  284
+ ],
+ "generated_text": " to to to to to to to to",
+ "text": "Once upon a time there was a little girl named Lily. She lived with her mother and father in a small house near the woods. Every day she went outside to play with her friends. to to to to to to to to",
+ "tokens_per_s": 0.8605491636286188,
+ "mean_ms_per_token": 1162.0486571428046,
+ "min_ms_per_token": 1134.6972060000553,
+ "first_ms": 1725.5255139989458,
+ "launches_per_token": 1371,
+ "nodes": 378,
+ "node_backends": {
+  "vc4": 378
+ },
+ "memory": {
+  "arena_bytes": 67108864,
+  "arena_mb": 64.0,
+  "pool_bytes": 31282752,
+  "pool_mb": 29.83355712890625,
+  "pool_segments": 1,
+  "peak_bytes": 27857472,
+  "peak_mb": 26.56695556640625,
+  "estimate_bytes": 31282752,
+  "scratch_bytes": 867328,
+  "device": "vc4"
+ },
+ "steps": [
+  {
+   "step": 0,
+   "wall_ms": 1725.5255139989458,
+   "launches": 1374,
+   "ort_ms": 136.5405680007825,
+   "logit_max_abs_diff": 21.494136810302734,
+   "ort_argmax": 198,
+   "parity": false,
+   "token": 284
+  },
+  {
+   "step": 1,
+   "wall_ms": 1134.6972060000553,
+   "launches": 1376,
+   "ort_ms": 39.08588299964322,
+   "logit_max_abs_diff": 18.181533813476562,
+   "ort_argmax": 607,
+   "parity": false,
+   "token": 284
+  },
+  {
+   "step": 2,
+   "wall_ms": 1171.7001460001484,
+   "launches": 1373,
+   "ort_ms": 32.33183300108067,
+   "logit_max_abs_diff": 19.80630874633789,
+   "ort_argmax": 262,
+   "parity": false,
+   "token": 284
+  },
+  {
+   "step": 3,
+   "wall_ms": 1199.9505149997276,
+   "launches": 1375,
+   "ort_ms": 37.55091099992569,
+   "logit_max_abs_diff": 21.576677322387695,
+   "ort_argmax": 262,
+   "parity": false,
+   "token": 284
+  },
+  {
+   "step": 4,
+   "wall_ms": 1172.1602010002243,
+   "launches": 1372,
+   "ort_ms": 35.17754500171577,
+   "logit_max_abs_diff": 23.375864028930664,
+   "ort_argmax": 262,
+   "parity": false,
+   "token": 284
+  },
+  {
+   "step": 5,
+   "wall_ms": 1155.218263000279,
+   "launches": 1373,
+   "ort_ms": 30.53425400139531,
+   "logit_max_abs_diff": 18.8392333984375,
+   "ort_argmax": 711,
+   "parity": false,
+   "token": 284
+  },
+  {
+   "step": 6,
+   "wall_ms": 1153.7515279997024,
+   "launches": 1371,
+   "ort_ms": 39.49129700049525,
+   "logit_max_abs_diff": 18.508756637573242,
+   "ort_argmax": 711,
+   "parity": false,
+   "token": 284
+  },
+  {
+   "step": 7,
+   "wall_ms": 1146.8627409994951,
+   "launches": 1371,
+   "ort_ms": 34.715347001110786,
+   "logit_max_abs_diff": 20.44757080078125,
+   "ort_argmax": 711,
+   "parity": false,
+   "token": 284
+  }
+ ],
+ "parity_all": false,
+ "ort_mean_ms": 35.55529571505239
+}

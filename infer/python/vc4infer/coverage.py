@@ -492,11 +492,23 @@ def _check_gemm(node, shapes, inits):
 
 
 def _check_matmul(node, shapes, inits):
-    for name in node.input[:2]:
-        rank = _rank(shapes, name)
-        if rank is not None and rank != 2:
-            return "unsupported", "rank %d operand (2-D only)" % rank
-    return "supported", "gemm"
+    ranks = [_rank(shapes, name) for name in node.input[:2]]
+    if any(r is None for r in ranks):
+        return "unknown", "operand rank unknown"
+    if min(ranks) < 2:
+        return "unsupported", "rank %d operand (rank >= 2)" % min(ranks)
+    a = shapes.get(node.input[0])
+    b = shapes.get(node.input[1])
+    if a and b:
+        if len(a) != len(b):
+            return "unsupported", "rank %d x %d operands" % (len(a), len(b))
+        ba, bb = tuple(a[:-2]), tuple(b[:-2])
+        if any(int(d) <= 0 for d in ba + bb):
+            return "unknown", "batch extent unknown"
+        if ba != bb:
+            return "unsupported", ("batch %s x %s (broadcasting needs a "
+                                   "panel copy)" % (ba, bb))
+    return "supported", "gemm rank %d x %d" % (ranks[0], ranks[1])
 
 
 def _check_concat(node, shapes, inits):

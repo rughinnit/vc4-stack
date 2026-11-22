@@ -447,8 +447,19 @@ def rec_matmul(op, rng, o):
                {"B": arr(rng, (4, 2), -1, 1), "C": arr(rng, (3, 2), -1, 1)},
                {"transB": 0}, edge=True, note="C broadcast over M"),
         ]
-    return [sp(op, "2d_4x8_8x3", ["A", "B"],
-               {"A": arr(rng, (4, 8), -1, 1), "B": arr(rng, (8, 3), -1, 1)})]
+    return [
+        sp(op, "2d_4x8_8x3", ["A", "B"],
+           {"A": arr(rng, (4, 8), -1, 1), "B": arr(rng, (8, 3), -1, 1)}),
+        # v10/v11/v12/YOLO26 attention: scores = q @ k^T and out = v @ scores,
+        # both rank 4 with a batch and a head extent.
+        sp(op, "batched_4d_attention_qk", ["A", "B"],
+           {"A": arr(rng, (4, 2, 25, 32), -1, 1),
+            "B": arr(rng, (4, 2, 32, 25), -1, 1)},
+           note="[B][H][M][K] x [B][H][K][N], one GEMM per B*H"),
+        sp(op, "batched_4d_attention_vs", ["A", "B"],
+           {"A": arr(rng, (1, 2, 64, 25), -1, 1),
+            "B": arr(rng, (1, 2, 25, 25), -1, 1)}),
+    ]
 
 
 def rec_einsum(op, rng, o):

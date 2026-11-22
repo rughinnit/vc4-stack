@@ -2642,19 +2642,46 @@ class Runner:
         return self._epilogue(node, self._matmul_impl(node))
 
     def _matmul_impl(self, node):
+        """MatMul of any rank >= 2, as one GEMM per batch index.
+
+        ONNX MatMul on rank-4 operands is a batched matmul: ``[B][H][M][K] x
+        [B][H][K][N] -> [B][H][M][N]``.  The QPU kernel is a single GEMM, so
+        the batch is unrolled into ``B*H`` launches over sub-ranges of the
+        same arena buffers -- no layout gather, no new kernel.  The attention
+        blocks in v10/v11/v12/YOLO26 use exactly this (B=1..4, H=2..4,
+        M=25, K=32..64, N=25).
+
+        Batch dimensions must match exactly; ONNX also permits broadcasting
+        them, which no model here does and which would need a panel copy.
+        """
         a = self._float(node.input[0])
         b = self._float(node.input[1])
-        if len(a.shape) != 2 or len(b.shape) != 2:
-            raise UnsupportedNode("MatMul %s: only 2-D (got %s x %s)"
+        if len(a.shape) < 2 or len(b.shape) < 2:
+            raise UnsupportedNode("MatMul %s: rank < 2 (got %s x %s)"
                                   % (node.name, a.shape, b.shape))
-        M, K = a.shape
-        K2, N = b.shape
+        M, K = a.shape[-2:]
+        K2, N = b.shape[-2:]
         if K != K2:
             raise UnsupportedNode("MatMul %s: K mismatch %s x %s"
                                   % (node.name, a.shape, b.shape))
-        out = self._alloc(M * N)
-        self.eng.matmul(a.buf, b.buf, out, M, N, K)
-        return Tensor(out, (M, N))
+        ba, bb = tuple(a.shape[:-2]), tuple(b.shape[:-2])
+        if ba != bb:
+            raise UnsupportedNode("MatMul %s: batch %s x %s (equal batch "
+                                  "dimensions only)" % (node.name, ba, bb))
+        if a.layout == "nhwc":
+            a = self._tmp(self._to_nchw_buf(a))
+        if b.layout == "nhwc":
+            b = self._tmp(self._to_nchw_buf(b))
+        batch = int(np.prod(ba)) if ba else 1
+        out = self._alloc(batch * M * N)
+        if batch == 1:
+            self.eng.matmul(a.buf, b.buf, out, M, N, K)
+        else:
+            for i in range(batch):
+                self.eng.matmul(self._buf_at(a, i * M * K * 4),
+                                self._buf_at(b, i * K * N * 4),
+                                self._buf_at(out, i * M * N * 4), M, N, K)
+        return Tensor(out, ba + (M, N))
 
     def _gemm(self, node):
         return self._epilogue(node, self._gemm_impl(node))

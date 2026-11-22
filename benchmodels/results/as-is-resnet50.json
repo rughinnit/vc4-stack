@@ -1,0 +1,10 @@
+{
+  "model": "light_resnet50.onnx",
+  "file": "/home/raspi/work/torch-vc4/.venv/lib/python3.13/site-packages/onnx/backend/test/data/light/light_resnet50.onnx",
+  "nodes": 415,
+  "opset": [
+    9
+  ],
+  "refusal": "UnsupportedNode: unsupported graph: graph pool needs at least 100.3 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 348.0 MiB, but the client arena is 93.0 MiB with 41.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 150.0 MiB would do - or lower VC4_POOL_RESERVE_MB",
+  "stage": "engine-open"
+}

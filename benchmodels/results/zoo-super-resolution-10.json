@@ -1,0 +1,88 @@
+{
+  "model": "super-resolution-10.onnx",
+  "task": "other",
+  "source": "ONNX Model Zoo",
+  "file": "benchmodels/zoo/super-resolution-10.onnx",
+  "fixed_file": "super-resolution-10-fixed.onnx",
+  "opset": [
+    10
+  ],
+  "nodes": 12,
+  "params": 59657,
+  "inputs": [
+    [
+      "input",
+      [
+        1,
+        1,
+        224,
+        224
+      ]
+    ],
+    [
+      "conv1.weight",
+      [
+        64,
+        1,
+        5,
+        5
+      ]
+    ],
+    [
+      "conv1.bias",
+      [
+        64
+      ]
+    ],
+    [
+      "conv2.weight",
+      [
+        64,
+        64,
+        3,
+        3
+      ]
+    ]
+  ],
+  "n_inputs": 9,
+  "outputs": [
+    [
+      "output",
+      [
+        1,
+        1,
+        672,
+        672
+      ]
+    ]
+  ],
+  "ops": [
+    "Constant",
+    "Conv",
+    "Relu",
+    "Reshape",
+    "Transpose"
+  ],
+  "n_feeds": 1,
+  "feed_elements": 50176,
+  "cpu": {
+    "ok": true,
+    "runs_ms": [
+      716.5903269997216,
+      707.7403500006767,
+      700.9180240002024,
+      717.117826001413,
+      702.0571350003593
+    ],
+    "wall_ms": 708.8847324004746,
+    "min_ms": 700.9180240002024
+  },
+  "plan": {
+    "ok": false,
+    "refusal": "UnsupportedNode: unsupported graph: graph pool needs at least 12.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 70.0 MiB, but the client arena is 93.0 MiB with 126.0 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 146.8 MiB would do - or lower VC4_POOL_RESERVE_MB"
+  },
+  "engine": {
+    "ok": false,
+    "refusal": "engine did not open: UnsupportedNode: unsupported graph: graph pool needs at least 12.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 70.0 MiB, but the client arena is 93.0 MiB with 126.0 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 146.8 MiB would do - or lower VC4_POOL_RESERVE_MB"
+  }
+}

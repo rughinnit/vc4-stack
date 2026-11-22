@@ -1,0 +1,136 @@
+{
+  "model": "modelC.onnx",
+  "task": "classification",
+  "source": "shipped selftest",
+  "file": "infer/packaging/vc4infer/data/models/modelC.onnx",
+  "fixed_file": null,
+  "opset": [
+    13
+  ],
+  "nodes": 5,
+  "params": 2388,
+  "inputs": [
+    [
+      "x",
+      [
+        1,
+        16,
+        8,
+        8
+      ]
+    ]
+  ],
+  "n_inputs": 1,
+  "outputs": [
+    [
+      "y",
+      [
+        1,
+        4
+      ]
+    ]
+  ],
+  "ops": [
+    "Conv",
+    "Flatten",
+    "Gemm",
+    "GlobalAveragePool",
+    "Relu"
+  ],
+  "n_feeds": 1,
+  "feed_elements": 1024,
+  "cpu": {
+    "ok": true,
+    "runs_ms": [
+      0.21630099945468828,
+      0.2108330008923076,
+      0.21072799972898792,
+      0.19906200031982735,
+      0.19625000095402356
+    ],
+    "wall_ms": 0.20663480026996695,
+    "min_ms": 0.19625000095402356
+  },
+  "engine_inputs": [
+    [
+      "x",
+      [
+        1,
+        16,
+        8,
+        8
+      ]
+    ]
+  ],
+  "plan": {
+    "model": "/home/raspi/work/vc4-models/infer/packaging/vc4infer/data/models/modelC.onnx",
+    "device": "vc4",
+    "mode": "strict",
+    "host_policy": "device",
+    "inputs": [
+      [
+        "x",
+        [
+          1,
+          16,
+          8,
+          8
+        ],
+        "float32"
+      ]
+    ],
+    "outputs": [
+      [
+        "y",
+        [
+          1,
+          4
+        ],
+        "float32"
+      ]
+    ],
+    "nodes": 5,
+    "dispatches": 5,
+    "unverified": [],
+    "tiers": {
+      "vc4": 5
+    },
+    "host_debt": []
+  },
+  "engine": {
+    "ok": true,
+    "runs_ms": [
+      6.095141001424054,
+      6.244046999199782,
+      6.107900999268168,
+      6.163473999549751,
+      6.177535999086103
+    ],
+    "wall_ms": 6.1576197997055715,
+    "min_ms": 6.095141001424054,
+    "launches": 9,
+    "qpu_ms": 0.8110506000000001,
+    "error": {
+      "max_abs": 2.60770320892334e-07,
+      "max_scaled": 2.462352958873035e-07,
+      "elements": 4
+    },
+    "memory": {
+      "arena_mb": 93.0,
+      "pool_mb": 1.0,
+      "peak_mb": 0.1,
+      "estimate_mb": 1.0,
+      "scratch_mb": 0.3,
+      "segments": 1
+    },
+    "outputs": [
+      [
+        "y",
+        [
+          1,
+          4
+        ]
+      ]
+    ]
+  }
+}

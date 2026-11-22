@@ -1,0 +1,84 @@
+{
+  "model": "light_densenet121-materialised.onnx",
+  "task": "classification",
+  "source": "ONNX backend test data (light), materialised",
+  "file": "benchmodels/models/light_densenet121-materialised.onnx",
+  "fixed_file": null,
+  "opset": [
+    9
+  ],
+  "nodes": 910,
+  "params": 8146152,
+  "inputs": [
+    [
+      "conv1/bn_scale_0",
+      [
+        64
+      ]
+    ],
+    [
+      "conv1/bn_bias_0",
+      [
+        64
+      ]
+    ],
+    [
+      "conv1/bn_mean_0",
+      [
+        64
+      ]
+    ],
+    [
+      "conv1/bn_var_0",
+      [
+        64
+      ]
+    ]
+  ],
+  "n_inputs": 13,
+  "outputs": [
+    [
+      "fc6_1",
+      [
+        1,
+        1000,
+        1,
+        1
+      ]
+    ]
+  ],
+  "ops": [
+    "Add",
+    "AveragePool",
+    "BatchNormalization",
+    "Concat",
+    "Conv",
+    "GlobalAveragePool",
+    "MaxPool",
+    "Mul",
+    "Relu",
+    "Unsqueeze"
+  ],
+  "n_feeds": 1,
+  "feed_elements": 150528,
+  "cpu": {
+    "ok": true,
+    "runs_ms": [
+      978.694870000254,
+      836.9491930006916,
+      817.4619000001258,
+      820.5614749986125,
+      933.8492560000304
+    ],
+    "wall_ms": 877.5033387999429,
+    "min_ms": 817.4619000001258
+  },
+  "plan": {
+    "ok": false,
+    "refusal": "UnsupportedNode: unsupported graph: graph pool needs at least 65.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 376.0 MiB, but the client arena is 93.0 MiB with 41.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 114.9 MiB would do - or lower VC4_POOL_RESERVE_MB"
+  },
+  "engine": {
+    "ok": false,
+    "refusal": "engine did not open: UnsupportedNode: unsupported graph: graph pool needs at least 65.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 376.0 MiB, but the client arena is 93.0 MiB with 41.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 114.9 MiB would do - or lower VC4_POOL_RESERVE_MB"
+  }
+}

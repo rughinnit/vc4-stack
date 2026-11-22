@@ -1,0 +1,12 @@
+{
+  "model": "light_densenet121-materialised.onnx",
+  "file": "benchmodels/models/light_densenet121-materialised.onnx",
+  "nodes": 910,
+  "opset": [
+    9
+  ],
+  "plan": {
+    "ok": false,
+    "refusal": "UnsupportedNode: node 'n0' (Conv): kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+  }
+}

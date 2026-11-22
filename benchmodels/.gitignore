@@ -1,0 +1,6 @@
+# Model files are fetched or generated; only the scripts and run records are
+# tracked.  See MODELS.md and fetch_models.sh.
+zoo/
+models/
+__pycache__/
+*.pyc

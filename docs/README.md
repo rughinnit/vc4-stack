@@ -26,6 +26,7 @@ and every path below is relative to the repository root unless it starts with
 | `ACCURACY.md` | **accuracy ledger**: VC4 vs the CPU on the same image (identical boxes, 0.00 px), per-op error bounds, training gradients, determinism, and where the error comes from (truncating FPU, no FMA, denormals) |
 | `BUGS.md` | every bug, its root cause, the fix, the verification and the commit — plus the open ones with workarounds and the process failures that cost time |
 | `BENCHMARKS.md` | **the registry**: hardware envelope, GEMM, YOLOv8n progression, 320/640, per-op torch_vc4 vs CPU, training, builds, copy bandwidth, ORT, backend overhead, clocks, completeness, framework effort |
+| [`MODELS.md`](MODELS.md) | **model coverage beyond YOLO**: fifteen graphs measured against ONNX Runtime on the CPU, the three that run on the QPUs, the exact first refusal for every other one (arena, 7x7 stem, grouped conv, `ConstantOfShape`, `Upsample`, int8), and what each gap would need |
 | `BACKENDS.md` | the two backends: `managed` (vc4d, unprivileged, ~0.1 ms/launch) vs `direct` (root, no overhead) — measured 488 vs 410 ms on YOLOv8n, and when to use which |
 | `ECOSYSTEM.md` | every VC4 repository, what each owns, how the two execution paths fit, and which repo to open for what |
 | `MEDIUM-CLASSIFICATION.md` | lnstadrum (2021): a 225 K-param GLSL classifier on Pi Zero at 595 ms; the GLES 2.0 limits it documents, its 8-bit/channel-shuffle co-design, and the three ways it corroborates our launch-bound, CPU-supply-bound results |

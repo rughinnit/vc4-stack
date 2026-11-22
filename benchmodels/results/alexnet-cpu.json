@@ -1,0 +1,84 @@
+{
+  "model": "light_bvlc_alexnet.onnx",
+  "task": "classification",
+  "source": "ONNX backend test data (light)",
+  "file": "/home/raspi/work/torch-vc4/.venv/lib/python3.13/site-packages/onnx/backend/test/data/light/light_bvlc_alexnet.onnx",
+  "fixed_file": null,
+  "opset": [
+    9
+  ],
+  "nodes": 40,
+  "params": 60965260,
+  "inputs": [
+    [
+      "data_0",
+      [
+        1,
+        3,
+        224,
+        224
+      ]
+    ],
+    [
+      "OC2_DUMMY_1",
+      [
+        2
+      ]
+    ],
+    [
+      "conv1_b_0__SHAPE",
+      [
+        1
+      ]
+    ],
+    [
+      "conv1_w_0__SHAPE",
+      [
+        4
+      ]
+    ]
+  ],
+  "n_inputs": 18,
+  "outputs": [
+    [
+      "prob_1",
+      [
+        1,
+        1000
+      ]
+    ]
+  ],
+  "ops": [
+    "ConstantOfShape",
+    "Conv",
+    "Dropout",
+    "Gemm",
+    "LRN",
+    "MaxPool",
+    "Relu",
+    "Reshape",
+    "Softmax"
+  ],
+  "n_feeds": 1,
+  "feed_elements": 150528,
+  "cpu": {
+    "ok": true,
+    "runs_ms": [
+      285.9647200002655,
+      288.43262199916353,
+      293.14212600002065,
+      299.1788079998514,
+      308.12021299971093
+    ],
+    "wall_ms": 294.9676977998024,
+    "min_ms": 285.9647200002655
+  },
+  "plan": {
+    "ok": false,
+    "refusal": "not attempted (--cpu-only)"
+  },
+  "engine": {
+    "ok": false,
+    "refusal": "not attempted (--cpu-only)"
+  }
+}

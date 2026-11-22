@@ -135,14 +135,16 @@ above.  The waste is a property of the 16-pixel VDR block: the panel pass
 reads 16 pixels at one constant pitch per tap, and a block that crosses a row
 boundary has no constant pitch.
 
-Removing it needs a panel pass whose 16-pixel block is assembled from up to
-four 4-pixel groups, each group being one VDR of at most four rows at the
-pixel pitch, with the group's base computed from its flat pixel index (a
-`mul24` divide by the groups per row, which is a uniform).  The GEMM then
-runs over `align16(ho*align4(wo))` rows and the output copy maps a flat pixel
-to `(y, x)`.  The block schedule is new; the taps, the channel-block loop and
-the GEMM stay as they are.  That is the next kernel, and it is the one change
-this pass identified that is worth more than the measurement noise.
+Removing it needs a panel pass whose 16-pixel block is assembled from four
+4-pixel groups, each group being one VDR of four rows at the pixel pitch and
+one transposing VDW of 16 k rows by 4 pixel words at the panel's 64-byte k
+pitch.  The group base walks with the flat pixel index and a row-wrap add; no
+divide is needed.  The GEMM then runs over `align16(ho*align4(wo))` rows and
+the output tensor's pitch becomes `align4(wo)`.
+
+That kernel is written (`kgen.build_im2col_nhwc_flat`, selected by
+`VC4_CONV_FLAT=1`) and has passed its CPU-side proof; the silicon gate is the
+next step.  See section 7.
 
 ## 3. GEMM: pack against kernel, and the stall-time state
 
@@ -266,12 +268,115 @@ tools/thermal-guard.sh --max 75 -- python3 infer/tools/onnx/profile_classes.py \
     infer/packaging/vc4infer/data/models/yolov8n_160.onnx --conv
 ```
 
-## 7. What is not in this pass
+## 7. The flat-panel im2col: written, CPU-verified, silicon gate pending
+
+`kgen.build_im2col_nhwc_flat(Cin, KH, KW, stride, dilation)` keeps the
+16-pixel block and takes its pixels from the flat output plane:
+`op = align4(wo)`, `M = align16(ho*op)`, four 4-pixel groups per block.
+
+| piece | shape | change from the row kernel |
+|---|---|---|
+| VDR per group | 4 rows (pixels) x 16 words (channels) at `stride*Cin*4` | 16 rows per block becomes 4 per group; both are load shapes already in the tree |
+| VDW per group | 16 k rows x 4 pixel words, 64-byte k pitch, `vdw_stride(48)` | the panel's transposing store with the word count cut to 4; the C store already runs the 4/16 combination |
+| VPM rows | `16*q + 4*g`, q the QPU, g the group | four QPUs maximum, as before |
+| group walk | add `4*stride*Cin*4`, counter, at zero add `row_adv - GPR*4*stride*Cin*4` | replaces `nx` blocks per row with a running flat index |
+| uniforms | u0..u14: source, panel, strides, GPR, first-group offset, groups left, row counter | the GEMM, taps and channel loop are untouched |
+| GIDX | none | blocks are contiguous per QPU, so the real-group count ends the kernel |
+
+### CPU-side proof (no GPU)
+
+`infer/tests/check_im2col_flat.py` re-runs the host uniforms and the kernel's
+group arithmetic in Python and checks, for every (pixel, tap, channel block)
+and for several QPU splits, that the VDR lane address is the pixel the flat
+index names, the panel destination is the panel's `[k][16-pixel]` slot, and
+the VPM row fields stay inside the 48-row window.  It then builds the panel
+the flat schedule writes and the panel the row schedule writes and compares
+them for every real output pixel.  13 shapes, 0 failures:
+
+| shape | M flat | M row | ratio | words flat | words row |
+|---|---:|---:|---:|---:|---:|
+| 160x160x16 k3 | 25,600 | 25,600 | 1.000 | 454 | 365 |
+| 20x20x64 k3 | 400 | 640 | 0.625 | 454 | 365 |
+| 10x10x32 k3 | 128 | 160 | 0.800 | 454 | 365 |
+| 5x5x16 k3 | 48 | 80 | 0.600 | 454 | 365 |
+| 13x7x16 k3 | 112 | 112 | 1.000 | 454 | 365 |
+| 7x13x16 k3 | 112 | 208 | 0.538 | 454 | 365 |
+| 3x1x16 k3 | 16 | 16 | 1.000 | 454 | 365 |
+| 4x3x16 k3 | 16 | 48 | 0.333 | 454 | 365 |
+| 20x20x16 k3 s2 | 128 | 160 | 0.800 | 454 | 365 |
+| 20x20x16 k3 p0 | 368 | 576 | 0.639 | 454 | 365 |
+| 20x20x16 k5 p2 | 400 | 640 | 0.625 | 1,048 | 995 |
+| 20x20x16 k3 p2 d2 | 400 | 640 | 0.625 | 454 | 365 |
+| 40x40x32 k1 | 1,600 | 1,920 | 0.833 | 180 | 119 |
+
+The instruction delta is +89 words for 3x3 (454 against 365), +53 for 5x5
+(1,048 against 995) and +61 for 1x1; the largest blob is 1,048 of the 2,048
+instruction slot.  The delta is per *block*, and the flat path runs 0.795 of
+the blocks, so the panel's instruction count per output pixel still rises
+(1.29 x for 3x3 at the model's mix) while its bytes fall by the same 0.795.
+
+Modelled over the model's 64 conv layers, the panel and GEMM row counts go
+33,952 -> 26,992, a ratio of **0.795** (20.5% fewer rows).  If the conv QPU
+time scales with M, that is 210 ms -> 167 ms, about 43 ms of the 274 ms
+total.  The panel pass also does four VDR/VDW commands per block instead of
+one, so the real gain will be lower; that is what the silicon gate measures.
+
+### Silicon gate: the 4-word transposing store is not legal
+
+Run on the rebased tree (origin/main 54ddbd0) with the packaged vc4d, one
+client, 45-48 C, `throttled=0x0`.  The blob identity was checked before the
+result was believed: a fresh cache directory holds
+`im2col_nhwc2_16_5_5_s1_d1.bin` (995 words) for the default path and
+`im2col_nhwc_flat_16_5_5_s1_d1.bin` (1,048 words) for the flag, and
+`loaded_kernels()` names the flat blob only when `VC4_CONV_FLAT=1`.  The flat
+path also changes the GEMM's name (`gemm_80_16_416_b1_q5` becomes
+`gemm_48_16_416_b1_q3`), so a cached program cannot be mistaken for the new
+one.
+
+The first probe was a 16-channel, 5x5 image with a 5x5 kernel and pad 2: one
+image, three 16-pixel blocks, 48 GEMM rows against 80.  Two store field
+combinations were tried:
+
+| VDW fields (VPM block) | result |
+|---|---|
+| 16 rows x 4 words, transposing, 48 B gap | runs, no error, **max abs error 84.1** against the direct convolution (values of magnitude 20): the panel is transposed wrongly, the pixels land in the wrong words |
+| 4 rows x 16 words, transposing, 48 B gap (the C store's own field values) | **launch error `V3D_ERR_STAT=0x10`**; SRQCS `qerr=0`, state LIVE, no timeout, no context reset, no reboot |
+
+The conclusion is that the VPM-to-DMA store transposes a 16x16 block: the
+panel's own store is 16/16 with a zero stride, the C store is 4/16 with
+`horizontal=1`, and a 4-word-wide transposing store is either mis-laid-out or
+rejected.  Every field combination that transposes at this width is outside
+the shapes already proven on silicon.
+
+The next design keeps only proven fields: four 4-row VDRs write VPM rows
+0..15 (one per group), then the panel's own 16x16 transposing store writes
+the block, so the store word is exactly the one the current im2col uses.  It
+costs four VDR setups and one extra wait per (tap, channel block) and no new
+VDW shape.  That is the next kernel; `check_im2col_flat.py` already models
+the group addresses it needs.
+
+**State of this pass:** the flag defaults off and the default path is
+unchanged.  On this boot the default path measured **267.3 ms QPU, 831
+launches, conv 205.9 ms**, parity **0/44,100 over 5e-4** (max abs 0.0204),
+and `test_nhwc`, `test_conv`, `test_matmul`, `test_ew` all pass.  No timeout,
+context reset or reboot occurred; the only error signature is the launch
+error above, which the daemon reported per launch and recovered from without
+a reset.
+
+**M and launches.** The flat block reduces the GEMM's M (the probe: 80 rows
+to 48, the model's 64 conv layers: 33,952 to 26,992, ratio 0.795) and does
+not add a launch per conv: the im2col is still one launch per conv and the
+GEMM one, with the im2col's QPU count the largest divisor of the block count
+up to four.  The probe measured 3 launches either way (weight pack, im2col,
+GEMM).  What rises is the im2col's instruction count per block (454 against
+365 for 3x3) at 0.795 of the blocks.
+
+## 8. What is not in this pass
 
 | candidate | measured reason it is not here |
 |---|---|
 | direct 3x3 conv | at most 50 ms (18%); the coalesced form repeats the panel transpose per column block, the naive form is 16x the A transactions |
-| flat conv blocks (remove the align16 M padding) | 14% of total QPU, and the design is in section 2; it needs a new block schedule (four 4-pixel groups per panel block) and its own silicon verification |
+| flat conv blocks | written and CPU-verified (section 7); the silicon gate is pending, so the default path is unchanged |
 | 16x32 GEMM tile | 1.33x fewer bytes per FLOP, but the C rows would have to take the A-file registers the addressing uses: a new schedule |
 | batching several ew groups per QPU | the long sigmoid/silu body reliably hangs a QPU on its second group at 12 QPUs; the launches it would save are host time |
 | L2 enable on the launch path | no change to 256^3 (0.0%) and none to a 64-column B tile that fits L2 |

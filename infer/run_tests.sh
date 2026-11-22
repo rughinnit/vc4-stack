@@ -79,6 +79,9 @@ make check-math
 echo "=== check_epilogue_emu (no GPU: the GEMM activation bodies)"
 python3 tests/check_epilogue_emu.py
 
+echo "=== check_im2col_flat (no GPU: the flat-panel schedule against the row panel)"
+TMPDIR=${TMPDIR:-$HOME/scratch/tmp} python3 tests/check_im2col_flat.py
+
 echo "=== test_artifact (no GPU: .vc4x container, keys, pinned arena plan)"
 TMPDIR=${TMPDIR:-$HOME/scratch/tmp}
 mkdir -p "$TMPDIR"

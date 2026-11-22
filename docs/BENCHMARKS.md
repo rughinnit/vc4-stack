@@ -260,11 +260,12 @@ runs on the QPU.
 ## 14. YOLO matrix: six families × five sizes × three resolutions
 
 Measured 2026-11-22 on the board in §1: 905 MiB RAM, core pinned at 400 MHz,
-fanless, `vc4infer` 1.2.8 with `vc4d` 1.2.9.  Coverage is **45 of the 90
-nominal cells**.  Every one of those 45 has an ONNX Runtime CPU baseline; one
-runs on the VC4 engine.  The other 45 ended in an export memory limit, an
-arena refusal, or an unsupported operator, and each record carries the exact
-first refusal.  The machine-readable form is
+fanless, `vc4infer` 1.2.8 with `vc4d` 1.2.9.  The original six-family grid
+covers **45 of its 90 nominal cells**.  Every one of those 45 has an ONNX
+Runtime CPU baseline; one runs on the VC4 engine.  The other 45 ended in an
+export memory limit, an arena refusal, or an unsupported operator, and each
+record carries the exact first refusal.  With YOLO26 added below the nominal
+total is **120** and coverage is **60 of 120**.  The machine-readable form is
 [`yolo-matrix.json`](yolo-matrix.json).
 
 **Models.**  `ultralytics` 8.4.215 provides v5u, v8, v9, v10, v11 and v12.
@@ -569,3 +570,148 @@ families.
 320 and 640 after every 160 l/x export hit the memory limit, and COCO mAP.
 The 22 are marked `not attempted (optional)` in the JSON rather than given an
 invented status.
+
+
+### YOLO26 (added 2026-11-23)
+
+YOLO26 is the current Ultralytics family, and `ultralytics` 8.4.215 loads
+`yolo26n.pt` through `yolo26x.pt` and exports both heads.  With it the nominal
+total becomes **120 cells**: seven families × five sizes × three resolutions
+(105), plus the 15 NMS-free variants of the YOLO26 cells.  **60 of 120 have an
+ONNX graph**: the 45 rows above plus 15 YOLO26 graphs.  No existing row was
+re-measured or edited; the 90-row grid above keeps its own 45-of-90 count.
+
+**Heads.**  `default` is `export(nms=None)`, the one-to-many head with raw
+output `[1,84,N]` and external NMS.  `nmsfree` is `export(nms=False)`, the
+end-to-end one-to-one head with top-k, output `[1,300,6]`.  The graphs differ
+in the final blocks; the backbone is shared.  Both used opset 17, batch 1,
+fixed `imgsz`, `simplify=False`, and the 700 MiB watchdog with the 80 MiB
+board floor described above.
+
+**Coverage.**  n and s exported at all three resolutions in both heads.  m is
+asymmetric because the memory ceiling, not the graph, decided each cell:
+`default` at 320 and `nmsfree` at 160 and 640.  l and x failed in both heads at
+every resolution.  The asymmetry is repeatable in the logs but it is a
+one-attempt-per-cell result, so it says the export is marginal at m, not that
+one head is intrinsically cheaper.
+
+#### Export
+
+| size | head | 160 s / MiB | 320 s / MiB | 640 s / MiB |
+|---|---|---|---|---|
+| n | default | 36 / 9.3 | 32 / 9.3 | 34 / 9.4 |
+| n | nmsfree | 24 / 9.3 | 22 / 9.3 | 25 / 9.4 |
+| s | default | 35 / 36.3 | 31 / 36.3 | 38 / 36.5 |
+| s | nmsfree | 31 / 36.3 | 36 / 36.4 | 42 / 36.5 |
+| m | default | — | 67 / 78.0 | — |
+| m | nmsfree | 66 / 78.0 | — | 95 / 78.1 |
+| l | default | — | — | — |
+| l | nmsfree | — | — | — |
+| x | default | — | — | — |
+| x | nmsfree | — | — | — |
+
+#### Fit at 64 MiB
+
+| size | head | 160 | 320 | 640 |
+|---|---|---|---|---|
+| n | default | unsupported op | unsupported op | needs 126 > 64 |
+| n | nmsfree | unsupported op | unsupported op | needs 126 > 64 |
+| s | default | needs 106 > 64 | needs 125 > 64 | needs 200 > 64 |
+| s | nmsfree | needs 106 > 64 | needs 125 > 64 | needs 200 > 64 |
+| m | default | — | needs 227 > 64 | — |
+| m | nmsfree | needs 206 > 64 | — | needs 310 > 64 |
+| l | default | — | — | — |
+| l | nmsfree | — | — | — |
+| x | default | — | — | — |
+| x | nmsfree | — | — | — |
+
+#### Performance
+
+| size | head | imgsz | CPU ms | CPU FPS | VC4 ms | VC4 FPS | ratio | launches | status |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| n | default | 160 | 86.6 | 11.55 | — | — | — | — | unsupported on VC4 |
+| n | nmsfree | 160 | 82.0 | 12.20 | — | — | — | — | unsupported on VC4 |
+| n | default | 320 | 254.9 | 3.92 | — | — | — | — | unsupported on VC4 |
+| n | nmsfree | 320 | 258.9 | 3.86 | — | — | — | — | unsupported on VC4 |
+| n | default | 640 | 1019.9 | 0.98 | — | — | — | — | does not fit (needs 126 MiB) |
+| n | nmsfree | 640 | 1090.2 | 0.92 | — | — | — | — | does not fit (needs 126 MiB) |
+| s | default | 160 | 216.9 | 4.61 | — | — | — | — | does not fit (needs 106 MiB) |
+| s | nmsfree | 160 | 210.2 | 4.76 | — | — | — | — | does not fit (needs 106 MiB) |
+| s | default | 320 | 720.0 | 1.39 | — | — | — | — | does not fit (needs 125 MiB) |
+| s | nmsfree | 320 | 795.4 | 1.26 | — | — | — | — | does not fit (needs 125 MiB) |
+| s | default | 640 | 2842.4 | 0.35 | — | — | — | — | does not fit (needs 200 MiB) |
+| s | nmsfree | 640 | 2761.9 | 0.36 | — | — | — | — | does not fit (needs 200 MiB) |
+| m | default | 160 | — | — | — | — | — | — | not exportable (memory limit) |
+| m | nmsfree | 160 | 577.5 | 1.73 | — | — | — | — | does not fit (needs 206 MiB) |
+| m | default | 320 | 2020.2 | 0.50 | — | — | — | — | does not fit (needs 227 MiB) |
+| m | nmsfree | 320 | — | — | — | — | — | — | not exportable (memory limit) |
+| m | default | 640 | — | — | — | — | — | — | not exportable (memory limit) |
+| m | nmsfree | 640 | 6772.8 | 0.15 | — | — | — | — | does not fit (needs 310 MiB) |
+| l | default | 160 | — | — | — | — | — | — | not exportable (memory limit) |
+| l | nmsfree | 160 | — | — | — | — | — | — | not exportable (memory limit) |
+| l | default | 320 | — | — | — | — | — | — | not exportable (memory limit) |
+| l | nmsfree | 320 | — | — | — | — | — | — | not exportable (memory limit) |
+| l | default | 640 | — | — | — | — | — | — | not exportable (memory limit) |
+| l | nmsfree | 640 | — | — | — | — | — | — | not exportable (memory limit) |
+| x | default | 160 | — | — | — | — | — | — | not exportable (memory limit) |
+| x | nmsfree | 160 | — | — | — | — | — | — | not exportable (memory limit) |
+| x | default | 320 | — | — | — | — | — | — | not exportable (memory limit) |
+| x | nmsfree | 320 | — | — | — | — | — | — | not exportable (memory limit) |
+| x | default | 640 | — | — | — | — | — | — | not exportable (memory limit) |
+| x | nmsfree | 640 | — | — | — | — | — | — | not exportable (memory limit) |
+
+#### Status per cell
+
+`default`:
+
+| size | 160 | 320 | 640 |
+|---|---|---|---|
+| n | unsupported | unsupported | no fit (needs 126) |
+| s | no fit (needs 106) | no fit (needs 125) | no fit (needs 200) |
+| m | — | no fit (needs 227) | — |
+| l | — | — | — |
+| x | — | — | — |
+
+`nmsfree`:
+
+| size | 160 | 320 | 640 |
+|---|---|---|---|
+| n | unsupported | unsupported | no fit (needs 126) |
+| s | no fit (needs 106) | no fit (needs 125) | no fit (needs 200) |
+| m | no fit (needs 206) | — | no fit (needs 310) |
+| l | — | — | — |
+| x | — | — | — |
+
+#### What this adds
+
+**YOLO26 is faster on the CPU than the older families at the same size, and no
+closer to the QPU.**  The n cell is 82.0 ms at 160 (12.20 FPS), against
+108.2 ms for v8n on the same image, and 1019.9 ms at 640 (0.98 FPS).  The m
+NMS-free graph at 640 is the slowest CPU cell in the whole matrix at 6772.8 ms
+(0.15 FPS).  No YOLO26 cell reaches the VC4 engine, so there is no ratio to
+report.
+
+**The first refusal is the same attention block as v10-v12.**  At 160 and 320
+the planner stops at `Split` on axis 2 and `MatMul` with a rank-4 operand in
+`/model.10/m/m.0/attn`; this is the C2PSA block, not the YOLO26 head.  The
+arena is the first refusal for every s and m cell and for n at 640: needs are
+106 MiB (s160), 125 (s320), 200 (s640), 206 (m160 nmsfree), 227 (m320 default),
+310 (m640 nmsfree) and 126 (n640), all against 64.
+
+**The NMS-free head adds one operator refusal, not a different memory story.**
+`ConstantOfShape` (`no implementation`) appears twice at the end of the
+`nmsfree` graph and is absent from `default`; it is the only operator the
+static check rejects in the new head beyond the shared Split/MatMul.  `TopK`,
+`GatherElements`, `Mod`, `Equal`, `ReduceMax`, `Where` and `Expand` are in the
+graph but this build does not list them as unsupported, so their runtime
+behaviour is **unmeasured**: every cell stops at the attention block or at the
+arena before reaching them.  Fixing Split/MatMul would expose that head to a
+second round of operator work.
+
+**l and x remain export-limited.**  Both heads die at the watchdog at every
+resolution; the observed peaks were 494-602 MiB.  As with the six families
+above, that is a 905 MiB RAM limit, not an engine verdict.
+
+**What I did not measure.**  Any VC4 execution for YOLO26, COCO mAP for either
+head, and the runtime cost of TopK, GatherElements and the rest of the
+end-to-end tail, which no cell reaches.

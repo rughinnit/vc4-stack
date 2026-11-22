@@ -205,6 +205,29 @@ tools/build-fast.sh infer --clean
 BUILD_FAST_TARGET=VC4CC tools/build-fast.sh /home/raspi/work/combined/build
 ```
 
+## Working with the frameworks
+
+The engine is shared; each framework is an adapter with its own entry point.
+All of them talk to `vc4d` by default, so nothing below needs root.
+
+| framework | entry point | detail |
+|---|---|---|
+| ONNX | `vc4infer run model.onnx --input x.npy --imgsz 160` | [`docs/ONNX.md`](docs/ONNX.md) |
+| ONNX, Python | `import vc4infer; eng = vc4infer.Engine("model.onnx"); eng.run({"x": a})` | [`docs/API.md`](docs/API.md) |
+| PyTorch | `import torch_vc4; t = t.to("vc4")` — the device is a real `PrivateUse1` | [`torch/README.md`](torch/README.md) |
+| JAX | `JAX_PLATFORMS=vc4` with the PJRT plugin registered (`jax_plugins.vc4` or `PJRT_NAMES_AND_LIBRARY_PATHS=vc4:/path/libpjrt_vc4.so`) | [`docs/PJRT.md`](docs/PJRT.md) |
+| TensorFlow | `load_pluggable_device_library("tf/build/libtf_vc4_plugin.so")`, then `with tf.device("/device:VCIV:0"):` | [`tf/README.md`](tf/README.md) |
+| LiteRT | `Interpreter(model, experimental_delegates=[load_delegate("litert/build/libvc4_delegate.so")])` | [`litert/README.md`](litert/README.md) |
+| ONNX Runtime | `import vc4infer.ort; InferenceSession(m, providers=["vc4"])` | [`docs/ONNXRUNTIME.md`](docs/ONNXRUNTIME.md) |
+| ggml / llama.cpp | `GGML_BACKEND_PATH=libggml-vc4.so`, loaded by `ggml_backend_load_all` | [`docs/GGML.md`](docs/GGML.md) |
+| TVM | `relax.ext.vc4` with the pattern table, then `FuseOpsByPattern` | [`tvm_byoc/README.md`](tvm_byoc/README.md) |
+
+Two environment variables matter everywhere: `VC4INFER_DAEMON=1` (the default
+in the packages) selects the unprivileged daemon, and `VC4INFER_KGEN` points at
+the kernel generator when running from a checkout rather than an installed
+package.  A model that uses an operator outside a framework's table fails and
+names it; it does not run on the ARM instead.
+
 ## Training and model development on the board
 
 Inference is the broad path; training exists but is capacity-bound.  What runs

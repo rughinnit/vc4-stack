@@ -46,19 +46,23 @@ depends on the channel axis converts on the host first (a byte gather).
 Supported nodes
     Conv          NHWC 1x1/3x3/5x5, stride 1/2, dilation 1..8, group=1,
                   grouped (per-group Cin/Cout/K %16) or depthwise (dense
-                  block-diagonal weight); NCHW fallback for the rest
+                  block-diagonal weight); 6x6 stride 2 (the v5 stem) as four
+                  3x3 stride-2 dilation-2 phases; NCHW fallback for the rest
     Relu, Sigmoid
     Add, Mul      same shape, or broadcast from a graph constant (host expand)
     MaxPool       2x2 s2 (NCHW) and kxk s1 (NHWC, SPPF)
     Concat        channel axis (4-D) and axis 1/-1 on 3-D
-    Split         channel axis (4-D)
-    Slice         any axis, int64 starts/ends/axes/steps
+    Split         any axis of any rank, any number of outputs (the channel
+                  axis of a 4-D tensor keeps the copy2d path; every other
+                  form is one gather per output)
+    Slice         any axis, int64 starts/ends/axes/steps, on a compact NCHW
+                  tensor or on a pitched NHWC conv output
     Div, Sub      lowered to GPU Mul / Mul+Add (constant operand for Div)
     Softmax       any axis (host permute to the last, <= 16 classes, rows%8)
     Transpose     host permute
     Resize        nearest (4 nearest_mode values) or linear (GPU Mul/Add),
                   all 6 coordinate_transformation_mode values
-    MatMul, Gemm  2-D
+    MatMul, Gemm  MatMul any rank >= 2 (one GEMM per batch index), Gemm 2-D
     Flatten, Reshape, Squeeze, Unsqueeze, Cast, Identity, Constant
     Shape, Gather int64 host tensors (static shapes)
 

@@ -29,7 +29,7 @@ vc4infer.__version__          # "1.2.1"
 vc4infer.devices()            # ["vc4"]
 vc4infer.Device("vc4")
 vc4infer.Engine(path, device=None, *, mode="strict", host_policy="device",
-                arena_mb=None, cache_dir=None)
+                arena_mb=None, cache_dir=None, passes=None)
 vc4infer.TensorSpec           # (name, shape, dtype)
 vc4infer.Plan                 # validated static plan
 vc4infer.NodeInfo             # (name, op, supported, constraint)
@@ -69,7 +69,7 @@ Only `"vc4"` exists.  `Device("cpu")` raises `DeviceError` listing
 
 ```python
 Engine(model_path, device=None, *, mode="strict", host_policy="device",
-       arena_mb=None, cache_dir=None)
+       arena_mb=None, cache_dir=None, passes=None)
 ```
 
 | parameter | meaning |
@@ -80,6 +80,7 @@ Engine(model_path, device=None, *, mode="strict", host_policy="device",
 | `host_policy` | hybrid only: `"device"` (default), `"structural"`, `"any"`. |
 | `arena_mb` | arena size to request from `vc4d` (default: the daemon's, normally 64 MiB). |
 | `cache_dir` | kernel blob cache (default `~/.cache/vc4infer/kcache`). |
+| `passes` | optimiser passes (`docs/OPTIMIZER.md`): `None` reads `$VC4_OPT`, the empty string runs none.  Grammar: `canonicalise`, `ew`, `epilogue`, `all`, and `-name` to disable one after `all`.  Every pass is off by default. |
 
 The constructor opens one arena and uploads the weights.  Only one engine
 should be open at a time; a second one cannot map a second 64 MiB arena and

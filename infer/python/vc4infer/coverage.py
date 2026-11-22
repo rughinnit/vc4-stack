@@ -35,6 +35,7 @@ Every node is also classified into exactly one execution tier:
 host-control | host-unwritten | unsupported-graph`` report used by
 ``Engine.node_backends`` and ``vc4infer nodes``.
 """
+import json
 import os
 import onnx
 import numpy as np
@@ -268,6 +269,29 @@ def _attr(node, name, default=None):
             return list(a.floats)
         return default
     return default
+
+
+def _opt_marker(node):
+    """The optimiser's provenance record on a node, or None.
+
+    Written by ``vc4infer.optimizer`` on one doc_string line; read here so the
+    static report and ``vc4infer nodes`` show which rewrite produced a node
+    and which nodes a fused dispatch replaced.  A malformed line is ignored:
+    the report must not fail because debug metadata is old.
+    """
+    for line in (node.doc_string or "").splitlines():
+        if not line.startswith("vc4-opt:"):
+            continue
+        try:
+            return json.loads(line[len("vc4-opt:"):].strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _fused_rules(node):
+    rec = _opt_marker(node) or {}
+    return rec.get("rules") or {}, rec.get("replaces") or []
 
 
 def _shape_map(model):
@@ -843,9 +867,21 @@ def analyse_model(model):
             status, reason = (fn(n, shapes, inits) if fn else
                               ("supported", OPS[n.op_type]))
         tier, tier_reason = _tier(n, status, reason, dtypes, model)
+        rules, replaced = _fused_rules(n)
+        if rules:
+            if "fused" in rules:
+                into = rules["fused"].get("into", "?")
+                by = rules["fused"].get("by", "fused")
+                tier_reason = ("fused into %s (%s): no separate dispatch"
+                               % (into, by))
+            else:
+                tier_reason = ("%s (optimiser: %s, replaces %d node(s))"
+                               % (tier_reason, ", ".join(sorted(rules)),
+                                  len(replaced)))
         nodes.append({"index": idx, "name": name, "op": n.op_type,
                       "status": status, "reason": reason,
                       "tier": tier, "tier_reason": tier_reason,
+                      "fused": sorted(rules), "replaces": replaced,
                       "macs": _macs(n, shapes, inits),
                       "outputs": [o for o in n.output if o]})
 
@@ -900,7 +936,9 @@ def analyse_model(model):
         "silu_pairs": silu_pairs,
         "silu_skip": silu_skip,
         "silu_src": silu_src,
-        "dispatches": len(nodes) - silu_pairs,
+        "dispatches": len(nodes) - len(
+            set(silu_skip) | {e["index"] for e in nodes
+                              if "fused" in (e.get("fused") or ())}),
         "shapes": shapes,
         "macs_total": sum(int(n.get("macs") or 0) for n in nodes),
         "tiers": {t: sum(1 for e in nodes if e["tier"] == t)
@@ -951,6 +989,7 @@ def backend_plan(rep, mode="hybrid", host_policy="device",
         out.append({"index": n["index"], "name": n["name"], "op": n["op"],
                     "backend": tier, "reason": reason,
                     "status": n["status"], "macs": int(n.get("macs") or 0),
+                    "fused": list(n.get("fused") or ()),
                     "mode": mode, "host_policy": host_policy})
     return out
 

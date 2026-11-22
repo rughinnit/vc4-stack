@@ -66,7 +66,7 @@ def main():
     eng = vc4infer.Engine(path, arena_mb=a.arena_mb)
     eng.run({"X": x})                     # warm-up
     t0 = time.perf_counter()
-    got = np.asarray(eng.run({"X": x})[0])
+    got = np.asarray(eng.run({"X": x})["Y"])
     ms = (time.perf_counter() - t0) * 1e3
     d = np.abs(got.astype(np.float64) - want.astype(np.float64))
     scaled = (d / (1.0 + np.abs(want))).max() if d.size else 0.0

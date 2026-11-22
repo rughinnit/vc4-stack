@@ -95,6 +95,9 @@ the operator; it does not run on the ARM instead.
   against ONNX Runtime, which plan, run or are refused, and why.
 - [`docs/STATUS.md`](docs/STATUS.md) — one row per workstream, its state, and
   the file or test behind that state.
+- [`docs/ACCURACY-FPS.md`](docs/ACCURACY-FPS.md) — YOLOv8n at 96/128/160 with
+  COCO weights: 2.83 / 2.60 / 2.14 FPS, the detections that survive each size,
+  and the launch and FLOP budget behind the curve.
 
 Accuracy is in [`docs/ACCURACY.md`](docs/ACCURACY.md) (identical detections to
 0.00 px against the CPU); the ncnn head-to-head (6.4×, same detections) in

@@ -1,0 +1,12 @@
+{
+  "model": "super-resolution-10.onnx",
+  "file": "benchmodels/zoo/super-resolution-10.onnx",
+  "nodes": 12,
+  "opset": [
+    10
+  ],
+  "plan": {
+    "ok": false,
+    "refusal": "UnsupportedNode: node 'Conv_0' (Conv): depthwise Cout 64 != Cin 1 (channel multiplier)"
+  }
+}

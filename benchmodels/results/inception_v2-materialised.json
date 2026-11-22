@@ -1,0 +1,87 @@
+{
+  "model": "light_inception_v2-materialised.onnx",
+  "task": "classification",
+  "source": "ONNX backend test data (light), materialised",
+  "file": "benchmodels/models/light_inception_v2-materialised.onnx",
+  "fixed_file": null,
+  "opset": [
+    9
+  ],
+  "nodes": 509,
+  "params": 11234794,
+  "inputs": [
+    [
+      "data_0",
+      [
+        1,
+        3,
+        224,
+        224
+      ]
+    ],
+    [
+      "conv1/7x7_s2/bn_scale_0",
+      [
+        64
+      ]
+    ],
+    [
+      "conv1/7x7_s2/bn_bias_0",
+      [
+        64
+      ]
+    ],
+    [
+      "conv1/7x7_s2/bn_mean_0",
+      [
+        64
+      ]
+    ]
+  ],
+  "n_inputs": 80,
+  "outputs": [
+    [
+      "prob_1",
+      [
+        1,
+        1000
+      ]
+    ]
+  ],
+  "ops": [
+    "Add",
+    "AveragePool",
+    "BatchNormalization",
+    "Concat",
+    "Conv",
+    "Gemm",
+    "MaxPool",
+    "Mul",
+    "Relu",
+    "Reshape",
+    "Softmax",
+    "Unsqueeze"
+  ],
+  "n_feeds": 1,
+  "feed_elements": 150528,
+  "cpu": {
+    "ok": true,
+    "runs_ms": [
+      438.1310000007943,
+      437.52522000067984,
+      438.137719000224,
+      439.4928709989472,
+      450.3388849989278
+    ],
+    "wall_ms": 440.72513899991463,
+    "min_ms": 437.52522000067984
+  },
+  "plan": {
+    "ok": false,
+    "refusal": "UnsupportedNode: unsupported graph: graph pool needs at least 85.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 167.4 MiB, but the client arena is 93.0 MiB with 41.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 135.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+  },
+  "engine": {
+    "ok": false,
+    "refusal": "engine did not open: UnsupportedNode: unsupported graph: graph pool needs at least 85.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 167.4 MiB, but the client arena is 93.0 MiB with 41.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 135.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+  }
+}

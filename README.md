@@ -93,6 +93,8 @@ Accuracy — including VC4 vs the CPU on the same image, where the detections ar
 identical to 0.00 px — is in [`docs/ACCURACY.md`](docs/ACCURACY.md), and the
 head-to-head against **ncnn** (6.4× faster than our GPU path at 160×160, with
 identical detections) is in [`docs/NCNN.md`](docs/NCNN.md).
+Model coverage beyond YOLO - which ONNX graphs plan, run or are refused, with
+the exact blocker and CPU/VC4 ratio - is in [`docs/MODELS.md`](docs/MODELS.md).
 
 Full table, the two execution paths and a "which repo do I open" guide:
 [`docs/ECOSYSTEM.md`](docs/ECOSYSTEM.md).

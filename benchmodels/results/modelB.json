@@ -1,0 +1,144 @@
+{
+  "model": "modelB.onnx",
+  "task": "classification",
+  "source": "shipped selftest",
+  "file": "infer/packaging/vc4infer/data/models/modelB.onnx",
+  "fixed_file": null,
+  "opset": [
+    13
+  ],
+  "nodes": 9,
+  "params": 6000,
+  "inputs": [
+    [
+      "x",
+      [
+        1,
+        16,
+        32,
+        32
+      ]
+    ]
+  ],
+  "n_inputs": 1,
+  "outputs": [
+    [
+      "y",
+      [
+        1,
+        16,
+        32,
+        32
+      ]
+    ]
+  ],
+  "ops": [
+    "Concat",
+    "Constant",
+    "Conv",
+    "MaxPool",
+    "Relu",
+    "Resize"
+  ],
+  "n_feeds": 1,
+  "feed_elements": 16384,
+  "cpu": {
+    "ok": true,
+    "runs_ms": [
+      1.605151999683585,
+      1.7364020004606573,
+      1.8427039995003724,
+      2.006922000873601,
+      1.7109860000346089
+    ],
+    "wall_ms": 1.780433200110565,
+    "min_ms": 1.605151999683585
+  },
+  "engine_inputs": [
+    [
+      "x",
+      [
+        1,
+        16,
+        32,
+        32
+      ]
+    ]
+  ],
+  "plan": {
+    "model": "/home/raspi/work/vc4-models/infer/packaging/vc4infer/data/models/modelB.onnx",
+    "device": "vc4",
+    "mode": "strict",
+    "host_policy": "device",
+    "inputs": [
+      [
+        "x",
+        [
+          1,
+          16,
+          32,
+          32
+        ],
+        "float32"
+      ]
+    ],
+    "outputs": [
+      [
+        "y",
+        [
+          1,
+          16,
+          32,
+          32
+        ],
+        "float32"
+      ]
+    ],
+    "nodes": 9,
+    "dispatches": 9,
+    "unverified": [],
+    "tiers": {
+      "vc4": 8,
+      "host-meta": 1
+    },
+    "host_debt": []
+  },
+  "engine": {
+    "ok": true,
+    "runs_ms": [
+      17.08657199924346,
+      17.221259000507416,
+      17.705164000290097,
+      17.285268999330583,
+      16.853394999998272
+    ],
+    "wall_ms": 17.230331799873966,
+    "min_ms": 16.853394999998272,
+    "launches": 19,
+    "qpu_ms": 5.2047674,
+    "error": {
+      "max_abs": 3.7550926208496094e-06,
+      "max_scaled": 2.1226572900588115e-06,
+      "elements": 16384
+    },
+    "memory": {
+      "arena_mb": 93.0,
+      "pool_mb": 5.0,
+      "peak_mb": 0.7,
+      "estimate_mb": 1.0,
+      "scratch_mb": 0.8,
+      "segments": 2
+    },
+    "outputs": [
+      [
+        "y",
+        [
+          1,
+          16,
+          32,
+          32
+        ]
+      ]
+    ]
+  }
+}

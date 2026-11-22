@@ -1,0 +1,12 @@
+{
+  "model": "fcn-resnet50-12-int8-fixed.onnx",
+  "file": "benchmodels/zoo/fixed/fcn-resnet50-12-int8-fixed.onnx",
+  "nodes": 91,
+  "opset": [
+    12
+  ],
+  "plan": {
+    "ok": false,
+    "refusal": "UnsupportedNode: node 'fused Conv_6_quant' (QLinearConv): no implementation"
+  }
+}

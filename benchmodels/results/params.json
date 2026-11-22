@@ -1,0 +1,17 @@
+{
+ "light_bvlc_alexnet.onnx": 60965260,
+ "light_densenet121.onnx": 8147351,
+ "light_inception_v1.onnx": 6998823,
+ "light_inception_v2.onnx": 11235409,
+ "light_resnet50.onnx": 25610554,
+ "light_shufflenet.onnx": 1420689,
+ "light_squeezenet.onnx": 1235613,
+ "light_vgg19.onnx": 143667329,
+ "light_zfnet512.onnx": 87250573,
+ "candy-8.onnx": 1679235,
+ "fcn-resnet50-12-int8.onnx": 35349786,
+ "super-resolution-10.onnx": 59657,
+ "modelA.onnx": 87018,
+ "modelB.onnx": 6000,
+ "modelC.onnx": 2388
+}

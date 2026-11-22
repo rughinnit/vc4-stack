@@ -47,8 +47,13 @@ vc4_status vc4__pack_run_q(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen,
     const uint32_t unitb = 32u * K;          /* bytes per 8-row work unit */
     const uint32_t units = rowblocks;
     /* the packer is a plain grid-stride loop with no in-kernel guard, so its
-     * QPU count must divide the work exactly */
+     * QPU count must divide the work exactly.  An explicit q that does not
+     * divide is refused; the default walks down to a divisor, because the
+     * old default of 4 silently left a partial unit for odd block counts. */
     int pnq = q > 0 ? q : (units < 4u ? (int)units : 4);
+    if (q <= 0)
+        while (pnq > 1 && units % (uint32_t)pnq)
+            --pnq;
     if (pnq < 1 || pnq > 4 || (uint32_t)pnq > units || units % (uint32_t)pnq)
         return VC4_ERR_INVAL;
 

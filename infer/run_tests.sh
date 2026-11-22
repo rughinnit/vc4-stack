@@ -195,6 +195,11 @@ fi
 echo "=== test_gate (formerly gated entry points are open; argument checks fire)"
 $RUN ./build/test_gate
 
+echo "=== test_autotune_api (Engine.autotune: cold, then the record)"
+AUTOTUNE_CACHE=${TMPDIR:-$HOME/scratch/tmp}/kcache-autotune-api
+VC4INFER_CACHE="$AUTOTUNE_CACHE" \
+    PYTHONPATH=$PYTHONPATH:. timeout -k 5 900 python3 tests/test_autotune_api.py
+
 for t in test_ew test_matmul test_conv; do
     echo "=== $t  (reps=$REPS)"
     timeout -k 5 900 $RUN ./build/$t "$REPS"

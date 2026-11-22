@@ -2579,9 +2579,11 @@ class Runner:
         return out
 
     def _matmul(self, node):
-        return self._epilogue(node, self._matmul_impl(node))
+        act = self._act_of(node)
+        t, folded = self._matmul_impl(node, act)
+        return t if folded else self._epilogue(node, t)
 
-    def _matmul_impl(self, node):
+    def _matmul_impl(self, node, act=None):
         a = self._float(node.input[0])
         b = self._float(node.input[1])
         if len(a.shape) != 2 or len(b.shape) != 2:
@@ -2593,8 +2595,9 @@ class Runner:
             raise UnsupportedNode("MatMul %s: K mismatch %s x %s"
                                   % (node.name, a.shape, b.shape))
         out = self._alloc(M * N)
-        self.eng.matmul(a.buf, b.buf, out, M, N, K)
-        return Tensor(out, (M, N))
+        self.eng.matmul(a.buf, b.buf, out, M, N, K,
+                        act=act if act is not None else vc4infer.ACT_NONE)
+        return Tensor(out, (M, N)), act is not None
 
     def _gemm(self, node):
         return self._epilogue(node, self._gemm_impl(node))

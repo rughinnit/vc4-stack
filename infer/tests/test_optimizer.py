@@ -44,7 +44,7 @@ import vc4infer                                            # noqa: E402
 from vc4infer import optimizer as O                        # noqa: E402
 from vc4infer._onnxrun import Runner                       # noqa: E402
 from vc4infer._binding import (OP_SILU, UOP_AFFINE,         # noqa: E402
-                               UOP_HARDSWISH)
+                               UOP_HARDSWISH, LAYOUT_ROW_MAJOR, ACT_RELU)
 
 MODEL = os.path.join(REPO, "infer", "packaging", "vc4infer", "data", "models",
                      "yolov8n_160.onnx")
@@ -172,6 +172,16 @@ def mk_conv_silu(shape=(1, 16, 8, 8)):
                   [numpy_helper.from_array(w, "W")])
 
 
+def mk_matmul_relu(shape=((4, 8), (8, 8))):
+    """2-D MatMul -> Relu: the executor folds it into one launch."""
+    x = _vi("X", shape[0])
+    w = np.random.default_rng(16).standard_normal(shape[1]).astype(np.float32)
+    n = [helper.make_node("MatMul", ["X", "W"], ["C"]),
+         helper.make_node("Relu", ["C"], ["Y"])]
+    return _model(n, [x], [_vi("Y", shape[0])],
+                  [numpy_helper.from_array(w, "W")])
+
+
 def mk_canonical(shape=(1, 16, 8, 8)):
     """Dead node, identity, no-op reshape/cast/transpose, Div/Sub by 2."""
     x = _vi("X", shape)
@@ -258,6 +268,9 @@ class FakeEngine:
 
     def fill2d(self, *a, **k):
         self._call("fill2d", 0)
+
+    def matmul(self, a, b, c, M, N, K, layout=LAYOUT_ROW_MAJOR, act=0):
+        self._call("matmul", act)
 
 
 # ------------------------------------------------------------------ tests
@@ -575,6 +588,18 @@ def test_runner_markers():
           "coverage carries the provenance record")
 
 
+def test_dispatch_matmul_fold():
+    print("matmul epilogue dispatch (fake engine)")
+    m = mk_matmul_relu()
+    path = save(m, "mmrelu.onnx")
+    eng = FakeEngine()
+    r = Runner(path, eng, passes="epilogue")
+    x = np.random.default_rng(17).standard_normal((4, 8)).astype(np.float32)
+    r.run({"X": x})
+    check(eng.calls == [("matmul", ACT_RELU)],
+          "one matmul call carrying the activation (%s)" % (eng.calls,))
+
+
 def test_resolve():
     print("pass switches")
     check([p.key for p in O.resolve_passes("")] == [], "default is no passes")
@@ -696,6 +721,7 @@ def main():
     test_epilogue()
     test_plan_model()
     test_dispatch_fake_engine()
+    test_dispatch_matmul_fold()
     test_runner_markers()
     test_resolve()
     test_opmatrix_sweep(sweep)

@@ -228,6 +228,30 @@ the kernel generator when running from a checkout rather than an installed
 package.  A model that uses an operator outside a framework's table fails and
 names it; it does not run on the ARM instead.
 
+## How this compares to CUDA and ROCm
+
+The same layers, at the scale one board can measure:
+
+| layer | NVIDIA | AMD | this project |
+|---|---|---|---|
+compute language and compiler | CUDA C++ / NVCC | HIP / HIP-Clang | OpenCL C through `VC4C` (fork) |
+compute runtime | CUDA runtime | HIP runtime | `VC4CL` (fork), plus `vc4d` for unprivileged launches |
+math kernels | cuBLAS, cuDNN | rocBLAS, MIOpen | hand-written kernels in `libvc4infer` and `kgen` |
+inference optimiser | TensorRT | MIGraphX | the `vc4infer` planner, with the pass pipeline in [`docs/OPTIMIZER.md`](docs/OPTIMIZER.md) |
+framework plugins | Torch-TensorRT, TF-TRT | MIOpen integrations | `torch_vc4`, PJRT, TF PluggableDevice, LiteRT delegate, ORT provider, ggml backend, TVM BYOC |
+profiling and telemetry | Nsight | rocprof | `vc4top`, `vc4-smi`, `vc4mon` counters |
+distribution | CUDA toolkit | ROCm repositories | `vc4-apt`, signed apt and pip |
+
+What is ours rather than a port: the hand-written QPU kernels and the generator
+that emits them, the executor and its numerics model (the FPU truncates, the VPM
+and DMA rows disagree, division needed a sign-preserving reciprocal), the
+unprivileged daemon and arena, and the measurement record.
+
+What is deliberately not attempted: a new language, a compiler written from
+scratch (VC4C is forked), tensor cores, unified memory, asynchronous copy
+engines, atomics, multi-GPU, or CUDA parity. The structural ceiling is
+28.8 GFLOP/s; a hand-written GEMM reaches 13.7.
+
 ## Training and model development on the board
 
 Inference is the broad path; training exists but is capacity-bound.  What runs

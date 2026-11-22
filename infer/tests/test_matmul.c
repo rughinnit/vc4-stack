@@ -93,7 +93,18 @@ static int one_shape(vc4_ctx *ctx, int M, int N, int K, int reps)
  * autotuner has chosen a launch for the shape -- the QPU count changes the row
  * blocks a QPU owns, not the body, so the answer must not move.
  */
-static int one_shape_act(vc4_ctx *ctx, int M, int N, int K, int reps, int tune)
+static vc4_status act_two_launch(vc4_ctx *ctx, vc4_act act, const vc4_buf *a,
+                                 vc4_buf *out, size_t n)
+{
+    if (act == VC4_ACT_RELU)
+        return vc4_elementwise(ctx, VC4_OP_RELU, a, NULL, out, n);
+    if (act == VC4_ACT_CLIP6)
+        return vc4_unary(ctx, VC4_UOP_CLIP, a, out, n, 0.0f, 6.0f, 0.0f);
+    return VC4_ERR_UNSUPPORTED;
+}
+
+static int one_shape_act(vc4_ctx *ctx, int M, int N, int K, int reps, int tune,
+                         vc4_act act, const char *name)
 {
     const size_t na = (size_t)M * K, nb = (size_t)N * K, nc = (size_t)M * N;
     float *A = malloc(na * 4), *B = malloc(nb * 4);
@@ -116,8 +127,12 @@ static int one_shape_act(vc4_ctx *ctx, int M, int N, int K, int reps, int tune)
     vc4_upload(ctx, &ba, A, na * 4);
     vc4_upload(ctx, &bb, B, nb * 4);
     ref_gemm(A, B, R, M, N, K);
-    for (size_t i = 0; i < nc; ++i)
-        R[i] = R[i] > 0.0 ? R[i] : 0.0;
+    for (size_t i = 0; i < nc; ++i) {
+        if (act == VC4_ACT_RELU)
+            R[i] = R[i] > 0.0 ? R[i] : 0.0;
+        else if (act == VC4_ACT_CLIP6)
+            R[i] = R[i] > 0.0 ? (R[i] < 6.0 ? R[i] : 6.0) : 0.0;
+    }
 
     if (tune) {
         vc4_tune_shape sh;
@@ -150,7 +165,7 @@ static int one_shape_act(vc4_ctx *ctx, int M, int N, int K, int reps, int tune)
         vc4_get_stats(ctx, &s0);
         vc4_status st = vc4_matmul_act(ctx, &ba, &bb, &bf, (uint32_t)M,
                                        (uint32_t)N, (uint32_t)K,
-                                       VC4_LAYOUT_ROW_MAJOR, VC4_ACT_RELU);
+                                       VC4_LAYOUT_ROW_MAJOR, act);
         vc4_get_stats(ctx, &s1);
         if (st != VC4_OK) {
             printf("FAIL: vc4_matmul_act(%d,%d,%d) -> %s (%s)\n", M, N, K,
@@ -163,7 +178,7 @@ static int one_shape_act(vc4_ctx *ctx, int M, int N, int K, int reps, int tune)
         st = vc4_matmul(ctx, &ba, &bb, &bm, (uint32_t)M, (uint32_t)N,
                         (uint32_t)K, VC4_LAYOUT_ROW_MAJOR);
         if (st == VC4_OK)
-            st = vc4_elementwise(ctx, VC4_OP_RELU, &bm, NULL, &b2, nc);
+            st = act_two_launch(ctx, act, &bm, &b2, nc);
         vc4_get_stats(ctx, &s1);
         if (st != VC4_OK) {
             printf("FAIL: two-launch matmul+relu -> %s (%s)\n",
@@ -181,10 +196,10 @@ static int one_shape_act(vc4_ctx *ctx, int M, int N, int K, int reps, int tune)
         check_t ck = { 0, 0, 0, 1 };
         for (size_t i = 0; i < nc; ++i)
             check_elem(&ck, Cf[i], R[i], TOL, i < 8);
-        printf("  M=%3d N=%3d K=%3d relu rep%d: mismatches=%ld/%zu maxabs=%.3g "
+        printf("  M=%3d N=%3d K=%3d %s rep%d: mismatches=%ld/%zu maxabs=%.3g "
                "| vs two launches: %zu differ | launches %llu vs %llu\n",
-               M, N, K, rep, ck.mismatches, nc, ck.max_abs, diff, l_fused,
-               l_two);
+               M, N, K, name, rep, ck.mismatches, nc, ck.max_abs, diff,
+               l_fused, l_two);
         if (ck.mismatches == 0)
             ++clean;
         if (diff == 0)
@@ -195,9 +210,9 @@ static int one_shape_act(vc4_ctx *ctx, int M, int N, int K, int reps, int tune)
             return 1;
         }
     }
-    printf("%s %dx%dx%d relu: %d/%d in tolerance, %d/%d bit-identical to two "
+    printf("%s %dx%dx%d %s: %d/%d in tolerance, %d/%d bit-identical to two "
            "launches\n", (clean == reps && exact == reps) ? "PASS" : "FAIL",
-           M, N, K, clean, reps, exact, reps);
+           M, N, K, name, clean, reps, exact, reps);
     free(A); free(B); free(Cf); free(C2); free(Cm); free(R);
     return (clean == reps && exact == reps) ? 0 : 1;
 }
@@ -252,10 +267,11 @@ int main(int argc, char **argv)
     rc |= one_shape(ctx, 16, 16, 16, reps);
     rc |= one_shape(ctx, 512, 64, 288, reps);
     /* the relu epilogue: default launch, then the autotuned one */
-    rc |= one_shape_act(ctx, 64, 64, 64, reps, 0);
-    rc |= one_shape_act(ctx, 20, 36, 44, reps, 0);
-    rc |= one_shape_act(ctx, 128, 128, 128, reps, 1);
-    rc |= refuse_act(ctx, VC4_ACT_CLIP6, "clip6");
+    rc |= one_shape_act(ctx, 64, 64, 64, reps, 0, VC4_ACT_RELU, "relu");
+    rc |= one_shape_act(ctx, 20, 36, 44, reps, 0, VC4_ACT_RELU, "relu");
+    rc |= one_shape_act(ctx, 128, 128, 128, reps, 1, VC4_ACT_RELU, "relu");
+    rc |= one_shape_act(ctx, 64, 64, 64, reps, 0, VC4_ACT_CLIP6, "clip6");
+    rc |= one_shape_act(ctx, 20, 36, 44, reps, 0, VC4_ACT_CLIP6, "clip6");
     rc |= refuse_act(ctx, VC4_ACT_SILU, "silu");
     rc |= refuse_act(ctx, (vc4_act)7, "act7");
 

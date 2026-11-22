@@ -191,32 +191,39 @@ equals the recorded steady-state count.
 Board: Raspberry Pi 3B, BCM2837, VideoCore IV, kernel 6.18.50, stock clocks
 (core 400 MHz, V3D 300 MHz), managed backend through vc4d, client arena 96 MiB.
 `tools/thermal-guard.sh --max 71` wrapped every run; the core clock stayed at
-400 MHz for all 40 measured loads and the 10 paired runs, peak 63.4 C,
-`throttled=0x20000` (set before this work).  Each load/first/steady row is the
-median of five *separate*
+400 MHz for all 40 measured loads, the 10 paired runs and the 5 passes-off
+runs, peak 65.5 C, `throttled=0x20000` (set before this work).  Each
+load/first/steady row is the median of five *separate*
 processes; steady state is the median of five timed runs after the first run,
 `VC4_OPT=all` on the ONNX path.  Both paths had a warm kernel cache, so no row
 includes JIT.
 
 | model | build | artifact | load ONNX | load artifact | first ONNX | first artifact | steady ONNX | steady artifact |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| modelC | 0.5 s | 0.05 MiB | 44.5 ms | 51.0 ms | 120.2 ms | 108.5 ms | 5.70 ms | 5.82 ms |
-| modelB | 0.7 s | 0.12 MiB | 60.4 ms | 51.4 ms | 171.9 ms | 138.7 ms | 15.66 ms | 15.87 ms |
-| modelA | 0.9 s | 0.75 MiB | 99.7 ms | 65.1 ms | 198.8 ms | 181.6 ms | 25.94 ms | 26.08 ms |
-| yolov8n_160 | 12.4 s | 25.08 MiB | 3211.8 ms | 479.5 ms | 1778.1 ms | 1463.1 ms | 473.83 ms | 468.85 ms |
+| modelC | 0.7 s | 0.05 MiB | 45.0 ms | 51.1 ms | 120.2 ms | 108.6 ms | 5.67 ms | 5.76 ms |
+| modelB | 0.7 s | 0.12 MiB | 60.9 ms | 51.7 ms | 172.0 ms | 138.5 ms | 15.66 ms | 15.88 ms |
+| modelA | 0.9 s | 0.75 MiB | 99.4 ms | 65.3 ms | 198.8 ms | 181.8 ms | 25.77 ms | 26.03 ms |
+| yolov8n_160 | 12.5 s | 25.08 MiB | 3209.2 ms | 481.4 ms | 1776.9 ms | 1463.1 ms | 472.87 ms | 468.38 ms |
 
 Time to the first result (load + first run) is the number a service pays at
 startup: YOLOv8n 4.99 s → 1.94 s (−61%), modelA 0.298 s → 0.247 s (−17%),
-modelB 0.232 s → 0.190 s (−18%), modelC 0.165 s → 0.160 s (−3%).
+modelB 0.233 s → 0.190 s (−18%), modelC 0.165 s → 0.160 s (−3%).
 
 **The gain is startup, not throughput.**  Steady state is the same 536 launches
 of the same kernels at the same shapes.  On YOLOv8n the artifact measured
-468.9 ms against 473.8 ms (five-process medians) and 469.3 against 474.5 ms in
+468.4 ms against 472.9 ms (five-process medians) and 468.3 against 473.0 ms in
 a paired run that loaded the ONNX path first — about 1%, consistent between the
 two orderings but not a launch-count effect.  The plausible cause is the
 12.4 MiB smaller resident arena from dropping the raw conv weights; it is not
 claimed as a speed-up.  On the three small models the medians differ by 0.1-2%
-in either direction (modelC's artifact steady state is 0.12 ms slower).
+in either direction (modelC's artifact steady state is 0.09 ms slower).
+
+The plan the artifact freezes is the one the epilogue pass produces: on this
+tree YOLOv8n runs at 468-473 ms / 536 launches with the pass on, against
+550.0 ms / 1,003 launches with `VC4_OPT=none` (five-process medians).  0.165 to
+0.175 ms of wall time per launch is what those 467 extra launches cost, so a
+frozen 536-launch plan is a frozen 536-launch cost; the artifact removes
+neither the launches nor their price.
 
 ### Where the startup difference comes from
 
@@ -230,7 +237,7 @@ YOLOv8n at 160, measured on the first run:
 | host permutation inside `vc4_conv_nhwc_pack_w` | ~294 ms of the first run's wall time | none |
 | panel upload at load | — | 12.37 MB (part of the 0.49 s load) |
 
-The first-run wall difference is 315 ms for YOLOv8n: 22 ms is QPU pack time,
+The first-run wall difference is 314 ms for YOLOv8n: 22 ms is QPU pack time,
 the rest is the host permute and the upload the packer does.  The artifact pays
 a 12.37 MB panel upload at load instead, which is inside the 485 ms.  Total host
 bytes moved are therefore similar; what changes is *when* and *how often* —

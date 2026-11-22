@@ -158,15 +158,24 @@ vc4_status vc4_conv_nhwc_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int Cin,
     return st;
 }
 
-/* The flat panel is opt-in until it has been gated on silicon: it changes
- * the panel row count and therefore the GEMM's M, so both paths must be
- * measurable side by side.  VC4_CONV_FLAT=1 selects it. */
+/* The flat panel is refused, not merely defaulted off.  Its block schedule is
+ * sound (13 shapes match the row-padded panel on the host, check_im2col_flat)
+ * but the panel write needs a 4-word transposing VPM store, and that shape
+ * either lands the data transposed into the wrong words or is rejected with
+ * V3D_ERR_STAT=0x00000010 -- see docs/KERNEL-EFF.md sec. 7.  The code below is
+ * kept for the next attempt, which keeps the 16x16 store and fills its rows
+ * from four 4-row VDRs; returning 0 here keeps a wrong panel unreachable. */
 static int conv_flat_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("VC4_CONV_FLAT");
-        on = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        if (e && *e && strcmp(e, "0") != 0)
+            fprintf(stderr, "vc4infer: VC4_CONV_FLAT refused: the flat panel's "
+                            "4-word transposing store is not a shape the QPU "
+                            "accepts; using the row-padded path "
+                            "(docs/KERNEL-EFF.md sec. 7)\n");
+        on = 0;
     }
     return on;
 }
@@ -214,7 +223,7 @@ static vc4_status nhwc_conv_pass(vc4_ctx *ctx, const nhwc_pad *pd, int nimg,
     vc4_kernel *k = NULL;
     vc4_status st;
 
-    if (flat) {
+    if (flat) {                       /* unreachable: see conv_flat_enabled */
         const int GPR = Wg / 4;                       /* groups per output row */
         const uint32_t blocks = M / 16u;
         const uint32_t groups = (uint32_t)ho * (uint32_t)GPR;

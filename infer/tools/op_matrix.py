@@ -495,6 +495,10 @@ def rec_matmul(op, rng, o):
         sp(op, "batched_4d_attention_vs", ["A", "B"],
            {"A": arr(rng, (1, 2, 64, 25), -1, 1),
             "B": arr(rng, (1, 2, 25, 25), -1, 1)}),
+        sp(op, "column_1000x169", ["A", "B"],
+           {"A": arr(rng, (1000, 169), -1, 1)},
+           {"B": arr(rng, (169, 1), -1, 1)},
+           note="125 eight-row units: the A panel cannot use 4 QPUs"),
     ]
 
 

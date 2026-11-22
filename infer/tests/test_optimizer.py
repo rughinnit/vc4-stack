@@ -19,7 +19,10 @@ runs on the ARM (or on a machine with no VideoCore at all):
   6. the executor's fused dispatch, with a fake engine: the graph rewrite is
      what removes the launch, including under VC4_NO_SILU_FUSE=1;
   7. semantics: onnx.reference gives the same answer before and after every
-     pass on the synthetic graphs.
+     pass on the synthetic graphs;
+  8. the plan-time ConstantOfShape fold: the node becomes an initialiser whose
+     bytes match benchmodels/materialise.py, IR-3 shape inputs are pruned, and
+     a fill over the fold budget refuses with its own arithmetic.
 
 No GPU work, no kernel cache, no ctypes call into libvc4infer.  The real gate
 (152/152 operators, YOLOv8n parity) still needs silicon; commands are in
@@ -27,6 +30,7 @@ docs/OPTIMIZER.md.
 
 usage: TMPDIR=$HOME/scratch/tmp python3 infer/tests/test_optimizer.py
 """
+import copy
 import os
 import sys
 import tempfile
@@ -627,6 +631,127 @@ def _same_answer(m0, m1, feeds, what, atol=1e-6):
     check(ok, "%s: same answer (max abs %.2e)" % (what, d))
 
 
+def _light(name):
+    """The ONNX backend test-data file, or None when the package omits it."""
+    root = os.environ.get("VC4_LIGHT_DATA") or os.path.join(
+        os.path.dirname(onnx.__file__), "backend", "test", "data", "light")
+    path = os.path.join(root, name)
+    return path if os.path.isfile(path) else None
+
+
+def mk_constantofshape(value=0.02, shape=(1, 2, 2, 2)):
+    """Y = X * ConstantOfShape(shape, value), in the corpus' IR-3 form."""
+    shp = numpy_helper.from_array(np.asarray(shape, np.int64), "shape")
+    val = numpy_helper.from_array(np.asarray([value], np.float32))
+    node = helper.make_node("ConstantOfShape", ["shape"], ["C"], value=val)
+    mul = helper.make_node("Mul", ["X", "C"], ["Y"])
+    m = _model([node, mul], [_vi("X", [1, 2, 2, 2])],
+               [_vi("Y", [1, 2, 2, 2])], [shp])
+    # IR v3 declares every initialiser as a graph input as well; the corpus
+    # graphs are written this way and it is why the fold has to prune inputs.
+    m.ir_version = 3
+    m.graph.input.append(helper.make_tensor_value_info(
+        "shape", TensorProto.INT64, [len(shape)]))
+    return m
+
+
+def test_plan_constant_fold():
+    print("plan-time ConstantOfShape fold")
+    m = mk_constantofshape()
+    rng = np.random.default_rng(31)
+    x = rng.standard_normal((1, 2, 2, 2)).astype(np.float32)
+    want = np.asarray(ReferenceEvaluator(m).run(None, {"X": x})[0])
+
+    folded, names = O.fold_plan_constants(m)
+    check(names == ["ConstantOfShape_0"],
+          "the node is recorded as folded (%s)" % (names,))
+    check(not any(n.op_type == "ConstantOfShape" for n in folded.graph.node),
+          "no ConstantOfShape node survives")
+    inits = {t.name: numpy_helper.to_array(t)
+             for t in folded.graph.initializer}
+    check("C" in inits and inits["C"].shape == (1, 2, 2, 2) and
+          inits["C"].dtype == np.float32 and
+          np.all(inits["C"] == np.float32(0.02)),
+          "the fill becomes a float32 initialiser of the node's shape")
+    check(folded.ir_version >= 4, "IR raised to 4 (%d)" % folded.ir_version)
+    check("shape" not in {i.name for i in folded.graph.input},
+          "the shape declaration is dropped from graph.input")
+    onnx.checker.check_model(folded)
+
+    got = np.asarray(ReferenceEvaluator(folded).run(None, {"X": x})[0])
+    check(got.tobytes() == want.tobytes(),
+          "folded graph is bit-identical to the node-by-node graph")
+
+    # the executor: the fold happens at load, so strict mode has no
+    # ConstantOfShape dispatch and the plan is one Mul
+    path = save(m, "cos.onnx")
+    eng = FakeEngine()
+    r = Runner(path, eng, passes="none")
+    check(r.plan_folds == ["ConstantOfShape_0"],
+          "the runner records the plan-time fold (%s)" % (r.plan_folds,))
+    check(len(r.graph.node) == 1, "one runtime node (%d)"
+          % len(r.graph.node))
+    r.run({"X": x})
+    check(len(eng.calls) == 1, "one dispatch, no refusal (%s)" % (eng.calls,))
+
+    # a constant fill that is itself the graph output is a constant too
+    shp = numpy_helper.from_array(np.asarray([2, 3], np.int64), "shape")
+    m4 = _model([helper.make_node("ConstantOfShape", ["shape"], ["Y"])],
+                [], [_vi("Y", [2, 3])], [shp])
+    folded4, names4 = O.fold_plan_constants(m4)
+    check(names4 == ["ConstantOfShape_0"] and
+          not folded4.graph.node and folded4.graph.initializer[0].name == "Y",
+          "a ConstantOfShape graph output folds to an initialiser")
+
+    # a shape that is not a plan-time constant keeps the node and is refused
+    # by the static report with the reason, not by "no implementation"
+    m2 = _model([helper.make_node("ConstantOfShape", ["s"], ["C"]),
+                 helper.make_node("Identity", ["C"], ["Y"])],
+                [_vi("X", [2]), helper.make_tensor_value_info(
+                    "s", TensorProto.INT64, [1])], [_vi("Y", [2])])
+    from vc4infer import coverage
+    rep = coverage.analyse_model(m2)
+    node = [n for n in rep["nodes"] if n["op"] == "ConstantOfShape"][0]
+    check(node["status"] == "unsupported" and
+          "not a plan-time constant" in node["reason"],
+          "a dynamic shape is refused for that reason (%s)" % node["reason"])
+
+    # a fill over the single-tensor limit refuses with its own arithmetic
+    big = (200, 256, 256)                       # 50 MiB of float32
+    m3 = mk_constantofshape(shape=big)
+    from vc4infer._errors import UnsupportedNode
+    try:
+        O.fold_plan_constants(m3)
+        check(False, "an over-budget fill is refused")
+    except UnsupportedNode as e:
+        check("MiB" in str(e) and "single-tensor limit" in str(e),
+              "over-budget fill names its size and limit (%s)" % e)
+
+
+def test_plan_fold_matches_materialise():
+    """The corpus fold produces the same bytes as benchmodels/materialise.py.
+    """
+    print("corpus fold vs materialise.py")
+    path = _light("light_squeezenet.onnx")
+    if path is None:
+        print("  SKIP: light_squeezenet.onnx not installed")
+        return
+    sys.path.insert(0, os.path.join(REPO, "benchmodels"))
+    import materialise
+    out = os.path.join(tmpdir(), "squeezenet-materialised.onnx")
+    n = materialise.materialise(path, out)
+    ref = onnx.load(out)
+    folded, names = O.fold_plan_constants(onnx.load(path))
+    check(len(names) == n == 39,
+          "%d nodes folded in both (%d)" % (len(names), n))
+    fi = {t.name: numpy_helper.to_array(t) for t in folded.graph.initializer}
+    ri = {t.name: numpy_helper.to_array(t) for t in ref.graph.initializer}
+    bad = [k for k in fi if k not in ri or
+           fi[k].shape != ri[k].shape or fi[k].tobytes() != ri[k].tobytes()]
+    check(not bad and set(fi) == set(ri),
+          "every folded initialiser is byte-identical to materialise.py")
+
+
 def test_opmatrix_sweep(directory):
     """Every saved op_matrix case, optimised, against its recorded oracle.
 
@@ -723,6 +848,8 @@ def main():
     test_dispatch_fake_engine()
     test_dispatch_matmul_fold()
     test_runner_markers()
+    test_plan_constant_fold()
+    test_plan_fold_matches_materialise()
     test_resolve()
     test_opmatrix_sweep(sweep)
     print("")

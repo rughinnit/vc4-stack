@@ -438,6 +438,12 @@ def rec_conv(op, rng, o):
         mk("6x6_stride2_stem", 3, 16, 6, 2, 2, 1, 1, hw=16,
            note="YOLOv5 stem, 3 real input channels: four 3x3 dilation-2 "
                 "stride-2 phases"),
+        mk("dense_cin1_5x5", 1, 64, 5, 1, 2, 1, 1,
+           note="dense 1->64: group == Cin == 1 is not depthwise"),
+        mk("1x1_cout1000", 512, 1000, 1, 1, 0, 1, 1, hw=13,
+           note="Cout is not 16-aligned: the padded output is sliced back"),
+        mk("1x1_cout1008", 512, 1008, 1, 1, 0, 1, 1, hw=13,
+           note="the same conv with an aligned Cout needs no slice"),
         mk("nonsquare_kernel_3x1", 16, 16, 3, 1, 0, 1, 1, w=1,
            edge=True, note="NCHW fallback only, documented"),
     ]
@@ -489,6 +495,10 @@ def rec_matmul(op, rng, o):
         sp(op, "batched_4d_attention_vs", ["A", "B"],
            {"A": arr(rng, (1, 2, 64, 25), -1, 1),
             "B": arr(rng, (1, 2, 25, 25), -1, 1)}),
+        sp(op, "column_1000x169", ["A", "B"],
+           {"A": arr(rng, (1000, 169), -1, 1)},
+           {"B": arr(rng, (169, 1), -1, 1)},
+           note="125 eight-row units: the A panel cannot use 4 QPUs"),
     ]
 
 

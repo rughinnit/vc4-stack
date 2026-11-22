@@ -698,15 +698,14 @@ arena is the first refusal for every s and m cell and for n at 640: needs are
 106 MiB (s160), 125 (s320), 200 (s640), 206 (m160 nmsfree), 227 (m320 default),
 310 (m640 nmsfree) and 126 (n640), all against 64.
 
-**The NMS-free head adds one operator refusal, not a different memory story.**
-`ConstantOfShape` (`no implementation`) appears twice at the end of the
-`nmsfree` graph and is absent from `default`; it is the only operator the
-static check rejects in the new head beyond the shared Split/MatMul.  `TopK`,
-`GatherElements`, `Mod`, `Equal`, `ReduceMax`, `Where` and `Expand` are in the
-graph but this build does not list them as unsupported, so their runtime
-behaviour is **unmeasured**: every cell stops at the attention block or at the
-arena before reaching them.  Fixing Split/MatMul would expose that head to a
-second round of operator work.
+**The NMS-free head's two `ConstantOfShape` nodes are now folded at plan
+time.**  They are constant anchor tensors, so they no longer appear as a
+refusal (the 2026-11-22 fold); the shared Split/MatMul remains the only
+operator refusal in the head.  `TopK`, `GatherElements`, `Mod`, `Equal`,
+`ReduceMax`, `Where` and `Expand` are in the graph but this build does not
+list them as unsupported, so their runtime behaviour is **unmeasured**: every
+cell stops at the attention block or at the arena before reaching them.
+Fixing Split/MatMul would expose that head to a second round of operator work.
 
 **l and x remain export-limited.**  Both heads die at the watchdog at every
 resolution; the observed peaks were 494-602 MiB.  As with the six families
@@ -722,24 +721,28 @@ Fifteen graphs outside the YOLO family, same protocol: nine ImageNet backbones
 from the ONNX backend test corpus, the three shipped `modelA/B/C` graphs, and
 three ONNX Model Zoo models (super-resolution, style transfer, int8
 segmentation).  Full tables, exact refusal strings and the corpus caveat are in
-[`MODELS.md`](MODELS.md).  Conditions: engine 1.2.8, managed, 96 MiB client
+[`MODELS.md`](MODELS.md).  Conditions: engine 1.2.10, managed, 96 MiB client
 arena, ONNX Runtime 1.32.0 on four threads, 3 warm-ups + 5 timed, guard
-`--max 71`; starts 59.1-64.5 C, peaks 60.1-71.4 C, core 400 MHz.
+`--max 71`; starts 56.9-60.7 C, peaks 59.1-70.4 C, core 400 MHz.  The re-run
+of the three fixed models used `infer/build/libvc4infer.so.1`; the installed
+copy predates the autotune entry point.
 
 | group | graphs | run on VC4 | headline |
 |---|---:|---:|---|
 | shipped small models | 3 | **3** | 29.8 / 17.2 / 6.2 ms; CPU 2.4 / 1.8 / 0.2 ms (12.4x / 9.7x / 30x); max abs 6.9e-06 / 3.8e-06 / 2.6e-07 |
-| ImageNet corpus, 224x224 | 9 | 0 | 7 stop on the arena (needs 104-603 MiB), 1 on a grouped conv, 1 plans 66/66 and then fails at its 1000-class 1x1 conv |
-| Model Zoo, other tasks | 3 | 0 | super-resolution needs 147 MiB, then a `Cin=1` conv; style transfer needs 540 MiB of 9x9-conv scratch; segmentation is int8 (`QLinearConv`) |
+| ImageNet corpus, 224x224 | 9 | **1** | SqueezeNet runs: 2892.7 ms VC4, 92.1 ms CPU, 1000/1000 outputs bit-identical; 3 stop on the arena (104-135 MiB), 4 on weight tensors of 144-392 MiB, 1 on grouped-conv alignment |
+| Model Zoo, other tasks | 3 | 0 | super-resolution needs 147 MiB of conv scratch (its `Cin=1` conv now plans 12/12); style transfer needs 540 MiB of 9x9-conv scratch; segmentation is int8 (`QLinearConv`) |
 
 The corpus graphs are topology-only: every weight is a `ConstantOfShape` node
-with the constant value 0.02.  Unmodified, the five small graphs stop at
-`ConstantOfShape` (`no implementation`) and the four large ones earlier at the
-arena; the numbers above are after an exact materialisation (ONNX Runtime output
-bit-identical, max abs 0.0).  `modelA/B/C` are the only non-YOLO models that
-execute on the QPUs.
+with the constant value 0.02.  The engine folds those nodes at plan time, so
+every corpus row is the unmodified file; SqueezeNet runs end to end and its 39
+folded tensors are byte-identical to `benchmodels/materialise.py`.  The other
+small graphs are planned as published and stop at their own constraint
+(arena, grouped-conv alignment).  `modelA/B/C` and SqueezeNet are the non-YOLO
+models that execute on the QPUs.
 
 The 152/152 operator result does not extend to model coverage.  The blockers
-are the arena (104-603 MiB against 96), conv kernels restricted to 1x1/3x3/5x5
-(the corpus stems are 7x7 and 11x11; style transfer is 9x9), grouped-conv
-16-alignment, the weight representation, and int8 - not missing operators.
+are the arena (104-603 MiB against 96, including single weight tensors of
+144-392 MiB that cannot be materialised into it), conv kernels restricted to
+1x1/3x3/5x5 (the corpus stems are 7x7 and 11x11; style transfer is 9x9),
+grouped-conv 16-alignment, and int8 - not missing operators.

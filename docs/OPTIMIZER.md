@@ -315,6 +315,17 @@ unknown.
 "v8n160" is YOLOv8n at 160x160.  The rewrite runs at `Runner.__init__`, before
 the pool plan, so the plan is sized from the graph that will execute.
 
+`constant-fold` also covers `ConstantOfShape` when its shape input is a
+plan-time constant.  That node is a tensor, not activation arithmetic, and the
+ONNX backend test corpus stores every weight and bias through it.  The same
+fold runs at load even with no pass selected (`optimizer.fold_plan_constants`):
+strict mode has no dispatch for the node, and the pool plan has to count the
+bytes the fill carries, so the node becomes an initialiser before the plan is
+built.  Shape tensors that only fed it are dropped, an IR-3 input declaration
+that existed only to list one goes with them, and the fold may use at most the
+client arena (one tensor and the total): a weight tensor bigger than the arena
+cannot run in it, and the refusal names the tensor and the arena.
+
 The ew/epilogue rules have no instance in YOLOv8n that the executor was not
 already handling except the SiLU fold: `conv-activation` takes the 57
 conv -> Mul(x, Sigmoid(x)) pairs out of the elementwise model and into the

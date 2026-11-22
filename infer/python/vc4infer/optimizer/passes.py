@@ -31,6 +31,7 @@ plan printer reports node count, dispatch count and the op histogram.
 
 Pass 1: canonicalise
     constant-fold      fold a node whose inputs are all plan-time constants
+                       (including ConstantOfShape used as a weight source)
     dead-node          drop nodes whose outputs nothing reads
     identity           remove no-op Reshape/Cast/Transpose/Identity/...
     div-const          Div(x, k) -> Mul(x, 1/k), the executor's own lowering
@@ -61,11 +62,20 @@ from .ir import Graph
 # and a numpy fold would move the last bits for no gain.  Add/Sub/Mul/Neg/Abs
 # are exact IEEE fp32 in both places.
 FOLD_OPS = frozenset((
-    "Shape", "Size", "Constant", "Identity", "Cast", "Reshape", "Flatten",
-    "Squeeze", "Unsqueeze", "Transpose", "Concat", "Gather", "Slice",
-    "Add", "Sub", "Mul", "Neg", "Abs",
+    "Shape", "Size", "Constant", "ConstantOfShape", "Identity", "Cast",
+    "Reshape", "Flatten", "Squeeze", "Unsqueeze", "Transpose", "Concat",
+    "Gather", "Slice", "Add", "Sub", "Mul", "Neg", "Abs",
 ))
 MAX_FOLD_BYTES = 32 << 20
+
+# The nodes the plan-time fold owns.  They produce a tensor from constants
+# alone, so they are weight sources rather than runtime work, and the executor
+# has no dispatch for ConstantOfShape: a graph that keeps one is refused in
+# strict mode.  The runner passes its client arena as the budget, because a
+# weight tensor larger than the arena cannot run however it is represented;
+# the module defaults apply to callers with no arena (tests, offline probes).
+PLAN_FOLD_OPS = frozenset(("ConstantOfShape",))
+PLAN_FOLD_BYTES = 64 << 20
 
 
 # ----------------------------------------------------------------- records
@@ -172,6 +182,63 @@ class _Ctx:
         return True
 
 
+def fold_plan_constants(model, budget=PLAN_FOLD_BYTES,
+                        limit=MAX_FOLD_BYTES):
+    """Materialise constant metadata nodes before the plan is built.
+
+    A ``ConstantOfShape`` whose shape input is a plan-time constant computes a
+    tensor: it is a weight source, not a per-run activation.  Strict mode has
+    no dispatch for the node, and the arena has to count the bytes it carries
+    like any other initialiser, so the fold runs at load time and rewrites the
+    node into an initialiser.  The value is the node's own ``value`` attribute,
+    so the replacement is exact.
+
+    The shape tensors that only fed those nodes are dropped, and a graph input
+    that existed only to declare an initialiser goes with them: the ONNX test
+    corpus is IR v3, where every initialiser must also be a graph input, and
+    the runner admits fp32 inputs only.
+
+    A constant fill larger than ``limit`` (one tensor) or ``budget`` (all of
+    them) raises :class:`UnsupportedNode` with the tensor's shape, its byte
+    count and the limit it missed.  The runner passes its client arena for
+    both: weights that do not fit the arena cannot run in it, and the fold
+    would copy them twice on a 1 GiB board.
+
+    Returns ``(model, folded_node_names)``.  The input model object is
+    returned unchanged when there is nothing to fold.
+    """
+    from .._errors import UnsupportedNode
+
+    if not any(n.op_type in PLAN_FOLD_OPS for n in model.graph.node):
+        return model, []
+    graph = Graph.from_model(model)
+    declared = set(graph.initializers)
+    refused = []
+    # An initialiser may be a graph output, so a constant fill that *is* the
+    # output folds too; the value is in the initialiser table either way.
+    st = _fold_constants(graph, ops=PLAN_FOLD_OPS, budget=budget,
+                         limit=limit, refused=refused, keep_outputs=False)
+    if refused:
+        name, shape, nbytes, why = refused[0]
+        raise UnsupportedNode(
+            name, "ConstantOfShape",
+            "constant fill %s needs %d bytes (%.1f MiB) of weights, %s"
+            % ("x".join(str(d) for d in shape), nbytes, nbytes / 2.0 ** 20,
+               why))
+    if not st.matched:
+        return model, []
+    graph.drop_unused_initializers()
+    used = {o.name for o in graph.outputs}
+    for n in graph.nodes:
+        used.update(i for i in n.proto.input if i)
+    graph.inputs = [vi for vi in graph.inputs
+                    if vi.name not in declared or vi.name in used]
+    graph.meta["ir_version"] = max(int(graph.meta.get("ir_version") or 0), 4)
+    graph.reindex()
+    graph.refresh()
+    return graph.to_model(), list(st.removed)
+
+
 # --------------------------------------------------------------- canonical
 class Canonicalise(Pass):
     key = "canonicalise"
@@ -191,20 +258,36 @@ class Canonicalise(Pass):
         return out
 
 
-def _fold_constants(graph):
+def _fold_constants(graph, ops=FOLD_OPS, budget=MAX_FOLD_BYTES,
+                    limit=MAX_FOLD_BYTES, refused=None, keep_outputs=True):
     st = RuleStat("constant-fold")
     before = len(graph.nodes)
     folded = {}
-    budget = MAX_FOLD_BYTES
+    start_budget = budget
     keep = []
+
+    def refuse(node, shape, nbytes):
+        """Record why a constant could not be folded, without materialising it."""
+        if refused is None:
+            return
+        if nbytes > limit:
+            why = ("over the %.1f MiB single-tensor limit"
+                   % (limit / 2.0 ** 20))
+        else:
+            why = ("over the %.1f MiB plan-time fold budget "
+                   "(%.1f MiB of weights folded before it)"
+                   % (start_budget / 2.0 ** 20,
+                      (start_budget - budget) / 2.0 ** 20))
+        refused.append((node.name, list(shape), int(nbytes), why))
     for node in graph.nodes:
         op = node.op_type
         outs = [o for o in node.proto.output if o]
-        if (op not in FOLD_OPS or not outs or len(outs) != 1 or
+        if (op not in ops or not outs or len(outs) != 1 or
                 any(a.type in (onnx.AttributeProto.GRAPH,
                                onnx.AttributeProto.GRAPHS)
                     for a in node.proto.attribute) or
-                outs[0] in graph.graph_outputs() or op == "Constant"):
+                (keep_outputs and outs[0] in graph.graph_outputs()) or
+                op == "Constant"):
             keep.append(node)
             continue
         ins = [i for i in node.proto.input if i]
@@ -217,13 +300,31 @@ def _fold_constants(graph):
         if not ok:
             keep.append(node)
             continue
+        # A constant fill's size follows from its shape input, so a tensor
+        # that is over the budget is refused before it is allocated.  VGG-19's
+        # 25088x4096 fill is 392 MiB: allocating it only to discard it is what
+        # made the probe swap on a 1 GiB board.
+        if op in PLAN_FOLD_OPS and node.proto.input and \
+                graph.is_const(node.proto.input[0]):
+            dims = [int(v) for v in
+                    np.asarray(graph.const(node.proto.input[0])).ravel()]
+            if dims and all(d >= 0 for d in dims):
+                val = node.attr("value")
+                itemsize = (np.asarray(val).dtype.itemsize
+                            if val is not None else 4)
+                nbytes = int(np.prod(dims)) * itemsize
+                if nbytes > limit or nbytes > budget:
+                    refuse(node, dims, nbytes)
+                    keep.append(node)
+                    continue
         arr = graph.eval_const(node, {**graph.initializers, **folded})
         if arr is None or arr.dtype == object:
             keep.append(node)
             continue
         if arr.dtype == np.float64:
             arr = arr.astype(np.float32)
-        if arr.nbytes > budget:
+        if arr.nbytes > limit or arr.nbytes > budget:
+            refuse(node, arr.shape, arr.nbytes)
             keep.append(node)
             continue
         budget -= arr.nbytes

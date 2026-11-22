@@ -456,6 +456,7 @@ class Pool:
         self.reserve = reserve
         self.segs = []                  # [[base, size, bump], ...]
         self.free = []                  # [(off, size)] engine-global offsets
+        self.live = {}                  # off -> aligned bytes, the owner
         self.high = 0                   # high-water of used_bytes
         if not self._add_segment(max(int(nbytes), self.MIN_SEG)):
             raise self._exhausted(int(nbytes))
@@ -505,10 +506,12 @@ class Pool:
                     self.free.pop(i)
                 else:
                     self.free[i] = (off + n, sz - n)
+                self.live[off] = n
                 return vc4infer.Buf(off, int(nbytes))
         seg = self._ensure(n)
         off = seg[0] + seg[2]
         seg[2] += n
+        self.live[off] = n
         used = self.used_bytes
         if used > self.high:
             self.high = used
@@ -518,10 +521,12 @@ class Pool:
         if b is None:
             return
         off = int(b.off)
-        inside = any(seg[0] <= off < seg[0] + seg[1] for seg in self.segs)
-        if not inside:
-            return
         n = _align(int(b.bytes))
+        if self.live.get(off) != n:
+            # a view into someone else's block, or a second release of one:
+            # freeing it again would hand the same bytes to two allocations
+            return
+        del self.live[off]
         lo, hi = off, off + n
         merged = []
         for o, sz in self.free:                 # sorted, so one pass coalesces
@@ -538,6 +543,7 @@ class Pool:
         for seg in self.segs:
             seg[2] = 0
         self.free = []
+        self.live = {}
         self.high = 0
 
     @property
@@ -692,6 +698,15 @@ class Runner:
             self.optimise_report = optimizer.optimise(self.model, passes=spec)
             if self.optimise_report.changed:
                 self.model = self.optimise_report.model
+        # ConstantOfShape with a constant shape computes a tensor, not a
+        # per-run activation.  Fold it before the pool is sized so the weights
+        # it carries are counted like any other initialiser; strict mode has no
+        # dispatch for the node, and a fill too large to fold is refused with
+        # its byte count (optimizer.passes.fold_plan_constants).
+        from .optimizer import fold_plan_constants
+        self.model, self.plan_folds = fold_plan_constants(
+            self.model, budget=int(eng.arena_bytes),
+            limit=int(eng.arena_bytes))
         self.graph = self.model.graph
         self.values = {}
         self.host = {}          # host copy of every initializer / Constant
@@ -753,6 +768,12 @@ class Runner:
                 raise UnsupportedNode("graph input %s: only fp32 inputs" % inp.name)
         self._find_silu()
         self._collect_fused()
+        # a graph output is held in `values` after a run; the next run filters
+        # `values` down to constants, so release it first (never a buffer an
+        # initialiser owns: an Identity of a constant shares that block)
+        self._const_offs = {v.buf.off for k, v in self.values.items()
+                            if k in self._consts and isinstance(v, Tensor)}
+        self._prev_outputs = ()
 
     # ---------------------------------------------------- optimiser markers
     def _collect_fused(self):
@@ -1607,9 +1628,10 @@ class Runner:
         else:
             ba = np.zeros(Cout, np.float32)
 
-        grouped = (group > 1 and group != Cin and Cin % group == 0
+        kind = coverage.conv_kind(group, Cin)
+        depthwise = kind == "depthwise"
+        grouped = (kind == "grouped" and Cin % group == 0
                    and Cout % group == 0)
-        depthwise = (group == Cin)
         if depthwise and Cout != Cin:
             raise UnsupportedNode("Conv %s: depthwise Cout %d != Cin %d "
                                   "(channel multiplier is not implemented)"
@@ -1653,8 +1675,12 @@ class Runner:
                                 act if act is not None else 0)
             if t.shape[1] != w.shape[0]:
                 # Cout is padded to 16 for the GEMM; take the real channels
-                # back on the QPUs (the DFL head's 1-channel conv)
-                t = self._slice_ch(t, 0, int(w.shape[0]))
+                # back on the QPUs (the DFL head's 1-channel conv).  The
+                # padded tensor is a per-node temporary: SqueezeNet's
+                # 512->1000 conv is 819 KiB of it on every run.
+                padded = t
+                t = self._slice_ch(padded, 0, int(w.shape[0]))
+                self._tmp(padded)
             return t, act is not None
 
         # ---------------- legacy NCHW path (non-square kernels, etc.) -------
@@ -1690,7 +1716,7 @@ class Runner:
         xp = self._pad_ch(x, cpad)
         if wa.shape[1] != cpad and group == 1:
             wa = np.pad(wa, ((0, 0), (0, cpad - wa.shape[1]), (0, 0), (0, 0)))
-        if group == Cin:
+        if kind == "depthwise":
             if sh != 1:
                 raise UnsupportedNode("Conv %s: stride-2 depthwise" % node.name)
             dense = np.zeros((opad, cpad, kh, kw), np.float32)
@@ -2126,11 +2152,11 @@ class Runner:
                 h, w, o = self.eng.maxpool_nhwc(x.buf, N, C, H, W, x.pitch,
                                                 n, pad, out)
                 return Tensor(out, (N, C, h, w), "nhwc", pitch=o)
-            x = self.upload(self.nchw(x))
+            x = self._tmp(self.upload(self.nchw(x)))
             N, C, H, W = x.shape
         pad = int(pads[0])
         if list(pads) != [0, 0, 0, 0] and list(pads) != [pad] * 4:
-            x = self._prepad(x, pads, value=-np.inf)
+            x = self._tmp(self._prepad(x, pads, value=-np.inf))
             pad = 0
         ho = (H + 2 * pad - n) // s + 1
         wo = (W + 2 * pad - n) // s + 1
@@ -2141,6 +2167,7 @@ class Runner:
             h, w = self.eng.maxpooln(x.buf, out, C, H, W, n, s, pad)
             t = Tensor(out, (1, C, hop, op))
             a = self.download(t)[:, :, :h, :w]
+            self._tmp(t)
             return self.upload(np.ascontiguousarray(a))
         # vc4_maxpooln is a single-image op: one launch per image, still all
         # arithmetic on the QPU.
@@ -2152,6 +2179,7 @@ class Runner:
             h, w = self.eng.maxpooln(sb, ob, C, H, W, n, s, pad)
             t = Tensor(ob, (1, C, hop, op))
             parts.append(self.download(t)[0, :, :h, :w])
+        self._tmp(Tensor(out, (N, C, hop, op)))
         return self.upload(np.ascontiguousarray(np.stack(parts)))
 
     def _concat(self, node):
@@ -2915,10 +2943,10 @@ class Runner:
         if N != 1:
             raise UnsupportedNode("GlobalAveragePool %s: batch != 1" % node.name)
         if x.layout == "nhwc":
-            x = self.upload(self.nchw(x))
+            x = self._tmp(self.upload(self.nchw(x)))
         HW = H * W
         b = np.full((HW, 1), 1.0 / HW, np.float32)
-        bb = self.upload(b)
+        bb = self._tmp(self.upload(b))
         out = self._alloc(C)
         self.eng.matmul(x.buf, bb.buf, out, C, 1, HW)
         return Tensor(out, (1, C, 1, 1))
@@ -3000,10 +3028,16 @@ class Runner:
     def _slice_ch(self, x, c0, cn):
         """x's channels [c0, c0+cn) as a new NHWC tensor, on the QPUs.
 
-        One copy2d covers a channel count that is a multiple of 16 (nblk
-        blocks of 16 lanes).  Any other count takes one call per 16-lane
-        block, the last one partial: a QPU store writes at most 16 words, so
-        a 24-channel conv output cannot be trimmed in a single call.
+        A copy2d_x store is at most 16 lanes wide and 16 words deep.  One call
+        covers all of the whole 16-lane blocks (`cn/16` blocks at 64-byte
+        steps), and a remainder of 1-15 channels is one more call with
+        ``nlane == depth ==`` the remainder.  The old single call passed the
+        whole count as both, which is `copy2d_x: invalid argument` as soon as
+        it exceeds 16: a 1x1 conv to 1000 channels pads Cout to 1008 and then
+        slices the real 1000 back, and 62*16 + 8 is not one store.  A
+        remainder smaller than a block must be stored at depth=nl as well: a
+        16-word store would spill into the next pixel (24 channels: the last
+        block is 8 words, the pixel is 24).
         """
         n, c, h, w = x.shape
         out = self._alloc_t((n, cn, h, w), "nhwc", w)
@@ -3011,24 +3045,20 @@ class Runner:
         # (cn % 16 == 0); 24 channels is 96 B and takes single-vector stores
         units = (4 if w % 4 == 0 else (2 if w % 2 == 0 else 1)) \
             if cn % 16 == 0 else 1
-        if cn % 16 == 0:
-            for i in range(n):
-                self._x(self._buf_at(x, (i * h * x.pitch * c + c0) * 4),
-                        out.buf if n == 1 else
-                        self._buf_at(out, i * h * w * cn * 4),
+        blocks, tail = divmod(cn, 16)
+        for i in range(n):
+            so = i * h * x.pitch * c * 4
+            do = i * h * w * cn * 4 if n > 1 else 0
+            if blocks:
+                self._x(self._buf_at(x, so + c0 * 4),
+                        self._buf_at(out, do),
                         h, w, x.pitch * c * 4, w * cn * 4, c * 4, cn * 4, 4,
-                        16, cn // 16, 64, 64, units, 16)
-            return out
-        # A destination pixel is cn words wide, so a partial block must be
-        # stored at depth=nl: a 16-word store would spill into the next pixel
-        # (24 channels: the last block is 8 words, the pixel is 24).
-        for k0 in range(0, cn, 16):
-            nl = min(16, cn - k0)
-            for i in range(n):
-                self._x(self._buf_at(x, (i * h * x.pitch * c + c0 + k0) * 4),
-                        self._buf_at(out, (i * h * w * cn + k0) * 4),
+                        16, blocks, 64, 64, units, 16)
+            if tail:
+                self._x(self._buf_at(x, so + (c0 + blocks * 16) * 4),
+                        self._buf_at(out, do + blocks * 16 * 4),
                         h, w, x.pitch * c * 4, w * cn * 4, c * 4, cn * 4, 4,
-                        nl, 1, 64, 64, units, nl)
+                        tail, 1, 64, 64, 1, tail)
         return out
 
     def _flatten(self, node):
@@ -3346,6 +3376,11 @@ class Runner:
 
     def run(self, feeds, profile=False):
         self.check_policy()
+        for name in self._prev_outputs:
+            v = self.values.get(name)
+            if isinstance(v, Tensor) and v.buf.off not in self._const_offs:
+                self.pool.release(v.buf)
+        self._prev_outputs = tuple(o.name for o in self.graph.output)
         self.values = {k: v for k, v in self.values.items()
                        if k in self._consts}
         self._count_host = False

@@ -787,6 +787,21 @@ class Graph:
                 return vals[0]
             if op == "Cast":
                 return _cast(vals[0], int(node.attr("to", TensorProto.FLOAT)))
+            if op == "ConstantOfShape":
+                # A constant fill is a tensor, not arithmetic: the ONNX test
+                # corpus stores every weight and bias this way, and a detector
+                # head may carry its anchor table the same way.  ONNX's default
+                # for an absent ``value`` attribute is float32 zero.
+                dims = [int(v) for v in vals[0].ravel()]
+                if not dims or any(d < 0 for d in dims):
+                    return None
+                val = node.attr("value")
+                if val is None:
+                    return np.zeros(dims, np.float32)
+                a = np.asarray(val)
+                if a.size != 1:
+                    return None
+                return np.full(dims, a.ravel()[0], dtype=a.dtype)
             if op == "Reshape":
                 return vals[0].reshape([int(v) for v in vals[1].ravel()])
             if op == "Flatten":

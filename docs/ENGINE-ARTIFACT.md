@@ -112,8 +112,11 @@ the load path (the C context keeps the names; the kernel table itself is an LRU
 of 128 code slots and a detector loads more than that).  Blobs are embedded by
 default; `--no-embed-kernels` records names and hashes only and the loader then
 needs the cache.  Either way the loader writes what it has into the kernel cache
-with the artifact's generator digest as the stamp, so the cache's own
-generator check accepts it.
+with the blob's own `.stamp` sidecar (the per-kernel digest of the generator
+hash and the kernel's argument vector), which is what the cache compares; a
+blob without its stamp is present but the cache regenerates it.  Checked with
+an empty cache directory: loading YOLOv8n's artifact wrote 98 blobs and their
+stamps, and the first run took 1.47 s with no generator invocation.
 
 ## What a load skips
 
@@ -197,23 +200,23 @@ includes JIT.
 
 | model | build | artifact | load ONNX | load artifact | first ONNX | first artifact | steady ONNX | steady artifact |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| modelC | 0.5 s | 0.05 MiB | 44.4 ms | 49.3 ms | 120.3 ms | 108.4 ms | 5.68 ms | 5.73 ms |
-| modelB | 0.7 s | 0.12 MiB | 60.4 ms | 50.4 ms | 172.1 ms | 138.8 ms | 15.66 ms | 15.91 ms |
-| modelA | 0.9 s | 0.75 MiB | 99.0 ms | 64.8 ms | 198.3 ms | 181.9 ms | 25.90 ms | 26.00 ms |
-| yolov8n_160 | 12.4 s | 25.07 MiB | 3202.1 ms | 486.3 ms | 1777.6 ms | 1461.9 ms | 474.20 ms | 468.42 ms |
+| modelC | 0.5 s | 0.05 MiB | 44.5 ms | 51.0 ms | 120.2 ms | 108.5 ms | 5.70 ms | 5.82 ms |
+| modelB | 0.7 s | 0.12 MiB | 60.4 ms | 51.4 ms | 171.9 ms | 138.7 ms | 15.66 ms | 15.87 ms |
+| modelA | 0.9 s | 0.75 MiB | 99.7 ms | 65.1 ms | 198.8 ms | 181.6 ms | 25.94 ms | 26.08 ms |
+| yolov8n_160 | 12.4 s | 25.08 MiB | 3211.8 ms | 479.5 ms | 1778.1 ms | 1463.1 ms | 473.83 ms | 468.85 ms |
 
 Time to the first result (load + first run) is the number a service pays at
-startup: YOLOv8n 4.98 s → 1.95 s (−61%), modelA 0.297 s → 0.247 s (−17%),
-modelB 0.233 s → 0.189 s (−19%), modelC 0.165 s → 0.158 s (−4%).
+startup: YOLOv8n 4.99 s → 1.94 s (−61%), modelA 0.298 s → 0.247 s (−17%),
+modelB 0.232 s → 0.190 s (−18%), modelC 0.165 s → 0.160 s (−3%).
 
 **The gain is startup, not throughput.**  Steady state is the same 536 launches
 of the same kernels at the same shapes.  On YOLOv8n the artifact measured
-468.4 ms against 474.2 ms (five-process medians) and 471.1 against 473.4 ms in
+468.9 ms against 473.8 ms (five-process medians) and 469.3 against 474.5 ms in
 a paired run that loaded the ONNX path first — about 1%, consistent between the
 two orderings but not a launch-count effect.  The plausible cause is the
 12.4 MiB smaller resident arena from dropping the raw conv weights; it is not
-claimed as a speed-up.  On the three small models the two medians differ by
-0.1-1% either way (modelB's artifact steady state is 0.2 ms slower).
+claimed as a speed-up.  On the three small models the medians differ by 0.1-2%
+in either direction (modelC's artifact steady state is 0.12 ms slower).
 
 ### Where the startup difference comes from
 
@@ -227,7 +230,7 @@ YOLOv8n at 160, measured on the first run:
 | host permutation inside `vc4_conv_nhwc_pack_w` | ~294 ms of the first run's wall time | none |
 | panel upload at load | — | 12.37 MB (part of the 0.49 s load) |
 
-The first-run wall difference is 316 ms for YOLOv8n: 22 ms is QPU pack time,
+The first-run wall difference is 315 ms for YOLOv8n: 22 ms is QPU pack time,
 the rest is the host permute and the upload the packer does.  The artifact pays
 a 12.37 MB panel upload at load instead, which is inside the 485 ms.  Total host
 bytes moved are therefore similar; what changes is *when* and *how often* —

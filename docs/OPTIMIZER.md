@@ -570,7 +570,7 @@ useful if it can be written once and loaded:
   lifetimes no longer match.
 
 Measured on YOLOv8n at 160 (bit-exact outputs, same 536 steady-state launches):
-load 3.21 s -> 0.49 s, first run 1.78 s -> 1.46 s, steady state unchanged.
+load 3.21 s -> 0.48 s, first run 1.78 s -> 1.46 s, steady state unchanged.
 `docs/ENGINE-ARTIFACT.md` has the format, the key checks and the full table.
 
 The artifact is additional to the pass pipeline in this document: the graph it

@@ -59,7 +59,7 @@ vc4infer bench  yolov8n_160.vc4x
 ```
 
 On YOLOv8n at 160 the outputs are bit-identical to the ONNX path and the
-steady-state launch count is the same 536; load falls from 3.21 s to 0.49 s and
+steady-state launch count is the same 536; load falls from 3.21 s to 0.48 s and
 the first run from 1.78 s to 1.46 s.  `--no-artifact` plans from the ONNX graph
 the artifact carries.  Format, keys and measurements:
 [`../docs/ENGINE-ARTIFACT.md`](../docs/ENGINE-ARTIFACT.md).

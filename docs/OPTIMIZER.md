@@ -376,36 +376,38 @@ the conv it compacts and then calls `vc4_relu` / `vc4_unary(VC4_UOP_CLIP)` as a
 second launch (`litert/src/vc4_delegate.c`, `run_conv`); it does not use the
 new entry points yet.
 
-Measured on the board (2026-11-22, `vc4d` on the tv socket, 46 MiB client
-arena because CMA on the shared board was full, peak 66 C): the same node
-range of YOLOv8n-160 runs in **719 launches with no pass and 252 with all of
-them** -- -467, exactly the modelled delta -- and `plan_diff.py --profile`
-agrees with the per-node rows for 117 of the 118 nodes it could profile.
-The one mismatch is `/model.0/conv/Conv` (modelled 2, recorded 3: the
-NCHW -> NHWC copy of the graph input is charged to that node) and it
-reproduces with `VC4_OPT=none`, so it predates this work.  The fold also
-changes no number: the tensor it feeds, `/model.22/dfl/Transpose`, is
-**bit-identical** between the same model run with every pass and run with
-none (33,600 elements, 0 differ), so the 57 rewrites moved where the
-activation runs and nothing else.
+Measured on the board (2026-11-22, on the merged base, `vc4d` on the tv
+socket with a 46 MiB client arena because CMA on the shared board was full,
+peak 65 C): YOLOv8n-160 runs **1003 launches with no pass and 536 with all of
+them**, and every one of the 467 is a `Mul` (468 -> 2; the remaining `Div_1`
+is the other 1).  The parity gate passes with the epilogue on:
 
-The full graph does not complete on this board today, and the reason is not
-the epilogue: `/model.22/dfl/Softmax` fails with `softmax: invalid argument`
-because the DFL head at imgsz 160 is `[1,16,4,525]`, so the per-position
-softmax has 2100 rows x 16 classes, and `vc4_softmax`'s generic path returns
-`VC4_ERR_INVAL` for that row count (a direct call with rows=2100, cols=16
-reproduces it; rows=1024, 2048 and 8400 succeed, 1025, 2000 and 2100 do
-not).  At 320 and 640 the row count is 8400 and 33600, both multiples of 8,
-which take the fused kernel and work.  `main` with `VC4_OPT=none` fails at
-the same node in the same way.  Until that is fixed the detections/tolerance
-half of the v8n160 gate cannot run, and the number above is the launch half.
+| input | over tolerance | max abs | max rel | detections (ref / vc4) | classes | max box diff | max score diff |
+|---|---:|---:|---:|---|---|---:|---:|
+| rng(0) | 0 / 44,100 | 2.04e-2 | 2.24e-4 | 0 / 0 | - | - | - |
+| `bus.jpg` | 0 / 44,100 | 1.34e-2 | 3.21e-4 | 4 / 4 | same | 2.2e-4 px | 8.5e-5 |
 
-The wall-time projection stands where it was: the recorded baseline is
-481.7 ms with 802 launches and a 222 ms launch path (this document,
-"Baseline"), i.e. 0.277 ms per launch, so removing the 467 SiLU launches is
-~129 ms and an expected ~353 ms.  That would clear the 420 ms criterion; the
-extra saving from not reading and writing the activation plane twice is not
-included, and none of it is measured yet.
+and the two graphs are **bit-identical to each other** on both inputs: the
+same model run with every pass and with none returns the same 44,100 values,
+to the last bit, and the tensor before the DFL softmax is identical too
+(33,600 elements, 0 differ).  The rewrites changed where the activation runs
+and nothing else, which is what the word "fused" has to mean.
+
+The *plan* says 752 -> 285, and it is the copy class that makes the run
+1003 rather than 752: the executor's pitched copies (`Concat` 231 launches
+against the modelled 38, `Reshape` 41 against 8, `Softmax` 40 against 23)
+are what `plan.py` calls approximate, and `plan_diff.py --profile` reports
+24 such rows.  It also reports two exact-class rows, both pre-existing and
+both a copy charged to a node the model counts as a bare conv:
+`/model.0/conv/Conv` (the NCHW -> NHWC conversion of the graph input, 2 -> 3)
+and `/model.22/dfl/conv/Conv` (the 1-channel head's `_slice_ch`, 2 -> 4).
+Neither is caused by the epilogue; the first reproduces with `VC4_OPT=none`
+on the pre-merge base.
+
+The wall time is not measured.  The projection is the recorded 0.277 ms per
+launch -- 467 fewer launches is ~129 ms off the 222 ms launch path, an
+expected ~353 ms against the 481.7 ms baseline -- and the extra saving from
+not reading and writing the activation plane twice is not included.
 
 ### Gates on silicon
 

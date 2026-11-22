@@ -422,8 +422,9 @@ YOLO_IMGSZ=320 python3 onnx/export_yolo.py    # writes models/yolov8n_320.onnx
   deliberate boundary, not a missing kernel: the head is not convolution work.
 * **Unsupported nodes raise**, they never fall back.  `Expand`,
   `BatchNormalization`, `Pow`, `LRN`, arbitrary `ConvTranspose`, conv kernels
-  outside 1x1/3x3/5x5 (or the NCHW fallback's 1x1/3x3), non-square pools and
-  `Softmax` with more than 16 classes are not implemented.
+  outside 1x1/3x3/5x5 and 6x6 stride 2 (or the NCHW fallback's 1x1/3x3),
+  non-square pools and `Softmax` with more than 16 classes are not
+  implemented.
 * **Detection quality depends on the input size.**  YOLOv8n was trained at 640;
   at 160x160 the same weights see a 4x smaller image, so small and distant
   objects are missed and boxes are coarse.  The export, the letterbox and the

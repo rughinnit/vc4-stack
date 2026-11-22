@@ -268,6 +268,26 @@ vc4_status vc4_conv_nhwc_dil_act(vc4_ctx *ctx, const vc4_buf *in, int nimg,
                                  vc4_act act, vc4_buf *out, int *ho, int *wo,
                                  int *opitch);
 /*
+ * The same op with independent top/left/bottom/right padding.  The output
+ * size is (H + pt + pb - dil*(KH-1) - 1)/stride + 1 (and likewise for W).
+ * It exists so a decomposed 6x6 stride-2 kernel can offset the input by one
+ * row/column per phase without materialising a shifted activation copy.
+ */
+vc4_status vc4_conv_nhwc_pads(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                              int Cin, int H, int W, int in_pitch,
+                              const vc4_buf *wpanel, int Cout, int KH, int KW,
+                              int stride, int pt, int pl, int pb, int pr,
+                              int dilation, vc4_buf *out, int *ho, int *wo,
+                              int *opitch);
+/* the same, with an activation in the GEMM's store */
+vc4_status vc4_conv_nhwc_pads_act(vc4_ctx *ctx, const vc4_buf *in, int nimg,
+                                  int Cin, int H, int W, int in_pitch,
+                                  const vc4_buf *wpanel, int Cout, int KH,
+                                  int KW, int stride, int pt, int pl,
+                                  int pb, int pr, int dilation,
+                                  vc4_act act, vc4_buf *out, int *ho,
+                                  int *wo, int *opitch);
+/*
  * Grouped conv: `groups` independent convs over channel blocks of Cin/groups
  * and Cout/groups.  wpanel[g] is the packed panel of group g (call
  * vc4_conv_nhwc_pack_w with the group's [Cout/groups][Cin/groups][KH][KW]

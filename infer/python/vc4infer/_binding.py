@@ -236,6 +236,19 @@ class Engine:
             [ctypes.POINTER(Buf), ctypes.POINTER(ctypes.c_int),
              ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
         L.vc4_conv_nhwc_dil.restype = ctypes.c_int
+        L.vc4_conv_nhwc_pads.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 5 + [ctypes.POINTER(Buf)] + [ctypes.c_int] * 4 + \
+            [ctypes.c_int] * 5 + [ctypes.POINTER(Buf),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int),
+                                  ctypes.POINTER(ctypes.c_int)]
+        L.vc4_conv_nhwc_pads.restype = ctypes.c_int
+        L.vc4_conv_nhwc_pads_act.argtypes = [ctypes.c_void_p,
+                                             ctypes.POINTER(Buf)] + \
+            [ctypes.c_int] * 5 + [ctypes.POINTER(Buf)] + [ctypes.c_int] * 10 + \
+            [ctypes.POINTER(Buf), ctypes.POINTER(ctypes.c_int),
+             ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        L.vc4_conv_nhwc_pads_act.restype = ctypes.c_int
         L.vc4_conv_nhwc_group.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)] + \
             [ctypes.c_int] * 5 + [ctypes.POINTER(ctypes.POINTER(Buf))] + \
             [ctypes.c_int] * 7 + [ctypes.POINTER(Buf),
@@ -584,6 +597,18 @@ class Engine:
             ctypes.byref(wpanel), Cout, KH, KW, stride, pad, dil, act,
             ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo),
             ctypes.byref(op)), "conv_nhwc_dil")
+        return ho.value, wo.value, op.value
+
+    def conv_nhwc_pads(self, x, nimg, Cin, H, W, in_pitch, wpanel, Cout, KH,
+                       KW, stride, pt, pl, pb, pr, dil, out, act=ACT_NONE):
+        ho = ctypes.c_int(0)
+        wo = ctypes.c_int(0)
+        op = ctypes.c_int(0)
+        self._check(self.lib.vc4_conv_nhwc_pads_act(
+            self.ctx, ctypes.byref(x), nimg, Cin, H, W, in_pitch,
+            ctypes.byref(wpanel), Cout, KH, KW, stride, pt, pl, pb, pr, dil,
+            act, ctypes.byref(out), ctypes.byref(ho), ctypes.byref(wo),
+            ctypes.byref(op)), "conv_nhwc_pads")
         return ho.value, wo.value, op.value
 
     def conv_nhwc_group(self, x, nimg, Cin, H, W, in_pitch, wpanels, Cout,

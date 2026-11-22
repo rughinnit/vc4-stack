@@ -231,6 +231,11 @@ PYTHONPATH=$PYTHONPATH:. timeout -k 5 1200 python3 tests/test_onnx_geom.py
 board
 cool
 
+echo "=== test_onnx_breadth (Split/Slice/MatMul/6x6 conv forms)"
+PYTHONPATH=$PYTHONPATH:. timeout -k 5 600 python3 tests/test_onnx_breadth.py
+board
+cool
+
 echo "=== test_copyops (layout copy kernels, byte-exact)"
 timeout -k 5 300 $RUN ./build/test_copyops
 board

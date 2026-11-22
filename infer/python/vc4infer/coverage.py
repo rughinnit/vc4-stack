@@ -35,6 +35,7 @@ Every node is also classified into exactly one execution tier:
 host-control | host-unwritten | unsupported-graph`` report used by
 ``Engine.node_backends`` and ``vc4infer nodes``.
 """
+import copy
 import json
 import os
 import onnx
@@ -55,7 +56,7 @@ OPS = {
     "Det": "QPU permutation gathers + QPU mul/add chain (Leibniz expansion)",
     "Einsum": "QPU copy2d permutations + QPU gemm contraction (lowered, not a kernel)",
     "DeformConv": "QPU offset coordinates + 4-tap bilinear im2col + QPU gemm",
-    "Conv": "QPU conv: NHWC 1x1/3x3/5x5 s1/s2, dilation 1..8, groups",
+    "Conv": "QPU conv: NHWC 1x1/3x3/5x5 s1/s2, 6x6 s2 as four dilated phases, dilation 1..8, groups",
     "Relu": "QPU elementwise",
     "Abs": "QPU unary (vc4_unary UOP_ABS, exact)",
     "Neg": "QPU unary (UOP_NEG, exact)",
@@ -76,12 +77,12 @@ OPS = {
     "Div": "QPU Mul by folded constant",
     "MaxPool": "QPU maxpool_nhwc + QPU -inf border",
     "Concat": "QPU copy2d, pitched channel concat",
-    "Split": "QPU copy2d, channel-strided",
-    "Slice": "QPU copy2d last-axis runs",
+    "Split": "QPU copy2d on the channel axis, QPU gather on any other axis",
+    "Slice": "QPU copy2d runs or channel-strided copy, QPU gather otherwise",
     "Resize": "QPU nearest (2x exact) / Mul+Add (bilinear)",
     "Transpose": "QPU copy2d ([0,2,1,3] only)",
     "Softmax": "QPU softmax_fwd (fused <=16 classes) / QPU reduce+exp+div (any class count)",
-    "MatMul": "QPU gemm",
+    "MatMul": "QPU gemm, one per batch index (rank >= 2)",
     "Gemm": "QPU gemm + Add",
     "GlobalAveragePool": "QPU gemm over 1/HW column",
     "Reshape": "view (no copy)",
@@ -387,8 +388,10 @@ def _check_conv(node, shapes, inits):
     native_group = (grouped and Cin % group == 0 and Cout % group == 0
                     and (Cin // group) % 16 == 0
                     and (Cout // group) % 16 == 0)
-    nhwc = (kh in (1, 3, 5) and kw in (1, 3, 5) and symm
-            and (group == 1 or native_group or depthwise))
+    six = (kh == 6 and kw == 6 and sh == 2 and dilv == 1 and group == 1
+           and symm)
+    nhwc = (six or (kh in (1, 3, 5) and kw in (1, 3, 5) and symm
+                    and (group == 1 or native_group or depthwise)))
     if nhwc:
         if depthwise and Cout != Cin:
             return "unsupported", ("depthwise Cout %d != Cin %d (channel "
@@ -492,11 +495,23 @@ def _check_gemm(node, shapes, inits):
 
 
 def _check_matmul(node, shapes, inits):
-    for name in node.input[:2]:
-        rank = _rank(shapes, name)
-        if rank is not None and rank != 2:
-            return "unsupported", "rank %d operand (2-D only)" % rank
-    return "supported", "gemm"
+    ranks = [_rank(shapes, name) for name in node.input[:2]]
+    if any(r is None for r in ranks):
+        return "unknown", "operand rank unknown"
+    if min(ranks) < 2:
+        return "unsupported", "rank %d operand (rank >= 2)" % min(ranks)
+    a = shapes.get(node.input[0])
+    b = shapes.get(node.input[1])
+    if a and b:
+        if len(a) != len(b):
+            return "unsupported", "rank %d x %d operands" % (len(a), len(b))
+        ba, bb = tuple(a[:-2]), tuple(b[:-2])
+        if any(int(d) <= 0 for d in ba + bb):
+            return "unknown", "batch extent unknown"
+        if ba != bb:
+            return "unsupported", ("batch %s x %s (broadcasting needs a "
+                                   "panel copy)" % (ba, bb))
+    return "supported", "gemm rank %d x %d" % (ranks[0], ranks[1])
 
 
 def _check_concat(node, shapes, inits):
@@ -512,11 +527,11 @@ def _check_concat(node, shapes, inits):
 def _check_split(node, shapes, inits):
     axis = int(_attr(node, "axis", 0))
     rank = _rank(shapes, node.input[0])
-    if rank is not None and rank != 4:
-        return "unknown", "rank %d (Split is channel-axis 4-D)" % rank
-    if axis != 1:
-        return "unsupported", "axis %d (channel axis 1)" % axis
-    return "supported", "axis 1"
+    if not rank:
+        return "unknown", "input rank unknown"
+    if not -rank <= axis < rank:
+        return "unsupported", "axis %d of rank %d" % (axis, rank)
+    return "supported", "axis %d of rank %d" % (axis % rank, rank)
 
 
 def _check_clip(node, shapes, inits):
@@ -815,10 +830,22 @@ def _tier(node, status, reason, dtypes, model):
             "numeric op with no VC4 kernel: %s" % reason)
 
 
-def analyse_model(model):
-    """Analyse an in-memory ModelProto and return the coverage report."""
+def analyse_model(model, shapes=None):
+    """Analyse an in-memory ModelProto and return the coverage report.
+
+    ``shapes`` lets a caller pass the map from ``refine_shapes`` (the runner
+    computes it once and reuses it for the pool estimate).  Without it the
+    map is recovered here: ONNX shape inference cannot see through a Slice
+    whose ends come from ``Shape(x)/2``, and v9 writes every C3k2 branch that
+    way, so a plain inference leaves every later tensor with unknown H/W and
+    the plan-time ``Shape`` folding fails.
+    """
     g = model.graph
-    shapes, dtypes = _shape_map(model)
+    if shapes is None:
+        shapes = refine_shapes(model)
+    else:
+        shapes = dict(shapes)
+    _shapes, dtypes = _shape_map(model)
     inits, init_types = _init_shapes(model)
     dtypes.update(init_types)
 
@@ -1072,3 +1099,79 @@ def fold_metadata(model, rep):
         folded.add(idx)
     return folded, known
 
+
+
+def refine_shapes(model, max_iter=16):
+    """Static shapes, recovering the ones ONNX inference cannot see.
+
+    A v9 C3k2 branch is ``Slice(x, starts=0, ends=Shape(x)[1]/2, axes=1)``
+    followed by more convs and more of the same.  ``ends`` is a runtime
+    value, so ``onnx.shape_inference`` gives the Slice output four symbolic
+    dims and every later tensor inherits them; the plan-time ``Shape``
+    folding then refuses the graph even though the input size is static.
+
+    The values are not runtime-dependent: they are Shape/Gather/Div/Mul on
+    integer metadata.  This function folds that chain with ``fold_metadata``,
+    replaces the Slice parameters it resolved, re-runs shape inference, and
+    repeats until no new parameter resolves (one Slice per C3k2 block, so a
+    handful of iterations).  It only changes a private copy of the graph;
+    the executor still runs the original nodes, whose values the plan-time
+    folder resolves.
+    """
+    shapes, dtypes = _shape_map(model)
+    if not any(n.op_type == "Slice" for n in model.graph.node):
+        return shapes
+
+    def meta(node):
+        if node.op_type in META_OPS:
+            return True
+        ins = [i for i in node.input if i]
+        return bool(ins) and all(
+            dtypes.get(i) is not None and not _is_float(dtypes[i])
+            for i in ins)
+
+    work = copy.deepcopy(model)
+    replaced = {}
+    for _ in range(max_iter):
+        fake = {"shapes": shapes,
+                "nodes": [{"tier": "host-meta" if meta(n) else "vc4"}
+                          for n in work.graph.node]}
+        try:
+            _folded, known = fold_metadata(work, fake)
+        except Exception:                                  # noqa: BLE001
+            break
+        extra = []
+        changed = False
+        for node in work.graph.node:
+            if node.op_type != "Slice":
+                continue
+            for k in range(1, min(5, len(node.input))):
+                name = node.input[k]
+                if not name or name not in known:
+                    continue
+                new = replaced.get(name)
+                if new is None:
+                    new = name + "__folded"
+                    replaced[name] = new
+                    extra.append(numpy_helper.from_array(
+                        np.asarray(known[name]), name=new))
+                node.input[k] = new
+                changed = True
+        if not changed:
+            break
+        work.graph.initializer.extend(extra)
+        try:
+            inf = onnx.shape_inference.infer_shapes(
+                work, strict_mode=False, data_prop=False)
+        except Exception:                                  # noqa: BLE001
+            break
+        newshapes = dict(shapes)
+        for v in list(inf.graph.value_info) + list(inf.graph.output):
+            dims = [int(d.dim_value) if d.HasField("dim_value") else -1
+                    for d in v.type.tensor_type.shape.dim]
+            if dims and all(d > 0 for d in dims):
+                newshapes[v.name] = dims
+        if newshapes == shapes:
+            break
+        shapes = newshapes
+    return shapes

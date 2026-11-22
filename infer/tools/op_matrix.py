@@ -242,6 +242,10 @@ class Spec:
     # `reps` independent runs (see stochastic_check)
     stochastic: bool = False
     reps: int = 1
+    # Nodes that run before the scored one and whose output it consumes.  A
+    # layout-dependent path cannot be reached from a one-node graph: the
+    # pitched NHWC buffer exists only because a Conv produced it.
+    pre: list = field(default_factory=list)
 
 
 def arr(rng, shape, lo=None, hi=None, dtype=np.float32):
@@ -260,12 +264,12 @@ def f32(*values):
 
 def sp(op, variant, ins, feeds, inits=None, attrs=None, *, required=True,
        edge=False, opset=None, n_out=None, out_types=None, note="",
-       oracle_gap=False, stochastic=False, reps=1):
+       oracle_gap=False, stochastic=False, reps=1, pre=None):
     return Spec(op=op, variant=variant, ins=list(ins), feeds=feeds,
                 inits=inits or {}, attrs=attrs or {}, required=required,
                 edge=edge, opset=opset, n_out=n_out, out_types=out_types,
                 note=note, oracle_gap=oracle_gap, stochastic=stochastic,
-                reps=reps)
+                reps=reps, pre=list(pre or []))
 
 
 # --------------------------------------------------------------- model build
@@ -287,6 +291,18 @@ def build_model(spec, schema, default_opset):
         n_out = max(n_out, 1)
     out_names = ["Y%d" % i for i in range(n_out)]
 
+    pre_nodes = []
+    produced = set()
+    pre_inits = {}
+    for j, p in enumerate(spec.pre):
+        outs = list(p["outs"])
+        pre_nodes.append(helper.make_node(
+            p["op"], list(p["ins"]), outs,
+            name="%s_%s_pre%d" % (spec.op, spec.variant, j),
+            **p.get("attrs", {})))
+        produced.update(outs)
+        pre_inits.update(p.get("inits", {}))
+
     bindings = {}
     for i, name in enumerate(spec.ins):
         if i >= len(schema.inputs):
@@ -294,6 +310,8 @@ def build_model(spec, schema, default_opset):
         value = spec.feeds.get(name)
         if value is None:
             value = spec.inits.get(name)
+        if value is None and name in produced:
+            value = np.zeros(1, np.float32)     # dtype only
         if value is None:
             continue
         bindings[schema.inputs[i].type_str] = NP2ONNX.get(
@@ -311,18 +329,27 @@ def build_model(spec, schema, default_opset):
                             name="%s_%s" % (spec.op, spec.variant),
                             **spec.attrs)
     inputs = []
-    for name in spec.ins:
-        a = spec.feeds.get(name)
-        if a is None or name in spec.inits:
+    seen = set()
+    all_ins = [n for p in spec.pre for n in p["ins"]] + list(spec.ins)
+    for name in all_ins:
+        if name in seen or name in spec.inits or name in pre_inits \
+                or name in produced:
             continue
+        a = spec.feeds.get(name)
+        if a is None:
+            continue
+        seen.add(name)
         a = np.ascontiguousarray(a)
         inputs.append(helper.make_tensor_value_info(
             name, NP2ONNX[np.dtype(a.dtype)], list(a.shape)))
+    merged = dict(pre_inits)
+    merged.update(spec.inits)
     inits = [numpy_helper.from_array(np.asarray(v), name=k)
-             for k, v in spec.inits.items()]
+             for k, v in merged.items()]
     outputs = [helper.make_tensor_value_info(n, t, None)
                for n, t in zip(out_names, out_types)]
-    graph = helper.make_graph([node], "opmatrix_%s_%s" % (spec.op, spec.variant),
+    graph = helper.make_graph(pre_nodes + [node],
+                              "opmatrix_%s_%s" % (spec.op, spec.variant),
                               inputs, outputs, initializer=inits)
     model = helper.make_model(
         graph, opset_imports=[helper.make_opsetid("", opset)],
@@ -408,6 +435,9 @@ def rec_conv(op, rng, o):
         mk("5x5_pad2", 16, 16, 5, 1, 2, 1, 1),
         mk("batch2", 16, 16, 3, 1, 1, 1, 1, n=2),
         mk("no_bias", 16, 16, 3, 1, 1, 1, 1, bias=False),
+        mk("6x6_stride2_stem", 3, 16, 6, 2, 2, 1, 1, hw=16,
+           note="YOLOv5 stem, 3 real input channels: four 3x3 dilation-2 "
+                "stride-2 phases"),
         mk("nonsquare_kernel_3x1", 16, 16, 3, 1, 0, 1, 1, w=1,
            edge=True, note="NCHW fallback only, documented"),
     ]
@@ -447,8 +477,19 @@ def rec_matmul(op, rng, o):
                {"B": arr(rng, (4, 2), -1, 1), "C": arr(rng, (3, 2), -1, 1)},
                {"transB": 0}, edge=True, note="C broadcast over M"),
         ]
-    return [sp(op, "2d_4x8_8x3", ["A", "B"],
-               {"A": arr(rng, (4, 8), -1, 1), "B": arr(rng, (8, 3), -1, 1)})]
+    return [
+        sp(op, "2d_4x8_8x3", ["A", "B"],
+           {"A": arr(rng, (4, 8), -1, 1), "B": arr(rng, (8, 3), -1, 1)}),
+        # v10/v11/v12/YOLO26 attention: scores = q @ k^T and out = v @ scores,
+        # both rank 4 with a batch and a head extent.
+        sp(op, "batched_4d_attention_qk", ["A", "B"],
+           {"A": arr(rng, (4, 2, 25, 32), -1, 1),
+            "B": arr(rng, (4, 2, 32, 25), -1, 1)},
+           note="[B][H][M][K] x [B][H][K][N], one GEMM per B*H"),
+        sp(op, "batched_4d_attention_vs", ["A", "B"],
+           {"A": arr(rng, (1, 2, 64, 25), -1, 1),
+            "B": arr(rng, (1, 2, 25, 25), -1, 1)}),
+    ]
 
 
 def rec_einsum(op, rng, o):
@@ -664,6 +705,12 @@ def rec_split(op, rng, o):
         sp(op, "explicit_sizes", ["input", "split"],
            {"input": arr(rng, (1, 8, 4, 4), -1, 1)}, {"split": i64(2, 6)},
            attrs={"axis": 1}, n_out=2),
+        # v10/v11/v26 attention splits a rank-4 [B][heads][C][HW] tensor on
+        # axis 2 into q, k and v.  The batch and head extents are 1 or 4.
+        sp(op, "attention_axis2_rank4", ["input", "split"],
+           {"input": arr(rng, (4, 2, 96, 25), -1, 1)},
+           {"split": i64(32, 32, 32)}, attrs={"axis": 2}, n_out=3,
+           note="v10/v11/v26/v12 attention: q, k, v on axis 2"),
     ]
 
 
@@ -682,6 +729,18 @@ def rec_slice(op, rng, o):
            {"data": arr(rng, (1, 4, 8, 8), -1, 1)},
            {"starts": i64(0), "ends": i64(8), "axes": i64(2),
             "steps": i64(2)}, edge=True),
+        # v9 slices every C3k2 branch in half on the channel axis, and the
+        # source is the NHWC output of the preceding conv -- pitched to
+        # align16(wo), not compact NCHW.  The graph therefore has to start
+        # with a Conv: a one-node Slice always sees an uploaded NCHW input.
+        sp(op, "channel_half_of_conv_nhwc", ["XP", "starts", "ends", "axes"],
+           {"X": arr(rng, (1, 16, 8, 8), -1, 1)},
+           {"starts": i64(0), "ends": i64(16), "axes": i64(1)},
+           note="v9: 32-channel conv output, 8 wide -> NHWC pitch 16",
+           pre=[{"op": "Conv", "ins": ["X", "W"], "outs": ["XP"],
+                 "attrs": {"strides": [1, 1], "pads": [1, 1, 1, 1],
+                           "dilations": [1, 1], "group": 1},
+                 "inits": {"W": arr(rng, (32, 16, 3, 3), -0.3, 0.3)}}]),
     ]
 
 

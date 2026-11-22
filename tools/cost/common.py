@@ -79,6 +79,19 @@ def core_hz():
         return 0
 
 
+def throttled():
+    out = subprocess.run(["vcgencmd", "get_throttled"],
+                         capture_output=True, text=True).stdout
+    return out.strip().split("=")[-1] if "=" in out else out.strip()
+
+
+def lcrit_alarm():
+    try:
+        return int(open("/sys/class/hwmon/hwmon1/in0_lcrit_alarm").read())
+    except OSError:
+        return None
+
+
 def cpu_totals():
     parts = open("/proc/stat").readline().split()
     vals = [int(v) for v in parts[1:]]

@@ -45,6 +45,8 @@ def main():
                     help="ncnn intra-op threads")
     args = ap.parse_args()
 
+    sys.stderr.write("co_run pid %d\n" % os.getpid())
+    sys.stderr.flush()
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
 
@@ -128,9 +130,16 @@ def main():
         },
         "system": sampler.summary(),
         "clocks": {"core_hz": common.core_hz(),
-                   "arm_hz": common.arm_hz()},
+                   "arm_hz": common.arm_hz(),
+                   "throttled": common.throttled(),
+                   "lcrit_alarm": common.lcrit_alarm()},
         "stopped": STOP,
     }
+    if h is not None and "engine" in h:
+        try:
+            h["engine"].close()
+        except Exception:
+            pass
     print("COST_JSON " + json.dumps(res, sort_keys=True))
     sys.stdout.flush()
     os._exit(99 if (STOP or rc != 0) else 0)

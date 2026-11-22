@@ -4,7 +4,7 @@
     measure.py --runtime vc4|ncnn --size 96|128|160 --runs N [--warmup 3]
 
 Writes one JSON object prefixed ``COST_JSON `` on stdout.  Run it under
-``tools/thermal-guard.sh --max 71``; the guard's own line reports the peak.
+``tools/thermal-guard.sh``; the guard's own line reports the peak.
 
 CPU time is read from /proc/<pid>/stat around the timed loop.  For vc4infer it
 is reported twice: the client process, and the client plus the vc4d daemon that
@@ -38,6 +38,9 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--threads", type=int, default=4,
                     help="ncnn intra-op threads")
+    ap.add_argument("--rate", type=float, default=None,
+                    help="deliver frames at this rate (FPS), sleeping "
+                         "between runs")
     args = ap.parse_args()
 
     # Import before the RSS baseline so the model, not the interpreter, is the
@@ -73,12 +76,24 @@ def main():
     cpu0 = cpu_snapshot()
     sampler.start()
     runs, elems = [], None
+    period = 1.0 / args.rate if args.rate else None
     t_start = time.perf_counter()
-    for _ in range(args.runs):
+    for i in range(args.runs):
+        if period is not None:
+            target = t_start + i * period
+            delay = target - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
         t = time.perf_counter()
         info = run()
         runs.append((time.perf_counter() - t) * 1e3)
         elems = info["elems"]
+    if period is not None:
+        # Complete the last frame period so runs/elapsed is the delivered rate,
+        # not the rate up to the end of the final inference.
+        tail = t_start + args.runs * period - time.perf_counter()
+        if tail > 0:
+            time.sleep(tail)
     wall = time.perf_counter() - t_start
     sampler.stop()
     cpu1 = cpu_snapshot()
@@ -94,6 +109,8 @@ def main():
         "runs": args.runs,
         "warmup": args.warmup,
         "threads": args.threads if args.runtime == "ncnn" else None,
+        "target_fps": args.rate,
+        "delivered_fps": args.runs / wall,
         "wall_ms": {
             "median": statistics.median(runs),
             "mean": statistics.mean(runs),
@@ -129,11 +146,18 @@ def main():
         "out_elems_expected": common.expected_elems(args.size),
         "system": sampler.summary(),
         "clocks": {"core_hz": common.core_hz(),
-                   "arm_hz": common.arm_hz()},
+                   "arm_hz": common.arm_hz(),
+                   "throttled": common.throttled(),
+                   "lcrit_alarm": common.lcrit_alarm()},
     }
     if "engine" in h:
         res["memory"] = h["engine"].memory()
         res["vc4d_pid"] = common.vc4d_pid()
+    if "engine" in h:
+        try:
+            h["engine"].close()
+        except Exception:
+            pass
     print("COST_JSON " + json.dumps(res, sort_keys=True))
     sys.stdout.flush()
     # ncnn's Python wheel frees its pool allocator before the Mats that point

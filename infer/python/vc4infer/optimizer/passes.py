@@ -71,9 +71,9 @@ MAX_FOLD_BYTES = 32 << 20
 # The nodes the plan-time fold owns.  They produce a tensor from constants
 # alone, so they are weight sources rather than runtime work, and the executor
 # has no dispatch for ConstantOfShape: a graph that keeps one is refused in
-# strict mode.  The budget is larger than one pass's because every weight of a
-# corpus graph arrives through these nodes; it is still bounded, because an
-# unfurled 400 MiB tensor would be copied twice on a 1 GiB board.
+# strict mode.  The runner passes its client arena as the budget, because a
+# weight tensor larger than the arena cannot run however it is represented;
+# the module defaults apply to callers with no arena (tests, offline probes).
 PLAN_FOLD_OPS = frozenset(("ConstantOfShape",))
 PLAN_FOLD_BYTES = 64 << 20
 
@@ -182,7 +182,8 @@ class _Ctx:
         return True
 
 
-def fold_plan_constants(model):
+def fold_plan_constants(model, budget=PLAN_FOLD_BYTES,
+                        limit=MAX_FOLD_BYTES):
     """Materialise constant metadata nodes before the plan is built.
 
     A ``ConstantOfShape`` whose shape input is a plan-time constant computes a
@@ -197,10 +198,11 @@ def fold_plan_constants(model):
     corpus is IR v3, where every initialiser must also be a graph input, and
     the runner admits fp32 inputs only.
 
-    A constant fill larger than the plan-time budget raises
-    :class:`UnsupportedNode` with the tensor's shape, its byte count and the
-    limit it missed; an unfurled tensor of that size would be copied twice on
-    a 1 GiB board.
+    A constant fill larger than ``limit`` (one tensor) or ``budget`` (all of
+    them) raises :class:`UnsupportedNode` with the tensor's shape, its byte
+    count and the limit it missed.  The runner passes its client arena for
+    both: weights that do not fit the arena cannot run in it, and the fold
+    would copy them twice on a 1 GiB board.
 
     Returns ``(model, folded_node_names)``.  The input model object is
     returned unchanged when there is nothing to fold.
@@ -214,9 +216,8 @@ def fold_plan_constants(model):
     refused = []
     # An initialiser may be a graph output, so a constant fill that *is* the
     # output folds too; the value is in the initialiser table either way.
-    st = _fold_constants(graph, ops=PLAN_FOLD_OPS, budget=PLAN_FOLD_BYTES,
-                         limit=MAX_FOLD_BYTES, refused=refused,
-                         keep_outputs=False)
+    st = _fold_constants(graph, ops=PLAN_FOLD_OPS, budget=budget,
+                         limit=limit, refused=refused, keep_outputs=False)
     if refused:
         name, shape, nbytes, why = refused[0]
         raise UnsupportedNode(
@@ -262,7 +263,22 @@ def _fold_constants(graph, ops=FOLD_OPS, budget=MAX_FOLD_BYTES,
     st = RuleStat("constant-fold")
     before = len(graph.nodes)
     folded = {}
+    start_budget = budget
     keep = []
+
+    def refuse(node, shape, nbytes):
+        """Record why a constant could not be folded, without materialising it."""
+        if refused is None:
+            return
+        if nbytes > limit:
+            why = ("over the %.1f MiB single-tensor limit"
+                   % (limit / 2.0 ** 20))
+        else:
+            why = ("over the %.1f MiB plan-time fold budget "
+                   "(%.1f MiB of weights folded before it)"
+                   % (start_budget / 2.0 ** 20,
+                      (start_budget - budget) / 2.0 ** 20))
+        refused.append((node.name, list(shape), int(nbytes), why))
     for node in graph.nodes:
         op = node.op_type
         outs = [o for o in node.proto.output if o]
@@ -284,6 +300,23 @@ def _fold_constants(graph, ops=FOLD_OPS, budget=MAX_FOLD_BYTES,
         if not ok:
             keep.append(node)
             continue
+        # A constant fill's size follows from its shape input, so a tensor
+        # that is over the budget is refused before it is allocated.  VGG-19's
+        # 25088x4096 fill is 392 MiB: allocating it only to discard it is what
+        # made the probe swap on a 1 GiB board.
+        if op in PLAN_FOLD_OPS and node.proto.input and \
+                graph.is_const(node.proto.input[0]):
+            dims = [int(v) for v in
+                    np.asarray(graph.const(node.proto.input[0])).ravel()]
+            if dims and all(d >= 0 for d in dims):
+                val = node.attr("value")
+                itemsize = (np.asarray(val).dtype.itemsize
+                            if val is not None else 4)
+                nbytes = int(np.prod(dims)) * itemsize
+                if nbytes > limit or nbytes > budget:
+                    refuse(node, dims, nbytes)
+                    keep.append(node)
+                    continue
         arr = graph.eval_const(node, {**graph.initializers, **folded})
         if arr is None or arr.dtype == object:
             keep.append(node)
@@ -291,11 +324,7 @@ def _fold_constants(graph, ops=FOLD_OPS, budget=MAX_FOLD_BYTES,
         if arr.dtype == np.float64:
             arr = arr.astype(np.float32)
         if arr.nbytes > limit or arr.nbytes > budget:
-            if refused is not None:
-                why = ("over the %d MiB single-tensor limit" % (limit >> 20)
-                       if arr.nbytes > limit else
-                       "over the remaining %d MiB fold budget" % (budget >> 20))
-                refused.append((node.name, list(arr.shape), arr.nbytes, why))
+            refuse(node, arr.shape, arr.nbytes)
             keep.append(node)
             continue
         budget -= arr.nbytes

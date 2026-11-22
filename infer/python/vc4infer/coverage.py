@@ -378,7 +378,8 @@ def _check_constantofshape(node, shapes, inits):
     shape = inits.get(name)
     if not shape:
         return ("unsupported",
-                "shape input %r is not a plan-time constant" % (name or "<none>",))
+                "shape input %r is not a plan-time constant"
+                % (name or "<none>",))
     return ("supported", "constant fill %s folded at plan time"
             % "x".join(str(int(d)) for d in shape))
 

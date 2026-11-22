@@ -729,7 +729,8 @@ def test_plan_constant_fold():
 
 
 def test_plan_fold_matches_materialise():
-    """The corpus fold produces the same bytes as benchmodels/materialise.py."""
+    """The corpus fold produces the same bytes as benchmodels/materialise.py.
+    """
     print("corpus fold vs materialise.py")
     path = _light("light_squeezenet.onnx")
     if path is None:
@@ -741,7 +742,8 @@ def test_plan_fold_matches_materialise():
     n = materialise.materialise(path, out)
     ref = onnx.load(out)
     folded, names = O.fold_plan_constants(onnx.load(path))
-    check(len(names) == n == 39, "%d nodes folded in both (%d)" % (len(names), n))
+    check(len(names) == n == 39,
+          "%d nodes folded in both (%d)" % (len(names), n))
     fi = {t.name: numpy_helper.to_array(t) for t in folded.graph.initializer}
     ri = {t.name: numpy_helper.to_array(t) for t in ref.graph.initializer}
     bad = [k for k in fi if k not in ri or

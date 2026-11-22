@@ -44,12 +44,14 @@ the engine: 96 MiB requested, 93.0 usable after the daemon's own reservation.
 The library is `infer/build/libvc4infer.so.1` built from this tree: the
 installed copy predates the autotune entry point and cannot be loaded by the
 current binding.  The re-runs of the fixed models and the operator
-sweep started at 58.0-60.7 C and peaked at 60.1-65.0 C under the same guard;
+sweep started at 56.9-60.7 C and peaked at 59.1-70.4 C under the same guard;
 the rows carried over from the first sweep keep their original conditions.
 
-The three shipped models were re-run after the fixes for parity, not to replace
-their times: max abs 6.9e-06 / 3.8e-06 / 2.6e-07 and 43 / 19 / 9 launches, the
-same as the table below.
+The three shipped models were re-run on the rebased tree for parity, not to
+replace their times: 29.6 / 16.8 / 6.2 ms, max abs 6.9e-06 / 3.8e-06 / 2.6e-07,
+and 43 / 21 / 9 launches.  The epilogue and operator-breadth merges on this
+base add two launches to modelB (19 -> 21) and 144 to SqueezeNet; the table's
+times for the shipped models are the first sweep's.
 
 Three cells did not fit the thermal envelope and carry no number: ResNet50 and
 VGG19 on the CPU, and FCN at 224x224 on the CPU.  The guard stopped the FCN
@@ -110,7 +112,7 @@ estimate of what the model would need.
 | **modelA** (shipped) | 3x32x32 | 87.0 k | **runs** | 2.4 | **29.8** | 12.4x | 6.9e-06 / 6.1e-06 |
 | **modelB** (shipped) | 16x32x32 | 6.0 k | **runs** | 1.8 | **17.2** | 9.7x | 3.8e-06 / 2.1e-06 |
 | **modelC** (shipped) | 16x8x8 | 2.4 k | **runs** | 0.2 | **6.2** | 30x | 2.6e-07 / 2.5e-07 |
-| SqueezeNet (as published) | 3x224x224 | 1.24 M | **runs** | 94.7 | **2889.4** | 30.5x | 0.0 / 0.0 |
+| SqueezeNet (as published) | 3x224x224 | 1.24 M | **runs** | 92.1 | **2892.7** | 31.4x | 0.0 / 0.0 |
 | ShuffleNet (as published) | 3x224x224 | 1.42 M | refused: grouped conv | 65.5 | — | — | — |
 | Inception v1 (as published) | 3x224x224 | 7.0 M | refused: arena (~104 MiB) | 336.7 | — | — | — |
 | Inception v2 (as published) | 3x224x224 | 11.2 M | refused: arena (~135 MiB) | 440.7 | — | — | — |
@@ -122,7 +124,7 @@ estimate of what the model would need.
 
 The four graphs in this table that execute on the QPUs are the three shipped
 models and SqueezeNet.  Launches and QPU busy time: modelA 43 / 12.6 ms,
-modelB 19 / 5.2 ms, modelC 9 / 0.8 ms, SqueezeNet 7633 / 763.8 ms.  The error
+modelB 21 / 5.3 ms, modelC 9 / 0.9 ms, SqueezeNet 7777 / 768.6 ms.  The error
 is against ONNX Runtime on the same random input, not against a labelled
 image; `modelA` is a 10-class softmax, `modelB` a 16-channel feature map,
 `modelC` a 4-class softmax and SqueezeNet a 1000-class softmax.

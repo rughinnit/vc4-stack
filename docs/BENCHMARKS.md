@@ -723,14 +723,14 @@ three ONNX Model Zoo models (super-resolution, style transfer, int8
 segmentation).  Full tables, exact refusal strings and the corpus caveat are in
 [`MODELS.md`](MODELS.md).  Conditions: engine 1.2.10, managed, 96 MiB client
 arena, ONNX Runtime 1.32.0 on four threads, 3 warm-ups + 5 timed, guard
-`--max 71`; starts 58.0-60.7 C, peaks 60.1-65.0 C, core 400 MHz.  The re-run
+`--max 71`; starts 56.9-60.7 C, peaks 59.1-70.4 C, core 400 MHz.  The re-run
 of the three fixed models used `infer/build/libvc4infer.so.1`; the installed
 copy predates the autotune entry point.
 
 | group | graphs | run on VC4 | headline |
 |---|---:|---:|---|
 | shipped small models | 3 | **3** | 29.8 / 17.2 / 6.2 ms; CPU 2.4 / 1.8 / 0.2 ms (12.4x / 9.7x / 30x); max abs 6.9e-06 / 3.8e-06 / 2.6e-07 |
-| ImageNet corpus, 224x224 | 9 | **1** | SqueezeNet runs: 2889.4 ms VC4, 94.7 ms CPU, 1000/1000 outputs bit-identical; 3 stop on the arena (104-135 MiB), 4 on weight tensors of 144-392 MiB, 1 on grouped-conv alignment |
+| ImageNet corpus, 224x224 | 9 | **1** | SqueezeNet runs: 2892.7 ms VC4, 92.1 ms CPU, 1000/1000 outputs bit-identical; 3 stop on the arena (104-135 MiB), 4 on weight tensors of 144-392 MiB, 1 on grouped-conv alignment |
 | Model Zoo, other tasks | 3 | 0 | super-resolution needs 147 MiB of conv scratch (its `Cin=1` conv now plans 12/12); style transfer needs 540 MiB of 9x9-conv scratch; segmentation is int8 (`QLinearConv`) |
 
 The corpus graphs are topology-only: every weight is a `ConstantOfShape` node

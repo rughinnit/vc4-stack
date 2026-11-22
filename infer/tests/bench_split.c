@@ -75,7 +75,7 @@ static int one(vc4_ctx *ctx, int M, int N, int K, int reps)
                         ctx->gpu_bus + P.off, Mp / 8u, 0) != VC4_OK ||
         vc4__gemm_run_q(ctx, Mp, Np, Kp, vc4_bus_addr(ctx, &B),
                         vc4_bus_addr(ctx, &C), ctx->gpu_bus + P.off, 0,
-                        VC4_ACT_NONE) != VC4_OK)
+                        VC4_ACT_NONE, 0) != VC4_OK)
         return -1;
 
     uint64_t cyc0 = ctx->st.gpu_cycles;
@@ -88,7 +88,7 @@ static int one(vc4_ctx *ctx, int M, int N, int K, int reps)
         double t1 = now_ms();
         if (vc4__gemm_run_q(ctx, Mp, Np, Kp, vc4_bus_addr(ctx, &B),
                             vc4_bus_addr(ctx, &C), ctx->gpu_bus + P.off, 0,
-                            VC4_ACT_NONE) != VC4_OK)
+                            VC4_ACT_NONE, 0) != VC4_OK)
             return -1;
         double t2 = now_ms();
         pack[r] = (double)(ctx->st.pack_ns - p0) / 1e6;

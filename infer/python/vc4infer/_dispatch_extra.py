@@ -146,7 +146,9 @@ class _Base:
         """
         t = self.r._panel_get(key)
         if t is None:
-            t = self.r.upload(np.ascontiguousarray(arr, dtype=np.float32))
+            t = self.r._panel_alloc(
+                key, lambda: self.r.upload(
+                    np.ascontiguousarray(arr, dtype=np.float32)))
             self.r._panels[key] = t
         return t
 

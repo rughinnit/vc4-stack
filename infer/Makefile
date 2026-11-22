@@ -18,7 +18,7 @@ LIB   = $(BUILD)/libvc4infer.a
 # same library: the op registry dispatches to them.
 SRC   = src/vc4_gen.c src/vc4_dev.c src/vc4_dev_remote.c src/vc4_kern.c src/vc4_gemm.c \
         src/vc4_ew.c src/vc4_conv.c src/vc4_nhwc.c src/vc4_api.c \
-        src/vc4_guard.c src/vc4_autotune.c \
+        src/vc4_guard.c src/vc4_autotune.c src/vc4_plan.c \
         ../training/src/vc4_convbwd.c ../training/src/vc4_train.c ../training/src/vc4_bwd.c
 OBJ   = $(addprefix $(BUILD)/,$(notdir $(SRC:.c=.o)))
 
@@ -35,7 +35,7 @@ HDRS  = $(wildcard src/*.h) $(wildcard include/*.h) \
 
 # every binary run_tests.sh runs is built by `make`: a release is built
 # from a clean tree, and a test the build forgot is a test that never ran.
-TESTS = $(BUILD)/test_matmul $(BUILD)/bench_split $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_onnxops $(BUILD)/test_nhwc $(BUILD)/test_copyops $(BUILD)/test_coherency $(BUILD)/test_gate $(BUILD)/test_gated $(BUILD)/test_daemon_recover $(BUILD)/test_daemon_arena $(BUILD)/test_daemon_reap $(BUILD)/test_direct_lock $(BUILD)/bench_matmul $(BUILD)/test_daemon_kernels $(BUILD)/test_daemon_uni $(BUILD)/test_autotune $(BUILD)/bench_autotune
+TESTS = $(BUILD)/test_matmul $(BUILD)/bench_split $(BUILD)/test_conv $(BUILD)/test_ew $(BUILD)/test_dispatch $(BUILD)/test_softmax_probe $(BUILD)/test_softmax_count $(BUILD)/test_onnxops $(BUILD)/test_nhwc $(BUILD)/test_copyops $(BUILD)/test_coherency $(BUILD)/test_gate $(BUILD)/test_gated $(BUILD)/test_daemon_recover $(BUILD)/test_daemon_arena $(BUILD)/test_daemon_reap $(BUILD)/test_direct_lock $(BUILD)/bench_matmul $(BUILD)/test_daemon_kernels $(BUILD)/test_daemon_uni $(BUILD)/test_autotune $(BUILD)/test_plan $(BUILD)/bench_autotune
 TRAIN_TESTS = $(BUILD)/test_train_ops $(BUILD)/test_grad $(BUILD)/test_train $(BUILD)/test_convgrad $(BUILD)/test_convnet $(BUILD)/test_bwd_one
 
 all: $(LIB) $(BUILD)/libvc4infer.so $(BUILD)/libvc4infer.so.1 $(TESTS) $(TRAIN_TESTS)

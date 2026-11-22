@@ -119,6 +119,14 @@ vc4_status vc4__remote_upload(vc4_ctx *ctx, vc4_buf *b, const void *src,
 vc4_status vc4__remote_download(vc4_ctx *ctx, const vc4_buf *b, void *dst,
                                 size_t bytes);
 void       vc4__remote_l2_flush(vc4_ctx *ctx);
+/* optional launch-path profiler (vc4_dev_remote.c) */
+const void *vc4_prof_ptr(void);
+void       vc4_prof_reset(void);
+void       vc4_prof_report(void);
+int        vc4_prof_enabled(void);
+uint64_t   vc4_prof_now(void);
+void       vc4_prof_add(int which, uint64_t ns);
+void       vc4_prof_bytes(int which, uint64_t n);
 void       vc4__remote_mark(vc4_ctx *ctx, uint32_t off, size_t bytes);
 void       vc4__remote_scratch_reset(vc4_ctx *ctx);
 void       vc4__mark_dirty(vc4_ctx *ctx, uint32_t off, size_t bytes);

@@ -499,6 +499,13 @@ def rec_matmul(op, rng, o):
            {"A": arr(rng, (1000, 169), -1, 1)},
            {"B": arr(rng, (169, 1), -1, 1)},
            note="125 eight-row units: the A panel cannot use 4 QPUs"),
+        # A C row pitch above 16384 floats does not fit the 8x64 store's
+        # 16-bit memory stride.  M=1 stayed exact because only row 0 of each
+        # tile was copied out; M=4 was wrong by 0.7-3.5 on rows 1 and 3.
+        sp(op, "wide_4x16385", ["A", "B"],
+           {"A": arr(rng, (4, 16), -1, 1)},
+           {"B": arr(rng, (16, 16385), -1, 1)},
+           note="row pitch above 16384 floats: the compact C tile layout"),
     ]
 
 

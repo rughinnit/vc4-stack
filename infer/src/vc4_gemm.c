@@ -89,7 +89,7 @@ vc4_status vc4__gemm_run(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                          uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus)
 {
     return vc4__gemm_run_q(ctx, M, N, K, b_bus, c_bus, panel_bus, 0,
-                           VC4_ACT_NONE);
+                           VC4_ACT_NONE, 0);
 }
 
 /* The activation's part of a blob name (empty for none).  A kernel with an
@@ -104,6 +104,13 @@ static void act_suffix(char *out, size_t n, int act)
     snprintf(out, n, "_a%d", act);
 }
 
+/* A row-major C row pitch of N*4 bytes needs (N-16)*4 in the VDW store's
+ * 16-bit memory-stride field (vpmwords.vdw_stride), which only fits while
+ * N <= 16384.  Wider results are written as one dense 8x64 tile per (row
+ * block, column block) and unpacked here: the tile pitch is 64 floats, so
+ * the stride is 192 and the field cannot overflow. */
+int vc4__matmul_compact(uint32_t N) { return N > 16384u; }
+
 /* The asm10 GEMM's blob name.  Shared with the autotuner, which names the
  * kernel its recorded parameters select. */
 void vc4__matmul_kernel_name(char *out, size_t n, uint32_t M, uint32_t N,
@@ -111,12 +118,13 @@ void vc4__matmul_kernel_name(char *out, size_t n, uint32_t M, uint32_t N,
 {
     char sfx[8];
     act_suffix(sfx, sizeof(sfx), act);
-    snprintf(out, n, "gemm10_%u_%u_%u_q%d%s", M, N, K, nq, sfx);
+    snprintf(out, n, "gemm10_%u_%u_%u_q%d%s%s", M, N, K, nq, sfx,
+             vc4__matmul_compact(N) ? "_c" : "");
 }
 
 vc4_status vc4__gemm_run_q(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
                            uint32_t b_bus, uint32_t c_bus, uint32_t panel_bus,
-                           int gemm_q, int act)
+                           int gemm_q, int act, uint32_t c_rb)
 {
     if (M % 8 || N % 64 || K % 16)
         return VC4_ERR_INVAL;
@@ -136,15 +144,19 @@ vc4_status vc4__gemm_run_q(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
     if (nq < 1 || nq > VC4_MAX_QPU || (uint32_t)nq > tr)
         return VC4_ERR_INVAL;
 
-    char name[80], nm[16], nn[16], nk[16], nkpu[8], nact[8];
+    const int compact = vc4__matmul_compact(N);
+    if (!c_rb)
+        c_rb = 8u * N * 4u;
+    char name[80], nm[16], nn[16], nk[16], nkpu[8], nact[8], ncmp[4];
     char *argv[] = { (char *)"gemm", (char *)"--M", nm, (char *)"--N", nn,
                      (char *)"--K", nk, (char *)"--nqpu", nkpu,
-                     (char *)"--act", nact, NULL };
+                     (char *)"--act", nact, (char *)"--compact", ncmp, NULL };
     snprintf(nm, sizeof(nm), "%u", M);
     snprintf(nn, sizeof(nn), "%u", N);
     snprintf(nk, sizeof(nk), "%u", K);
     snprintf(nkpu, sizeof(nkpu), "%d", nq);
     snprintf(nact, sizeof(nact), "%d", act);
+    snprintf(ncmp, sizeof(ncmp), "%d", compact ? 1 : 0);
     vc4__matmul_kernel_name(name, sizeof(name), M, N, K, nq, act);
 
     vc4_kernel *k = NULL;
@@ -153,7 +165,6 @@ vc4_status vc4__gemm_run_q(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
         return st;
 
     const uint32_t a_rb = 32u * K;             /* one 8-row panel block     */
-    const uint32_t c_rb = 8u * N * 4u;         /* 8 C rows                  */
     for (int i = 0; i < nq; ++i) {
         uint32_t *u = vc4__uni(ctx, k, i);
         u[0] = panel_bus;
@@ -175,6 +186,31 @@ vc4_status vc4__gemm_run_q(vc4_ctx *ctx, uint32_t M, uint32_t N, uint32_t K,
 
 /* zero-fill helper for padded scratch copies */
 static void zero(uint8_t *p, size_t bytes) { memset(p, 0, bytes); }
+
+/* Scatter the compact tile layout into a row-major [M][N] result.
+ *
+ * The kernel writes one dense 8x64 tile per (row block, column block):
+ * tile(rb, cb) at ((rb * NCB) + cb) * 2048, rows of 256 bytes inside it.
+ * Both streams are sequential, so the copy is a row of 256-byte copies. */
+static void unpack_compact(uint8_t *dst, const uint8_t *src, uint32_t M,
+                           uint32_t N, uint32_t Np)
+{
+    const uint32_t cb_n = Np / 64u;
+    const uint32_t rb_n = (M + 7u) / 8u;
+    for (uint32_t rb = 0; rb < rb_n; ++rb) {
+        const uint32_t rows = M - rb * 8u > 8u ? 8u : M - rb * 8u;
+        for (uint32_t cb = 0; cb < cb_n; ++cb) {
+            const uint32_t col0 = cb * 64u;
+            if (col0 >= N)
+                break;
+            const uint32_t cols = N - col0 > 64u ? 64u : N - col0;
+            const uint8_t *tile = src + ((size_t)rb * cb_n + cb) * 2048u;
+            for (uint32_t r = 0; r < rows; ++r)
+                memcpy(dst + (size_t)(rb * 8u + r) * N * 4u +
+                       (size_t)col0 * 4u, tile + r * 256u, (size_t)cols * 4u);
+        }
+    }
+}
 
 vc4_status vc4__matmul_tuned(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
                              vc4_buf *C, uint32_t M, uint32_t N, uint32_t K,
@@ -246,10 +282,14 @@ vc4_status vc4__matmul_tuned(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
         b_src_bus = ctx->gpu_bus + (uint32_t)((uint8_t *)bp - ctx->arena);
     }
 
-    /* C: the GEMM writes full 8x64 tiles */
+    /* C: the GEMM writes full 8x64 tiles.  Above 16384 columns the row pitch
+     * does not fit the store's 16-bit stride, so the kernel writes a compact
+     * tile layout instead (see vc4__matmul_compact). */
+    const int compact = vc4__matmul_compact(Np);
+    const uint32_t c_rb = compact ? Np * 32u : 8u * Np * 4u;
     uint32_t c_dst_bus = c_bus;
     float *c_tmp = NULL;
-    if (Mp != M || Np != N) {
+    if (Mp != M || Np != N || compact) {
         c_tmp = vc4__scratch_alloc(ctx, (size_t)Mp * Np * 4, NULL);
         if (!c_tmp)
             return VC4_ERR_NOMEM;
@@ -264,13 +304,18 @@ vc4_status vc4__matmul_tuned(vc4_ctx *ctx, const vc4_buf *A, const vc4_buf *B,
         return st;
     }
     st = vc4__gemm_run_q(ctx, Mp, Np, Kp, b_src_bus, c_dst_bus,
-                         ctx->gpu_bus + pb.off, p ? (int)p->gemm_q : 0, act);
+                         ctx->gpu_bus + pb.off, p ? (int)p->gemm_q : 0, act,
+                         c_rb);
     if (st == VC4_OK && c_tmp) {
         vc4__l2_flush(ctx);
         vc4__invalidate_off(ctx, C->off, (size_t)M * N * 4);
-        for (uint32_t r = 0; r < M; ++r)
-            memcpy(ctx->arena + C->off + (size_t)r * N * 4,
-                   (uint8_t *)c_tmp + (size_t)r * Np * 4, (size_t)N * 4);
+        if (compact)
+            unpack_compact(ctx->arena + C->off, (const uint8_t *)c_tmp, M, N,
+                           Np);
+        else
+            for (uint32_t r = 0; r < M; ++r)
+                memcpy(ctx->arena + C->off + (size_t)r * N * 4,
+                       (uint8_t *)c_tmp + (size_t)r * Np * 4, (size_t)N * 4);
         vc4__mark_dirty(ctx, C->off, (size_t)M * N * 4);
     }
     vc4__scratch_reset(ctx);

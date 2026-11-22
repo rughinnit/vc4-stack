@@ -15,6 +15,28 @@ here, or a fork of an upstream project that this stack improves.
 | `rughinnit/VC4CL` | OpenCL runtime. Debian 13 fixes, unprivileged operation, the M21 GEMM investigation | branches `fix/debian13-*`, `docs/m21-gemm-findings`; **3.085 GFLOP/s** with the improved compiler | `.deb` for VC4CL |
 | `rughinnit/VC4CLStdLib` | GPU-side OpenCL standard library used by VC4C/VC4CL | unmodified upstream plus the toolchain notes | — |
 
+## What lives inside this repository
+
+The main repository is one product tree rather than a collection of unrelated
+projects: everything below is built, tested and measured together, and the
+directories are not separately versioned.
+
+| path | what it is | start here | status |
+|---|---|---|---|
+| `infer/` | **libvc4infer + vc4infer** — the engine (dma-buf arena, kernel JIT/cache, strict op registry, matmul/conv/elementwise), the ONNX executor, the Python API, the CLI, and the `.deb`/wheel builders | [`infer/README.md`](../infer/README.md), [`VC4INFER.md`](VC4INFER.md) | active — vc4infer **1.2.1**; YOLOv8n 160x160 runs end to end on the QPUs at **2.09 FPS** (stock clocks, quiet board) |
+| `torch/` | **torch_vc4** — the PyTorch `PrivateUse1` backend: compiled extension over the same engine and `vc4d`, the aten subset, autograd, the op table | [`torch/README.md`](../torch/README.md), [`torch/COMPLETENESS.md`](../torch/COMPLETENESS.md) | feature-complete for its declared subset — 48 registration checks, 244 completeness checks on silicon |
+| `kernels/` | hand-written QPU kernels: `wider-tile/asm6..asm10`, each with its NOTES/RESULTS and generator, plus the `attempt-asm10` history | [`kernels/wider-tile/`](../kernels/wider-tile) | verified, frozen (results in `kernels/wider-tile/RESULTS*.md`) |
+| `training/` | backward kernels (`vc4_train.c`, `vc4_convbwd.c`) and the MLP/conv trainer with finite-difference checks | [`training/README.md`](../training/README.md) | toy scale; gradients verified |
+| `tools/` | `build-fast.sh` (memory-aware `-j` + ccache), `qpu_disasm.py`, `xcheck/` (four independent encoders), `gput.sh` (locked GPU run + board check) | script headers | in use |
+| `vc4d/` | privileged helper daemon (protocol v2): `/dev/mem` and V3D dispatch in one small root process that drops capabilities, so the engine runs unprivileged | [`vc4d/README.md`](../vc4d/README.md) | stable; 82/82 hostile cases |
+| `docs/` | the single source of documentation | [`docs/README.md`](README.md) | — |
+
+`infer/` is one product directory: `src/` and `include/` are the C library,
+`python/vc4infer/` is the installable package, `cli/` holds the `/usr/bin/vc4infer`
+entry point, and `tests/`, `examples/`, `packaging/` and `pyproject.toml` belong
+to the same product.  The backward kernels are compiled into the same library
+from `training/src/`.
+
 ## How they fit together
 
 Two execution paths and one distribution channel:
@@ -56,6 +78,20 @@ Two execution paths and one distribution channel:
 
 The state of every workstream, with the file or test behind it, is in
 [STATUS.md](STATUS.md).
+
+## Old paths (for older links)
+
+| was | now |
+|---|---|
+| `engine/` (sources, Makefile, tests, tools, blobs, kcaches) | `infer/` |
+| `engine/attempt-asm10/` | `kernels/attempt-asm10/` |
+| `engine/RESULTS*.md`, `engine/*.log` | `docs/results/`, `docs/logs/` |
+| `onnx/` (exporter, verifier, coverage, bench, executor wrapper) | `infer/tools/onnx/` |
+| `vc4infer/` (Python package) | `infer/python/vc4infer/` |
+| `pyproject.toml` | `infer/pyproject.toml` |
+| `cli/`, `examples/`, `packaging/` | `infer/cli/`, `infer/examples/`, `infer/packaging/` |
+| `engine/src/vc4_train.c`, `vc4_convbwd.c`, training tests | `training/src/`, `training/tests/` |
+| the `torch-vc4` repository (backend, tests, `COMPLETENESS.md`) | `torch/` (history grafted; the repository is a mirror) |
 
 ## Rules this family follows
 

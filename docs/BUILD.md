@@ -180,3 +180,40 @@ was small (478.7 ms mean).
 Still tmpfs and deliberately so: `/run` (200 MB, sockets/state) and `/dev/shm`
 (500 MB, POSIX shared memory).  Do not put model data or build output there
 either.
+
+## Building and running from a checkout
+
+The packages are built from the same tree; this is the developer path, with the
+same targets `packaging/` runs:
+
+```sh
+make -C infer -j4                            # libvc4infer.a/.so + all tests
+python3 infer/tools/check_math.py            # GPU-free: kernel formulas vs Python
+
+infer/run_tests.sh                           # full serialised suite (root, /dev/mem)
+REPS=5 VC4INFER_DAEMON=1 infer/run_tests.sh  # same, unprivileged through vc4d
+
+infer/cli/vc4infer nodes infer/packaging/vc4infer/data/models/modelA.onnx
+infer/packaging/vc4infer/build_deb.sh        # -> dist/vc4infer_<ver>_arm64.deb
+infer/packaging/build_wheel.sh               # -> dist/vc4infer-<ver>-py3-none-any.whl
+
+make -C torch                                # -> dist/torch_vc4-<ver>-cp313-...whl
+```
+
+`make -C torch` (equivalently `packaging/build_torch_wheel.sh`) builds the
+PyTorch backend wheel into the same shared `dist/` from `torch/`, against this
+checkout's `infer/` and `vc4d/` builds.  It needs an interpreter with torch
+`2.15.0+cpu` installed and refuses to run with a message naming what is
+missing; `make -C infer` does not depend on it (nor on torch being present).
+`packaging/publish_apt.sh` copies `dist/torch_vc4-*.whl` into `vc4-apt/pip/`
+under its unchanged name.
+
+**One GPU user at a time.**  Two concurrent workloads, or a wild kernel, can
+hang the V3D hard enough to need a power cycle.  In daemon mode `vc4d` takes
+`/tmp/vc4-gpu.lock` per launch; a client must **not** hold that lock itself
+(the daemon answers `E_BUSY` and the engine retries for ~60 s).  The direct-root
+test suite takes the lock itself and checks `STATE: LIVE` after every stage.
+See [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) section 4.
+
+Job counts are the ones measured above: `-j4` for the plain-C engine on a quiet
+board, `-j2` (or `-j1` shared) for the VC4C compiler, ccache on both.

@@ -220,95 +220,97 @@ unchanged until a pass is enabled.  To gate a pass, run the sweep and the
 model with the same `VC4_OPT` value.  The QPU is exclusive: check `ps` and
 `systemctl is-active vc4d` first and run nothing else while this runs.
 
-    ssh raspberrypi
-    cd ~/work/vc4-opt
-    export TMPDIR=$HOME/scratch/tmp
-    mkdir -p $TMPDIR/optmatrix
+```bash
+ssh raspberrypi
+cd ~/work/vc4-opt
+export TMPDIR=$HOME/scratch/tmp
+mkdir -p $TMPDIR/optmatrix
 
-    # 1. operator sweep, every pass on.  Expected: 152 complete / 152
-    #    expressible, 0 vc4-limited, 0 refused, 0 mismatch, 0 hang.
-    #    (--out-dir keeps docs/completeness.json untouched.)
-    VC4_OPT=all python3 infer/tools/op_matrix.py \
-        --out-dir $TMPDIR/optmatrix --work-dir $TMPDIR/optmatrix/work
+# 1. operator sweep, every pass on.  Expected: 152 complete / 152
+#    expressible, 0 vc4-limited, 0 refused, 0 mismatch, 0 hang.
+#    (--out-dir keeps docs/completeness.json untouched.)
+VC4_OPT=all python3 infer/tools/op_matrix.py \
+    --out-dir $TMPDIR/optmatrix --work-dir $TMPDIR/optmatrix/work
 
-    # 2. the fixed input and the CPU reference (deterministic, rng(0))
-    python3 - <<'PY'
-    import sys
-    import numpy as np
-    sys.path.insert(0, "infer/tools/onnx")
-    import ref_onnx
-    x = np.random.default_rng(0).standard_normal((1, 3, 160, 160))
-    x = x.astype(np.float32)
-    np.save("yolo160_in.npy", x)
-    out, = ref_onnx.run_model(
-        "infer/packaging/vc4infer/data/models/yolov8n_160.onnx", {"images": x})
-    np.save("yolo160_ref.npy", np.asarray(out, np.float32))
-    PY
+# 2. the fixed input and the CPU reference (deterministic, rng(0))
+python3 - <<'PY'
+import sys
+import numpy as np
+sys.path.insert(0, "infer/tools/onnx")
+import ref_onnx
+x = np.random.default_rng(0).standard_normal((1, 3, 160, 160))
+x = x.astype(np.float32)
+np.save("yolo160_in.npy", x)
+out, = ref_onnx.run_model(
+    "infer/packaging/vc4infer/data/models/yolov8n_160.onnx", {"images": x})
+np.save("yolo160_ref.npy", np.asarray(out, np.float32))
+PY
 
-    # 3. one profiled run with every pass on: tolerance, detections, launches,
-    #    and the per-node rows that step 4 checks the plan model against.
-    #    Random fixed input: over_tolerance 0 / 44,100, max_abs <= 2.1e-2,
-    #    max_rel (|ref| >= 1) <= 3.3e-4, no detections on either side.
-    #    Image input, when YOLO_IMAGE exists (default the bus.jpg used in
-    #    docs/ACCURACY.md): 4 detections, same classes, max box difference
-    #    0.00 px, max score difference <= 1e-4.
-    #    launches 802 (unchanged by the passes).
-    YOLO_IMAGE=${YOLO_IMAGE:-$HOME/scratch/refs/yolo/bus.jpg}
-    VC4_OPT=all YOLO_IMAGE=$YOLO_IMAGE python3 - <<'PY'
-    import json
-    import os
-    import sys
-    import numpy as np
-    import vc4infer
-    from vc4infer.postprocess import Letterbox, decode_yolo
-    sys.path.insert(0, "infer/tools/onnx")
-    import ref_onnx
-    model = "infer/packaging/vc4infer/data/models/yolov8n_160.onnx"
-    eng = vc4infer.Engine(model, passes="all")
-    name = eng.inputs[0].name
+# 3. one profiled run with every pass on: tolerance, detections, launches,
+#    and the per-node rows that step 4 checks the plan model against.
+#    Random fixed input: over_tolerance 0 / 44,100, max_abs <= 2.1e-2,
+#    max_rel (|ref| >= 1) <= 3.3e-4, no detections on either side.
+#    Image input, when YOLO_IMAGE exists (default the bus.jpg used in
+#    docs/ACCURACY.md): 4 detections, same classes, max box difference
+#    0.00 px, max score difference <= 1e-4.
+#    launches 802 (unchanged by the passes).
+YOLO_IMAGE=${YOLO_IMAGE:-$HOME/scratch/refs/yolo/bus.jpg}
+VC4_OPT=all YOLO_IMAGE=$YOLO_IMAGE python3 - <<'PY'
+import json
+import os
+import sys
+import numpy as np
+import vc4infer
+from vc4infer.postprocess import Letterbox, decode_yolo
+sys.path.insert(0, "infer/tools/onnx")
+import ref_onnx
+model = "infer/packaging/vc4infer/data/models/yolov8n_160.onnx"
+eng = vc4infer.Engine(model, passes="all")
+name = eng.inputs[0].name
 
-    def compare(x, tag):
-        ref, = ref_onnx.run_model(model, {name: x})
-        got = eng.run({name: x})["output0"]
-        r = np.asarray(ref, np.float64)
-        d = np.abs(got.astype(np.float64) - r)
-        tol = 5e-4 + 5e-4 * np.maximum(np.abs(r), 1.0)
-        a, b = decode_yolo(ref, imgsz=160), decode_yolo(got, imgsz=160)
-        out = {"input": tag, "over_tolerance": int((d > tol).sum()),
-               "elements": int(d.size), "max_abs": float(d.max()),
-               "max_rel": float((d / np.abs(r))[np.abs(r) >= 1].max()),
-               "detections_ref": len(a), "detections_vc4": len(b),
-               "classes_equal": [int(v) for v in a.classes] ==
-                                [int(v) for v in b.classes]}
-        if len(a) and len(a) == len(b):
-            out["max_box_diff"] = float(np.abs(a.boxes - b.boxes).max())
-            out["max_score_diff"] = float(np.abs(a.scores - b.scores).max())
-        return out
+def compare(x, tag):
+    ref, = ref_onnx.run_model(model, {name: x})
+    got = eng.run({name: x})["output0"]
+    r = np.asarray(ref, np.float64)
+    d = np.abs(got.astype(np.float64) - r)
+    tol = 5e-4 + 5e-4 * np.maximum(np.abs(r), 1.0)
+    a, b = decode_yolo(ref, imgsz=160), decode_yolo(got, imgsz=160)
+    out = {"input": tag, "over_tolerance": int((d > tol).sum()),
+           "elements": int(d.size), "max_abs": float(d.max()),
+           "max_rel": float((d / np.abs(r))[np.abs(r) >= 1].max()),
+           "detections_ref": len(a), "detections_vc4": len(b),
+           "classes_equal": [int(v) for v in a.classes] ==
+                            [int(v) for v in b.classes]}
+    if len(a) and len(a) == len(b):
+        out["max_box_diff"] = float(np.abs(a.boxes - b.boxes).max())
+        out["max_score_diff"] = float(np.abs(a.scores - b.scores).max())
+    return out
 
-    eng.run({name: np.load("yolo160_in.npy")})       # warm-up (kernel JIT)
-    res = [compare(np.load("yolo160_in.npy"), "rng0")]
-    img = os.environ.get("YOLO_IMAGE", "")
-    if img and os.path.isfile(img):
-        from PIL import Image
-        x, _meta = Letterbox(160)(Image.open(img).convert("RGB"))
-        res.append(compare(x, os.path.basename(img)))
-    print(json.dumps(res, indent=1))
-    eng.run({name: np.load("yolo160_in.npy")}, profile=True)   # launch count
-    print("launches", int(sum(p["launches"] for p in eng.last_profile)),
-          "nodes", len(eng.last_profile))
-    json.dump({"profile": [{"name": p["name"], "op": p["op"],
-                            "launches": p["launches"]}
-                           for p in eng.last_profile]},
-              open("yolo160_opt.json", "w"))
-    PY
+eng.run({name: np.load("yolo160_in.npy")})       # warm-up (kernel JIT)
+res = [compare(np.load("yolo160_in.npy"), "rng0")]
+img = os.environ.get("YOLO_IMAGE", "")
+if img and os.path.isfile(img):
+    from PIL import Image
+    x, _meta = Letterbox(160)(Image.open(img).convert("RGB"))
+    res.append(compare(x, os.path.basename(img)))
+print(json.dumps(res, indent=1))
+eng.run({name: np.load("yolo160_in.npy")}, profile=True)   # launch count
+print("launches", int(sum(p["launches"] for p in eng.last_profile)),
+      "nodes", len(eng.last_profile))
+json.dump({"profile": [{"name": p["name"], "op": p["op"],
+                        "launches": p["launches"]}
+                       for p in eng.last_profile]},
+          open("yolo160_opt.json", "w"))
+PY
 
-    # 4. the plan model against those rows (no device needed afterwards)
-    python3 infer/tools/plan_diff.py \
-        infer/packaging/vc4infer/data/models/yolov8n_160.onnx --passes all \
-        --profile yolo160_opt.json
-    # Expected: 0 exact-class mismatches.  Copy-class rows may differ while
-    # the layout-copy model is approximate; the tool names them and does not
-    # fail on them.
+# 4. the plan model against those rows (no device needed afterwards)
+python3 infer/tools/plan_diff.py \
+    infer/packaging/vc4infer/data/models/yolov8n_160.onnx --passes all \
+    --profile yolo160_opt.json
+# Expected: 0 exact-class mismatches.  Copy-class rows may differ while
+# the layout-copy model is approximate; the tool names them and does not
+# fail on them.
+```
 
 `yolo_bench.py ... --atol 5e-4 --rtol 5e-4 --repeat 5 --json` is the existing
 timing command and should be used for the wall-time figure that goes into

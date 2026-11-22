@@ -255,3 +255,317 @@ runs on the QPU.
 | `direct` backend | 2.03 → 2.43 FPS |
 | `/tmp` off tmpfs | 452 MB RAM returned; 1.84 → 2.09 FPS in that window |
 | `-O3 -march=native` ("fast" package) | **within noise (1.4–1.7 % slower)**; the win is 401 prewarmed blobs, zero JIT |
+
+
+## 14. YOLO matrix: six families × five sizes × three resolutions
+
+Measured 2026-11-22 on the board in §1: 905 MiB RAM, core pinned at 400 MHz,
+fanless, `vc4infer` 1.2.8 with `vc4d` 1.2.9.  Coverage is **45 of the 90
+nominal cells**.  Every one of those 45 has an ONNX Runtime CPU baseline; one
+runs on the VC4 engine.  The other 45 ended in an export memory limit, an
+arena refusal, or an unsupported operator, and each record carries the exact
+first refusal.  The machine-readable form is
+[`yolo-matrix.json`](yolo-matrix.json).
+
+**Models.**  `ultralytics` 8.4.215 provides v5u, v8, v9, v10, v11 and v12.
+"YOLOv5" here is the Ultralytics `yolov5*u.pt` re-export; the standalone
+`yolov5` package is not installed.  YOLOv9 was published as t/s/m/c/e, so the
+n column uses `yolov9t`, the x column uses `yolov9e`, and the l column has no
+checkpoint.  Sizes are the published n/s/m/l/x where they exist.
+
+**Export.**  torch 2.15.0+cpu, opset 17, batch 1, fixed `imgsz`,
+`simplify=False`, `device="cpu"`, one model at a time, `TMPDIR` on ext4.
+The requested cgroup guard is inert on this kernel: `/proc/cmdline` contains
+`cgroup_disable=memory`, root `cgroup.controllers` lists only
+`cpuset cpu io pids`, and a 300 MB allocation inside
+`systemd-run --scope --property=MemoryMax=100M` completed with no `memory.max`
+in the scope.  Exports therefore ran under a per-process RSS watchdog
+(`mem_watch.py`): 550 MiB for n/s at 160, 700 MiB for every other cell, and a
+hard stop at 80 MiB of board-wide MemAvailable.  The watchdog kills only that
+process group; rc=137 is recorded as `memory limit reached`, never as a crash.
+
+**Plan.**  `Engine.plan()` against the default daemon (96 MiB served, 64 MiB
+client arena).  A 150 MiB plan was attempted through a second `vc4d` on a
+private socket: requested at `--arena-mb 150`, it started with a **37 MiB**
+arena because CMA had 37 MiB free with the 96 MiB and 48 MiB daemons resident.
+Stopping the system daemon is excluded by the run rules, so there is no
+measured 150 MiB column.  Where the engine names a number ("about N MiB would
+do"), that number is recorded as the need, not as a measured fit.
+
+**Timing.**  Three warm-up and five timed images, the same fixed resize of the
+Ultralytics `bus.jpg` sample on both backends, `VC4INFER_DAEMON=1`, managed
+backend.  CPU is ONNX Runtime 1.32.0, `CPUExecutionProvider`,
+`intra_op_num_threads=4`, `inter_op_num_threads=1`.  Every run is wrapped in
+`tools/thermal-guard.sh --max 71`.  The first pass began with the SoC at 79 C
+and the guard killed 26 CPU and 32 VC4 runs at the limit; those records were
+discarded and every killed cell was re-run after cooling to 60 C.  No
+thermal-killed number appears below.  The one surviving VC4 row started at
+65.5 C and peaked at 67.1 C (`throttled=0x20000`, core 400 MHz).
+
+**Accuracy.**  The CPU output on the fixed image is the reference.  `max abs`
+is the largest elementwise difference over every graph output; `scaled` is the
+largest `|VC4-CPU|/(1+|CPU|)`; `det` is boxes after a 0.25 score threshold and
+class-wise NMS at 0.45, VC4/CPU; `box` is the largest matched corner delta in
+pixels (same class, IoU > 0.5).  **COCO mAP was not evaluated**; this is parity
+with the CPU graph, not detection quality.
+
+### Export
+
+| version | size | weights | 160 s / MiB | 320 s / MiB | 640 s / MiB |
+|---|---|---|---|---|---|
+| v5 | n | yolov5nu.pt | 29 / 10.2 | 29 / 10.2 | 32 / 10.3 |
+| v5 | s | yolov5su.pt | 32 / 34.9 | 25 / 35.0 | 32 / 35.1 |
+| v5 | m | yolov5mu.pt | 89 / 95.8 | — | — |
+| v5 | l | yolov5lu.pt | — | — | — |
+| v5 | x | yolov5xu.pt | — | — | — |
+| v8 | n | yolov8n.pt | 28 / 12.1 | 19 / 12.1 | 22 / 12.2 |
+| v8 | s | yolov8s.pt | 43 / 42.6 | 30 / 42.6 | 38 / 42.8 |
+| v8 | m | yolov8m.pt | — | — | — |
+| v8 | l | yolov8l.pt | — | — | — |
+| v8 | x | yolov8x.pt | — | — | — |
+| v9 | n | yolov9t.pt | 32 / 8.2 | 26 / 8.2 | 30 / 8.3 |
+| v9 | s | yolov9s.pt | 46 / 27.6 | 36 / 27.6 | 44 / 27.8 |
+| v9 | m | yolov9m.pt | 76 / 76.7 | 65 / 76.7 | — |
+| v9 | l | none | — | — | — |
+| v9 | x | yolov9e.pt | — | — | — |
+| v10 | n | yolov10n.pt | 23 / 8.8 | 20 / 8.9 | 24 / 9.0 |
+| v10 | s | yolov10s.pt | 32 / 27.7 | 28 / 27.8 | 38 / 27.9 |
+| v10 | m | yolov10m.pt | 64 / 58.7 | 49 / 58.7 | — |
+| v10 | l | yolov10l.pt | — | — | — |
+| v10 | x | yolov10x.pt | — | — | — |
+| v11 | n | yolo11n.pt | 24 / 10.1 | 21 / 10.1 | 25 / 10.2 |
+| v11 | s | yolo11s.pt | 36 / 36.1 | 34 / 36.1 | 39 / 36.2 |
+| v11 | m | yolo11m.pt | 92 / 76.7 | 68 / 76.8 | — |
+| v11 | l | yolo11l.pt | — | — | — |
+| v11 | x | yolo11x.pt | — | — | — |
+| v12 | n | yolo12n.pt | 29 / 10.0 | 25 / 10.0 | 35 / 10.2 |
+| v12 | s | yolo12s.pt | 41 / 35.5 | 34 / 35.5 | 47 / 35.6 |
+| v12 | m | yolo12m.pt | 85 / 77.1 | 72 / 77.1 | — |
+| v12 | l | yolo12l.pt | — | — | — |
+| v12 | x | yolo12x.pt | — | — | — |
+
+### Fit
+
+| version | size | 160 | 320 | 640 |
+|---|---|---|---|---|
+| v5 | n | unsupported op | needs 95 > 64 | needs 292 > 64 |
+| v5 | s | needs 96 > 64 | needs 146 > 64 | needs 348 > 64 |
+| v5 | m | needs 218 > 64 | — | — |
+| v5 | l | — | — | — |
+| v5 | x | — | — | — |
+| v8 | n | fits 64 (peak 42) | fits 64 (peak 85) | needs 126 > 64 |
+| v8 | s | needs 100 > 64 | needs 119 > 64 | needs 194 > 64 |
+| v8 | m | — | — | — |
+| v8 | l | — | — | — |
+| v8 | x | — | — | — |
+| v9 | n | fits 64 (peak 20) | fits 64 (peak 29) | needs 119 > 64 |
+| v9 | s | fits 64 (peak 63) | needs 89 > 64 | needs 164 > 64 |
+| v9 | m | needs 172 > 64 | needs 191 > 64 | — |
+| v9 | l | — | — | — |
+| v9 | x | — | — | — |
+| v10 | n | unsupported op | unsupported op | needs 141 > 64 |
+| v10 | s | needs 209 > 64 | needs 226 > 64 | needs 301 > 64 |
+| v10 | m | needs 263 > 64 | needs 283 > 64 | — |
+| v10 | l | — | — | — |
+| v10 | x | — | — | — |
+| v11 | n | unsupported op | unsupported op | needs 127 > 64 |
+| v11 | s | needs 103 > 64 | needs 122 > 64 | needs 197 > 64 |
+| v11 | m | needs 201 > 64 | needs 222 > 64 | — |
+| v11 | l | — | — | — |
+| v11 | x | — | — | — |
+| v12 | n | unsupported op | unsupported op | needs 141 > 64 |
+| v12 | s | needs 161 > 64 | needs 180 > 64 | needs 255 > 64 |
+| v12 | m | needs 298 > 64 | needs 326 > 64 | — |
+| v12 | l | — | — | — |
+| v12 | x | — | — | — |
+
+The need is the engine's own floor (weights, packed conv panels,
+largest tensor) plus its scratch reserve and 8 MiB; `fits` means the
+static plan accepted the graph at the 64 MiB client arena.
+
+### Performance
+
+#### 160 × 160
+
+| version | size | CPU ms | CPU FPS | VC4 ms | VC4 FPS | ratio | launches | error | status |
+|---|---|---:|---:|---:|---:|---:|---:|---|---|
+| v5 | n | 103.0 | 9.71 | — | — | — | — | — | unsupported on VC4 |
+| v5 | s | 237.4 | 4.21 | — | — | — | — | — | does not fit (needs 96 MiB) |
+| v5 | m | 555.0 | 1.80 | — | — | — | — | — | does not fit (needs 218 MiB) |
+| v5 | l | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v5 | x | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v8 | n | 108.2 | 9.24 | 521.0 | 1.92 | 4.8× | 802 | 1.5e-02 / 3.1e-04; 4/4 det; box 0.00 px | ok (64 MiB arena) |
+| v8 | s | 272.2 | 3.67 | — | — | — | — | — | does not fit (needs 100 MiB) |
+| v8 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v8 | l | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v8 | x | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v9 | n | 114.3 | 8.75 | — | — | — | — | — | unsupported on VC4 |
+| v9 | s | 283.5 | 3.53 | — | — | — | — | — | does not fit (runtime arena) |
+| v9 | m | 659.8 | 1.52 | — | — | — | — | — | does not fit (needs 172 MiB) |
+| v9 | l | — | — | — | — | — | — | — | not exportable (no upstream l weights) |
+| v9 | x | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v10 | n | 85.7 | 11.67 | — | — | — | — | — | unsupported on VC4 |
+| v10 | s | 223.4 | 4.48 | — | — | — | — | — | does not fit (needs 209 MiB) |
+| v10 | m | 508.7 | 1.97 | — | — | — | — | — | does not fit (needs 263 MiB) |
+| v10 | l | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v10 | x | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v11 | n | 93.3 | 10.71 | — | — | — | — | — | unsupported on VC4 |
+| v11 | s | 386.0 | 2.59 | — | — | — | — | — | does not fit (needs 103 MiB) |
+| v11 | m | 486.8 | 2.05 | — | — | — | — | — | does not fit (needs 201 MiB) |
+| v11 | l | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v11 | x | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v12 | n | 99.2 | 10.08 | — | — | — | — | — | unsupported on VC4 |
+| v12 | s | 383.5 | 2.61 | — | — | — | — | — | does not fit (needs 161 MiB) |
+| v12 | m | 598.3 | 1.67 | — | — | — | — | — | does not fit (needs 298 MiB) |
+| v12 | l | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v12 | x | — | — | — | — | — | — | — | not exportable (memory limit) |
+
+#### 320 × 320
+
+| version | size | CPU ms | CPU FPS | VC4 ms | VC4 FPS | ratio | launches | error | status |
+|---|---|---:|---:|---:|---:|---:|---:|---|---|
+| v5 | n | 274.5 | 3.64 | — | — | — | — | — | does not fit (needs 95 MiB) |
+| v5 | s | 764.3 | 1.31 | — | — | — | — | — | does not fit (needs 146 MiB) |
+| v5 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v5 | l | — | — | — | — | — | — | — | not attempted (optional) |
+| v5 | x | — | — | — | — | — | — | — | not attempted (optional) |
+| v8 | n | 349.2 | 2.86 | — | — | — | — | — | does not fit (runtime arena) |
+| v8 | s | 783.4 | 1.28 | — | — | — | — | — | does not fit (needs 119 MiB) |
+| v8 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v8 | l | — | — | — | — | — | — | — | not attempted (optional) |
+| v8 | x | — | — | — | — | — | — | — | not attempted (optional) |
+| v9 | n | 339.0 | 2.95 | — | — | — | — | — | unsupported on VC4 |
+| v9 | s | 987.7 | 1.01 | — | — | — | — | — | does not fit (needs 89 MiB) |
+| v9 | m | 1982.8 | 0.50 | — | — | — | — | — | does not fit (needs 191 MiB) |
+| v9 | l | — | — | — | — | — | — | — | not exportable (no upstream l weights) |
+| v9 | x | — | — | — | — | — | — | — | not attempted (optional) |
+| v10 | n | 303.5 | 3.30 | — | — | — | — | — | unsupported on VC4 |
+| v10 | s | 756.7 | 1.32 | — | — | — | — | — | does not fit (needs 226 MiB) |
+| v10 | m | 1989.0 | 0.50 | — | — | — | — | — | does not fit (needs 283 MiB) |
+| v10 | l | — | — | — | — | — | — | — | not attempted (optional) |
+| v10 | x | — | — | — | — | — | — | — | not attempted (optional) |
+| v11 | n | 309.8 | 3.23 | — | — | — | — | — | unsupported on VC4 |
+| v11 | s | 748.7 | 1.34 | — | — | — | — | — | does not fit (needs 122 MiB) |
+| v11 | m | 2043.4 | 0.49 | — | — | — | — | — | does not fit (needs 222 MiB) |
+| v11 | l | — | — | — | — | — | — | — | not attempted (optional) |
+| v11 | x | — | — | — | — | — | — | — | not attempted (optional) |
+| v12 | n | 323.7 | 3.09 | — | — | — | — | — | unsupported on VC4 |
+| v12 | s | 812.0 | 1.23 | — | — | — | — | — | does not fit (needs 180 MiB) |
+| v12 | m | 2144.0 | 0.47 | — | — | — | — | — | does not fit (needs 326 MiB) |
+| v12 | l | — | — | — | — | — | — | — | not attempted (optional) |
+| v12 | x | — | — | — | — | — | — | — | not attempted (optional) |
+
+#### 640 × 640
+
+| version | size | CPU ms | CPU FPS | VC4 ms | VC4 FPS | ratio | launches | error | status |
+|---|---|---:|---:|---:|---:|---:|---:|---|---|
+| v5 | n | 1207.0 | 0.83 | — | — | — | — | — | does not fit (needs 292 MiB) |
+| v5 | s | 2598.0 | 0.38 | — | — | — | — | — | does not fit (needs 348 MiB) |
+| v5 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v5 | l | — | — | — | — | — | — | — | not attempted (optional) |
+| v5 | x | — | — | — | — | — | — | — | not attempted (optional) |
+| v8 | n | 1330.3 | 0.75 | — | — | — | — | — | does not fit (needs 126 MiB) |
+| v8 | s | 3224.5 | 0.31 | — | — | — | — | — | does not fit (needs 194 MiB) |
+| v8 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v8 | l | — | — | — | — | — | — | — | not attempted (optional) |
+| v8 | x | — | — | — | — | — | — | — | not attempted (optional) |
+| v9 | n | 1480.3 | 0.68 | — | — | — | — | — | does not fit (needs 119 MiB) |
+| v9 | s | 3593.6 | 0.28 | — | — | — | — | — | does not fit (needs 164 MiB) |
+| v9 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v9 | l | — | — | — | — | — | — | — | not exportable (no upstream l weights) |
+| v9 | x | — | — | — | — | — | — | — | not attempted (optional) |
+| v10 | n | 1164.6 | 0.86 | — | — | — | — | — | does not fit (needs 141 MiB) |
+| v10 | s | 2937.0 | 0.34 | — | — | — | — | — | does not fit (needs 301 MiB) |
+| v10 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v10 | l | — | — | — | — | — | — | — | not attempted (optional) |
+| v10 | x | — | — | — | — | — | — | — | not attempted (optional) |
+| v11 | n | 1132.6 | 0.88 | — | — | — | — | — | does not fit (needs 127 MiB) |
+| v11 | s | 2840.8 | 0.35 | — | — | — | — | — | does not fit (needs 197 MiB) |
+| v11 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v11 | l | — | — | — | — | — | — | — | not attempted (optional) |
+| v11 | x | — | — | — | — | — | — | — | not attempted (optional) |
+| v12 | n | 1361.1 | 0.73 | — | — | — | — | — | does not fit (needs 141 MiB) |
+| v12 | s | 3152.6 | 0.32 | — | — | — | — | — | does not fit (needs 255 MiB) |
+| v12 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
+| v12 | l | — | — | — | — | — | — | — | not attempted (optional) |
+| v12 | x | — | — | — | — | — | — | — | not attempted (optional) |
+
+### Status per cell
+
+#### 160 × 160
+
+| version | n | s | m | l | x |
+|---|---|---|---|---|---|
+| v5 | unsupported | no fit (needs 96) | no fit (needs 218) | — | — |
+| v8 | 4.8× CPU | no fit (needs 100) | — | — | — |
+| v9 | unsupported | no fit (runtime) | no fit (needs 172) | — | — |
+| v10 | unsupported | no fit (needs 209) | no fit (needs 263) | — | — |
+| v11 | unsupported | no fit (needs 103) | no fit (needs 201) | — | — |
+| v12 | unsupported | no fit (needs 161) | no fit (needs 298) | — | — |
+
+#### 320 × 320
+
+| version | n | s | m | l | x |
+|---|---|---|---|---|---|
+| v5 | no fit (needs 95) | no fit (needs 146) | — | — | — |
+| v8 | no fit (runtime) | no fit (needs 119) | — | — | — |
+| v9 | unsupported | no fit (needs 89) | no fit (needs 191) | — | — |
+| v10 | unsupported | no fit (needs 226) | no fit (needs 283) | — | — |
+| v11 | unsupported | no fit (needs 122) | no fit (needs 222) | — | — |
+| v12 | unsupported | no fit (needs 180) | no fit (needs 326) | — | — |
+
+#### 640 × 640
+
+| version | n | s | m | l | x |
+|---|---|---|---|---|---|
+| v5 | no fit (needs 292) | no fit (needs 348) | — | — | — |
+| v8 | no fit (needs 126) | no fit (needs 194) | — | — | — |
+| v9 | no fit (needs 119) | no fit (needs 164) | — | — | — |
+| v10 | no fit (needs 141) | no fit (needs 301) | — | — | — |
+| v11 | no fit (needs 127) | no fit (needs 197) | — | — | — |
+| v12 | no fit (needs 141) | no fit (needs 255) | — | — | — |
+
+### What this says
+
+**One cell runs, and it is slower than the CPU.**  Of 45 exported graphs, only
+YOLOv8n at 160×160 completes on the QPU: 521.0 ms, 1.92 FPS, 802 launches,
+with the QPU busy 50 % of the wall.  The same graph on four A53 cores takes
+108.2 ms (9.24 FPS), so the VC4 is **4.8× slower**.  Parity is exact enough:
+4/4 detections, largest matched box delta 0.0002 px, max scaled difference
+3.1e-4 (the 1.5e-2 max absolute is the logit range, which is why the scaled
+number is the meaningful one).
+
+**The arena is the main hardware limit, and the gap is large.**  35 exported
+cells hit the 64 MiB client arena: 33 were refused at plan time, and 2
+(v8n320, v9s160) passed the plan and then died inside a kernel with `out of
+arena memory`, so the planner's clamp is optimistic at 64 MiB.  The measured
+needs range from 89 MiB to 348 MiB.  The worst are v5s640 **348 MiB (5.4× the
+arena)**, v12m320 326 MiB (5.1×), v10s640 301 MiB, and v12m160 298 MiB.
+Even the cheapest refusals are close to double the arena:
+v8s160 needs 100 MiB, v8n640 126 MiB, v9n640 119 MiB.  A 150 MiB arena would
+cover the n column at 640 and most of the s column at 160, but it cannot be
+mapped on this boot because CMA is occupied by the resident daemons.
+
+**Nine cells are op-limited, not size-limited.**  v5's 6×6 stride-2 stem
+conv is unsupported; v9's Slice form needs a compact NCHW source; v10, v11 and
+v12 use `Split` on axis 2 in their attention blocks.  These are visible at
+160×160, where the arena is not in the way.  A larger board would not change
+them; they need kernel or graph-rewrite work.  A larger arena would only move
+the first refusal to the same operator.
+
+**l and x are export-limited, not engine-limited.**  The largest successful
+exports peaked at 439 MiB RSS for n, 597 MiB for s and 627 MiB for m.  Every
+l and x attempt was killed by the watchdog (peak 486-610 MiB, or the 80 MiB
+board floor), so no l/x ONNX graph exists to plan against.  On a board with
+more RAM those cells would at least be measurable; on this one the answer says
+nothing about whether the kernel could run them.
+
+**The CPU fallback is the practical path at this size.**  All 45 exported
+cells have a CPU number, from 85.7 ms (v10n160, 11.7 FPS) to 3594 ms
+(v9s640, 0.28 FPS).  At 640 the fallback is 0.28-0.86 FPS across the six
+families.
+
+**What I did not measure.**  The 150 MiB arena column, the 22 l/x cells at
+320 and 640 after every 160 l/x export hit the memory limit, and COCO mAP.
+The 22 are marked `not attempted (optional)` in the JSON rather than given an
+invented status.

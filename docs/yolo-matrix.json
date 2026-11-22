@@ -1,0 +1,5540 @@
+{
+ "generated": "2026-11-22T14:38:01",
+ "board": "Raspberry Pi 3B, BCM2837, VideoCore IV, 905 MiB RAM",
+ "engine": "vc4infer 1.2.8 / vc4d 1.2.9, managed backend",
+ "export": {
+  "ultralytics": "8.4.215",
+  "torch": "2.15.0+cpu",
+  "opset": 17,
+  "simplify": false,
+  "batch": 1
+ },
+ "cpu": {
+  "provider": "CPUExecutionProvider",
+  "onnxruntime": "1.32.0",
+  "intra_op_threads": 4
+ },
+ "protocol": {
+  "warmups": 3,
+  "timed": 5,
+  "input": "Ultralytics bus.jpg resized to the matrix resolution",
+  "arena_default_mb": 64,
+  "arena_150_mb": 145,
+  "thermal_limit_c": 71
+ },
+ "cells": [
+  {
+   "version": "v5",
+   "size": "n",
+   "imgsz": 160,
+   "weights": "yolov5nu.pt",
+   "onnx": "work/onnx/yolo/v5/n_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v5_n_160.log",
+    "wall_s": 28.8,
+    "peak_rss_mib": 382.0,
+    "size_mib": 10.17,
+    "export_s": 15.7,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v5/n_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 103.02714699992066,
+    "mean_ms": 98.66345680002269,
+    "min_ms": 80.39678599971012,
+    "fps_median": 9.706179673215352,
+    "runs_ms": [
+     103.22032000021863,
+     103.02714699992066,
+     80.39678599971012,
+     102.62106000027416,
+     104.05197099998986
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v5_n_160.npz",
+    "wall_s": 2.3835372889998325
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v5/n_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "node '/model.0/conv/Conv' (Conv): kernel 6x6 (NCHW fallback: 1x1, 3x3)",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "  File \"/usr/lib/python3/dist-packages/vc4infer/engine.py\", line 351, in plan",
+     "    raise UnsupportedNode(bad[0].name, bad[0].op,",
+     "                          bad[0].constraint)",
+     "vc4infer._errors.UnsupportedNode: node '/model.0/conv/Conv' (Conv): kernel 6x6 (NCHW fallback: 1x1, 3x3)"
+    ],
+    "wall_s": 0.9402779029996964
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v5/n_160.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 36.87335205078125,
+     "estimate_bytes": 36.87335205078125,
+     "floor_bytes": 20.98822021484375,
+     "scratch_bytes": 16.34478759765625,
+     "arena_bytes": 64.0,
+     "clamped": false
+    },
+    "estimate_mb": 36.87335205078125,
+    "unsupported": [
+     {
+      "name": "/model.0/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 6x6 (NCHW fallback: 1x1, 3x3)"
+     }
+    ],
+    "static_plan": "refused",
+    "refusal": "node '/model.0/conv/Conv' (Conv): kernel 6x6 (NCHW fallback: 1x1, 3x3)",
+    "ok": false
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 63.4,
+    "peak_c": 64.5,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 65.0,
+    "peak_c": 65.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "unsupported on VC4"
+  },
+  {
+   "version": "v5",
+   "size": "n",
+   "imgsz": 320,
+   "weights": "yolov5nu.pt",
+   "onnx": "work/onnx/yolo/v5/n_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v5_n_320.log",
+    "wall_s": 29.4,
+    "peak_rss_mib": 401.2,
+    "size_mib": 10.2,
+    "export_s": 7.8,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 328.2,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v5/n_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 274.52800299988667,
+    "mean_ms": 279.40552239997487,
+    "min_ms": 269.6307549999801,
+    "fps_median": 3.6426156496698545,
+    "runs_ms": [
+     269.6307549999801,
+     290.49128699989524,
+     274.52800299988667,
+     289.6348429999307,
+     272.7427240001816
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v5_n_320.npz",
+    "wall_s": 3.32231971300007
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v5/n_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 22.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 77.9 MiB, but the client arena is 64.0 MiB with 64.5 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 94.6 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 22.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 77.9 MiB, but the client arena is 64.0 MiB with 64.5 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 94.6 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 0.7456010369996875
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v5/n_320.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 22.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 77.9 MiB, but the client arena is 64.0 MiB with 64.5 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 94.6 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 22.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 77.9 MiB, but the client arena is 64.0 MiB with 64.5 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 94.6 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 71.4,
+    "peak_c": 72.5,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 58.5,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 95 MiB)"
+  },
+  {
+   "version": "v5",
+   "size": "n",
+   "imgsz": 640,
+   "weights": "yolov5nu.pt",
+   "onnx": "work/onnx/yolo/v5/n_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v5_n_640.log",
+    "wall_s": 32.5,
+    "peak_rss_mib": 414.1,
+    "size_mib": 10.32,
+    "export_s": 11.6,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 323.0,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v5/n_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 1206.9612290006262,
+    "mean_ms": 1208.58793339994,
+    "min_ms": 1186.7155230002027,
+    "fps_median": 0.8285270280206168,
+    "runs_ms": [
+     1186.7155230002027,
+     1201.389423999899,
+     1210.0971499994557,
+     1206.9612290006262,
+     1237.7763409995168
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v5_n_640.npz",
+    "wall_s": 11.492371393999747
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v5/n_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 26.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 239.9 MiB, but the client arena is 64.0 MiB with 256.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 291.7 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 26.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 239.9 MiB, but the client arena is 64.0 MiB with 256.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 291.7 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 0.7525028129994098
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v5/n_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 26.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 239.9 MiB, but the client arena is 64.0 MiB with 256.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 291.7 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 26.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 239.9 MiB, but the client arena is 64.0 MiB with 256.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 291.7 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.6,
+    "peak_c": 67.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 292 MiB)"
+  },
+  {
+   "version": "v5",
+   "size": "s",
+   "imgsz": 160,
+   "weights": "yolov5su.pt",
+   "onnx": "work/onnx/yolo/v5/s_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v5_s_160.log",
+    "wall_s": 31.9,
+    "peak_rss_mib": 517.9,
+    "size_mib": 34.94,
+    "export_s": 16.1,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v5/s_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 237.44743099996413,
+    "mean_ms": 240.87490699994305,
+    "min_ms": 223.39446699970722,
+    "fps_median": 4.211458493312362,
+    "runs_ms": [
+     228.7085340003614,
+     237.44743099996413,
+     265.26273699982994,
+     223.39446699970722,
+     249.56136599985257
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v5_s_160.npz",
+    "wall_s": 3.978306663999774
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v5/s_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 71.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 102.3 MiB, but the client arena is 64.0 MiB with 16.3 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 95.6 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 71.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 102.3 MiB, but the client arena is 64.0 MiB with 16.3 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 95.6 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 0.928807649999726
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v5/s_160.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 71.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 102.3 MiB, but the client arena is 64.0 MiB with 16.3 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 95.6 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 71.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 102.3 MiB, but the client arena is 64.0 MiB with 16.3 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 95.6 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 67.1,
+    "peak_c": 68.8,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 67.7,
+    "peak_c": 69.3,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 96 MiB)"
+  },
+  {
+   "version": "v5",
+   "size": "s",
+   "imgsz": 320,
+   "weights": "yolov5su.pt",
+   "onnx": "work/onnx/yolo/v5/s_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v5_s_320.log",
+    "wall_s": 25.4,
+    "peak_rss_mib": 556.6,
+    "size_mib": 34.97,
+    "export_s": 11.9,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 196.6,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v5/s_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 764.3159919998652,
+    "mean_ms": 764.017311200223,
+    "min_ms": 755.1348900005905,
+    "fps_median": 1.308359383379455,
+    "runs_ms": [
+     764.3159919998652,
+     771.0177210001348,
+     755.1348900005905,
+     765.4322700000193,
+     764.1856830005054
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v5_s_320.npz",
+    "wall_s": 8.317960258999847
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v5/s_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 73.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 175.8 MiB, but the client arena is 64.0 MiB with 64.5 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 146.0 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 73.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 175.8 MiB, but the client arena is 64.0 MiB with 64.5 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 146.0 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 2.2041784050006754
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v5/s_320.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 73.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 175.8 MiB, but the client arena is 64.0 MiB with 64.5 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 146.0 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 73.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 175.8 MiB, but the client arena is 64.0 MiB with 64.5 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 146.0 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.1,
+    "peak_c": 65.5,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 58.5,
+    "peak_c": 59.6,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 146 MiB)"
+  },
+  {
+   "version": "v5",
+   "size": "s",
+   "imgsz": 640,
+   "weights": "yolov5su.pt",
+   "onnx": "work/onnx/yolo/v5/s_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v5_s_640.log",
+    "wall_s": 32.4,
+    "peak_rss_mib": 546.3,
+    "size_mib": 35.09,
+    "export_s": 18.1,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 201.2,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v5/s_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 2597.9694769998787,
+    "mean_ms": 2641.666076599904,
+    "min_ms": 2591.778116000114,
+    "fps_median": 0.38491599260619286,
+    "runs_ms": [
+     2597.9694769998787,
+     2591.778116000114,
+     2596.4223209998636,
+     2646.9234269998196,
+     2775.237041999844
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v5_s_640.npz",
+    "wall_s": 24.097861233999993
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v5/s_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 83.0 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 462.2 MiB, but the client arena is 64.0 MiB with 256.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 347.8 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 83.0 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 462.2 MiB, but the client arena is 64.0 MiB with 256.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 347.8 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 2.190752030999647
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v5/s_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 83.0 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 462.2 MiB, but the client arena is 64.0 MiB with 256.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 347.8 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 83.0 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 462.2 MiB, but the client arena is 64.0 MiB with 256.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 347.8 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 72.0,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 59.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 348 MiB)"
+  },
+  {
+   "version": "v5",
+   "size": "m",
+   "imgsz": 160,
+   "weights": "yolov5mu.pt",
+   "onnx": "work/onnx/yolo/v5/m_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v5_m_160.log",
+    "wall_s": 88.8,
+    "peak_rss_mib": 551.7,
+    "size_mib": 95.79,
+    "export_s": 67.5,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v5/m_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 555.0432069994713,
+    "mean_ms": 550.6919999999809,
+    "min_ms": 535.8809150002344,
+    "fps_median": 1.801661541640942,
+    "runs_ms": [
+     537.378383000032,
+     567.9516780000995,
+     557.2058170000673,
+     535.8809150002344,
+     555.0432069994713
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v5_m_160.npz",
+    "wall_s": 9.296771981000347
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v5/m_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 193.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 251.8 MiB, but the client arena is 64.0 MiB with 16.3 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 218.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 193.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 251.8 MiB, but the client arena is 64.0 MiB with 16.3 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 218.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 15.338148947999798
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v5/m_160.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 193.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 251.8 MiB, but the client arena is 64.0 MiB with 16.3 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 218.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 193.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 251.8 MiB, but the client arena is 64.0 MiB with 16.3 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 218.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.1,
+    "peak_c": 64.5,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 70.9,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 218 MiB)"
+  },
+  {
+   "version": "v5",
+   "size": "m",
+   "imgsz": 320,
+   "weights": "yolov5mu.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v5_m_320.log",
+    "rc": 137,
+    "peak_rss_mib": 607.4,
+    "min_avail_mib": 57.2,
+    "limit_mib": 700,
+    "wall_s": 45.0,
+    "reason": "memory limit reached (700 MiB limit, peak 607 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v5",
+   "size": "m",
+   "imgsz": 640,
+   "weights": "yolov5mu.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v5_m_640.log",
+    "rc": 137,
+    "peak_rss_mib": 579.9,
+    "min_avail_mib": 45.9,
+    "limit_mib": 700,
+    "wall_s": 61.9,
+    "reason": "memory limit reached (700 MiB limit, peak 580 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v5",
+   "size": "l",
+   "imgsz": 160,
+   "weights": "yolov5lu.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v5_l_160.log",
+    "rc": 137,
+    "peak_rss_mib": 588.9,
+    "min_avail_mib": 42.3,
+    "limit_mib": 700,
+    "wall_s": 23.2,
+    "reason": "memory limit reached (700 MiB limit, peak 589 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v5",
+   "size": "l",
+   "imgsz": 320,
+   "weights": "yolov5lu.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v5",
+   "size": "l",
+   "imgsz": 640,
+   "weights": "yolov5lu.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v5",
+   "size": "x",
+   "imgsz": 160,
+   "weights": "yolov5xu.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v5_x_160.log",
+    "rc": 137,
+    "peak_rss_mib": 564.1,
+    "min_avail_mib": 72.8,
+    "limit_mib": 700,
+    "wall_s": 74.1,
+    "reason": "memory limit reached (700 MiB limit, peak 564 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v5",
+   "size": "x",
+   "imgsz": 320,
+   "weights": "yolov5xu.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v5",
+   "size": "x",
+   "imgsz": 640,
+   "weights": "yolov5xu.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v8",
+   "size": "n",
+   "imgsz": 160,
+   "weights": "yolov8n.pt",
+   "onnx": "work/onnx/yolo/v8/n_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v8_n_160.log",
+    "wall_s": 27.7,
+    "peak_rss_mib": 396.6,
+    "size_mib": 12.08,
+    "export_s": 11.6,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v8/n_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 108.22131499980969,
+    "mean_ms": 105.97038820005764,
+    "min_ms": 98.99716400013858,
+    "fps_median": 9.240323867823621,
+    "runs_ms": [
+     111.17954100018324,
+     98.99716400013858,
+     101.38639000024341,
+     108.22131499980969,
+     110.06753099991329
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v8_n_160.npz",
+    "wall_s": 1.7530866870001773
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v8/n_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 520.9625500001493,
+    "mean_ms": 523.9695252001184,
+    "min_ms": 519.4151290002083,
+    "fps_median": 1.9195237738292577,
+    "runs_ms": [
+     520.4712610002389,
+     538.0306179999934,
+     520.9625500001493,
+     519.4151290002083,
+     520.968068000002
+    ],
+    "launches": 802,
+    "gpu_ms": 263.839118,
+    "qpu_duty": 50.3539052007333,
+    "arena_mb": 64.0,
+    "pool_mb": 41.59686279296875,
+    "peak_mb": 28.47894287109375,
+    "estimate_mb": 41.59686279296875,
+    "scratch_mb": 5.75811767578125,
+    "max_abs": 0.0153350830078125,
+    "max_scaled": 0.0003078398798027548,
+    "detections": {
+     "decode": "ok",
+     "vc4_count": 4,
+     "ref_count": 4,
+     "matched": 4,
+     "max_box_delta_px": 0.0001983642578125
+    },
+    "wall_s": 6.9855598070003
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v8/n_160.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 41.59686279296875,
+     "estimate_bytes": 41.59686279296875,
+     "floor_bytes": 24.7823486328125,
+     "scratch_bytes": 5.75811767578125,
+     "arena_bytes": 64.0,
+     "clamped": false
+    },
+    "estimate_mb": 41.59686279296875,
+    "unsupported": [],
+    "static_plan": "ok",
+    "ok": true
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 65.5,
+    "peak_c": 66.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 65.5,
+    "peak_c": 67.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": 4.813862685008637,
+   "status": "ok (64 MiB arena)"
+  },
+  {
+   "version": "v8",
+   "size": "n",
+   "imgsz": 320,
+   "weights": "yolov8n.pt",
+   "onnx": "work/onnx/yolo/v8/n_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v8_n_320.log",
+    "wall_s": 19.1,
+    "peak_rss_mib": 422.1,
+    "size_mib": 12.11,
+    "export_s": 6.5,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 310.5,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v8/n_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 349.1643879997355,
+    "mean_ms": 354.52608360010345,
+    "min_ms": 344.4857390004472,
+    "fps_median": 2.8639805042224338,
+    "runs_ms": [
+     357.73717000029137,
+     349.1643879997355,
+     345.05770600026153,
+     376.18541499978164,
+     344.4857390004472
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v8_n_320.npz",
+    "wall_s": 3.9923301799999535
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v8/n_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "node '/model.0/conv/Conv' (Conv): engine error: conv_nhwc_dil: out of arena memory ()",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    out = self._dispatch(node)",
+     "  File \"/usr/lib/python3/dist-packages/vc4infer/_onnxrun.py\", line 2723, in _dispatch",
+     "    raise UnsupportedNode(node.name, op, \"engine error: %s\" % e)",
+     "vc4infer._errors.UnsupportedNode: node '/model.0/conv/Conv' (Conv): engine error: conv_nhwc_dil: out of arena memory ()"
+    ],
+    "wall_s": 1.373403911999958
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v8/n_320.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 41.79656982421875,
+     "estimate_bytes": 85.453857421875,
+     "floor_bytes": 25.9542236328125,
+     "scratch_bytes": 22.20343017578125,
+     "arena_bytes": 64.0,
+     "clamped": true
+    },
+    "estimate_mb": 41.79656982421875,
+    "unsupported": [],
+    "static_plan": "ok",
+    "ok": true
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 60.1,
+    "peak_c": 63.4,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 60.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (runtime arena)"
+  },
+  {
+   "version": "v8",
+   "size": "n",
+   "imgsz": 640,
+   "weights": "yolov8n.pt",
+   "onnx": "work/onnx/yolo/v8/n_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v8_n_640.log",
+    "wall_s": 22.2,
+    "peak_rss_mib": 433.4,
+    "size_mib": 12.23,
+    "export_s": 9.8,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 304.5,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v8/n_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 1330.3396119999888,
+    "mean_ms": 1361.5699534000669,
+    "min_ms": 1316.8089689997942,
+    "fps_median": 0.751687757757309,
+    "runs_ms": [
+     1330.3396119999888,
+     1324.6033820005323,
+     1316.8089689997942,
+     1408.2659900004728,
+     1427.8318139995463
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v8_n_640.npz",
+    "wall_s": 12.787699989999965
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v8/n_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 30.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 259.3 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 126.5 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 30.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 259.3 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 126.5 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 0.896091245000207
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v8/n_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 30.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 259.3 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 126.5 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 30.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 259.3 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 126.5 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 60.1,
+    "peak_c": 67.7,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 60.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 126 MiB)"
+  },
+  {
+   "version": "v8",
+   "size": "s",
+   "imgsz": 160,
+   "weights": "yolov8s.pt",
+   "onnx": "work/onnx/yolo/v8/s_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v8_s_160.log",
+    "wall_s": 42.8,
+    "peak_rss_mib": 476.8,
+    "size_mib": 42.62,
+    "export_s": 23.1,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v8/s_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 272.1856100001787,
+    "mean_ms": 270.14319080008136,
+    "min_ms": 257.39443200018286,
+    "fps_median": 3.6739635133515818,
+    "runs_ms": [
+     281.7626690002726,
+     265.16230700008236,
+     257.39443200018286,
+     272.1856100001787,
+     274.21093599969026
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v8_s_160.npz",
+    "wall_s": 4.512882425000043
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v8/s_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 86.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 119.4 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 100.3 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 86.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 119.4 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 100.3 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 0.9934551709998232
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v8/s_160.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 86.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 119.4 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 100.3 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 86.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 119.4 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 100.3 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 66.6,
+    "peak_c": 69.3,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 69.3,
+    "peak_c": 69.3,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 100 MiB)"
+  },
+  {
+   "version": "v8",
+   "size": "s",
+   "imgsz": 320,
+   "weights": "yolov8s.pt",
+   "onnx": "work/onnx/yolo/v8/s_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v8_s_320.log",
+    "wall_s": 30.3,
+    "peak_rss_mib": 558.8,
+    "size_mib": 42.65,
+    "export_s": 13.2,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 177.4,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v8/s_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 783.438149000176,
+    "mean_ms": 783.2132415999695,
+    "min_ms": 781.2205380000705,
+    "fps_median": 1.27642494978857,
+    "runs_ms": [
+     782.9044719997,
+     785.0498439997864,
+     783.4532050001144,
+     781.2205380000705,
+     783.438149000176
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v8_s_320.npz",
+    "wall_s": 9.007250803000261
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v8/s_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 88.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 198.6 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 119.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 88.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 198.6 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 119.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 2.7248103850006373
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v8/s_320.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 88.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 198.6 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 119.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 88.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 198.6 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 119.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 70.9,
+    "peak_c": 73.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 119 MiB)"
+  },
+  {
+   "version": "v8",
+   "size": "s",
+   "imgsz": 640,
+   "weights": "yolov8s.pt",
+   "onnx": "work/onnx/yolo/v8/s_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v8_s_640.log",
+    "wall_s": 38.5,
+    "peak_rss_mib": 591.7,
+    "size_mib": 42.77,
+    "export_s": 21.5,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 150.7,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v8/s_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 3224.5196889998624,
+    "mean_ms": 3267.1120227996653,
+    "min_ms": 2985.1542179994794,
+    "fps_median": 0.31012370723348454,
+    "runs_ms": [
+     3568.339919999744,
+     3560.98190099965,
+     3224.5196889998624,
+     2985.1542179994794,
+     2996.5643859995907
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v8_s_640.npz",
+    "wall_s": 30.45467123400067
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v8/s_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 98.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 508.8 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 194.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 98.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 508.8 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 194.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 2.6395650550002756
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v8/s_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 98.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 508.8 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 194.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 98.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 508.8 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 194.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.6,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.6,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 194 MiB)"
+  },
+  {
+   "version": "v8",
+   "size": "m",
+   "imgsz": 160,
+   "weights": "yolov8m.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v8_m_160.log",
+    "rc": 137,
+    "peak_rss_mib": 568.6,
+    "min_avail_mib": 44.6,
+    "limit_mib": 700,
+    "wall_s": 35.0,
+    "reason": "memory limit reached (700 MiB limit, peak 569 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v8",
+   "size": "m",
+   "imgsz": 320,
+   "weights": "yolov8m.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v8_m_320.log",
+    "rc": 137,
+    "peak_rss_mib": 566.2,
+    "min_avail_mib": 39.8,
+    "limit_mib": 700,
+    "wall_s": 50.7,
+    "reason": "memory limit reached (700 MiB limit, peak 566 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v8",
+   "size": "m",
+   "imgsz": 640,
+   "weights": "yolov8m.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v8_m_640.log",
+    "rc": 137,
+    "peak_rss_mib": 586.7,
+    "min_avail_mib": 62.2,
+    "limit_mib": 700,
+    "wall_s": 26.1,
+    "reason": "memory limit reached (700 MiB limit, peak 587 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v8",
+   "size": "l",
+   "imgsz": 160,
+   "weights": "yolov8l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v8_l_160.log",
+    "rc": 137,
+    "peak_rss_mib": 598.7,
+    "min_avail_mib": 62.5,
+    "limit_mib": 700,
+    "wall_s": 23.9,
+    "reason": "memory limit reached (700 MiB limit, peak 599 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v8",
+   "size": "l",
+   "imgsz": 320,
+   "weights": "yolov8l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v8",
+   "size": "l",
+   "imgsz": 640,
+   "weights": "yolov8l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v8",
+   "size": "x",
+   "imgsz": 160,
+   "weights": "yolov8x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v8_x_160.log",
+    "rc": 137,
+    "peak_rss_mib": 577.7,
+    "min_avail_mib": 65.2,
+    "limit_mib": 700,
+    "wall_s": 58.8,
+    "reason": "memory limit reached (700 MiB limit, peak 578 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v8",
+   "size": "x",
+   "imgsz": 320,
+   "weights": "yolov8x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v8",
+   "size": "x",
+   "imgsz": 640,
+   "weights": "yolov8x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v9",
+   "size": "n",
+   "imgsz": 160,
+   "weights": "yolov9t.pt",
+   "onnx": "work/onnx/yolo/v9/n_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v9_n_160.log",
+    "wall_s": 31.9,
+    "peak_rss_mib": 415.4,
+    "size_mib": 8.15,
+    "export_s": 15.5,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v9/n_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 114.26863999986381,
+    "mean_ms": 114.40021039989006,
+    "min_ms": 108.73744199989233,
+    "fps_median": 8.751307445342762,
+    "runs_ms": [
+     114.26863999986381,
+     108.73744199989233,
+     111.5634829998271,
+     119.50463499988473,
+     117.92685199998232
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v9_n_160.npz",
+    "wall_s": 1.9746419650000462
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v9/n_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "node '/model.2/Slice' (Slice): Slice /model.2/Slice: needs the compact NCHW source",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "  File \"/usr/lib/python3/dist-packages/vc4infer/_onnxrun.py\", line 2726, in _dispatch",
+     "    raise UnsupportedNode(node.name if not e.node else e.node,",
+     "                          op if not e.op else e.op, e.detail)",
+     "vc4infer._errors.UnsupportedNode: node '/model.2/Slice' (Slice): Slice /model.2/Slice: needs the compact NCHW source"
+    ],
+    "wall_s": 1.266110830999878
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v9/n_160.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 20.3985595703125,
+     "estimate_bytes": 20.3985595703125,
+     "floor_bytes": 17.41839599609375,
+     "scratch_bytes": 5.75811767578125,
+     "arena_bytes": 64.0,
+     "clamped": false
+    },
+    "estimate_mb": 20.3985595703125,
+    "unsupported": [],
+    "static_plan": "ok",
+    "ok": true
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 65.5,
+    "peak_c": 66.6,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 66.6,
+    "peak_c": 66.6,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "unsupported on VC4"
+  },
+  {
+   "version": "v9",
+   "size": "n",
+   "imgsz": 320,
+   "weights": "yolov9t.pt",
+   "onnx": "work/onnx/yolo/v9/n_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v9_n_320.log",
+    "wall_s": 26.1,
+    "peak_rss_mib": 412.7,
+    "size_mib": 8.18,
+    "export_s": 13.0,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 320.3,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v9/n_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 338.98444500027836,
+    "mean_ms": 343.01424220002446,
+    "min_ms": 335.9265359999881,
+    "fps_median": 2.949987867434976,
+    "runs_ms": [
+     362.4438859997099,
+     337.72301199996946,
+     338.98444500027836,
+     335.9265359999881,
+     339.99333200017645
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v9_n_320.npz",
+    "wall_s": 4.054888407999897
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v9/n_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "node '/model.2/Slice' (Slice): Slice /model.2/Slice: needs the compact NCHW source",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "  File \"/usr/lib/python3/dist-packages/vc4infer/_onnxrun.py\", line 2726, in _dispatch",
+     "    raise UnsupportedNode(node.name if not e.node else e.node,",
+     "                          op if not e.op else e.op, e.detail)",
+     "vc4infer._errors.UnsupportedNode: node '/model.2/Slice' (Slice): Slice /model.2/Slice: needs the compact NCHW source"
+    ],
+    "wall_s": 3.2375111299998025
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v9/n_320.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 29.217041015625,
+     "estimate_bytes": 29.217041015625,
+     "floor_bytes": 18.59027099609375,
+     "scratch_bytes": 22.20343017578125,
+     "arena_bytes": 64.0,
+     "clamped": false
+    },
+    "estimate_mb": 29.217041015625,
+    "unsupported": [],
+    "static_plan": "ok",
+    "ok": true
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 70.9,
+    "peak_c": 73.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "unsupported on VC4"
+  },
+  {
+   "version": "v9",
+   "size": "n",
+   "imgsz": 640,
+   "weights": "yolov9t.pt",
+   "onnx": "work/onnx/yolo/v9/n_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v9_n_640.log",
+    "wall_s": 30.0,
+    "peak_rss_mib": 421.2,
+    "size_mib": 8.3,
+    "export_s": 16.9,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 331.7,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v9/n_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 1480.2685489994474,
+    "mean_ms": 1506.1271007998585,
+    "min_ms": 1451.832605999698,
+    "fps_median": 0.67555309519744,
+    "runs_ms": [
+     1451.832605999698,
+     1476.2534809997305,
+     1560.7708059997094,
+     1561.510062000707,
+     1480.2685489994474
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v9_n_640.npz",
+    "wall_s": 14.032679918000213
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v9/n_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 23.3 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 65.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 119.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 23.3 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 65.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 119.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 0.8286919310003213
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v9/n_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 23.3 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 65.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 119.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 23.3 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 65.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 119.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.1,
+    "peak_c": 67.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 60.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 119 MiB)"
+  },
+  {
+   "version": "v9",
+   "size": "s",
+   "imgsz": 160,
+   "weights": "yolov9s.pt",
+   "onnx": "work/onnx/yolo/v9/s_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v9_s_160.log",
+    "wall_s": 46.0,
+    "peak_rss_mib": 522.4,
+    "size_mib": 27.62,
+    "export_s": 25.0,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v9/s_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 283.5006400000566,
+    "mean_ms": 286.4171162000275,
+    "min_ms": 280.38715899992894,
+    "fps_median": 3.527328897740056,
+    "runs_ms": [
+     280.38715899992894,
+     301.2225430002218,
+     283.63600200009387,
+     283.33923699983643,
+     283.5006400000566
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v9_s_160.npz",
+    "wall_s": 4.2888290989999405
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v9/s_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "node '/model.0/conv/Conv' (Conv): engine error: conv_nhwc_dil: out of arena memory ()",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    out = self._dispatch(node)",
+     "  File \"/usr/lib/python3/dist-packages/vc4infer/_onnxrun.py\", line 2723, in _dispatch",
+     "    raise UnsupportedNode(node.name, op, \"engine error: %s\" % e)",
+     "vc4infer._errors.UnsupportedNode: node '/model.0/conv/Conv' (Conv): engine error: conv_nhwc_dil: out of arena memory ()"
+    ],
+    "wall_s": 1.8882821070001228
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v9/s_160.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 58.24188232421875,
+     "estimate_bytes": 62.80401611328125,
+     "floor_bytes": 56.5269775390625,
+     "scratch_bytes": 5.75811767578125,
+     "arena_bytes": 64.0,
+     "clamped": true
+    },
+    "estimate_mb": 58.24188232421875,
+    "unsupported": [],
+    "static_plan": "ok",
+    "ok": true
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 67.7,
+    "peak_c": 69.8,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 69.8,
+    "peak_c": 69.8,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (runtime arena)"
+  },
+  {
+   "version": "v9",
+   "size": "s",
+   "imgsz": 320,
+   "weights": "yolov9s.pt",
+   "onnx": "work/onnx/yolo/v9/s_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v9_s_320.log",
+    "wall_s": 35.5,
+    "peak_rss_mib": 548.7,
+    "size_mib": 27.65,
+    "export_s": 19.3,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 185.1,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v9/s_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 987.7468730001056,
+    "mean_ms": 1003.7746694000816,
+    "min_ms": 968.4403660003227,
+    "fps_median": 1.0124051286162798,
+    "runs_ms": [
+     987.7468730001056,
+     970.8016169997791,
+     987.7865589996873,
+     968.4403660003227,
+     1104.0979320005135
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v9_s_320.npz",
+    "wall_s": 10.117574851999962
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v9/s_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 58.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 78.3 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 89.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 58.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 78.3 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 89.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 1.9422085890000744
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v9/s_320.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 58.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 78.3 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 89.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 58.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 78.3 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 89.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.6,
+    "peak_c": 66.6,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 59.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 89 MiB)"
+  },
+  {
+   "version": "v9",
+   "size": "s",
+   "imgsz": 640,
+   "weights": "yolov9s.pt",
+   "onnx": "work/onnx/yolo/v9/s_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v9_s_640.log",
+    "wall_s": 44.5,
+    "peak_rss_mib": 574.1,
+    "size_mib": 27.77,
+    "export_s": 27.6,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 151.3,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v9/s_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 3593.6480649997975,
+    "mean_ms": 3464.7699461997036,
+    "min_ms": 3124.4173489994864,
+    "fps_median": 0.27826876252559707,
+    "runs_ms": [
+     3719.2281439993167,
+     3733.50184300034,
+     3593.6480649997975,
+     3153.054329999577,
+     3124.4173489994864
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v9_s_640.npz",
+    "wall_s": 31.700255718000335
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v9/s_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 68.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 141.9 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 164.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 68.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 141.9 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 164.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 1.9493467669999518
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v9/s_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 68.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 141.9 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 164.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 68.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 141.9 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 164.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.1,
+    "peak_c": 73.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.6,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 164 MiB)"
+  },
+  {
+   "version": "v9",
+   "size": "m",
+   "imgsz": 160,
+   "weights": "yolov9m.pt",
+   "onnx": "work/onnx/yolo/v9/m_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v9_m_160.log",
+    "wall_s": 75.6,
+    "peak_rss_mib": 510.1,
+    "size_mib": 76.69,
+    "export_s": 48.9,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v9/m_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 659.8129799995149,
+    "mean_ms": 672.0862235999448,
+    "min_ms": 647.3904380000022,
+    "fps_median": 1.5155809756891039,
+    "runs_ms": [
+     647.3904380000022,
+     683.0719530007627,
+     656.713413000034,
+     659.8129799995149,
+     713.44233399941
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v9_m_160.npz",
+    "wall_s": 9.584420895999756
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v9/m_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 158.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 170.3 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 172.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 158.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 170.3 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 172.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 4.917938297000546
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v9/m_160.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 158.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 170.3 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 172.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 158.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 170.3 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 172.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 60.1,
+    "peak_c": 65.5,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 172 MiB)"
+  },
+  {
+   "version": "v9",
+   "size": "m",
+   "imgsz": 320,
+   "weights": "yolov9m.pt",
+   "onnx": "work/onnx/yolo/v9/m_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v9_m_320.log",
+    "wall_s": 65.2,
+    "peak_rss_mib": 508.1,
+    "size_mib": 76.72,
+    "export_s": 41.6,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 113.3,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v9/m_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 1982.801218000077,
+    "mean_ms": 2000.72391779986,
+    "min_ms": 1977.7336469996953,
+    "fps_median": 0.5043369909811913,
+    "runs_ms": [
+     2072.0248059997175,
+     1978.2865849997506,
+     1982.801218000077,
+     1977.7336469996953,
+     1992.7733330000592
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v9_m_320.npz",
+    "wall_s": 20.646536425999784
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v9/m_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 160.7 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 189.2 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 190.9 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 160.7 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 189.2 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 190.9 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 4.873711655999614
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v9/m_320.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 160.7 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 189.2 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 190.9 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 160.7 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 189.2 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 190.9 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 70.9,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 61.2,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 191 MiB)"
+  },
+  {
+   "version": "v9",
+   "size": "m",
+   "imgsz": 640,
+   "weights": "yolov9m.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v9_m_640.log",
+    "rc": 137,
+    "peak_rss_mib": 602.3,
+    "min_avail_mib": 47.3,
+    "limit_mib": 700,
+    "wall_s": 42.5,
+    "reason": "memory limit reached (700 MiB limit, peak 602 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v9",
+   "size": "l",
+   "imgsz": 160,
+   "weights": null,
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (no upstream l weights)"
+  },
+  {
+   "version": "v9",
+   "size": "l",
+   "imgsz": 320,
+   "weights": null,
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (no upstream l weights)"
+  },
+  {
+   "version": "v9",
+   "size": "l",
+   "imgsz": 640,
+   "weights": null,
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (no upstream l weights)"
+  },
+  {
+   "version": "v9",
+   "size": "x",
+   "imgsz": 160,
+   "weights": "yolov9e.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v9_x_160.log",
+    "rc": 137,
+    "peak_rss_mib": 501.3,
+    "min_avail_mib": 56.5,
+    "limit_mib": 700,
+    "wall_s": 68.1,
+    "reason": "memory limit reached (700 MiB limit, peak 501 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v9",
+   "size": "x",
+   "imgsz": 320,
+   "weights": "yolov9e.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v9",
+   "size": "x",
+   "imgsz": 640,
+   "weights": "yolov9e.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v10",
+   "size": "n",
+   "imgsz": 160,
+   "weights": "yolov10n.pt",
+   "onnx": "work/onnx/yolo/v10/n_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v10_n_160.log",
+    "wall_s": 23.0,
+    "peak_rss_mib": 412.9,
+    "size_mib": 8.84,
+    "export_s": 9.2,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v10/n_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 85.65526600023077,
+    "mean_ms": 90.57576720015277,
+    "min_ms": 82.45610699987083,
+    "fps_median": 11.674705440729188,
+    "runs_ms": [
+     82.45610699987083,
+     105.90160500032653,
+     85.65526600023077,
+     84.6209619999172,
+     94.24489600041852
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v10_n_160.npz",
+    "wall_s": 1.5848990859999503
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v10/n_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "node '/model.10/attn/Split' (Split): axis 2 (channel axis 1)",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "  File \"/usr/lib/python3/dist-packages/vc4infer/engine.py\", line 351, in plan",
+     "    raise UnsupportedNode(bad[0].name, bad[0].op,",
+     "                          bad[0].constraint)",
+     "vc4infer._errors.UnsupportedNode: node '/model.10/attn/Split' (Split): axis 2 (channel axis 1)"
+    ],
+    "wall_s": 0.7271192430002884
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v10/n_160.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 58.24188232421875,
+     "estimate_bytes": 70.637939453125,
+     "floor_bytes": 39.2879638671875,
+     "scratch_bytes": 5.75811767578125,
+     "arena_bytes": 64.0,
+     "clamped": true
+    },
+    "estimate_mb": 58.24188232421875,
+    "unsupported": [
+     {
+      "name": "/model.10/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.10/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.10/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.22/m.0/cv1/cv1.2/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     }
+    ],
+    "static_plan": "refused",
+    "refusal": "node '/model.10/attn/Split' (Split): axis 2 (channel axis 1)",
+    "ok": false
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 66.1,
+    "peak_c": 68.2,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 66.6,
+    "peak_c": 67.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "unsupported on VC4"
+  },
+  {
+   "version": "v10",
+   "size": "n",
+   "imgsz": 320,
+   "weights": "yolov10n.pt",
+   "onnx": "work/onnx/yolo/v10/n_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v10_n_320.log",
+    "wall_s": 20.5,
+    "peak_rss_mib": 415.2,
+    "size_mib": 8.87,
+    "export_s": 8.0,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 317.6,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v10/n_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 303.47130099971764,
+    "mean_ms": 305.05794459986646,
+    "min_ms": 299.7099739995974,
+    "fps_median": 3.2952045109561463,
+    "runs_ms": [
+     299.7099739995974,
+     300.81052300010924,
+     303.47130099971764,
+     311.61014000008436,
+     309.68778499982363
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v10_n_320.npz",
+    "wall_s": 3.5061787099998583
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v10/n_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "node '/model.10/attn/Split' (Split): axis 2 (channel axis 1)",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "  File \"/usr/lib/python3/dist-packages/vc4infer/engine.py\", line 351, in plan",
+     "    raise UnsupportedNode(bad[0].name, bad[0].op,",
+     "                          bad[0].constraint)",
+     "vc4infer._errors.UnsupportedNode: node '/model.10/attn/Split' (Split): axis 2 (channel axis 1)"
+    ],
+    "wall_s": 1.0535431329999483
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v10/n_320.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 41.79656982421875,
+     "estimate_bytes": 122.50250244140625,
+     "floor_bytes": 40.4598388671875,
+     "scratch_bytes": 22.20343017578125,
+     "arena_bytes": 64.0,
+     "clamped": true
+    },
+    "estimate_mb": 41.79656982421875,
+    "unsupported": [
+     {
+      "name": "/model.10/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.10/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.10/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.22/m.0/cv1/cv1.2/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     }
+    ],
+    "static_plan": "refused",
+    "refusal": "node '/model.10/attn/Split' (Split): axis 2 (channel axis 1)",
+    "ok": false
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.1,
+    "peak_c": 63.4,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "unsupported on VC4"
+  },
+  {
+   "version": "v10",
+   "size": "n",
+   "imgsz": 640,
+   "weights": "yolov10n.pt",
+   "onnx": "work/onnx/yolo/v10/n_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v10_n_640.log",
+    "wall_s": 23.8,
+    "peak_rss_mib": 423.7,
+    "size_mib": 8.99,
+    "export_s": 11.3,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 317.3,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v10/n_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 1164.569819999997,
+    "mean_ms": 1180.29849200002,
+    "min_ms": 1160.9912019998774,
+    "fps_median": 0.8586861713452291,
+    "runs_ms": [
+     1163.946193999891,
+     1160.9912019998774,
+     1183.8997810000365,
+     1164.569819999997,
+     1228.0854630002978
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v10_n_640.npz",
+    "wall_s": 11.310925064999992
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v10/n_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 45.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 327.2 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 141.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 45.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 327.2 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 141.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 0.6942187240001658
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v10/n_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 45.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 327.2 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 141.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 45.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 327.2 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 141.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 60.7,
+    "peak_c": 67.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 141 MiB)"
+  },
+  {
+   "version": "v10",
+   "size": "s",
+   "imgsz": 160,
+   "weights": "yolov10s.pt",
+   "onnx": "work/onnx/yolo/v10/s_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v10_s_160.log",
+    "wall_s": 31.9,
+    "peak_rss_mib": 517.3,
+    "size_mib": 27.72,
+    "export_s": 14.9,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v10/s_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 223.3908899997914,
+    "mean_ms": 225.35483060000843,
+    "min_ms": 216.4645110001402,
+    "fps_median": 4.476458283508937,
+    "runs_ms": [
+     216.4645110001402,
+     223.3908899997914,
+     220.50604900005055,
+     232.86560299993653,
+     233.54710000012346
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v10_s_160.npz",
+    "wall_s": 3.561489220999647
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v10/s_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 193.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 277.7 MiB, but the client arena is 64.0 MiB with 8.1 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 209.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 193.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 277.7 MiB, but the client arena is 64.0 MiB with 8.1 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 209.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 0.6899231590000454
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v10/s_160.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 193.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 277.7 MiB, but the client arena is 64.0 MiB with 8.1 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 209.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 193.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 277.7 MiB, but the client arena is 64.0 MiB with 8.1 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 209.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 69.8,
+    "peak_c": 70.9,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 69.8,
+    "peak_c": 70.4,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 209 MiB)"
+  },
+  {
+   "version": "v10",
+   "size": "s",
+   "imgsz": 320,
+   "weights": "yolov10s.pt",
+   "onnx": "work/onnx/yolo/v10/s_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v10_s_320.log",
+    "wall_s": 28.3,
+    "peak_rss_mib": 545.5,
+    "size_mib": 27.75,
+    "export_s": 12.5,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 205.1,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v10/s_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 756.7271020002408,
+    "mean_ms": 758.6213758000667,
+    "min_ms": 745.2470849998463,
+    "fps_median": 1.3214803558068966,
+    "runs_ms": [
+     756.0184220001247,
+     772.6439560001381,
+     745.2470849998463,
+     756.7271020002408,
+     762.4703139999838
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v10_s_320.npz",
+    "wall_s": 8.011107725999864
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v10/s_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 195.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 374.0 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 225.6 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 195.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 374.0 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 225.6 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 1.7829174429998602
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v10/s_320.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 195.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 374.0 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 225.6 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 195.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 374.0 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 225.6 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.6,
+    "peak_c": 65.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 58.5,
+    "peak_c": 59.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 226 MiB)"
+  },
+  {
+   "version": "v10",
+   "size": "s",
+   "imgsz": 640,
+   "weights": "yolov10s.pt",
+   "onnx": "work/onnx/yolo/v10/s_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v10_s_640.log",
+    "wall_s": 38.0,
+    "peak_rss_mib": 552.1,
+    "size_mib": 27.88,
+    "export_s": 20.1,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 196.4,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v10/s_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 2937.035188000209,
+    "mean_ms": 2837.7727934001086,
+    "min_ms": 2500.373803000002,
+    "fps_median": 0.34047940728993703,
+    "runs_ms": [
+     2997.8402230003667,
+     2954.003484000168,
+     2937.035188000209,
+     2799.611268999797,
+     2500.373803000002
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v10_s_640.npz",
+    "wall_s": 25.901546512000095
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v10/s_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 204.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 756.1 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 300.7 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 204.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 756.1 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 300.7 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 1.7820920960002695
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v10/s_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 204.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 756.1 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 300.7 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 204.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 756.1 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 300.7 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.1,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.6,
+    "peak_c": 59.6,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 301 MiB)"
+  },
+  {
+   "version": "v10",
+   "size": "m",
+   "imgsz": 160,
+   "weights": "yolov10m.pt",
+   "onnx": "work/onnx/yolo/v10/m_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v10_m_160.log",
+    "wall_s": 63.7,
+    "peak_rss_mib": 545.0,
+    "size_mib": 58.69,
+    "export_s": 40.3,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v10/m_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 508.6558349998995,
+    "mean_ms": 510.0278184000672,
+    "min_ms": 504.36998599980143,
+    "fps_median": 1.9659658480084035,
+    "runs_ms": [
+     511.9473320000907,
+     506.41421700038336,
+     504.36998599980143,
+     518.751722000161,
+     508.6558349998995
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v10_m_160.npz",
+    "wall_s": 7.451949996999701
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v10/m_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 249.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 324.0 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 263.0 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 249.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 324.0 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 263.0 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 3.802113133999228
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v10/m_160.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 249.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 324.0 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 263.0 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 249.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 324.0 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 263.0 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 60.1,
+    "peak_c": 64.5,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 263 MiB)"
+  },
+  {
+   "version": "v10",
+   "size": "m",
+   "imgsz": 320,
+   "weights": "yolov10m.pt",
+   "onnx": "work/onnx/yolo/v10/m_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v10_m_320.log",
+    "wall_s": 49.1,
+    "peak_rss_mib": 626.8,
+    "size_mib": 58.72,
+    "export_s": 29.5,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 116.0,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v10/m_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 1988.9945220002119,
+    "mean_ms": 2002.3783425998772,
+    "min_ms": 1858.643980999659,
+    "fps_median": 0.5027665933410215,
+    "runs_ms": [
+     1988.9945220002119,
+     2177.4648739997247,
+     1858.643980999659,
+     2109.2211689997384,
+     1877.567167000052
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v10_m_320.npz",
+    "wall_s": 19.553475918999993
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v10/m_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 252.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 496.8 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 283.0 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 252.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 496.8 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 283.0 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 3.752997638999659
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v10/m_320.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 252.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 496.8 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 283.0 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 252.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 496.8 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 283.0 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.1,
+    "peak_c": 71.4,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 60.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 283 MiB)"
+  },
+  {
+   "version": "v10",
+   "size": "m",
+   "imgsz": 640,
+   "weights": "yolov10m.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v10_m_640.log",
+    "rc": 137,
+    "peak_rss_mib": 537.4,
+    "min_avail_mib": 54.1,
+    "limit_mib": 700,
+    "wall_s": 59.0,
+    "reason": "memory limit reached (700 MiB limit, peak 537 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v10",
+   "size": "l",
+   "imgsz": 160,
+   "weights": "yolov10l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v10_l_160.log",
+    "rc": 137,
+    "peak_rss_mib": 503.2,
+    "min_avail_mib": 50.1,
+    "limit_mib": 700,
+    "wall_s": 57.9,
+    "reason": "memory limit reached (700 MiB limit, peak 503 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v10",
+   "size": "l",
+   "imgsz": 320,
+   "weights": "yolov10l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v10",
+   "size": "l",
+   "imgsz": 640,
+   "weights": "yolov10l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v10",
+   "size": "x",
+   "imgsz": 160,
+   "weights": "yolov10x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v10_x_160.log",
+    "rc": 137,
+    "peak_rss_mib": 581.4,
+    "min_avail_mib": 68.1,
+    "limit_mib": 700,
+    "wall_s": 39.4,
+    "reason": "memory limit reached (700 MiB limit, peak 581 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v10",
+   "size": "x",
+   "imgsz": 320,
+   "weights": "yolov10x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v10",
+   "size": "x",
+   "imgsz": 640,
+   "weights": "yolov10x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v11",
+   "size": "n",
+   "imgsz": 160,
+   "weights": "yolo11n.pt",
+   "onnx": "work/onnx/yolo/v11/n_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v11_n_160.log",
+    "wall_s": 23.9,
+    "peak_rss_mib": 416.3,
+    "size_mib": 10.06,
+    "export_s": 10.5,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v11/n_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 93.32798199966419,
+    "mean_ms": 89.52970979999009,
+    "min_ms": 76.94365499992273,
+    "fps_median": 10.71490006077275,
+    "runs_ms": [
+     103.5895600002732,
+     78.33441000002495,
+     93.32798199966419,
+     76.94365499992273,
+     95.45294200006538
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v11_n_160.npz",
+    "wall_s": 1.6157328039998902
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v11/n_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "node '/model.10/m/m.0/attn/Split' (Split): axis 2 (channel axis 1)",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "  File \"/usr/lib/python3/dist-packages/vc4infer/engine.py\", line 351, in plan",
+     "    raise UnsupportedNode(bad[0].name, bad[0].op,",
+     "                          bad[0].constraint)",
+     "vc4infer._errors.UnsupportedNode: node '/model.10/m/m.0/attn/Split' (Split): axis 2 (channel axis 1)"
+    ],
+    "wall_s": 0.7719127899999876
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v11/n_160.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 45.5897216796875,
+     "estimate_bytes": 45.5897216796875,
+     "floor_bytes": 24.999755859375,
+     "scratch_bytes": 5.75811767578125,
+     "arena_bytes": 64.0,
+     "clamped": false
+    },
+    "estimate_mb": 45.5897216796875,
+    "unsupported": [
+     {
+      "name": "/model.10/m/m.0/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.10/m/m.0/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.10/m/m.0/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     }
+    ],
+    "static_plan": "refused",
+    "refusal": "node '/model.10/m/m.0/attn/Split' (Split): axis 2 (channel axis 1)",
+    "ok": false
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 66.6,
+    "peak_c": 67.7,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 65.5,
+    "peak_c": 67.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "unsupported on VC4"
+  },
+  {
+   "version": "v11",
+   "size": "n",
+   "imgsz": 320,
+   "weights": "yolo11n.pt",
+   "onnx": "work/onnx/yolo/v11/n_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v11_n_320.log",
+    "wall_s": 21.2,
+    "peak_rss_mib": 419.9,
+    "size_mib": 10.09,
+    "export_s": 7.7,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 307.5,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v11/n_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 309.75690899958863,
+    "mean_ms": 340.8642221998889,
+    "min_ms": 282.23468599935586,
+    "fps_median": 3.228337999722641,
+    "runs_ms": [
+     309.75690899958863,
+     291.4749050005412,
+     282.23468599935586,
+     449.9485430005734,
+     370.9060679993854
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v11_n_320.npz",
+    "wall_s": 3.6650856390006084
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v11/n_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "node '/model.10/m/m.0/attn/Split' (Split): axis 2 (channel axis 1)",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "  File \"/usr/lib/python3/dist-packages/vc4infer/engine.py\", line 351, in plan",
+     "    raise UnsupportedNode(bad[0].name, bad[0].op,",
+     "                          bad[0].constraint)",
+     "vc4infer._errors.UnsupportedNode: node '/model.10/m/m.0/attn/Split' (Split): axis 2 (channel axis 1)"
+    ],
+    "wall_s": 1.1672126630001003
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v11/n_320.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 41.79656982421875,
+     "estimate_bytes": 95.48162841796875,
+     "floor_bytes": 26.171630859375,
+     "scratch_bytes": 22.20343017578125,
+     "arena_bytes": 64.0,
+     "clamped": true
+    },
+    "estimate_mb": 41.79656982421875,
+    "unsupported": [
+     {
+      "name": "/model.10/m/m.0/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.10/m/m.0/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.10/m/m.0/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     }
+    ],
+    "static_plan": "refused",
+    "refusal": "node '/model.10/m/m.0/attn/Split' (Split): axis 2 (channel axis 1)",
+    "ok": false
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.1,
+    "peak_c": 63.4,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 72.0,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "unsupported on VC4"
+  },
+  {
+   "version": "v11",
+   "size": "n",
+   "imgsz": 640,
+   "weights": "yolo11n.pt",
+   "onnx": "work/onnx/yolo/v11/n_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v11_n_640.log",
+    "wall_s": 25.4,
+    "peak_rss_mib": 427.3,
+    "size_mib": 10.21,
+    "export_s": 11.6,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 325.2,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v11/n_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 1132.5987849995727,
+    "mean_ms": 1144.2485572000805,
+    "min_ms": 1121.5030350003872,
+    "fps_median": 0.8829251922607151,
+    "runs_ms": [
+     1148.0564780003988,
+     1121.5030350003872,
+     1129.8018150000644,
+     1132.5987849995727,
+     1189.2826729999797
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v11_n_640.npz",
+    "wall_s": 11.073540370000046
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v11/n_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 30.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 297.2 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 126.8 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 30.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 297.2 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 126.8 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 0.7769529079996573
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v11/n_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 30.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 297.2 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 126.8 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 30.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 297.2 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 126.8 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 60.1,
+    "peak_c": 66.6,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 127 MiB)"
+  },
+  {
+   "version": "v11",
+   "size": "s",
+   "imgsz": 160,
+   "weights": "yolo11s.pt",
+   "onnx": "work/onnx/yolo/v11/s_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v11_s_160.log",
+    "wall_s": 35.5,
+    "peak_rss_mib": 532.2,
+    "size_mib": 36.1,
+    "export_s": 18.4,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v11/s_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 386.01530999994793,
+    "mean_ms": 396.633887400003,
+    "min_ms": 355.18819099979737,
+    "fps_median": 2.590570824768932,
+    "runs_ms": [
+     448.99629200017444,
+     416.74815899978057,
+     386.01530999994793,
+     376.2214850003147,
+     355.18819099979737
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v11_s_160.npz",
+    "wall_s": 5.516083542999695
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v11/s_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 89.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 131.8 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 103.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 89.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 131.8 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 103.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 2.3389621420001276
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v11/s_160.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 89.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 131.8 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 103.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 89.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 131.8 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 103.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 69.8,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 103 MiB)"
+  },
+  {
+   "version": "v11",
+   "size": "s",
+   "imgsz": 320,
+   "weights": "yolo11s.pt",
+   "onnx": "work/onnx/yolo/v11/s_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v11_s_320.log",
+    "wall_s": 33.8,
+    "peak_rss_mib": 553.8,
+    "size_mib": 36.13,
+    "export_s": 16.3,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 175.5,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v11/s_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 748.7220330003765,
+    "mean_ms": 748.6002219999136,
+    "min_ms": 735.4895549997309,
+    "fps_median": 1.3356091525618254,
+    "runs_ms": [
+     748.7220330003765,
+     754.0143659998648,
+     748.6154719999831,
+     756.1596839996128,
+     735.4895549997309
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v11_s_320.npz",
+    "wall_s": 8.312087447000522
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v11/s_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 91.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 222.7 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 122.0 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 91.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 222.7 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 122.0 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 2.3122413179999057
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v11/s_320.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 91.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 222.7 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 122.0 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 91.8 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 222.7 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 122.0 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.6,
+    "peak_c": 65.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.6,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 122 MiB)"
+  },
+  {
+   "version": "v11",
+   "size": "s",
+   "imgsz": 640,
+   "weights": "yolo11s.pt",
+   "onnx": "work/onnx/yolo/v11/s_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v11_s_640.log",
+    "wall_s": 38.8,
+    "peak_rss_mib": 596.6,
+    "size_mib": 36.25,
+    "export_s": 22.8,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 145.6,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v11/s_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 2840.7630640003845,
+    "mean_ms": 2747.6191756002663,
+    "min_ms": 2420.920942000521,
+    "fps_median": 0.3520180942481673,
+    "runs_ms": [
+     2840.7630640003845,
+     2856.034137000279,
+     2851.9342210001923,
+     2768.443513999955,
+     2420.920942000521
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v11_s_640.npz",
+    "wall_s": 25.66942072600068
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v11/s_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 101.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 585.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 197.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 101.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 585.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 197.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 2.276289079999515
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v11/s_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 101.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 585.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 197.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 101.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 585.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 197.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 60.1,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 61.2,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 197 MiB)"
+  },
+  {
+   "version": "v11",
+   "size": "m",
+   "imgsz": 160,
+   "weights": "yolo11m.pt",
+   "onnx": "work/onnx/yolo/v11/m_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v11_m_160.log",
+    "wall_s": 91.7,
+    "peak_rss_mib": 542.1,
+    "size_mib": 76.74,
+    "export_s": 68.2,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v11/m_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 486.7721790001269,
+    "mean_ms": 486.5195506001328,
+    "min_ms": 485.26976500033925,
+    "fps_median": 2.054349124993315,
+    "runs_ms": [
+     485.26976500033925,
+     487.5293549998787,
+     487.24441200010915,
+     485.7820420002099,
+     486.7721790001269
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v11_m_160.npz",
+    "wall_s": 8.410465085999931
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v11/m_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 185.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 262.5 MiB, but the client arena is 64.0 MiB with 7.6 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 201.0 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 185.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 262.5 MiB, but the client arena is 64.0 MiB with 7.6 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 201.0 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 4.903712911000184
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v11/m_160.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 185.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 262.5 MiB, but the client arena is 64.0 MiB with 7.6 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 201.0 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 185.4 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 262.5 MiB, but the client arena is 64.0 MiB with 7.6 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 201.0 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 71.4,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 58.5,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 201 MiB)"
+  },
+  {
+   "version": "v11",
+   "size": "m",
+   "imgsz": 320,
+   "weights": "yolo11m.pt",
+   "onnx": "work/onnx/yolo/v11/m_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v11_m_320.log",
+    "wall_s": 68.5,
+    "peak_rss_mib": 583.8,
+    "size_mib": 76.77,
+    "export_s": 46.5,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 94.9,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v11/m_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 2043.3721509998577,
+    "mean_ms": 2048.8152715999604,
+    "min_ms": 2032.1509349996631,
+    "fps_median": 0.4893871140950426,
+    "runs_ms": [
+     2080.7213190000766,
+     2049.342346999765,
+     2038.4896060004394,
+     2032.1509349996631,
+     2043.3721509998577
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v11_m_320.npz",
+    "wall_s": 21.036463105999246
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v11/m_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 190.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 452.2 MiB, but the client arena is 64.0 MiB with 23.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 221.9 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 190.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 452.2 MiB, but the client arena is 64.0 MiB with 23.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 221.9 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 4.8019514810002875
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v11/m_320.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 190.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 452.2 MiB, but the client arena is 64.0 MiB with 23.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 221.9 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 190.1 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 452.2 MiB, but the client arena is 64.0 MiB with 23.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 221.9 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 60.1,
+    "peak_c": 70.9,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 222 MiB)"
+  },
+  {
+   "version": "v11",
+   "size": "m",
+   "imgsz": 640,
+   "weights": "yolo11m.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v11_m_640.log",
+    "rc": 137,
+    "peak_rss_mib": 604.6,
+    "min_avail_mib": 70.8,
+    "limit_mib": 700,
+    "wall_s": 26.0,
+    "reason": "memory limit reached (700 MiB limit, peak 605 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v11",
+   "size": "l",
+   "imgsz": 160,
+   "weights": "yolo11l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v11_l_160.log",
+    "rc": 137,
+    "peak_rss_mib": 610.1,
+    "min_avail_mib": 78.9,
+    "limit_mib": 700,
+    "wall_s": 48.8,
+    "reason": "memory limit reached (700 MiB limit, peak 610 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v11",
+   "size": "l",
+   "imgsz": 320,
+   "weights": "yolo11l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v11",
+   "size": "l",
+   "imgsz": 640,
+   "weights": "yolo11l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v11",
+   "size": "x",
+   "imgsz": 160,
+   "weights": "yolo11x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v11_x_160.log",
+    "rc": 137,
+    "peak_rss_mib": 572.8,
+    "min_avail_mib": 79.0,
+    "limit_mib": 700,
+    "wall_s": 43.5,
+    "reason": "memory limit reached (700 MiB limit, peak 573 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v11",
+   "size": "x",
+   "imgsz": 320,
+   "weights": "yolo11x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v11",
+   "size": "x",
+   "imgsz": 640,
+   "weights": "yolo11x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v12",
+   "size": "n",
+   "imgsz": 160,
+   "weights": "yolo12n.pt",
+   "onnx": "work/onnx/yolo/v12/n_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v12_n_160.log",
+    "wall_s": 28.9,
+    "peak_rss_mib": 417.5,
+    "size_mib": 10.01,
+    "export_s": 14.8,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v12/n_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 99.17114800009585,
+    "mean_ms": 95.00340380000125,
+    "min_ms": 85.27266000010059,
+    "fps_median": 10.083577937395999,
+    "runs_ms": [
+     87.0761159999347,
+     100.31430399976671,
+     99.17114800009585,
+     85.27266000010059,
+     103.18279100010841
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v12_n_160.npz",
+    "wall_s": 1.9963453840000511
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v12/n_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "node '/model.6/m.0/m.0.0/attn/Split' (Split): axis 2 (channel axis 1)",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "  File \"/usr/lib/python3/dist-packages/vc4infer/engine.py\", line 351, in plan",
+     "    raise UnsupportedNode(bad[0].name, bad[0].op,",
+     "                          bad[0].constraint)",
+     "vc4infer._errors.UnsupportedNode: node '/model.6/m.0/m.0.0/attn/Split' (Split): axis 2 (channel axis 1)"
+    ],
+    "wall_s": 1.01149098399992
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v12/n_160.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 58.24188232421875,
+     "estimate_bytes": 66.42626953125,
+     "floor_bytes": 39.62835693359375,
+     "scratch_bytes": 5.75811767578125,
+     "arena_bytes": 64.0,
+     "clamped": true
+    },
+    "estimate_mb": 58.24188232421875,
+    "unsupported": [
+     {
+      "name": "/model.6/m.0/m.0.0/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.0/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.0/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.0/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.1/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.1/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.1/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.1/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.0/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.0/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.0/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.0/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.1/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.1/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.1/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.1/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.0/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.0/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.0/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.0/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.1/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.1/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.1/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.1/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.0/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.0/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.0/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.0/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.1/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.1/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.1/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.1/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     }
+    ],
+    "static_plan": "refused",
+    "refusal": "node '/model.6/m.0/m.0.0/attn/Split' (Split): axis 2 (channel axis 1)",
+    "ok": false
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 66.1,
+    "peak_c": 66.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 66.6,
+    "peak_c": 67.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "unsupported on VC4"
+  },
+  {
+   "version": "v12",
+   "size": "n",
+   "imgsz": 320,
+   "weights": "yolo12n.pt",
+   "onnx": "work/onnx/yolo/v12/n_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v12_n_320.log",
+    "wall_s": 25.0,
+    "peak_rss_mib": 428.4,
+    "size_mib": 10.04,
+    "export_s": 12.0,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 305.0,
+    "limit_mib": 550
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v12/n_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 323.7404510000488,
+    "mean_ms": 314.5840881999902,
+    "min_ms": 283.8643019999836,
+    "fps_median": 3.0888941956772937,
+    "runs_ms": [
+     324.2095569999037,
+     338.9618739997786,
+     323.7404510000488,
+     302.1442570002364,
+     283.8643019999836
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v12_n_320.npz",
+    "wall_s": 4.039670013999967
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v12/n_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "node '/model.6/m.0/m.0.0/attn/Split' (Split): axis 2 (channel axis 1)",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "  File \"/usr/lib/python3/dist-packages/vc4infer/engine.py\", line 351, in plan",
+     "    raise UnsupportedNode(bad[0].name, bad[0].op,",
+     "                          bad[0].constraint)",
+     "vc4infer._errors.UnsupportedNode: node '/model.6/m.0/m.0.0/attn/Split' (Split): axis 2 (channel axis 1)"
+    ],
+    "wall_s": 1.3698229520005043
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v12/n_320.onnx",
+    "arena_mb": 64.0,
+    "plan": {
+     "pool_bytes": 41.79656982421875,
+     "estimate_bytes": 135.251708984375,
+     "floor_bytes": 40.80023193359375,
+     "scratch_bytes": 22.20343017578125,
+     "arena_bytes": 64.0,
+     "clamped": true
+    },
+    "estimate_mb": 41.79656982421875,
+    "unsupported": [
+     {
+      "name": "/model.6/m.0/m.0.0/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.0/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.0/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.0/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.1/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.1/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.1/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.0/m.0.1/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.0/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.0/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.0/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.0/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.1/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.1/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.1/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.6/m.1/m.1.1/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.0/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.0/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.0/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.0/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.1/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.1/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.1/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.0/m.0.1/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.0/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.0/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.0/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.0/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.1/attn/Split",
+      "op": "Split",
+      "why": "axis 2 (channel axis 1)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.1/attn/MatMul",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.1/attn/MatMul_1",
+      "op": "MatMul",
+      "why": "rank 4 operand (2-D only)"
+     },
+     {
+      "name": "/model.8/m.1/m.1.1/attn/pe/conv/Conv",
+      "op": "Conv",
+      "why": "kernel 7x7 (NCHW fallback: 1x1, 3x3)"
+     }
+    ],
+    "static_plan": "refused",
+    "refusal": "node '/model.6/m.0/m.0.0/attn/Split' (Split): axis 2 (channel axis 1)",
+    "ok": false
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 70.9,
+    "peak_c": 73.6,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 58.5,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "unsupported on VC4"
+  },
+  {
+   "version": "v12",
+   "size": "n",
+   "imgsz": 640,
+   "weights": "yolo12n.pt",
+   "onnx": "work/onnx/yolo/v12/n_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v12_n_640.log",
+    "wall_s": 35.1,
+    "peak_rss_mib": 438.6,
+    "size_mib": 10.16,
+    "export_s": 17.6,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 291.4,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v12/n_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 1361.1306390002937,
+    "mean_ms": 1362.2259810001196,
+    "min_ms": 1335.787492000236,
+    "fps_median": 0.7346833370340319,
+    "runs_ms": [
+     1335.787492000236,
+     1355.851067999538,
+     1370.0184160006756,
+     1388.342289999855,
+     1361.1306390002937
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v12_n_640.npz",
+    "wall_s": 13.177252106999731
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v12/n_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 45.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 467.3 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 141.4 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 45.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 467.3 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 141.4 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 0.8772940520002521
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v12/n_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 45.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 467.3 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 141.4 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 45.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 467.3 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 141.4 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 60.1,
+    "peak_c": 67.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 141 MiB)"
+  },
+  {
+   "version": "v12",
+   "size": "s",
+   "imgsz": 160,
+   "weights": "yolo12s.pt",
+   "onnx": "work/onnx/yolo/v12/s_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v12_s_160.log",
+    "wall_s": 40.7,
+    "peak_rss_mib": 527.9,
+    "size_mib": 35.46,
+    "export_s": 21.2,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v12/s_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 383.5438810001506,
+    "mean_ms": 370.1406701999076,
+    "min_ms": 248.54058799974155,
+    "fps_median": 2.6072636001709735,
+    "runs_ms": [
+     488.2292160000361,
+     337.299769999845,
+     393.08989599976485,
+     383.5438810001506,
+     248.54058799974155
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v12_s_160.npz",
+    "wall_s": 5.866981927999859
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v12/s_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 147.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 203.5 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 160.9 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 147.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 203.5 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 160.9 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 2.4034550540000055
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v12/s_160.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 147.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 203.5 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 160.9 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 147.2 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 203.5 MiB, but the client arena is 64.0 MiB with 5.8 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 160.9 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 70.9,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 60.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 161 MiB)"
+  },
+  {
+   "version": "v12",
+   "size": "s",
+   "imgsz": 320,
+   "weights": "yolo12s.pt",
+   "onnx": "work/onnx/yolo/v12/s_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v12_s_320.log",
+    "wall_s": 34.0,
+    "peak_rss_mib": 578.8,
+    "size_mib": 35.49,
+    "export_s": 16.9,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 151.9,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v12/s_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 811.9631340005071,
+    "mean_ms": 811.5504968001915,
+    "min_ms": 791.4582650000739,
+    "fps_median": 1.2315830092839848,
+    "runs_ms": [
+     811.9631340005071,
+     817.4274419998255,
+     791.4582650000739,
+     832.7591940005732,
+     804.1444489999776
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v12_s_320.npz",
+    "wall_s": 9.123367041000165
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v12/s_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 149.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 332.4 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 179.7 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 149.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 332.4 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 179.7 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 2.397419275000175
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v12/s_320.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 149.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 332.4 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 179.7 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 149.5 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 332.4 MiB, but the client arena is 64.0 MiB with 22.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 179.7 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 60.1,
+    "peak_c": 65.5,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 72.0,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 180 MiB)"
+  },
+  {
+   "version": "v12",
+   "size": "s",
+   "imgsz": 640,
+   "weights": "yolo12s.pt",
+   "onnx": "work/onnx/yolo/v12/s_640.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v12_s_640.log",
+    "wall_s": 47.3,
+    "peak_rss_mib": 580.7,
+    "size_mib": 35.61,
+    "export_s": 29.3,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 152.0,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v12/s_640.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 640",
+    "ok": true,
+    "median_ms": 3152.6065739999467,
+    "mean_ms": 3064.462246199946,
+    "min_ms": 2786.9481460002135,
+    "fps_median": 0.31719784138216317,
+    "runs_ms": [
+     3293.781225999737,
+     3279.686631999539,
+     3152.6065739999467,
+     2809.2886530002943,
+     2786.9481460002135
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      8400
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v12_s_640.npz",
+    "wall_s": 28.980832910000572
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v12/s_640.onnx",
+    "imgsz": 640,
+    "input": "bus.jpg resized 640",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 158.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 957.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 254.8 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 158.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 957.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 254.8 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 2.3809692929999073
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v12/s_640.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 158.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 957.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 254.8 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 158.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 957.7 MiB, but the client arena is 64.0 MiB with 87.9 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 254.8 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.1,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 60.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 255 MiB)"
+  },
+  {
+   "version": "v12",
+   "size": "m",
+   "imgsz": 160,
+   "weights": "yolo12m.pt",
+   "onnx": "work/onnx/yolo/v12/m_160.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v12_m_160.log",
+    "wall_s": 85.3,
+    "peak_rss_mib": 547.3,
+    "size_mib": 77.06,
+    "export_s": 60.6,
+    "opset": 17,
+    "rc": 0
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v12/m_160.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 160",
+    "ok": true,
+    "median_ms": 598.3259370004816,
+    "mean_ms": 598.6964910001916,
+    "min_ms": 586.2457290004386,
+    "fps_median": 1.6713298524432763,
+    "runs_ms": [
+     586.2457290004386,
+     601.9082030006757,
+     592.7567329999874,
+     598.3259370004816,
+     614.2458529993746
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      525
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v12_m_160.npz",
+    "wall_s": 9.394416565999563
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v12/m_160.onnx",
+    "imgsz": 160,
+    "input": "bus.jpg resized 160",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 281.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 377.5 MiB, but the client arena is 64.0 MiB with 8.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 298.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 281.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 377.5 MiB, but the client arena is 64.0 MiB with 8.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 298.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 4.986503332999746
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v12/m_160.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 281.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 377.5 MiB, but the client arena is 64.0 MiB with 8.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 298.1 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 281.9 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 377.5 MiB, but the client arena is 64.0 MiB with 8.2 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 298.1 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.1,
+    "peak_c": 65.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 298 MiB)"
+  },
+  {
+   "version": "v12",
+   "size": "m",
+   "imgsz": 320,
+   "weights": "yolo12m.pt",
+   "onnx": "work/onnx/yolo/v12/m_320.onnx",
+   "export": {
+    "ok": true,
+    "log": "/home/raspi/scratch/logs/yolo-export/v12_m_320.log",
+    "wall_s": 72.3,
+    "peak_rss_mib": 534.0,
+    "size_mib": 77.09,
+    "export_s": 46.3,
+    "opset": 17,
+    "rc": 0,
+    "min_avail_mib": 80.1,
+    "limit_mib": 700
+   },
+   "cpu": {
+    "model": "/home/raspi/work/onnx/yolo/v12/m_320.onnx",
+    "provider": "CPUExecutionProvider",
+    "intra_op_threads": 4,
+    "input": "bus.jpg resized 320",
+    "ok": true,
+    "median_ms": 2143.983238999681,
+    "mean_ms": 2145.12084099988,
+    "min_ms": 2112.688600999718,
+    "fps_median": 0.46642155675926383,
+    "runs_ms": [
+     2139.0063729995745,
+     2161.4127089997055,
+     2168.5132830007205,
+     2143.983238999681,
+     2112.688600999718
+    ],
+    "output_names": [
+     "output0"
+    ],
+    "outputs": [
+     [
+      1,
+      84,
+      2100
+     ]
+    ],
+    "ref_npz": "/home/raspi/scratch/refs/yolo/v12_m_320.npz",
+    "wall_s": 22.086828935000085
+   },
+   "vc4": {
+    "model": "/home/raspi/work/onnx/yolo/v12/m_320.onnx",
+    "imgsz": 320,
+    "input": "bus.jpg resized 320",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 286.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 624.6 MiB, but the client arena is 64.0 MiB with 31.6 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 326.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 286.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 624.6 MiB, but the client arena is 64.0 MiB with 31.6 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 326.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ],
+    "wall_s": 4.884367642000143
+   },
+   "plan_default": {
+    "model": "/home/raspi/work/onnx/yolo/v12/m_320.onnx",
+    "ok": false,
+    "refusal": "unsupported graph: graph pool needs at least 286.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 624.6 MiB, but the client arena is 64.0 MiB with 31.6 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 326.2 MiB would do - or lower VC4_POOL_RESERVE_MB",
+    "error_type": "UnsupportedNode",
+    "traceback_tail": [
+     "    raise UnsupportedNode(",
+     "    ...<7 lines>...",
+     "           _mib(floor + scratch + (8 << 20))))",
+     "vc4infer._errors.UnsupportedNode: unsupported graph: graph pool needs at least 286.6 MiB (weights + packed conv panels + the largest tensor) and this model's peak is about 624.6 MiB, but the client arena is 64.0 MiB with 31.6 MiB reserved for conv/elementwise scratch: start vc4d with a larger --arena-mb (or set VC4INFER_ARENA_MB) - about 326.2 MiB would do - or lower VC4_POOL_RESERVE_MB"
+    ]
+   },
+   "plan_150": null,
+   "thermal_cpu": {
+    "start_c": 59.6,
+    "peak_c": 72.0,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "thermal_vc4": {
+    "start_c": 59.1,
+    "peak_c": 60.1,
+    "core_hz": 400000000,
+    "throttled": "0x20000"
+   },
+   "ratio": null,
+   "status": "does not fit (needs 326 MiB)"
+  },
+  {
+   "version": "v12",
+   "size": "m",
+   "imgsz": 640,
+   "weights": "yolo12m.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v12_m_640.log",
+    "rc": 137,
+    "peak_rss_mib": 528.2,
+    "min_avail_mib": 79.0,
+    "limit_mib": 700,
+    "wall_s": 74.8,
+    "reason": "memory limit reached (700 MiB limit, peak 528 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v12",
+   "size": "l",
+   "imgsz": 160,
+   "weights": "yolo12l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v12_l_160.log",
+    "rc": 137,
+    "peak_rss_mib": 486.0,
+    "min_avail_mib": 51.9,
+    "limit_mib": 700,
+    "wall_s": 64.5,
+    "reason": "memory limit reached (700 MiB limit, peak 486 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v12",
+   "size": "l",
+   "imgsz": 320,
+   "weights": "yolo12l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v12",
+   "size": "l",
+   "imgsz": 640,
+   "weights": "yolo12l.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v12",
+   "size": "x",
+   "imgsz": 160,
+   "weights": "yolo12x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "log": "/home/raspi/scratch/logs/yolo-export/v12_x_160.log",
+    "rc": 137,
+    "peak_rss_mib": 551.3,
+    "min_avail_mib": 76.6,
+    "limit_mib": 700,
+    "wall_s": 44.5,
+    "reason": "memory limit reached (700 MiB limit, peak 551 MiB)"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not exportable (memory limit)"
+  },
+  {
+   "version": "v12",
+   "size": "x",
+   "imgsz": 320,
+   "weights": "yolo12x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  },
+  {
+   "version": "v12",
+   "size": "x",
+   "imgsz": 640,
+   "weights": "yolo12x.pt",
+   "onnx": null,
+   "export": {
+    "ok": false,
+    "reason": "not attempted"
+   },
+   "cpu": null,
+   "vc4": null,
+   "plan_default": null,
+   "plan_150": null,
+   "thermal_cpu": null,
+   "thermal_vc4": null,
+   "ratio": null,
+   "status": "not attempted (optional)"
+  }
+ ]
+}

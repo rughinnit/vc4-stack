@@ -24,7 +24,8 @@ Documentation = "https://github.com/rughinnit/vc4-stack/blob/main/docs/VC4INFER.
 
 [tool.setuptools]
 package-dir = { "" = "python" }
-packages = ["vc4infer", "vc4infer.contrib", "vc4infer.ort"]
+packages = ["vc4infer", "vc4infer.contrib", "vc4infer.ort",
+            "vc4infer.optimizer"]
 include-package-data = false
 
 [tool.setuptools.package-data]

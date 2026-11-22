@@ -684,3 +684,52 @@ load 3.21 s -> 0.48 s, first run 1.78 s -> 1.46 s, steady state unchanged.
 The artifact is additional to the pass pipeline in this document: the graph it
 contains is the graph these passes produced.  Autotuning remains phase E.
 
+
+## Pass 7: the frozen execution plan
+
+Passes 1 to 4 rewrite the graph; passes 5 and 6 decide where its bytes live.
+What none of them removes is the per-node Python that *executes* the result:
+the dispatch table, the attribute reads, the Tensor and pool bookkeeping, the
+liveness pass.  That work is a decision about the graph, and the graph does
+not change between frames, so it is made once and replayed.
+
+This is not a graph pass and it does not change a node: it records the device
+calls the optimised graph makes and replays them in C.  It lives in
+`infer/python/vc4infer/_plan.py` and `infer/src/vc4_plan.c`; the design, the
+boundary and the coverage on YOLOv8n-160 are in
+[CPU-BREAKDOWN.md](CPU-BREAKDOWN.md) section 6.
+
+What matters here is how it consumes this pipeline.  The recording is taken
+from a frame that has already honoured every marker:
+
+* a node in `_skip` (a fused activation, the Sigmoid of a SiLU pair) is
+  recorded as a zero-cost step, exactly as the loop skipped it;
+* an `_alias` entry (the fused activation's output name moved onto the
+  producer's buffer) becomes an `ALIAS` record, so the output name still
+  resolves to the right buffer without a copy;
+* the layout map (`_collect_layout`) is already applied, so a relabelled
+  1-channel plane is an alias rather than a conversion;
+* the epilogue's activation is inside the conv's `act` argument, so the
+  activation is part of the Python conv step, not a separate record.
+
+The plan does not re-derive any of those decisions, which is the point: a
+pass that changes what the executor does changes the recording automatically,
+and a node whose new call is not on the representable list falls back to the
+Python path by itself.
+
+The relationship to the engine artifact (passes 5 and 6) is that the two
+freeze different things.  The artifact freezes the graph, the panels and the
+arena offsets into a file that a later process loads; the plan freezes the
+sequence of calls one process makes over those offsets.  A loaded artifact
+already pins its arena plan, so the runner does not build a plan on that path:
+two pinned allocators describing the same buffer would be one too many.  A
+plain ONNX run builds the plan on its first frame, which is why the build cost
+(+107 ms on the 160 graph, measured with the device calls stubbed) is paid
+once per `Runner` and not once per process start.
+
+Correctness and the measured host delta are in CPU-BREAKDOWN.md 6.4-6.6.  The
+byte-for-byte gate on the real models is `tools/cost/check_plan_equiv.py` on
+the board; the CPU-side gates are `infer/tests/test_cplan.py` (build, fallback
+boundary, equivalence on synthetic graphs, and the structure of the real 160
+graph) and `infer/build/test_plan` (the C walker's decoding and stop-on-error
+rule, with a hook instead of the device).

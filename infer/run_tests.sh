@@ -90,6 +90,12 @@ TMPDIR="$TMPDIR" python3 tests/test_artifact.py
 echo "=== test_model_sums (no GPU: the shipped model manifest, a corrupted copy)"
 TMPDIR="$TMPDIR" python3 tests/test_model_sums.py
 
+echo "=== test_plan (no GPU: the frozen-plan walker decodes and stops on error)"
+./build/test_plan
+
+echo "=== test_cplan (no GPU: plan build, fallback boundary, replay equivalence)"
+TMPDIR="$TMPDIR" python3 tests/test_cplan.py
+
 echo "=== test_dispatch (no GPU)"
 ./build/test_dispatch
 

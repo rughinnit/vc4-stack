@@ -93,6 +93,16 @@ def generator_digest():
     return buf.value.decode()
 
 
+def plan_op_size():
+    """sizeof(vc4_plan_op) in the loaded library, or None if it has no plan."""
+    lib = library()
+    fn = getattr(lib, "vc4_plan_op_size", None)
+    if fn is None:
+        return None
+    fn.restype = ctypes.c_size_t
+    return int(fn())
+
+
 def kernel_abi_tag():
     """The ABI tag the generator digest hashes, or ``None`` without the symbol."""
     lib = library()
@@ -144,6 +154,28 @@ RED_SUM, RED_MEAN, RED_MAX, RED_MIN, RED_ARGMAX, RED_ARGMIN = range(6)
 
 class Buf(ctypes.Structure):
     _fields_ = [("off", ctypes.c_uint32), ("bytes", ctypes.c_size_t)]
+
+
+# Frozen execution plans: the record layout mirrors vc4_plan_op in
+# vc4infer.h.  vc4_plan_op_size() is the ABI check between the two; a writer
+# that gets this wrong would hand the C walker garbage offsets, so the plan
+# builder refuses to run when the sizes disagree.
+PLAN_ALIAS, PLAN_EW, PLAN_UNARY = 0, 1, 2
+PLAN_COPY2D, PLAN_COPY2D_N, PLAN_COPY2D_X = 3, 4, 5
+PLAN_FILL2D, PLAN_GATHER, PLAN_BLIT = 6, 7, 8
+PLAN_REDUCE, PLAN_CUMSUM = 9, 10
+PLAN_KINDS = 11
+
+PLAN_ARGS = 14
+
+
+class PlanOp(ctypes.Structure):
+    _fields_ = [("kind", ctypes.c_uint16), ("flags", ctypes.c_uint16),
+                ("a_off", ctypes.c_uint32), ("a_bytes", ctypes.c_uint32),
+                ("b_off", ctypes.c_uint32), ("b_bytes", ctypes.c_uint32),
+                ("c_off", ctypes.c_uint32), ("c_bytes", ctypes.c_uint32),
+                ("n", ctypes.c_int64),
+                ("p", ctypes.c_int64 * PLAN_ARGS)]
 
 
 class OpInfo(ctypes.Structure):
@@ -381,6 +413,15 @@ class Engine:
                                  ctypes.POINTER(Buf), ctypes.c_uint32,
                                  ctypes.c_uint32]
         L.vc4_cumsum.restype = ctypes.c_int
+        # A frozen plan is one call per segment; a library that predates the
+        # walker keeps working (the runner then never builds a plan).
+        try:
+            L.vc4_plan_run.argtypes = [ctypes.c_void_p,
+                                       ctypes.POINTER(PlanOp), ctypes.c_size_t]
+            L.vc4_plan_run.restype = ctypes.c_int
+            self.plan_supported = True
+        except AttributeError:
+            self.plan_supported = False
         L.vc4_get_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(Stats)]
         L.vc4_get_stats.restype = None
         L.vc4_autotune.argtypes = [ctypes.c_void_p, ctypes.c_int,
@@ -625,6 +666,17 @@ class Engine:
         self._check(self.lib.vc4_cumsum(self.ctx, ctypes.byref(a),
                                         ctypes.byref(out), int(rows),
                                         int(cols)), "cumsum")
+
+    def plan_run(self, ops):
+        """Replay a frozen plan: one ctypes call, one C loop, no Python node.
+
+        ``ops`` is a (PlanOp * n) array built once by
+        ``vc4infer._plan``; it is not copied and not inspected here.
+        """
+        if not self.plan_supported:
+            raise Unsupported("this libvc4infer has no vc4_plan_run")
+        self._check(self.lib.vc4_plan_run(self.ctx, ops, len(ops)),
+                    "plan_run")
 
     # ---- NHWC (the YOLO plane)
     def conv_nhwc_wpanel_bytes(self, Cin, Cout, KH, KW, bias=True):

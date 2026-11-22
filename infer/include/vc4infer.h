@@ -544,6 +544,87 @@ vc4_status vc4_cumsum(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
                       uint32_t rows, uint32_t cols);
 
 /* ======================================================================
+ * frozen execution plans
+ *
+ * A plan is the list of device calls one graph makes, recorded once from a
+ * correct frame and replayed per frame by the ARM without the Python
+ * executor.  It is a straight-line program over *arena offsets*, not over
+ * tensors: the offsets are the ones the run that recorded it used, so the
+ * pool the caller hands to the plan must keep handing out those offsets
+ * (the runner pins its pool to the recording).
+ *
+ * Only calls whose whole effect is a device read and a device write are
+ * representable.  A conv, a GEMM, a softmax or anything that transfers
+ * bytes between the host and the arena is not: a node that makes such a
+ * call stays on the Python path, and the plan yields before it.
+ *
+ * The record is a fixed-size POD with no pointers, so a writer in another
+ * language can build it (vc4infer/_plan.py does) and vc4_plan_op_size() is
+ * the ABI check between the two.
+ * ====================================================================== */
+typedef enum {
+    VC4_PLAN_ALIAS = 0,   /* no device call: a view or a relabel          */
+    VC4_PLAN_EW,          /* vc4_elementwise                              */
+    VC4_PLAN_UNARY,       /* vc4_unary                                    */
+    VC4_PLAN_COPY2D,      /* vc4_copy2d                                   */
+    VC4_PLAN_COPY2D_N,    /* vc4_copy2d_n                                 */
+    VC4_PLAN_COPY2D_X,    /* vc4_copy2d_x                                 */
+    VC4_PLAN_FILL2D,      /* vc4_fill2d                                   */
+    VC4_PLAN_GATHER,      /* vc4_gather                                   */
+    VC4_PLAN_BLIT,        /* vc4_blit                                     */
+    VC4_PLAN_REDUCE,      /* vc4_reduce                                   */
+    VC4_PLAN_CUMSUM,      /* vc4_cumsum                                   */
+    VC4_PLAN_KINDS
+} vc4_plan_kind;
+
+/*
+ * A record.  ``a``/``b``/``out`` are engine buffers (b unused for the unary
+ * forms); ``n`` is the element or byte count; ``p`` holds kind-specific
+ * integer arguments and, where the C call takes a float (a unary parameter
+ * or a fill value), that float's IEEE-754 bits as an int64 so nothing is
+ * rounded on the way through.
+ *
+ *   EW        p0 = vc4_op, p1 = b present
+ *   UNARY     p0 = vc4_uop, p1..p3 = float bits of p0..p2
+ *   COPY2D    p0..p6  = rows, vpr, srow, drow, svec, dvec, slane
+ *   COPY2D_N  p0..p9  = the above, nlane, units, depth
+ *   COPY2D_X  p0..p12 = the above, nblk, sbstep, dbstep, units, depth
+ *   FILL2D    p0..p3  = rows, vpr, drow, dvec; p4 = value bits
+ *   GATHER    p0 = value bits of the fill
+ *   BLIT      n = bytes
+ *   REDUCE    p0..p2  = outer, red, vc4_redop
+ *   CUMSUM    p0..p1  = rows, cols
+ */
+typedef struct {
+    uint16_t kind;
+    uint16_t flags;       /* reserved, 0 */
+    uint32_t a_off, a_bytes;
+    uint32_t b_off, b_bytes;
+    uint32_t c_off, c_bytes;
+    int64_t  n;
+    int64_t  p[14];       /* 12 used today; the slack keeps the size 8-aligned */
+} vc4_plan_op;
+
+/*
+ * The hook exists so the walker can be exercised with no VideoCore present:
+ * a test supplies a callback that records the decoded call instead of
+ * issuing it.  The production path passes NULL and gets the real entry
+ * points.
+ */
+typedef struct {
+    vc4_status (*call)(void *user, const vc4_plan_op *op,
+                       const vc4_buf *a, const vc4_buf *b, const vc4_buf *out);
+    void *user;
+} vc4_plan_hooks;
+
+/* Run every record in order; the first failing call returns its status. */
+vc4_status vc4_plan_run(vc4_ctx *ctx, const vc4_plan_op *ops, size_t n);
+vc4_status vc4_plan_run_h(vc4_ctx *ctx, const vc4_plan_op *ops, size_t n,
+                          const vc4_plan_hooks *hooks);
+/* sizeof(vc4_plan_op), for a writer that mirrors the struct. */
+size_t vc4_plan_op_size(void);
+
+/* ======================================================================
  * training: forward + backward
  *
  * Every entry point here runs *all* its arithmetic on the QPUs.  The CPU only

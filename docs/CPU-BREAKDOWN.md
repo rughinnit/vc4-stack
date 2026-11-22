@@ -241,8 +241,10 @@ dominated by four costs:
   work in Python; the plan removed the largest parts of it, not all of it.
 
 A C-side execution plan that walked the node list and called the existing C op
-entry points would remove the last two rows together; that is the larger
-rewrite this measurement does not attempt.  Reducing the launch count further
+entry points would remove the last two rows together.  Section 6 starts that
+for the node classes that dominate the launch count; its figure is host-only
+and the client/daemon rows still need a run on the board.  Reducing the launch
+count further
 (Softmax still issues 40 launches, Add 38; the Reshape row was 41 before the
 layout pass and is 8 after it, sec. 3.3) would attack the first two.
 
@@ -250,3 +252,194 @@ At these numbers the QPU path now spends less CPU per delivered frame than
 ncnn at 4 threads with passive waiting at 128 and 160, and is about level with
 ncnn at 3 threads at 160.  It is still 5-7 % above both at 96, where ncnn's
 own CPU per frame is smallest.
+
+## 6. An execution plan in C
+
+The two rows this page called addressable - the Python executor (0.035 s) and
+the per-node host code (0.045 s) - are per-node Python work for 332 launches.
+What they compute is the same on every frame: which engine call to make, with
+which buffers, for a graph whose shapes and layout decisions are already
+fixed.  This section describes a plan that records that answer once and
+replays it in C, scoped to the node classes that dominate the launch count
+(elementwise, unary, concat, split, copy/layout, reshape-class).  Convolution
+and GEMM stay on the Python path in this pass.
+
+The implementation is `infer/src/vc4_plan.c`,
+`infer/python/vc4infer/_plan.py` and the plan hooks in
+`infer/python/vc4infer/_onnxrun.py`.
+
+### 6.1 What a plan is
+
+A plan is a straight line of device calls over **arena offsets**, not over
+tensors.  Each record is a fixed-size POD (`vc4_plan_op`, 152 bytes) with:
+
+| field | meaning |
+|---|---|
+| `kind` | one of `EW`, `UNARY`, `COPY2D`, `COPY2D_N`, `COPY2D_X`, `FILL2D`, `GATHER`, `BLIT`, `REDUCE`, `CUMSUM`, `ALIAS` |
+| `a`, `b`, `out` | engine buffer `(offset, bytes)` for the operands and the store; `b` only for `EW` |
+| `n` | element count, or byte count for `BLIT` |
+| `p[14]` | kind-specific integers: the elementwise op code, the unary op and its three float parameters (carried as IEEE-754 bits, so nothing is rounded), the copy strides, the fill value |
+
+There is no function pointer, no allocation and no host address in a record.
+`vc4_plan_run(ctx, ops, n)` decodes each record and calls the entry point the
+executor itself called - `vc4_elementwise`, `vc4_unary`, `vc4_copy2d_x`,
+`vc4_fill2d`, `vc4_gather`, `vc4_blit`, `vc4_reduce`, `vc4_cumsum` - so the
+bytes moved, the launch count and the kernel choice are the recording's, not
+the walker's.  An `ALIAS` record makes no call: it is a reshape, a flatten, an
+identity or a fused activation's relabel, whose output name maps to a buffer
+another record already produced.
+
+The Python side mirrors the struct (`_binding.PlanOp`) and refuses to build a
+plan when `vc4_plan_op_size()` disagrees with its own `sizeof`; the two
+writers cannot drift silently.
+
+### 6.2 How it is built
+
+The first strict, non-profile frame after the runner exists runs exactly as
+before, with two additions:
+
+* the engine is wrapped in `_plan.Trace`, which copies each call's decoded
+  arguments into a list (a call it does not recognise is recorded as
+  "other" and marks its node unrepresentable);
+* the pool labels every allocation, so the frame's offsets can be named.
+
+After the frame the trace is split per node.  A node becomes a run of C
+records when **every** call it made is on the representable list and **every**
+output it produced is an arena buffer.  A node with no calls whose outputs
+alias existing buffers becomes an `ALIAS`.  Everything else becomes a
+`("p", index)` step: the replay driver hands that index to the ordinary
+`Runner._dispatch`, exactly as the loop did before, and continues after it.
+Skipped and folded nodes (the optimiser's fused activations, the SiLU pairs)
+become `("s", index)` steps and cost nothing.
+
+The pool is then switched, in place, from bump/free allocation to the
+recording: every non-persistent allocation the replay still asks for (a
+Python node's buffers, the input uploads) is served its recorded offset.  The
+segment allocations are the same engine buffers, so constants and packed
+panels keep their addresses.  `Pool.check` is off for this mode, because the
+C steps write buffers the Python allocator never sees and an overlap check
+could only report false conflicts; the recording came from a frame that
+already ran correctly.
+
+Panels are a plan-time concept, and the allocator now says so: a buffer that
+is created once and kept (a broadcast expansion, a conv weight panel, a GEMM
+operand) is allocated under its own `panel:` scope rather than the node's, and
+its upload is marked static.  Without that, the panel's ordinal would vanish
+from the node's allocation sequence on replay and the pinned offsets after it
+would name the wrong buffers.  This is the invariant a node scope has to
+keep: every allocation under it must happen on every frame.
+
+### 6.3 The boundary, and what happens when the plan is wrong
+
+The rule is about calls, not op types, which is what keeps the boundary
+honest as handlers change:
+
+* a node is a C step if all its calls are representable and all its outputs
+  are buffers;
+* otherwise it is a Python step, unchanged, with the same allocator keys and
+  the same dispatcher;
+* the plan is not built or not used for a profile run (per-node stats and the
+  backend report would stop being per node), a hybrid run (`host_policy`
+  tiers), an engine artifact (its own pinned arena plan already owns the
+  offsets) or when `$VC4_NO_CPLAN=1`;
+* a feed whose shape or element count differs from the recording is refused
+  by name, because a static plan pins the buffers;
+* if a Python node allocates differently on a later frame than it did while
+  recording - a handler that branches on activation values, such as
+  Softmax's range check - the pinned pool raises `ArtifactPlanError`, the
+  plan is dropped for that Runner, the pool returns to the ordinary
+  allocator and **the frame is re-run from the feeds on the Python path**.
+  The failure costs the plan, not the answer.  `runner.plan_error` records
+  why, and later frames do not try again.
+
+### 6.4 Coverage on YOLOv8n-160
+
+With `passes="all"`, the optimised graph has 252 nodes: 138 execute and 114
+are skipped (fused activations and the epilogue).  Of the 138, 47 become C
+nodes - 17 `Concat`, 8 `Split`, 8 `Add`, 8 `Reshape`, 2 `Slice`, 2 `Mul`,
+1 `Transpose`, 1 `Sigmoid` - with 105 records between them, 92 of them
+`COPY2D_X`.  That is the copy work this page counts as structural: the 17
+channel concats, the 8 channel splits and the DFL permute.
+
+The 91 Python steps are 64 `Conv`, 19 `Constant`, 3 `MaxPool`, 2 `Resize`,
+2 `Sub` and 1 `Softmax`.  Conv, MaxPool and Resize are the stated scope
+boundary.  `Constant` is a node that re-uploads its data on every frame - a
+pre-existing cost, not one the plan introduces, and folding it to an
+initialiser is a graph pass, not a plan feature.  `Sub` is a runtime tensor
+minus a broadcast constant: `_scaled` uploads a full-size constant buffer per
+frame, which is exactly the host traffic that keeps its node in Python.
+
+### 6.5 What is measured, and what is not
+
+**Not measured on silicon.**  No client frame was measured for this change:
+the board was not available for GPU work, and the plan changes no kernel, so a
+new client figure would have to come from a dedicated run.  The client and
+daemon rows of sections 2 and 4 are therefore unchanged here, not updated -
+there is no frame of evidence for a new number yet.  The gate is
+a three-round, interleaved A/B on one client with `VC4_NO_CPLAN=1` against the
+default, both at 96/128/160, with `tools/cost/breakdown.py` and
+`/proc/<pid>/stat`; commands are in 6.6.  Until that runs, no claim is made
+about client CPU per frame.
+
+**Measured on the ARM, host only.**  `infer/tests/bench_cplan.py` runs the real
+160 graph with the engine's calls stubbed to a counter, so the engine's own
+time is removed identically from both sides and the difference is the work
+this change moves: the per-node executor loop and the node host code.  On the
+board, ARM pinned at 1.0 GHz, no GPU client and no `vc4d` traffic,
+`time.thread_time()` around the frame, nine frames after the build frame,
+three runs.  The table is one run; the bracketed figures are the spread of the
+median across the three.
+
+| frame | host ms | min | max |
+|---|---:|---:|---:|
+| Python path (`VC4_NO_CPLAN=1`) | 124.5 (123.8-124.9) | 123.1 | 127.2 |
+| frozen plan | 74.0 (74.0-74.3) | 73.6 | 74.9 |
+
+The plan path issues the same calls per frame (189 in this stub run, identical
+lists) and is **40 % cheaper in host time**: 50.2 ms per frame of executor and
+node-host work removed.  The delta is the stable quantity - 49.7, 50.3 and
+50.5 ms in the three runs.
+
+Two caveats, both about what the stub can and cannot say.  The absolute
+figure is not the client CPU of section 2, because the stub replaces the
+engine's own work (C op setup, the launch path) with a counter.  And the
+stub's bytes are not a correctness oracle: the synthetic equivalence tests
+(`infer/tests/test_cplan.py`) compare calls and bytes for elementwise, unary,
+concat, split, reshape, alias and a Python boundary, but the byte-for-byte
+claim for the real models is the silicon gate.
+
+The build frame costs **+107 ms** (257 ms to 364 ms with the same stub) because
+it runs the tracer and the labeler alongside the normal frame.  It is paid
+once per `Runner`, so a frame rate that matters has to amortise it; at the
+160 frame rate of section 4 it is about a quarter of one frame's CPU.
+
+### 6.6 The first run on silicon
+
+```
+make -C infer
+tools/thermal-guard.sh --max 75           # one client, nothing else on the GPU
+
+# correctness first: byte equality, every model, both paths
+python3 tools/cost/check_plan_equiv.py
+./build/test_plan                          # the walker, no device
+TMPDIR=$HOME/scratch/tmp python3 infer/tests/test_cplan.py
+
+# then the account, three interleaved rounds per size
+VC4INFER_PROF=1 python3 tools/cost/breakdown.py --size 160 --runs 8
+VC4_NO_CPLAN=1 VC4INFER_PROF=1 \
+    python3 tools/cost/breakdown.py --size 160 --runs 8
+```
+
+The per-size matrix is 96/128/160 with and without the plan, median of ten
+after three warm-ups, one fresh `vc4d` per cell (`docs/COST-COMPARISON.md`
+protocol); the host-only benchmark above is not a substitute for it.  The op
+gate is `tools/op_matrix.py` 152/152 as before; the plan adds no op and
+changes no kernel.  What to look at on the first frame after the build: the
+call count in the profile must equal the launch count the daemon logs,
+`runner.plan_error` must stay `None`, and the daemon log must show no
+`GPU lock` or timeout line.
+
+A fallback is not a failure of the model, but it is a finding: if
+`plan_error` is set on a real frame, the Python node that allocated
+differently has to be identified before the plan can be claimed for that
+model.

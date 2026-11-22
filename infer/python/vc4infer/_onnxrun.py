@@ -124,6 +124,7 @@ _UNARY_NV4_VERIFIED = os.environ.get("VC4_UNARY_VERIFIED", "1") != "0"
 _UNARY_NV4_STAGED = ("Exp", "Log", "Sqrt", "Reciprocal", "Erf", "Sin", "Cos",
                      "Round", "Softplus", "Elu", "Selu", "Gelu", "Mish")
 from ._hybrid import HostEvaluator, outer_refs             # noqa: E402
+from . import _plan                                        # noqa: E402
 
 # Kept for the scripts that print the engine directory.
 ENGINE = _first_dir(os.environ.get("VC4INFER_ENGINE"),
@@ -472,6 +473,11 @@ class Pool:
         self.pin = dict(pin) if pin is not None else None
         self.labeler = labeler
         self.record = record
+        # A frozen-plan pool hands out recorded offsets for the nodes that
+        # still run in Python; the C steps write their own recorded buffers,
+        # so the overlap check cannot see the whole frame and is off.  An
+        # artifact plan keeps it on: there the pinned plan is the frame.
+        self.check = True
         self.pinned_live = []           # pinned: sorted [(off, end, key)]
         self.live_bytes = 0
         if self.pin is not None:
@@ -597,7 +603,7 @@ class Pool:
             raise ArtifactPlanError(
                 "arena plan: allocation %r at segment %d + %d B (%d B) runs "
                 "past the %d B segment" % (key, seg_i, int(rel), n, seg[1]))
-        for lo, hi, other in self.pinned_live:
+        for lo, hi, other in (self.pinned_live if self.check else ()):
             if off < hi and lo < end:
                 raise ArtifactPlanError(
                     "arena plan: allocation %r at offset %d (%d B) overlaps "
@@ -1039,6 +1045,16 @@ class Runner:
                             if k in self._consts and isinstance(v, Tensor)
                             and getattr(v, "has_buf", True)}
         self._prev_outputs = ()
+        # Frozen execution plan (docs/CPU-BREAKDOWN.md sec. 6): the first
+        # strict frame records the device calls it makes, every later frame
+        # replays them in C and only the nodes the plan cannot express come
+        # back through _dispatch.  cplan is public enough to inspect (a test
+        # and the docs read its summary) but nothing else depends on it.
+        self.cplan = None
+        self.plan_error = None
+        self._plan_build = None
+        self._plan_saved = None
+        self._cplan_enabled = (os.environ.get("VC4_NO_CPLAN", "") in ("", "0"))
 
     def _apply_exec_state(self, st):
         """Restore the rewrite tables a build recorded, instead of rescanning.
@@ -1096,6 +1112,25 @@ class Runner:
             else:
                 t = buf
             self._art_panels[p.panel] = t
+
+    def _panel_alloc(self, key, fn):
+        """Allocate a cached panel under its own scope, as plan-time data.
+
+        Two reasons, both about a frozen plan.  A panel is created once and
+        kept, so on a later frame nothing is allocated for it: if it shared a
+        node's scope, its ordinal would vanish from that node's allocation
+        sequence and every pinned offset after it would name the wrong
+        buffer.  And the transfer that fills it is not per-frame work, so the
+        tracer marks it static and the plan omits it on replay.
+        """
+        prev = self._alloc_scope
+        self._alloc_scope = "panel:" + repr(key)
+        self.eng.plan_static = True
+        try:
+            return fn()
+        finally:
+            self.eng.plan_static = False
+            self._alloc_scope = prev
 
     def _panel_get(self, key):
         """The executor's packed-panel lookup, with the artifact's panels."""
@@ -1864,15 +1899,19 @@ class Runner:
                    (pt, pl, pb, pr) if pads is not None else None)
             wp = self._panel_get(key)
             if wp is None:
-                wt = self.upload(np.ascontiguousarray(wa, np.float32))
-                bb = self.upload(np.ascontiguousarray(ba, np.float32))
-                wp = self.pool.alloc(self.eng.conv_nhwc_wpanel_bytes(
-                    Cin, Cout, kh, kw, True))
-                self.eng.conv_nhwc_pack_w(wt.buf, Cin, Cout, kh, kw, bb.buf,
-                                          wp)
+                def _mk_panel(wa=wa, ba=ba, key=key, Cin=Cin, Cout=Cout,
+                              kh=kh, kw=kw):
+                    wt = self.upload(np.ascontiguousarray(wa, np.float32))
+                    bb = self.upload(np.ascontiguousarray(ba, np.float32))
+                    w = self.pool.alloc(self.eng.conv_nhwc_wpanel_bytes(
+                        Cin, Cout, kh, kw, True))
+                    self.eng.conv_nhwc_pack_w(wt.buf, Cin, Cout, kh, kw,
+                                              bb.buf, w)
+                    self._free(wt)
+                    self._free(bb)
+                    return w
+                wp = self._panel_alloc(key, _mk_panel)
                 self._panels[key] = wp
-                self._free(wt)
-                self._free(bb)
             h, w, o = self.eng.conv_nhwc_pads(
                 x.buf, N, Cin, H, W, x.pitch, wp, Cout, kh, kw, sh, pt, pl,
                 pb, pr, dil, out, act=act)
@@ -1896,16 +1935,22 @@ class Runner:
             key = ("panelg", node.name, g, cg, og, kh, kw, dil)
             wp = self._panel_get(key)
             if wp is None:
-                wg = np.ascontiguousarray(wa[g * og:(g + 1) * og], np.float32)
-                bg = np.ascontiguousarray(ba[g * og:(g + 1) * og], np.float32)
-                wt = self.upload(wg)
-                bb = self.upload(bg)
-                wp = self.pool.alloc(self.eng.conv_nhwc_wpanel_bytes(
-                    cg, og, kh, kw, True))
-                self.eng.conv_nhwc_pack_w(wt.buf, cg, og, kh, kw, bb.buf, wp)
+                def _mk_gpanel(g=g, key=key, og=og, cg=cg, kh=kh, kw=kw):
+                    wg = np.ascontiguousarray(wa[g * og:(g + 1) * og],
+                                              np.float32)
+                    bg = np.ascontiguousarray(ba[g * og:(g + 1) * og],
+                                              np.float32)
+                    wt = self.upload(wg)
+                    bb = self.upload(bg)
+                    w = self.pool.alloc(self.eng.conv_nhwc_wpanel_bytes(
+                        cg, og, kh, kw, True))
+                    self.eng.conv_nhwc_pack_w(wt.buf, cg, og, kh, kw,
+                                              bb.buf, w)
+                    self._free(wt)
+                    self._free(bb)
+                    return w
+                wp = self._panel_alloc(key, _mk_gpanel)
                 self._panels[key] = wp
-                self._free(wt)
-                self._free(bb)
             panels.append(wp)
         h, w, o = self.eng.conv_nhwc_group(
             x.buf, N, Cin, H, W, x.pitch, panels, Cout, groups, kh, kw, sh,
@@ -2246,11 +2291,15 @@ class Runner:
             return t
         b = np.ascontiguousarray(
             np.broadcast_to(np.asarray(c, np.float32), ref.shape))
+        # A plan-time panel is uploaded once and kept, so the transfer is not
+        # per-frame work: the plan records it as a static entry and omits it
+        # on replay.  Per-frame host traffic (a compaction, a broadcast built
+        # for a runtime tensor) is not marked and keeps its node in Python.
         if layout == "nhwc":
-            t = self.upload_nhwc(
-                np.ascontiguousarray(b.transpose(0, 2, 3, 1)), ref.shape)
+            t = self._panel_alloc(key, lambda: self.upload_nhwc(
+                np.ascontiguousarray(b.transpose(0, 2, 3, 1)), ref.shape))
         else:
-            t = self.upload(b)
+            t = self._panel_alloc(key, lambda: self.upload(b))
         self._panels[key] = t
         return t
 
@@ -3327,7 +3376,8 @@ class Runner:
         keyb = ("gemmB", node.name)
         bb = self._panel_get(keyb)
         if bb is None:
-            bb = self.upload(np.ascontiguousarray(ba))
+            bb = self._panel_alloc(
+                keyb, lambda: self.upload(np.ascontiguousarray(ba)))
             self._panels[keyb] = bb
         out = self._alloc(M * N)
         self.eng.matmul(a.buf, bb.buf, out, M, N, K)
@@ -3345,7 +3395,8 @@ class Runner:
                 elif ca.shape != (M, N):
                     raise UnsupportedNode("Gemm %s: C shape %s"
                                           % (node.name, ca.shape))
-                cb = self.upload(np.ascontiguousarray(ca))
+                cb = self._panel_alloc(
+                    keyc, lambda: self.upload(np.ascontiguousarray(ca)))
                 self._panels[keyc] = cb
             o2 = self._alloc(M * N)
             self.eng.elementwise(vc4infer.OP_ADD, t.buf, o2, M * N, b=cb.buf)
@@ -3802,8 +3853,177 @@ class Runner:
             last[o.name] = len(self.graph.node)
         self._last_use = last
 
+    # ------------------------------------------------------- frozen plan
+    def _start_plan_build(self, feeds, profile):
+        """Begin recording this frame's device calls, or return None.
+
+        Recording is only meaningful for a frame that runs the strict Python
+        path over an unpinned pool: an artifact's arena plan already owns the
+        offsets, a profile run needs its per-node stats, and a hybrid run has
+        a backend report that a C step could not fill in.
+        """
+        if (self.cplan is not None or self._plan_build is not None
+                or profile or self.mode != "strict"
+                or not self._cplan_enabled):
+            return None
+        if getattr(self.pool, "pin", None) is not None:
+            return None
+        if getattr(self.pool, "record", None) is not None:
+            return None                      # an artifact build owns it
+        if not _plan.supports(self.eng):
+            return None
+        build = _plan.Build(feeds)
+        build.tracer = _plan.Trace(self.eng)
+        self._plan_saved = (self.pool.labeler, self.pool.record, self._labels)
+        self.pool.labeler = self._next_alloc_key
+        self.pool.record = []
+        self._labels = True
+        self._plan_build = build
+        return build
+
+    def _finish_plan_build(self, build, feeds):
+        """Freeze the recording into a plan and pin the pool to its offsets.
+
+        The pool object is the same one the recorded frame used, so the
+        constants and the packed panels keep their engine allocations; only
+        the allocator's behaviour changes, from bump/free to "hand back the
+        offset this key had".
+        """
+        records = self.pool.record or []
+        plan = build.finish(records)
+        if plan is None:
+            self._abort_plan_build()
+            return
+        self.pool.record = None
+        self.pool.pin = dict(plan.pin)
+        self.pool.check = False
+        self.cplan = plan
+        self._plan_build = None
+        self._plan_saved = None
+
+    def _abort_plan_build(self):
+        if self._plan_saved is not None:
+            self.pool.labeler, self.pool.record, self._labels = \
+                self._plan_saved
+        self._plan_saved = None
+        self._plan_build = None
+
+    def _drop_plan(self, why):
+        """Abandon the plan after a frame that did not match its recording.
+
+        The pinned pool is the tripwire: a node that allocated a different
+        number or size of buffers than the recording did cannot be served its
+        recorded offset, and continuing would write one tensor over another.
+        The pool returns to the ordinary allocator, the plan is forgotten for
+        this Runner, and the frame is re-run from the feeds on the Python
+        path.  A handler that branches on activation values (Softmax's
+        range check is one) can trigger this; it costs the plan, not the
+        answer.
+        """
+        self.cplan = None
+        self._cplan_enabled = False
+        self.plan_error = why
+        pool = self.pool
+        pool.pin = None
+        pool.check = True
+        pool.labeler = None
+        pool.live = {}
+        pool.free = []
+        self._labels = False
+        self._garbage = []
+        self._plan_saved = None
+
+    def _run_plan(self, feeds):
+        """Replay the frozen plan: one C call per run of device ops.
+
+        Nodes the plan cannot express are the only ones that reach Python.
+        The values a C step wrote are addressed by their recorded buffer, so
+        a Python node that reads one gets a Tensor built from the plan's
+        descriptor - the same (offset, shape, layout, pitch) the recording
+        produced.
+        """
+        plan = self.cplan
+        plan.check_feeds(feeds)
+        try:
+            return self._run_plan_steps(plan, feeds)
+        except ArtifactPlanError as e:
+            self._drop_plan(str(e))
+            return self.run(feeds)
+
+    def _run_plan_steps(self, plan, feeds):
+        self.pool.begin_run()
+        self.values = {k: v for k, v in self.values.items()
+                       if k in self._consts}
+        self._count_host = False
+        self._node_ctx = None
+        self._node_idx = None
+        self.host_bytes = 0
+        self._host_site_acc = {}
+        self.host_sites = []
+        self.boundary_uploads = 0
+        self.boundary_downloads = 0
+        self._alloc_seq = {}
+        self._garbage = []
+        self.profile = []
+        self.backend_report = []
+        for name, arr in feeds.items():
+            self._alloc_scope = "in:" + name
+            try:
+                self.values[name] = self.upload(arr)
+            finally:
+                self._alloc_scope = None
+        for kind, item in plan.steps:
+            if kind == "c":
+                self.eng.plan_run(item)
+            elif kind == "p":
+                self._run_plan_node(item)
+            # "s": the optimiser skipped the node; its output names already
+            # describe the buffer the recording produced
+        res = []
+        for o in self.graph.output:
+            v = self.values.get(o.name)
+            if v is None:
+                v = plan.tensor(o.name)
+            res.append(self.nchw(v) if isinstance(v, Tensor)
+                       else np.asarray(v))
+        return res
+
+    def _run_plan_node(self, idx):
+        """Run one non-representable node through the ordinary dispatcher."""
+        node = self.graph.node[idx]
+        for name in node.input:
+            if name and name not in self.values:
+                self.values[name] = self.cplan.tensor(name)
+        self._node_idx = idx
+        self._alloc_scope = "n%d:%s" % (idx, node.op_type)
+        self._node_ctx = (idx, self._names[idx], node.op_type)
+        self._count_host = True
+        try:
+            out = self._dispatch(node)
+        finally:
+            self._count_host = False
+            self._alloc_scope = None
+        outs = out if isinstance(out, list) else [out]
+        outs = self._relabel_outputs(node, outs)
+        for i, oname in enumerate(node.output):
+            if oname:
+                self.values[oname] = (outs[i] if i < len(outs)
+                                      else outs[-1])
+        keep = set(t.buf.off for t in outs if isinstance(t, Tensor))
+        for t in self._garbage:
+            if isinstance(t, Tensor) and t.buf.off not in keep:
+                self._release_buf(t.buf)
+        self._garbage = []
+
     def run(self, feeds, profile=False):
         self.check_policy()
+        if isinstance(self.eng, _plan.Trace):
+            # the build frame raised; drop the half-recorded plan and unwrap
+            self.eng = self.eng._eng
+            self._abort_plan_build()
+        if (self.cplan is not None and not profile
+                and self.mode == "strict"):
+            return self._run_plan(feeds)
         self.pool.begin_run()
         for name in self._prev_outputs:
             v = self.values.get(name)
@@ -3823,6 +4043,9 @@ class Runner:
         # on every run must produce the same key on every run, which is what
         # lets a recorded plan pin its buffers to fixed offsets.
         self._alloc_seq = {}
+        build = self._start_plan_build(feeds, profile)
+        if build is not None:
+            self.eng = build.tracer
         if self._labels:
             for name, arr in feeds.items():
                 self._alloc_scope = "in:" + name
@@ -3864,12 +4087,15 @@ class Runner:
                             "backend": backend, "reason": reason,
                             "wall_ms": 0.0, "gpu_ms": 0.0, "launches": 0,
                             "flops": 0, "macs": 0})
+                if build is not None:
+                    build.note(idx, node, [], self.values, skipped=True)
                 continue
             self._node_idx = idx
             if self._labels:
                 self._alloc_scope = "n%d:%s" % (idx, node.op_type)
             tier = plan[idx]["backend"] if hybrid else None
             reason = plan[idx]["reason"] if hybrid else ""
+            n0 = len(build.tracer.calls) if build is not None else 0
             t0 = time.perf_counter()
             s0 = self.eng.stats if track else None
             self._node_ctx = (idx, name, node.op_type)
@@ -3913,6 +4139,8 @@ class Runner:
                     if oname:
                         self.values[oname] = (outs[i] if i < len(outs)
                                               else outs[-1])
+            if build is not None:
+                build.note(idx, node, build.tracer.calls[n0:], self.values)
             if hybrid:
                 self.backend_report.append({
                     "index": idx, "name": name, "op": node.op_type,
@@ -3938,6 +4166,9 @@ class Runner:
                     v = self.values.pop(name, None)
                     if isinstance(v, Tensor) and v.buf.off not in keep:
                         self._release_buf(v.buf)
+        if build is not None:
+            self.eng = build.tracer._eng
+            self._finish_plan_build(build, feeds)
         self.host_sites = sorted(self._host_site_acc.values(),
                                  key=lambda e: -e["bytes"])
         self.host_bytes = sum(e["bytes"] for e in self.host_sites)

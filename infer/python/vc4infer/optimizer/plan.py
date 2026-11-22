@@ -21,12 +21,17 @@ nodes exactly (525 launches: 468 Mul, 38 Add, 4 Sub, 1 Div, 14 Sigmoid) and
 all 64 conv rows (128 launches).  ``compare_profile`` re-checks that against a
 fresh ``yolo_bench.py --json`` run, which is the command to run on silicon.
 
-Everything else (layout copies, softmax's row copy, the pool border) is marked
-approximate: it is included so the plan is not silently short, never used to
-claim a gain.  ``Plan.unmodelled`` lists the node ops whose launches are not
-modelled at all.
+Layout conversions are priced exactly from the stored extent: the number of
+``copy2d_x`` calls the executor's ``to_nhwc``/``_to_nchw_buf`` issues for that
+tensor (41 calls on the YOLOv8n-160 head, 33 of them one 1-channel plane, which
+is the row the layout pass removes).  What remains approximate is softmax's
+row copy and the pool border; they are included so the plan is not silently
+short, never used to claim a gain.  ``Plan.unmodelled`` lists the node ops
+whose launches are not modelled at all.
 """
 from __future__ import annotations
+
+import json
 
 from onnx import TensorProto
 
@@ -34,9 +39,74 @@ EW_GROUP = 256
 EW_QPU = 12
 ALIGN16 = 16
 
+# The layout-assignment pass records one tensor -> layout map on a line of the
+# model doc_string, the same place the other passes leave provenance.  It is
+# data read by the executor and by this module; a model without the line is
+# planned exactly as before.
+LAYOUT_PREFIX = "vc4-layout: "
+
 
 def align16(v):
     return (int(v) + ALIGN16 - 1) // ALIGN16 * ALIGN16
+
+
+def layout_record(doc_string):
+    """name -> "nhwc/<pitch>" | "nchw" from a model doc_string, or {}."""
+    for line in (doc_string or "").splitlines():
+        if not line.startswith(LAYOUT_PREFIX):
+            continue
+        try:
+            rec = json.loads(line[len(LAYOUT_PREFIX):])
+        except ValueError:
+            continue
+        got = rec.get("layouts") if isinstance(rec, dict) else None
+        if isinstance(got, dict):
+            return got
+    return {}
+
+
+def set_layout_record(graph, layouts):
+    """Write the layout map onto the graph's model doc_string."""
+    lines = [ln for ln in (graph.meta.get("doc_string") or "").splitlines()
+             if not ln.startswith(LAYOUT_PREFIX)]
+    if layouts:
+        lines.append(LAYOUT_PREFIX + json.dumps({"layouts": layouts},
+                                                sort_keys=True))
+    graph.meta["doc_string"] = "\n".join(lines)
+
+
+def parse_layout(value):
+    """("nhwc", pitch) | ("nchw", 0) from a recorded layout string."""
+    if isinstance(value, str) and value.startswith("nhwc"):
+        _, _, pitch = value.partition("/")
+        return ("nhwc", int(pitch)) if pitch else ("nhwc", 0)
+    return ("nchw", 0)
+
+
+def to_nchw_calls(shape, layout):
+    """copy2d_x calls ``_to_nchw_buf`` issues for one stored tensor.
+
+    Mirrors the executor: a compact NHWC tensor with 16-aligned channels moves
+    whole 16-word vectors, a narrow row takes one call per image, and anything
+    else takes one call per 16 columns.  A 1-channel NHWC tensor is *not*
+    special-cased here: the executor converts it unless the layout pass chose
+    NCHW for it, and that choice is what this function is asked to price.
+    """
+    if not shape or len(shape) != 4 or layout[0] != "nhwc":
+        return 0
+    n, c, h, w = (int(d) for d in shape)
+    if min(n, c, h, w) <= 0:
+        return 0
+    pitch = layout[1] or w
+    per_image = 0
+    if pitch == w and c % 16 == 0:
+        hw = h * w
+        per_image = (1 if hw >= 16 else 0) + (1 if hw % 16 else 0)
+    elif w <= 16:
+        per_image = 1
+    else:
+        per_image = (w + 15) // 16
+    return n * per_image
 
 
 def stored_floats(shape, layout):
@@ -151,6 +221,26 @@ def conv_nhwc(node, xshape, wshape, group):
     return True
 
 
+def to_nhwc_calls(shape, layout, cpad=None):
+    """copy2d_x calls ``to_nhwc`` issues to hand this tensor to a conv.
+
+    An NHWC tensor whose channel count already matches is returned as is (the
+    executor's early return).  Otherwise each image costs one call per
+    16-channel block, plus one fill call when the pad has to be zeroed.
+    """
+    if not shape or len(shape) != 4:
+        return 0
+    n, c, h, w = (int(d) for d in shape)
+    if min(n, c, h, w) <= 0:
+        return 0
+    cp = align16(c) if cpad is None else int(cpad)
+    if layout[0] == "nhwc":
+        if cp == c:
+            return 0
+        return n * (((c + 15) // 16) + (1 if cp > c else 0))
+    return n * ((c + 15) // 16)
+
+
 def layouts(graph):
     """name -> ("nhwc", pitch) | ("nchw", 0), following the executor's rules."""
     out = {}
@@ -188,6 +278,9 @@ def layouts(graph):
         for name in node.proto.output:
             if name:
                 out[name] = loc
+    rec = layout_record(graph.meta.get("doc_string") or "")
+    for name, value in rec.items():
+        out[name] = parse_layout(value)
     return out
 
 
@@ -303,8 +396,15 @@ def node_launches(graph, node, loc):
             return 0, 0                     # the host concatenate path
         batch = int(shape[0]) if shape and len(shape) == 4 else 1
         return 0, max(1, n) * max(1, batch)
-    if op in ("Reshape", "Transpose", "Pad"):
+    if op in ("Transpose", "Pad"):
         return 0, 1
+    if op in ("Reshape", "Flatten", "Squeeze", "Unsqueeze"):
+        # A view on NCHW; on NHWC the executor converts first.  The conversion
+        # is priced from the *stored* tensor, so a pitched conv output and a
+        # 1-channel plane cost what they cost on the board (plan_diff names
+        # the rows the layout pass removes).
+        lay_in = loc.get(ins[0], ("nchw", 0)) if ins else ("nchw", 0)
+        return 0, to_nchw_calls(graph.shape(ins[0]) if ins else None, lay_in)
     if op in ("Slice", "Gather", "Expand", "Tile"):
         return 0, 1
     if op in ("Sub", "Div"):
@@ -358,6 +458,7 @@ class Plan:
         self.per_node = {}
         self.exact = 0
         self.copy = 0
+        self.copy_nodes = 0
         self.unmodelled = set()
         for node in graph.nodes:
             if node.rule("fused") or node.name in implicit_nodes:
@@ -372,6 +473,8 @@ class Plan:
                     self.by_op.get(node.op_type, 0) + exact + copy
             self.exact += exact
             self.copy += copy
+            if copy:
+                self.copy_nodes += 1
             if not exact and not copy and node.op_type not in (
                     _META | _VIEW) and node.op_type not in _COPY:
                 if graph.shape(node.proto.output[0] if node.proto.output else ""):
@@ -386,7 +489,8 @@ class Plan:
     def summary(self):
         return {"nodes": self.nodes, "dispatches": self.dispatches,
                 "launches": self.total, "exact": self.exact,
-                "copy": self.copy, "ops": self.histogram}
+                "copy": self.copy, "copy_nodes": self.copy_nodes,
+                "ops": self.histogram}
 
     def diff(self, other):
         """other - self, per op and in total."""
@@ -400,6 +504,7 @@ class Plan:
                 "launches": other.total - self.total,
                 "exact": other.exact - self.exact,
                 "copy": other.copy - self.copy,
+                "copy_nodes": other.copy_nodes - self.copy_nodes,
                 "ops": dict(sorted(ops.items(), key=lambda kv: kv[1]))}
 
 
@@ -444,9 +549,9 @@ def format_plan(plan, label=""):
     if label:
         lines.append(label)
     lines.append("nodes %d  dispatches %d  launches %d "
-                 "(exact %d + copy ~%d)"
+                 "(exact %d + copy ~%d over %d nodes)"
                  % (plan.nodes, plan.dispatches, plan.total, plan.exact,
-                    plan.copy))
+                    plan.copy, plan.copy_nodes))
     lines.append(head)
     ops = [n.op_type for n in plan.graph.nodes]
     for op, launches in plan.by_op.items():

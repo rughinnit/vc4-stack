@@ -1,9 +1,10 @@
 """Graph optimiser for the vc4infer executor.
 
-Phase A and B of ``docs/OPTIMIZER.md``:
+Phases A to C of ``docs/OPTIMIZER.md``:
 
     ir         the graph representation (nodes, attributes, shapes, provenance)
-    passes     the switchable pass pipeline (canonicalise, ew, epilogue)
+    passes     the switchable pass pipeline (canonicalise, ew, epilogue,
+               layout)
     plan       launch accounting from the plan, before and after a pass
 
 The pipeline is off by default; an operator sweep and end-to-end parity are

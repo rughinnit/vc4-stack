@@ -44,6 +44,14 @@ Pass 3: epilogue
     conv-bias          Conv + Add(per-channel constant) -> Conv bias
     conv-activation    Conv/MatMul + Relu / Clip[0,6] / silu -> the GEMM's
                        store
+Pass 4: layout
+    layout             choose NHWC or NCHW for every tensor and record the map
+                       on the model doc_string.  A tensor stays in the packed
+                       NHWC form across elementwise/unary/gather ops, and a
+                       conversion is charged only where an op has to read the
+                       other form.  A 1-channel NHWC tensor has NCHW byte order
+                       (pitch == W), so the pass chooses the form its consumers
+                       need instead of paying a conversion for it.
 """
 from __future__ import annotations
 
@@ -797,8 +805,230 @@ def _fuse_conv_activation(graph):
     return st
 
 
+# ------------------------------------------------------------------ layout
+# Ops the executor runs from a compact NCHW buffer: an NHWC operand is moved
+# there by ``_to_nchw_buf`` before the op runs.  These are the sites a layout
+# choice can remove.  Cast, Div, Gather, GatherElements, GatherND and Softmax
+# are in the family tables (``_dispatch_extra``/``_dispatch_norm``) and all
+# enter through ``_Base.ten``, which converts to NCHW, so they belong here even
+# though their ONNX semantics are elementwise.
+_LAYOUT_NCHW = frozenset((
+    "Reshape", "Flatten", "Squeeze", "Unsqueeze", "Transpose", "MatMul",
+    "Gemm", "GlobalAveragePool", "Softmax", "Cast", "Div", "Gather",
+    "GatherElements", "GatherND",
+))
+
+# Ops the main table runs in place: they touch every element or move whole
+# rows and keep the operand's layout and pitch.  Split, Slice and Resize are
+# layout-preserving too but are handled with their own rule because their
+# output inherits the input's layout.
+_LAYOUT_NEUTRAL = frozenset((
+    "Abs", "Neg", "Sign", "Clip", "LeakyRelu", "HardSigmoid", "HardSwish",
+    "Sigmoid", "Tanh", "Exp", "Log", "Sqrt", "Reciprocal", "Erf", "Sin",
+    "Cos", "Floor", "Ceil", "Round", "Softplus", "Softsign", "Elu", "Selu",
+    "Gelu", "Mish", "Silu", "Add", "Sub", "Mul", "Identity", "Dropout",
+    "Split", "Slice", "Resize",
+))
+
+
+def _maxpool_nhwc(node):
+    """True when the executor takes the NHWC ring kernel for this pool."""
+    ks = node.attr("kernel_shape")
+    st = node.attr("strides") or [1, 1]
+    pd = node.attr("pads") or [0, 0, 0, 0]
+    if not ks or len(ks) < 2 or int(ks[0]) != int(ks[1]):
+        return False
+    n = int(ks[0])
+    return (int(st[0]) == 1 and n in (3, 5) and
+            [int(p) for p in pd] == [(n - 1) // 2] * 4)
+
+
+def _conv_layout(node, graph, align16, conv_nhwc):
+    """The output layout a conv delivers, including the trimmed-Cout pitch."""
+    ins = [i for i in node.proto.input if i]
+    x = graph.shape(ins[0]) if ins else None
+    w = graph.shape(ins[1]) if len(ins) > 1 else None
+    if not conv_nhwc(node, x, w, int(node.attr("group", 1))):
+        return ("nchw", 0)
+    ks = node.attr("kernel_shape") or [w[2], w[3]]
+    st = node.attr("strides") or [1, 1]
+    pd = node.attr("pads") or [0, 0, 0, 0]
+    dl = node.attr("dilations") or [1, 1]
+    wo = (int(x[3]) + int(pd[1]) + int(pd[3]) -
+          int(dl[1]) * (int(ks[1]) - 1) - 1) // int(st[1]) + 1
+    # The NHWC gemm writes Cout padded to 16 and the caller trims the real
+    # channels back with _slice_ch, which compacts the pitch to wo.
+    return ("nhwc", int(wo) if int(w[0]) % 16 else align16(wo))
+
+
+def _layout_equiv(layout, shape):
+    """True when NHWC storage of `shape` is byte-identical to NCHW."""
+    return (layout[0] == "nhwc" and shape and len(shape) == 4 and
+            int(shape[1]) == 1 and int(shape[3]) > 0 and
+            int(layout[1]) == int(shape[3]))
+
+
+def _layout_nchw_needed(graph):
+    """Tensors whose value a later op (or the graph output) reads as NCHW.
+
+    Seeds are the inputs of every NCHW-only op and every graph output; the
+    need propagates backwards through layout-neutral ops, so a chain
+    conv -> Relu -> Reshape marks the conv output as well as the Relu's.
+    It stops at ops that can absorb NHWC (conv, pool, resize, concat): those
+    convert at their own use site, which the pass charges.
+    """
+    need = set(graph.graph_outputs())
+    changed = True
+    while changed:
+        changed = False
+        for node in graph.nodes:
+            op = node.op_type
+            outs = [o for o in node.proto.output if o]
+            if not outs:
+                continue
+            if op in _LAYOUT_NCHW:
+                force = True
+            elif op in _LAYOUT_NEUTRAL:
+                force = any(o in need for o in outs)
+            else:
+                force = False
+            if not force:
+                continue
+            for i in node.proto.input:
+                if i and i not in graph.initializers and i not in need:
+                    need.add(i)
+                    changed = True
+    return need
+
+
+def _layout_input_need(node, k, lay, graph):
+    """The form this node reads input `k` in, or None when either will do."""
+    from .plan import conv_nhwc
+    op = node.op_type
+    if op in _LAYOUT_NCHW:
+        return "nchw"
+    if op == "Conv":
+        if k != 0:
+            return None
+        ins = [i for i in node.proto.input if i]
+        x = graph.shape(ins[0]) if ins else None
+        w = graph.shape(ins[1]) if len(ins) > 1 else None
+        return "nhwc" if conv_nhwc(node, x, w,
+                                   int(node.attr("group", 1))) else "nchw"
+    if op == "MaxPool":
+        return "nhwc" if _maxpool_nhwc(node) else "nchw"
+    if op == "Concat":
+        outs = [o for o in node.proto.output if o]
+        return "nhwc" if outs and lay.get(outs[0], ("nchw", 0))[0] == "nhwc" \
+            else "nchw"
+    if op in ("Split", "Slice", "Resize"):
+        return None
+    if op in _LAYOUT_NEUTRAL:
+        outs = [o for o in node.proto.output if o]
+        return lay.get(outs[0], ("nchw", 0))[0] if outs else None
+    return None
+
+
+class LayoutAssignment(Pass):
+    key = "layout"
+    title = "packed NHWC between compatible nodes, conversions at boundaries"
+
+    def run(self, graph, ctx=None):
+        from .plan import (align16, conv_nhwc, set_layout_record,
+                           to_nchw_calls, to_nhwc_calls)
+
+        lay = {}
+        for name in graph.initializers:
+            lay[name] = ("nchw", 0)
+        for vi in graph.inputs:
+            lay[vi.name] = ("nchw", 0)     # the ONNX boundary is NCHW
+        need = _layout_nchw_needed(graph)
+        st = RuleStat("layout")
+        cv = RuleStat("layout-convert")
+        av = RuleStat("layout-avoid")
+
+        # 1. one forward walk: choose the layout every node delivers.
+        for node in graph.nodes:
+            op = node.op_type
+            ins = [i for i in node.proto.input if i]
+            outs = [o for o in node.proto.output if o]
+            cand = ("nchw", 0)
+            if op == "Conv":
+                cand = _conv_layout(node, graph, align16, conv_nhwc)
+            elif op == "Concat":
+                ls = [lay.get(i, ("nchw", 0)) for i in ins]
+                shp = graph.shape(outs[0]) if outs else None
+                if ls and all(v[0] == "nhwc" for v in ls) and \
+                        shp and len(shp) == 4:
+                    cand = ("nhwc", int(shp[3]))
+            elif op in ("Split", "Slice", "Gather", "Resize",
+                        "GatherElements", "GatherND"):
+                cand = lay.get(ins[0], ("nchw", 0)) if ins else ("nchw", 0)
+            elif op == "MaxPool":
+                src = lay.get(ins[0], ("nchw", 0)) if ins else ("nchw", 0)
+                cand = src if (src[0] == "nhwc" and _maxpool_nhwc(node)) \
+                    else ("nchw", 0)
+            elif op in _LAYOUT_NEUTRAL:
+                for i in ins:
+                    if i in graph.initializers:
+                        continue
+                    cand = lay.get(i, ("nchw", 0))
+                    break
+            for o in outs:
+                choice = cand
+                if _layout_equiv(choice, graph.shape(o)):
+                    # same bytes either way: take the form the consumers read
+                    if o in need:
+                        choice = ("nchw", 0)
+                        av.matched += 1
+                        av.notes.append(
+                            "%s: chosen nchw at the producer; %d copy2d_x "
+                            "calls avoided (1-channel NHWC is NCHW byte "
+                            "order)" % (o, to_nchw_calls(graph.shape(o),
+                                                         cand)))
+                lay[o] = choice
+
+        # 2. charge a conversion only where a reader needs the other form.
+        for node in graph.nodes:
+            for k, name in enumerate(node.proto.input):
+                if not name or name in graph.initializers:
+                    continue
+                want = _layout_input_need(node, k, lay, graph)
+                if want is None:
+                    continue
+                got = lay.get(name, ("nchw", 0))
+                if got[0] == want:
+                    continue
+                shp = graph.shape(name)
+                if want == "nchw" and _layout_equiv(got, shp):
+                    lay[name] = ("nchw", 0)
+                    av.matched += 1
+                    av.notes.append(
+                        "%s <- %s: %d copy2d_x calls avoided (1-channel NHWC "
+                        "is NCHW byte order)" %
+                        (node.name, name, to_nchw_calls(shp, got)))
+                    continue
+                cv.matched += 1
+                calls = (to_nchw_calls(shp, got) if want == "nchw"
+                         else to_nhwc_calls(shp, got))
+                cv.notes.append("%s <- %s: %s -> %s, %d calls" %
+                                (node.name, name, got[0], want, calls))
+
+        n_nhwc = sum(1 for v in lay.values() if v[0] == "nhwc")
+        st.matched = len(lay) - len(graph.initializers)
+        st.notes.append("%d tensors: %d nhwc, %d nchw; %d conversions kept, "
+                        "%d avoided" % (st.matched, n_nhwc,
+                                        st.matched - n_nhwc, cv.matched,
+                                        av.matched))
+        record = {name: ("%s/%d" % v if v[0] == "nhwc" else "nchw")
+                  for name, v in lay.items() if name not in graph.initializers}
+        set_layout_record(graph, record)
+        graph.meta["layout"] = True
+        return [st, cv, av]
+
+
 # --------------------------------------------------------------- pipeline
-PIPELINE = (Canonicalise(), ElementwiseFusion(), Epilogue())
+PIPELINE = (Canonicalise(), ElementwiseFusion(), Epilogue(), LayoutAssignment())
 PASSES = {p.key: p for p in PIPELINE}
 
 

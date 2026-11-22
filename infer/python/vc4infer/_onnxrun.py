@@ -41,7 +41,11 @@ Two conv paths
 Layout bookkeeping: a 4-D fp32 tensor carries a ``layout`` ("nchw"/"nhwc") and,
 for NHWC, the storage ``pitch`` (the conv writes ``align16(wo)`` columns).
 Elementwise ops are layout-agnostic (they touch every element); every op that
-depends on the channel axis converts on the host first (a byte gather).
+depends on the channel axis converts on the host first (a byte gather).  The
+optimiser's layout pass can record a per-tensor choice on the model
+doc_string; the executor honours the one decision that changes behaviour, a
+1-channel NHWC plane whose pitch is its width, which it relabels to NCHW
+instead of converting.
 
 Supported nodes
     Conv          NHWC 1x1/3x3/5x5, stride 1/2, dilation 1..8, group=1,
@@ -1027,6 +1031,7 @@ class Runner:
         else:
             self._find_silu()
             self._collect_fused()
+        self._collect_layout()
         # a graph output is held in `values` after a run; the next run filters
         # `values` down to constants, so release it first (never a buffer an
         # initialiser owns: an Identity of a constant shares that block)
@@ -1107,6 +1112,46 @@ class Runner:
 
 
     # ---------------------------------------------------- optimiser markers
+    def _collect_layout(self):
+        """Read the layout pass's tensor map from the model doc_string.
+
+        The graph stays ONNX NCHW; the map says which tensors the executor
+        stores packed NHWC and which it can relabel to NCHW because the two
+        forms are the same bytes (a 1-channel plane with pitch == W).  Only
+        the relabel is applied here: every other NHWC decision is already the
+        executor's own, and the pass only records it.  A model without the
+        line yields an empty set and the old behaviour, bit for bit.
+        """
+        self._layout_nchw = set()
+        try:
+            from .optimizer.plan import layout_record
+            rec = layout_record(getattr(self.model, "doc_string", "") or "")
+        except Exception:                       # pragma: no cover
+            return
+        self._layout_nchw = {name for name, value in rec.items()
+                             if value == "nchw"}
+
+    def _relabel_outputs(self, node, outs):
+        """Apply the pass's NCHW choice to a 1-channel NHWC result.
+
+        NHWC [n][1][h][w] with pitch == w and NCHW [n][1][h][w] have the same
+        byte order, so the same buffer can be read as either.  The pass names
+        the tensors whose readers want NCHW; this turns the label, not the
+        bytes, and saves the conversion the executor would otherwise issue.
+        """
+        if not self._layout_nchw or not node.output:
+            return outs
+        relabelled = []
+        for k, name in enumerate(node.output):
+            t = outs[k] if k < len(outs) else outs[-1]
+            if (name and name in self._layout_nchw and
+                    isinstance(t, Tensor) and t.layout == "nhwc" and
+                    len(t.shape) == 4 and t.shape[1] == 1 and
+                    t.pitch == t.shape[3]):
+                t = Tensor(t.buf, t.shape, "nchw")
+            relabelled.append(t)
+        return relabelled
+
     def _collect_fused(self):
         """Read the optimiser's provenance records into dispatch tables.
 
@@ -3863,6 +3908,7 @@ class Runner:
                 outs = []
             else:
                 outs = out if isinstance(out, list) else [out]
+                outs = self._relabel_outputs(node, outs)
                 for i, oname in enumerate(node.output):
                     if oname:
                         self.values[oname] = (outs[i] if i < len(outs)

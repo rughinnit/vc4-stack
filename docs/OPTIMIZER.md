@@ -54,8 +54,9 @@ bisected to one rewrite.
 7 | launch batching | several kernels per daemon round-trip, or a persistent work queue | attacks the 222 ms directly |
 8 | kernel autotuning | QPU counts per shape (GEMM and its packer), recorded per generator | recorded per shape; see "Pass 8" |
 
-Passes 1-3 are graph rewrites on the Python side; 4 and 6 touch tensor layout
-and arena planning; 7 needs runtime work in `vc4d` and the client; 8 is
+Passes 1-3 are graph rewrites on the Python side; 4 decides tensor layout in
+the graph and is read by the executor; 5 and 6 touch weight packing and arena
+planning; 7 needs runtime work in `vc4d` and the client; 8 is
 measurement-driven and must be recorded per shape.
 
 ## Correctness gates
@@ -141,36 +142,6 @@ with the default launch's output at the tolerance of `docs/ACCURACY.md`
 this hardware the chosen launch is expected to be bit-identical - the QPU count
 moves row blocks between QPUs, not the k order - and the check is there because
 "expected" is not a verification.
-
-### Silicon result and the acceptance margin
-
-Measured through `infer/build/bench_autotune 5` with the ARM capped at 1.0 GHz,
-one client and `throttled=0x0` (2026-11-23):
-
-| shape | cold search | chosen | default ms | tuned ms | gain |
-|---|---:|---|---:|---:|---:|
-| 128^3 | 5.12 s | pack_q=4 gemm_q=12 | 1.001 | 0.993 | 1.01x |
-| 256^3 | 5.89 s | pack_q=2 gemm_q=11 | 4.250 | 4.202 | 1.01x |
-| 512^3 | 9.78 s | pack_q=4 gemm_q=12 | 28.581 | 34.130 | 0.84x |
-| conv 32x32x32 3x3 | 8.13 s | im2col_q=4 gemm_q=9 | 12.912 | 10.104 | 1.28x |
-
-The 512^3 row chose the default parameters and still lost 16%: the same launch
-measured 28.581 ms and then 34.130 ms with an identical cycle count.  The
-board's memory path has an intermittent stall state (see `KERNELS.md` section
-9), so a before/after comparison that spans the search is not a measurement.
-For that reason the honest gain for these four shapes is **1.00x**:
-12 GEMM QPUs and 4 pack QPUs are the ladder's first candidates, and the search
-confirms them.  An interleaved A/B/A sequence inside `bench_autotune` is the
-next change to this harness, not to the tuner.
-
-The acceptance margin still does its job.  A candidate must beat the default
-by more than `TUNE_ACCEPT_MARGIN` (3%) to be recorded, and the default is
-recorded otherwise; on an earlier boot the same benchmark wrote 0.93x, 0.82x
-and 0.77x records, all of which are now 1.00x.  A record can no longer make a
-shape slower than not tuning it.
-
-The per-class QPU breakdown, the conv panel/GEMM split and the stall-state
-evidence are in [`KERNEL-EFF.md`](KERNEL-EFF.md).
 
 ### The cache
 
@@ -284,9 +255,9 @@ because the digest changes.
 - no change to the operator semantics or the coverage denominator;
 - no hidden host computation.
 
-## Implementation: phases A and B
+## Implementation: phases A to C
 
-Phases A and B are in `infer/python/vc4infer/optimizer/`.  Every pass is off by
+Phases A to C are in `infer/python/vc4infer/optimizer/`.  Every pass is off by
 default; the pipeline is selected with `VC4_OPT` or `Engine(..., passes=...)`:
 
     VC4_OPT=canonicalise        # one pass
@@ -377,10 +348,18 @@ YOLOv8n-160, modelled:
 
 | | nodes | dispatches | launches |
 |---|---:|---:|---:|
-| baseline | 263 | 206 | 752 (679 exact + 73 copy) |
-| after canonicalise | 252 | 195 | 752 |
-| after ew | 252 | 195 | 752 |
-| after epilogue | 252 | 138 | 285 (212 exact + 73 copy) |
+| baseline | 263 | 206 | 785 (679 exact + 106 copy over 36 nodes) |
+| after canonicalise | 252 | 195 | 785 |
+| after ew | 252 | 195 | 785 |
+| after epilogue | 252 | 138 | 318 (212 exact + 106 copy) |
+| after layout | 252 | 138 | 285 (212 exact + 73 copy over 35 nodes) |
+
+The copy class is priced per node from the executor's own conversion rules:
+a `Reshape` on a pitched NHWC tensor costs the `_to_nchw_buf` calls its stored
+extent needs (33 for the 1-channel DFL plane, 2 for 20 columns, 1 for 10), not
+a flat one.  That is why the baseline is 785 here rather than the 752 quoted
+before the layout pass existed: the old model undercounted the six box-head
+conversions by 33 launches, and the layout pass removes exactly those.
 
 Two honest notes on that table:
 
@@ -389,15 +368,15 @@ Two honest notes on that table:
   is a startup and debugging win, not a speed win;
 - the ew pass changes no launch *because the executor already fused SiLU*
   (`Runner._find_silu`).  With `VC4_NO_SILU_FUSE=1` and no pass the same graph
-  plans 1219 launches; with the pass the plan stays at 752 and the rewrite is
+  plans 1252 launches; with the pass the plan stays at 785 and the rewrite is
   recorded in the graph, which is what makes it switchable and bisectable.
   With the pass on, the 467 SiLU launch sets are a recorded graph rewrite
   instead of a special case in `Runner._find_silu`;
 - the epilogue pass then moves those 57 pairs into the conv that produces
   them.  It needs the ew pass: the pattern it matches is a `Mul` carrying the
   `silu` record, because that is what names the tensor the activation reads.
-  `VC4_OPT=all,-epilogue` and `VC4_OPT=all,-ew` both stay at 752 launches,
-  which is the bisection switch.
+  `VC4_OPT=all,-epilogue` and `VC4_OPT=all,-ew` both stay at 752 launches
+  (785 minus the layout pass's 33), which is the bisection switch.
 
 ### The activation epilogue
 
@@ -473,6 +452,98 @@ scale with the launch count).  In FPS terms: **1.82 -> 2.13**.
 The projection therefore over-stated the gain.  The read/write saving from not
 materialising the activation plane twice is included in the 79 ms; it is not
 separable from the launch cost with this measurement.
+
+### Pass 4: layout assignment
+
+ONNX has no tensor-format field: the graph is NCHW by definition, while the
+executor stores a conv's output packed NHWC (`[n][h][pitch][c]`) and converts
+at the use site.  `layout` makes that choice explicit instead of leaving it to
+each node: one forward walk assigns every tensor `nhwc/<pitch>` or `nchw`,
+records the map on one line of the model doc_string, and names every edge
+where a reader still needs the other form.
+
+The rules are the executor's dispatch table, not ONNX's semantics:
+
+| tensor | layout |
+|---|---|
+| `Conv` on the NHWC path | NHWC, pitch `align16(Wo)` (`Wo` when Cout is trimmed back) |
+| elementwise/unary, `Split`, `Slice`, `Resize` | the operand's form, unchanged |
+| `Reshape`, `Flatten`, `Squeeze`, `Unsqueeze`, `Transpose`, `MatMul`, `Gemm`, `GlobalAveragePool`, `Softmax`, `Cast`, `Div`, `Gather*` | NCHW; an NHWC operand is converted once, at that node |
+| `Concat` | NHWC only when every input is NHWC, else the host path |
+| `MaxPool` | NHWC only for the kxk stride-1 ring kernel |
+| graph input and output | NCHW, the ONNX boundary |
+
+A conversion is not inserted as an ONNX node.  A `Transpose` is defined on the
+logical NCHW shape, so inserting one would permute the values as well as
+relabel them and would change every consumer's shape; the engine's conversion
+is `to_nhwc`/`_to_nchw_buf` inside the consuming node.  The pass therefore
+records where that copy happens, and removes it where the two forms are the
+same bytes.
+
+That equivalence is what pays on YOLOv8n: a 1-channel NHWC plane with
+`pitch == W` is byte-identical to NCHW, so the pass names it NCHW at the
+producer and the executor relabels the buffer after the node instead of
+converting it at the consumer.  `Runner._collect_layout` reads the record;
+`_relabel_outputs` changes the label only when the runtime tensor really is
+`[n][1][h][w]` with `pitch == w`, so a stale or wrong record cannot move a
+byte.  A model without the record runs exactly as before.
+
+Measured on the board (2026-11-23, rebased tree `920a683` plus this pass, 96
+MiB client arena, one client, three interleaved rounds):
+
+| imgsz | `all,-layout` | `all` | removed |
+|---:|---:|---:|---:|
+| 96 | 291 | 279 | 12 |
+| 128 | 297 | 276 | 21 |
+| 160 | 365 | 332 | 33 |
+
+The count is `ceil(anchors/16)`: the DFL plane is 4x189, 4x336 and 4x525
+anchors at the three sizes.  Outputs are **bit-identical** at every size in
+every round (`np.array_equal`), and against the shipped references the corpus
+is 0 over tolerance: modelA/B/C at 4.8e-6, 4.4e-6 and 4.1e-7 max abs, YOLOv8n
+at 2.04e-2 / 2.24e-4 and 0/44,100, `bus.jpg` with 4/4 detections, the same
+classes, 2.2e-4 px box difference.
+
+At 160 the frame goes from 470.5 to 465.9 ms (**-1.0 %**) and total CPU from
+0.264 to 0.260 s (**-1.4 %**, daemon CPU -1.9 %); at 96 and 128 the wall and
+CPU delta is inside the run-to-run spread.  The per-size table, the protocol
+and the copy-row accounting are in `docs/CPU-BREAKDOWN.md` sec. 3.3.
+
+**Default: included in `all`.**  It removes launches at every size, its output
+is bit-identical, and it is free at 96/128 and 1 % faster at 160.  The gain is
+small because these are the cheapest copies in the frame -- four rows by 16
+words -- and the 73 copy launches that remain are concat/split/head-reshape
+data movement, not relabels.
+
+The copy-row table at 160, modelled from the executor's own conversion rules.
+The pass removes one row and 33 launches; every other row is unchanged:
+
+| copy row | before | after | what it is |
+|---|---:|---:|---|
+| `/model.22/dfl/Reshape_1` (from `dfl/conv`) | 33 | 0 | NHWC->NCHW of a 1x1x4x525 plane; identical bytes |
+| 13 C2f/SPPF `Concat` | 38 | 38 | channel concat, a real copy |
+| 8 `Split` | 16 | 16 | channel split, a real copy |
+| 3 SPPF `MaxPool` | 6 | 6 | border fill + interior copy |
+| 2 `Resize` | 2 | 2 | nearest upsample |
+| 6 box-head `Reshape` | 8 | 8 | NHWC->NCHW before the anchor concat |
+| `dfl/Transpose` | 1 | 1 | permute before the class softmax |
+| 2 `Slice` | 2 | 2 | box-coordinate slices |
+| **total** | **106** | **73** | 36 copy nodes -> 35 |
+
+Conversions that stay, with the reason:
+
+| edge | calls | reason |
+|---|---:|---|
+| `images -> /model.0/conv/Conv` | 1 | the graph input is ONNX NCHW at the boundary |
+| 6 box-head `Conv -> Reshape` | 8 | the anchor concat is written on `[1,64,525]`; the conv GEMM writes pixel-major, so the reorder is real |
+| `dfl/Softmax -> dfl/conv` | 1 | the 1x1 GEMM's im2col wants packed channels |
+| `dfl/conv -> dfl/Reshape_1` | 33 | removed: 1-channel plane, byte-identical order |
+
+On the other shipped models the pass plans no change (modelA, modelB,
+modelC): their graphs have no equivalent-layout conversion and no elementwise
+chain that would otherwise convert.  Its gate is therefore the launch delta
+above, the corpus parity and the operator sweep, not a corpus-wide launch
+count.
 
 ### Gates on silicon
 
@@ -586,7 +657,8 @@ launch-accounting gate.
 | merging two independent elementwise launches | they are sequential in the graph; batching them is phase D (daemon round-trips), not a graph rewrite |
 | `MatMul/Gemm + Add` -> `Gemm` with C | `Runner._gemm` materialises C and adds it with a separate `vc4_elementwise` call, so the rewrite saves no launch; not implemented rather than sold as one |
 | silu in the asm10 matmul epilogue | the 8x64 tile has one B register left after the k loop and silu needs twelve (`docs/KERNELS.md` sec. 7.4); the conv GEMM has 19, which is where every YOLOv8n pair lives |
-| layout assignment, autotuning | phases C-E; not part of this merge |
+| anchor-major DFL head | the box-head `Reshape`/`Concat`/`Transpose` copies are structural: keeping the anchor axis outer would change the ONNX shapes the head is written in (and the exported output), so it is a head rewrite rather than a layout assignment |
+| autotuning | phase E; not part of this merge |
 | weight prepacking and the arena plan | delivered as the engine artifact (`docs/ENGINE-ARTIFACT.md`): packed panels, fixed offsets and the kernel list are built once and loaded, which removes the packing work from every process start |
 
 ## Passes 5 and 6: the engine artifact
@@ -610,6 +682,5 @@ load 3.21 s -> 0.48 s, first run 1.78 s -> 1.46 s, steady state unchanged.
 `docs/ENGINE-ARTIFACT.md` has the format, the key checks and the full table.
 
 The artifact is additional to the pass pipeline in this document: the graph it
-contains is the graph these passes produced.  Layout assignment and autotuning
-remain phases C-E.
+contains is the graph these passes produced.  Autotuning remains phase E.
 

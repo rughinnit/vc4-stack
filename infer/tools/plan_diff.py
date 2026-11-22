@@ -47,9 +47,10 @@ def _ops_line(ops):
 
 
 def _print_plan(plan, indent="  "):
-    print("%snodes %d  dispatches %d  launches %d (exact %d + copy ~%d)"
+    print("%snodes %d  dispatches %d  launches %d (exact %d + copy ~%d "
+          "over %d nodes)"
           % (indent, plan.nodes, plan.dispatches, plan.total, plan.exact,
-             plan.copy))
+             plan.copy, plan.copy_nodes))
     print("%sops: %s" % (indent, _ops_line(plan.histogram)))
     for op, n in plan.by_op.items():
         print("%s  %-14s %5d" % (indent, op, n))
@@ -98,9 +99,9 @@ def main(argv=None):
         print("after %s: %s" % (res.key, res.title))
         _print_plan(plan, "  ")
         print("  delta: nodes %+d  dispatches %+d  launches %+d "
-              "(exact %+d, copy %+d)"
+              "(exact %+d, copy %+d over %+d nodes)"
               % (d["nodes"], d["dispatches"], d["launches"], d["exact"],
-                 d["copy"]))
+                 d["copy"], d["copy_nodes"]))
         if d["ops"]:
             print("  launches by op: %s"
                   % ", ".join("%s %+d" % (k, v) for k, v in d["ops"].items()))

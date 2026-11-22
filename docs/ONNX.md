@@ -432,8 +432,10 @@ Normative kernel constraints (all checked before a launch):
 * VDR pitch: `stride*Cin_total*4 <= 8191` bytes.  For grouped conv this is the
   **total** Cin (the group block is a contiguous sub-range of each pixel).
 * output pitch `Wg = align16(wo)`; only columns `[0,wo)` are meaningful.
-* depthwise (`group == Cin == Cout`) is still the verified block-diagonal
-  dense expansion; it requires `Cout == Cin` (a channel multiplier raises).
+* depthwise (`group == Cin > 1`) is still the verified block-diagonal dense
+  expansion; it requires `Cout == Cin` (a channel multiplier raises).  A
+  dense conv has `group == 1`, so a single-channel input is **not** read as
+  depthwise: `1 -> 64` takes the dense path (`coverage.conv_kind`).
   A native per-channel kernel was written and reached `st=0` on C=16/C=32
   standalone launches, but the full test still produced wrong planes and then
   poisoned the arena for later ops, so it is **not shipped** (see §8.5).

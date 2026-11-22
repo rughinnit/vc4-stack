@@ -1614,9 +1614,10 @@ class Runner:
         else:
             ba = np.zeros(Cout, np.float32)
 
-        grouped = (group > 1 and group != Cin and Cin % group == 0
+        kind = coverage.conv_kind(group, Cin)
+        depthwise = kind == "depthwise"
+        grouped = (kind == "grouped" and Cin % group == 0
                    and Cout % group == 0)
-        depthwise = (group == Cin)
         if depthwise and Cout != Cin:
             raise UnsupportedNode("Conv %s: depthwise Cout %d != Cin %d "
                                   "(channel multiplier is not implemented)"
@@ -1697,7 +1698,7 @@ class Runner:
         xp = self._pad_ch(x, cpad)
         if wa.shape[1] != cpad and group == 1:
             wa = np.pad(wa, ((0, 0), (0, cpad - wa.shape[1]), (0, 0), (0, 0)))
-        if group == Cin:
+        if kind == "depthwise":
             if sh != 1:
                 raise UnsupportedNode("Conv %s: stride-2 depthwise" % node.name)
             dense = np.zeros((opad, cpad, kh, kw), np.float32)

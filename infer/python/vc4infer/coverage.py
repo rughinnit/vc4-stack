@@ -356,6 +356,22 @@ def _is_float(elem):
     return elem in _FLOAT_TYPES
 
 
+def conv_kind(group, cin):
+    """The conv path a (group, input-channel) pair selects.
+
+    ``group == Cin`` means depthwise only when the group count is greater
+    than one.  A dense conv is ``group == 1``, and with a single-channel input
+    that is also ``Cin == 1``; reading the equality alone classified a dense
+    1->64 conv as depthwise and refused it as a "channel multiplier".  The
+    executor and the static report both call this so they cannot disagree.
+    """
+    if group == 1:
+        return "dense"
+    if group == cin:
+        return "depthwise"
+    return "grouped"
+
+
 def _check_constantofshape(node, shapes, inits):
     """A constant fill is foldable iff its shape input is a plan-time value."""
     name = node.input[0] if node.input else ""
@@ -396,8 +412,9 @@ def _check_conv(node, shapes, inits):
         return "unsupported", "input rank %d" % len(xs)
 
     symm = pads[0] == pads[1] == pads[2] == pads[3]
-    depthwise = group == Cin
-    grouped = group > 1 and not depthwise
+    ck = conv_kind(group, Cin)
+    depthwise = ck == "depthwise"
+    grouped = ck == "grouped"
     native_group = (grouped and Cin % group == 0 and Cout % group == 0
                     and (Cin // group) % 16 == 0
                     and (Cout // group) % 16 == 0)
@@ -424,7 +441,7 @@ def _check_conv(node, shapes, inits):
         return "unsupported", ("batch %d needs the NHWC conv path" % N)
     if dilv != 1:
         return "unsupported", "dilation %d needs the NHWC conv path" % dilv
-    if group not in (1, Cin):
+    if grouped:
         return "unsupported", "group %d needs 16-aligned per-group blocks" % group
     if kh != kw or kh not in (1, 3):
         return "unsupported", "kernel %dx%d (NCHW fallback: 1x1, 3x3)" % (kh, kw)

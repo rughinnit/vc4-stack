@@ -47,8 +47,16 @@ Launches barely move (462 → 536) because most of them are not convs:
 | 160 | 131 | 231 | 174 | 536 |
 
 YOLOv8n's C2f blocks concatenate on a pitched NHWC plane, and on this engine
-each `Concat` is a set of launches (231 of them) whatever the resolution.  That
+each `Concat` was a set of launches (231 of them) whatever the resolution.  That
 is the first reason the cost does not scale with pixels.
+
+**These counts are the pre-concat window.**  `Concat` now takes one launch per
+input instead of one per 16-channel block, and a per-run node plan replaced the
+per-frame dispatch rebuild: the same graph runs in **291 / 297 / 365** launches
+at 96/128/160, at 315.7 / 348.2 / 432.5 ms and 3.16 / 2.86 / 2.31 FPS, with
+output bit-identical ([CPU-BREAKDOWN.md](CPU-BREAKDOWN.md)).  The tables in this
+section stay as measured: the detections and `bus.jpg` boxes below were taken in
+that window, and their wall column belongs to the same record.
 
 ## 2. The measured curve
 
@@ -180,6 +188,13 @@ Priced at those two constants:
 | 96 | 0.197 | 179.8 | 1.10 | 59.7 ms | 462 | 77.6 ms | 137.3 ms | 353.9 ms | 2.58× |
 | 128 | 0.350 | 204.0 | 1.72 | 106.1 ms | 468 | 78.6 ms | 184.7 ms | 384.9 ms | 2.08× |
 | 160 | 0.546 | 262.7 | 2.08 | 165.5 ms | 536 | 90.0 ms | 255.5 ms | 466.4 ms | 1.83× |
+
+The launch column is the pre-concat count.  At the current 291 / 297 / 365 the
+launch floor is 48.9 / 49.9 / 61.3 ms rather than 77.6 / 78.6 / 90.0, so
+arithmetic is the larger half of the floor at every size, and pricing the
+pre-concat measured wall against the current floor would put it at 1.9–2.9×
+instead of 1.8–2.6×.  The `measured` column belongs to its own window;
+[CPU-BREAKDOWN.md](CPU-BREAKDOWN.md) carries the current wall and CPU set.
 
 The measurement is 1.8–2.6× the floor, and the reason is the same at
 every size: **0.168 ms is the marginal price of a launch, not the price of a

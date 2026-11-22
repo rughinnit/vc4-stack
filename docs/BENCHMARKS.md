@@ -255,6 +255,13 @@ runs on the QPU.
 | `direct` backend | 2.03 → 2.43 FPS |
 | `/tmp` off tmpfs | 452 MB RAM returned; 1.84 → 2.09 FPS in that window |
 | `-O3 -march=native` ("fast" package) | **within noise (1.4–1.7 % slower)**; the win is 401 prewarmed blobs, zero JIT |
+| activation epilogue (relu/clip/silu folded into the GEMM store) | 1,003 → 536 launches; 550.0 → 468–473 ms; 1.82 → 2.13 FPS; the 467 removed launches price at 0.168 ms each, 79 ms |
+| one launch per concat input, node plan built once per run | 536 → 365 launches at 160 (468 → 297 at 128, 462 → 291 at 96); 432.5 ms, 2.31 FPS; 24–29 % less CPU per frame |
+
+Each pair is measured within its own window.  The launch counts here and the
+ones in §3 do not line up for the same change — §3 records 784 launches at
+1.2.4, while the epilogue was measured from 1,003 on a later tree — and that
+gap is left open rather than reconciled by guesswork.
 
 
 ## 14. YOLO matrix: six families × five sizes × three resolutions

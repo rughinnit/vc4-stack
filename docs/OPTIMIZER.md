@@ -383,7 +383,11 @@ them** -- -467, exactly the modelled delta -- and `plan_diff.py --profile`
 agrees with the per-node rows for 117 of the 118 nodes it could profile.
 The one mismatch is `/model.0/conv/Conv` (modelled 2, recorded 3: the
 NCHW -> NHWC copy of the graph input is charged to that node) and it
-reproduces with `VC4_OPT=none`, so it predates this work.
+reproduces with `VC4_OPT=none`, so it predates this work.  The fold also
+changes no number: the tensor it feeds, `/model.22/dfl/Transpose`, is
+**bit-identical** between the same model run with every pass and run with
+none (33,600 elements, 0 differ), so the 57 rewrites moved where the
+activation runs and nothing else.
 
 The full graph does not complete on this board today, and the reason is not
 the epilogue: `/model.22/dfl/Softmax` fails with `softmax: invalid argument`

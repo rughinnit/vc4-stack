@@ -106,13 +106,39 @@ def check_blob_words():
     import vpmwords as V
     import tempfile
 
-    def immediates(kind, cin, kh, kw):
+    def emitted(kind, cin, kh, kw):
         fd, path = tempfile.mkstemp(prefix="check_words_", suffix=".bin")
         os.close(fd)
         try:
-            return blob_immediates(kind(cin, kh, kw).write(path))
+            return kind(cin, kh, kw).write(path)
         finally:
             os.unlink(path)
+
+    def immediates(kind, cin, kh, kw):
+        return blob_immediates(emitted(kind, cin, kh, kw))
+
+    def dst_advances(words_):
+        """Words that add the 1024-byte k-block step to a register.
+
+        The destination's step is the one register the generator owns that the
+        schedule model cannot see: it must appear once per tap (inside the
+        channel loop, where each iteration runs it), or every tap's tile lands
+        on the block's first k rows and the rest of the panel stays unwritten.
+        """
+        reg = None
+        for w in words_:
+            if ((w >> 60) & 0xF) == 14 and (w & 0xFFFFFFFF) == 1024:
+                reg = (w >> 38) & 0x3F
+        assert reg is not None, "no 1024-byte k-block step in the blob"
+        n = 0
+        for w in words_:
+            if ((w >> 60) & 0xF) in (14, 15):
+                continue                    # literal or branch, no ALU
+            if ((w >> 24) & 0x1F) != 12:    # ADD_ADD
+                continue
+            if ((w >> 12) & 0x3F) == reg and ((w >> 6) & 7) == 7:  # breg
+                n += 1
+        return n
 
     store = V.vdw_basic(0, 16, 16, horizontal=0)
     for cin, kh, kw in ((16, 3, 3), (16, 5, 5), (64, 3, 3)):
@@ -134,6 +160,10 @@ def check_blob_words():
             assert cin * 4 in flat, \
                 "no %d-byte channel-block back-step literal (Cin %d)" % (
                     cin * 4, cin)
+        nadv = dst_advances(emitted(kgen.build_im2col_nhwc_flat2, cin, kh, kw))
+        assert nadv == kh * kw, \
+            "%dx%d k%d: %d destination advances, expected one per tap (%d)" % (
+                cin, kh, kw, nadv, kh * kw)
     print("blob words: store %#x is the row kernel's 16 x 16 transposing "
           "store with a zero stride, the load is four VPM rows, and neither "
           "refused shape (4-word store, 48 B gap) appears" % store)
@@ -165,6 +195,7 @@ def constants(W, H, Cin, KH, KW, stride, pad, dil):
     C4 = Cin * 4
     row_pitch = (W + 2 * pad) * Cin * 4
     return dict(wo=wo, ho=ho, Wf=Wf, Wg=al(wo, 16), GPR=GPR, M=M, K=K, nk=nk,
+                dst_step=64 * nk,
                 C4=C4, C4d=C4 * dil, pitch=stride * C4,
                 gadv=4 * stride * C4,
                 row_pitch=row_pitch, radv=stride * row_pitch,
@@ -237,12 +268,18 @@ def flat_panel(img, W, H, Cin, KH, KW, stride, pad, dil, g, nq):
     less the KW-1 pixels already covered at a new one) and a 64-byte advance
     per channel block that the next tap's step has to carry back -- so a wrong
     step constant or a missing back-step shows up as a wrong address, not as
-    the same wrong offset on both sides.
+    the same wrong offset on both sides.  The destination is accumulated the
+    same way, one k block per (tap, channel block), because it is the other
+    register the generator owns: a missing advance would land every tap's tile
+    on the block's first 1024 bytes and leave the rest of the panel unwritten.
+
+    The memory layout is the GEMM's k-major A: word (block, k, pixel) sits at
+    ``block*16*nk + k*16 + pixel`` floats, i.e. k rows of 64 bytes.
     """
     p = padded(img, pad)
     buf = p.astype(np.float32).tobytes()
     nlim = len(buf)
-    panel = np.full((g["M"], g["K"]), np.nan, dtype=np.float32)
+    out = np.full(g["blocks"] * 16 * g["nk"], np.nan, dtype=np.float32)
     ncb = Cin // 16
     adj = Cin * 4 if ncb > 1 else 0
     stx = g["C4d"] - adj
@@ -250,6 +287,7 @@ def flat_panel(img, W, H, Cin, KH, KW, stride, pad, dil, g, nq):
     for q, blocks in walk(nq, g):
         for (b, gidx0, src) in blocks:
             qs = list(src)
+            dst = b * g["dst_step"] // 4       # float index of k row 0
             for s in range(KH * KW):
                 ky, kx = divmod(s, KW)
                 if s:
@@ -288,10 +326,19 @@ def flat_panel(img, W, H, Cin, KH, KW, stride, pad, dil, g, nq):
                     assert vrow == set(range(16 * q, 16 * q + 16)), \
                         "block %d tap %d cb %d: VPM rows %s" % (
                             b, s, cb, sorted(vrow))
-                    # the 16 x 16 transposing store
-                    ks = s * Cin + cb * 16
-                    panel[b * 16:(b + 1) * 16, ks:ks + 16] = vpm
-    return panel
+                    # the 16 x 16 transposing store: k row w is a memory
+                    # row of 16 pixel words, and the k index must be the one
+                    # the destination register holds
+                    assert dst == b * g["dst_step"] // 4 + \
+                        (s * Cin + cb * 16) * 16, \
+                        "block %d tap %d cb %d: destination %d, expected %d" \
+                        % (b, s, cb, dst,
+                           b * g["dst_step"] // 4 + (s * Cin + cb * 16) * 16)
+                    out[dst:dst + 256] = vpm.T.reshape(-1)
+                    dst += 256
+    # back to the logical [M][K] panel the GEMM's rows name
+    return out.reshape(g["blocks"], g["nk"], 16).transpose(0, 2, 1) \
+              .reshape(g["blocks"] * 16, g["nk"])[:, :g["K"]]
 
 
 def current_panel(img, W, H, Cin, KH, KW, stride, pad, dil, g):

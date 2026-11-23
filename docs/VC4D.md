@@ -1,7 +1,7 @@
 # vc4d — privileged helper for unprivileged VC4 compute
 
 Source tree: `/home/raspi/work/vc4d`. Installed as `vc4d.service` (active,
-protocol version 2).
+protocol version 3; version-2 clients are still served).
 
 Goal: move `/dev/mem` and V3D dispatch out of client processes, so engines and
 tools run unprivileged without raw memory access.
@@ -10,7 +10,7 @@ tools run unprivileged without raw memory access.
 AF_UNIX SOCK_SEQPACKET `/run/vc4d.sock` (0660 root:vc4), 28-byte header
 (`magic "VC4D"`, len == datagram size, op, version, seq, status, two detail
 words), 64 KiB cap.  Ops: HELLO, ALLOC(+fd via SCM_RIGHTS), FREE, UPLOAD,
-LAUNCH, WAIT, READ_REGS, WRITEREG, SYNC, STATS, PING, CLOSE.
+LAUNCH, LAUNCH_BATCH, WAIT, READ_REGS, WRITEREG, SYNC, STATS, PING, CLOSE.
 
 - **ALLOC** returns `{handle, off, len, bus}`; `bus` is the GPU bus address of
   the region, so a client can build pointer uniforms itself.
@@ -32,6 +32,12 @@ LAUNCH, WAIT, READ_REGS, WRITEREG, SYNC, STATS, PING, CLOSE.
   ownership/alignment/range, then validates the words and points SRQUA at the
   block.  Containment is per-arena instead of per-buffer.  The client must
   have cleaned its cache (see below).
+- **LAUNCH_BATCH** (protocol 3, `HELLO.flags & 0x20`): one request carries an
+  ordered list of launches and fences; the daemon executes them in order, each
+  launch completing before the next is kicked, and replies once with a status
+  per entry.  The first failure stops the list and the entries after it are
+  `E_NOTRUN`.  A batch launch carries its uniforms in the arena (no per-word
+  array) and implies `WAIT`.  The single `LAUNCH` message is unchanged.
 - **UNI_MASK** (`flags & 4`): `launch_req.uni_addr` is authoritative.  Bit *u*
   means "uniform word *u* is a GPU bus address the program consumes": such a
   word must lie inside this client's arena, and a word whose bit is clear is a

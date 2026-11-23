@@ -245,6 +245,10 @@ class Engine:
         L.vc4_upload.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf), ctypes.c_void_p,
                                  ctypes.c_size_t]
         L.vc4_upload.restype = ctypes.c_int
+        L.vc4_batch_begin.argtypes = [ctypes.c_void_p]
+        L.vc4_batch_begin.restype = None
+        L.vc4_batch_end.argtypes = [ctypes.c_void_p]
+        L.vc4_batch_end.restype = ctypes.c_int
         L.vc4_invalidate_buf.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)]
         L.vc4_invalidate_buf.restype = None
         L.vc4_download.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
@@ -438,6 +442,9 @@ class Engine:
         L.vc4_arena_bytes.restype = ctypes.c_size_t
 
         self.ctx = ctypes.c_void_p()
+        # >0 while a caller (the executor's node loop) holds one batch scope
+        # open; see batch_hold()/batch_release().
+        self._batch_hold = 0
         if not arena_bytes:
             # A 320x320 YOLO needs ~91 MiB (activations + weights + the
             # per-conv im2col scratch); the daemon's default 72 MiB is too
@@ -473,13 +480,63 @@ class Engine:
 
     # ---- helpers
     def _check(self, st, what):
+        # A caller may hold a batch scope open across several C API calls (the
+        # executor does this per graph node).  Inside it the queue is not
+        # drained here: the calls in one node are exactly the launches whose
+        # ordering the device guarantees, and the scope's release reports the
+        # first failure.  Outside a scope the batch covers one C API call, so
+        # the call that issued a launch also reports its timeout or error.
+        if self._batch_hold:
+            if st != VC4_OK:
+                # Do not leave earlier launches of this node queued behind an
+                # exception: complete what was issued, then raise the original.
+                self.lib.vc4_batch_end(self.ctx)
+            if st == VC4_OK:
+                return
+            msg = self.lib.vc4_last_error(self.ctx).decode()
+            if st == ERR_UNSUPPORTED:
+                raise Unsupported("%s: %s" % (what, msg))
+            raise Error("%s: %s (%s)"
+                        % (what, self.lib.vc4_strerror(st).decode(), msg), st)
+        bst = self.lib.vc4_batch_end(self.ctx)
         if st == VC4_OK:
+            st = bst
+        if st == VC4_OK:
+            self.lib.vc4_batch_begin(self.ctx)
             return
         msg = self.lib.vc4_last_error(self.ctx).decode()
         if st == ERR_UNSUPPORTED:
             raise Unsupported("%s: %s" % (what, msg))
         raise Error("%s: %s (%s)"
                     % (what, self.lib.vc4_strerror(st).decode(), msg), st)
+
+    def batch_hold(self):
+        """Open a batch scope that spans several API calls.
+
+        The executor holds one per graph node.  Inside it launches accumulate
+        and are submitted once at release; a download, upload, dirty mark,
+        scratch reset or explicit invalidate still drains the queue first,
+        because those are the points where the client touches memory the
+        queue may be using.
+        """
+        if self._batch_hold == 0:
+            self.lib.vc4_batch_begin(self.ctx)
+        self._batch_hold += 1
+
+    def batch_release(self):
+        """Close a scope; submit its launches and raise the first failure."""
+        if self._batch_hold <= 0:
+            raise RuntimeError("batch_release without batch_hold")
+        self._batch_hold -= 1
+        if self._batch_hold:
+            return
+        st = self.lib.vc4_batch_end(self.ctx)
+        if st != VC4_OK:
+            msg = self.lib.vc4_last_error(self.ctx).decode()
+            if st == ERR_UNSUPPORTED:
+                raise Unsupported("batch: %s" % msg)
+            raise Error("batch: %s (%s)"
+                        % (self.lib.vc4_strerror(st).decode(), msg), st)
 
     @property
     def arena_bytes(self):
@@ -542,9 +599,14 @@ class Engine:
         """
         if np is None:
             raise RuntimeError("numpy is not installed")
+        # The pointer escapes to Python, so the queue has to drain before it
+        # is handed out and batching resumes only once it is back.
+        self.lib.vc4_batch_end(self.ctx)
         self.lib.vc4_invalidate_buf(self.ctx, ctypes.byref(buf))
         p = self.lib.vc4_host_ptr(self.ctx, ctypes.byref(buf))
-        return np.ctypeslib.as_array((ctypes.c_float * count).from_address(p))
+        out = np.ctypeslib.as_array((ctypes.c_float * count).from_address(p))
+        self.lib.vc4_batch_begin(self.ctx)
+        return out
 
     # ---- ops
     def matmul(self, a, b, c, M, N, K, layout=LAYOUT_ROW_MAJOR,

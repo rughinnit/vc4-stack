@@ -18,17 +18,26 @@
 #define VC4D_MAGIC      0x44344356u   /* "VC4D" */
 /* 2: launch_req grew flags/uni_handle/uni_off (UNI_IN_ARENA mode).
  *
- * Version 2 is kept for the G3/G4 additions below: they are opt-in, so a
+ * Version 3 adds the batch launch below.  HELLO accepts both 2 and 3: a
+ * version-2 client gets the same daemon it always had (the batch op is simply
+ * never sent, and the HELLO flag says so), and a version-3 client checks
+ * VC4D_F_LAUNCH_BATCH before using it.  The single-launch message, its
+ * validation and its replies are byte-for-byte unchanged.
+ *
+ * Version 2 is also where the G3/G4 additions live: they are opt-in, so a
  * client that sends neither a program name nor a uniform address mask sees
- * exactly the old behaviour (and a new client can check the HELLO flags
- * before using either).  Bumping the version would have made every old
- * client fail at HELLO instead. */
-#define VC4D_VERSION    2u
+ * exactly the old behaviour. */
+#define VC4D_VERSION    3u
+#define VC4D_VERSION_MIN 2u           /* oldest HELLO version still served  */
 
 #define VC4D_MAX_MSG    (64u * 1024u) /* hard cap on one message             */
 #define VC4D_MAX_QPU    12u
 #define VC4D_MAX_UNI    16u           /* uniform words per QPU (64 B / 4)    */
 #define VC4D_MAX_PROG   16u * 1024u   /* max QPU program bytes (one slot)    */
+/* One batch request carries at most this many entries.  The limit is what
+ * keeps one request inside VC4D_MAX_MSG and gives the client a fixed shadow
+ * slot for every launch's uniform block: 64 * 12 * 64 = 48 KiB. */
+#define VC4D_BATCH_MAX  64u
 
 /* ---- status codes ------------------------------------------------------- */
 enum {
@@ -45,6 +54,8 @@ enum {
     VC4D_E_DENIED = 10,  /* policy refusal (allowlist, raw reg, ...)       */
     VC4D_E_IO     = 11,  /* socket / fd transfer failure                   */
     VC4D_E_DEAD   = 12,  /* daemon marked dead after a GPU timeout         */
+    VC4D_E_NOTRUN = 13,  /* batch entry was not executed: an earlier one
+                          * failed and execution stopped                   */
 };
 
 /* HELLO flags */
@@ -54,6 +65,7 @@ enum {
 #define VC4D_F_UNI_MASK     (1u << 3)  /* LAUNCH may declare address slots */
 #define VC4D_F_ARENA_RESTORE (1u << 4) /* a degraded arena is restored when
                                         * CMA recovers and the daemon is idle */
+#define VC4D_F_LAUNCH_BATCH  (1u << 5) /* VC4D_OP_LAUNCH_BATCH is supported */
 
 /* UPLOAD flags.  NAMED: the payload is
  *     struct vc4d_upload_req, code bytes, name bytes (no NUL)
@@ -88,6 +100,7 @@ enum {
     VC4D_OP_SYNC      = 10,
     VC4D_OP_CLOSE     = 11,
     VC4D_OP_PING      = 12,
+    VC4D_OP_LAUNCH_BATCH = 13,
 };
 
 struct vc4d_hdr {
@@ -194,6 +207,74 @@ struct vc4d_wait_rsp {
 struct vc4d_sync_req   { uint32_t handle; uint32_t dir; };
 struct vc4d_wreg_req   { uint32_t off; uint32_t val; };
 
+/*
+ * LAUNCH_BATCH: one request, an ordered list of launches, one completion.
+ *
+ * The goal is the per-launch host cost of a graph: an inference that issues
+ * hundreds of launches otherwise pays a sendmsg/recvmsg pair and a daemon
+ * request dispatch for every one.  A batch is executed strictly in order and
+ * each launch waits for its own completion before the next is kicked, so the
+ * GPU sees exactly the sequence it would have seen from separate LAUNCH
+ * messages, including kernel-to-kernel memory ordering (the daemon's L2
+ * write-back after each kick).
+ *
+ * One entry is a launch or a fence:
+ *
+ *   VC4D_BENT_LAUNCH  prog/timeout_ms/nqpu/flags/uni_handle/uni_off/uni_addr
+ *                     mean exactly what they mean in struct vc4d_launch_req.
+ *                     VC4D_LAUNCH_UNI_ARENA is required (a batch carries no
+ *                     per-word uniform array; uniforms live in the arena),
+ *                     VC4D_LAUNCH_WAIT is implied (every entry completes
+ *                     before the next starts), and VC4D_LAUNCH_UNI_MASK is
+ *                     optional.  handle/dir must be 0.
+ *
+ *   VC4D_BENT_FENCE   handle/dir are a struct vc4d_sync_req: the daemon does
+ *                     the same L2 write-back/invalidate a SYNC request does,
+ *                     at this point in the order.  This is a *device* fence.
+ *                     A client-side fence (the CPU is about to read a result
+ *                     or rewrite a buffer an earlier entry reads) is a batch
+ *                     boundary by construction: no entry may depend on CPU
+ *                     work between two entries.
+ *
+ * Validation is per entry and identical to LAUNCH's.  Execution stops at the
+ * first entry that fails; every entry after it is reported VC4D_E_NOTRUN, and
+ * entries before it have already run and completed.  The reply header status
+ * is the first failure (VC4D_OK when all ran), detail0 is the number of
+ * entries that ran (a fence counts as run), and detail1 is the failing index
+ * (0xffffffff when none).  The payload is `count` entries of
+ * struct vc4d_batch_item, in request order.
+ */
+#define VC4D_BENT_LAUNCH 0u
+#define VC4D_BENT_FENCE  1u
+
+struct vc4d_batch_ent {
+    uint32_t kind;         /* VC4D_BENT_*                                  */
+    uint32_t prog;         /* LAUNCH: program handle                       */
+    uint32_t timeout_ms;   /* LAUNCH: 0 = daemon default                   */
+    uint32_t nqpu;         /* LAUNCH                                       */
+    uint32_t nuni;         /* LAUNCH: must equal the UPLOAD declaration    */
+    uint32_t flags;        /* LAUNCH: VC4D_LAUNCH_* (ARENA required)       */
+    uint32_t uni_handle;   /* LAUNCH: client region holding the uniforms   */
+    uint32_t uni_off;      /* LAUNCH: byte offset, 64-byte aligned         */
+    uint32_t uni_addr;     /* LAUNCH: UNI_MASK slot mask                   */
+    uint32_t handle;       /* FENCE: client region                         */
+    uint32_t dir;          /* FENCE: VC4D_SYNC_W2G / G2R                   */
+};
+struct vc4d_batch_req {
+    uint32_t count;        /* 1..VC4D_BATCH_MAX entries follow             */
+    uint32_t flags;        /* reserved, must be 0                          */
+    uint32_t reserved[2];
+};
+struct vc4d_batch_item {
+    uint32_t status;       /* VC4D_* for this entry                        */
+    uint32_t launch;       /* LAUNCH: launch id; FENCE: 0                  */
+    uint32_t errs;         /* LAUNCH: newly raised V3D_ERR_STAT bits       */
+    uint32_t pad;
+    uint64_t wall_ns;      /* LAUNCH: kick -> idle; FENCE: 0               */
+    uint32_t cycles;       /* LAUNCH: PCTR0 exec cycles                    */
+    uint32_t pad2;
+};
+
 /* READ_REGS: count == 0 -> snapshot (payload = struct vc4d_regs),
  * count >  0 -> raw words [off, off+count), payload = vc4d_regs_req + words */
 struct vc4d_regs_req   { uint32_t off; uint32_t count; };
@@ -217,6 +298,9 @@ struct vc4d_stats_rsp {
 _Static_assert(sizeof(struct vc4d_hdr) == 28, "hdr");
 _Static_assert(sizeof(struct vc4d_uni) == 16, "uni");
 _Static_assert(sizeof(struct vc4d_launch_req) == 32, "launch_req");
+_Static_assert(sizeof(struct vc4d_batch_ent) == 44, "batch_ent");
+_Static_assert(sizeof(struct vc4d_batch_req) == 16, "batch_req");
+_Static_assert(sizeof(struct vc4d_batch_item) == 32, "batch_item");
 _Static_assert(sizeof(struct vc4d_stats_rsp) == 96, "stats_rsp");
 _Static_assert(sizeof(struct vc4d_regs) == 72, "regs");
 

@@ -28,6 +28,7 @@
 
 struct vc4c_conn {
     int fd;
+    uint32_t version;      /* protocol version sent in every header */
     uint32_t seq;
     int last;
     struct vc4d_hello_rsp info;
@@ -105,7 +106,7 @@ static int xfer(vc4c_conn *c, uint16_t op, const void *payload, size_t plen,
     h.magic = VC4D_MAGIC;
     h.len = (uint32_t)(sizeof(h) + plen);
     h.op = op;
-    h.version = VC4D_VERSION;
+    h.version = c->version;
     h.seq = ++c->seq;
 
     struct iovec iov[2] = {
@@ -194,14 +195,36 @@ static int xfer(vc4c_conn *c, uint16_t op, const void *payload, size_t plen,
     return 0;
 }
 
-int vc4c_info(vc4c_conn *c, struct vc4d_hello_rsp *out)
+/* HELLO.  A version-3 client starts with 3 and drops to 2 when the daemon
+ * answers E_VERSION, so a new library works against a daemon that predates
+ * the batch op; the HELLO flags then say which optional ops exist. */
+static int info_as(vc4c_conn *c, uint32_t version,
+                   struct vc4d_hello_rsp *out)
 {
-    struct vc4d_hello_req q = { .version = VC4D_VERSION, .flags = 0 };
+    struct vc4d_hello_req q = { .version = version, .flags = 0 };
+    uint32_t old = c->version;
+    c->version = version;
     size_t n = 0;
     int rc = xfer(c, VC4D_OP_HELLO, &q, sizeof(q), -1, NULL,
                   out, sizeof(*out), &n, NULL, NULL);
-    if (rc == 0 && n != sizeof(*out))
-        return -VC4D_E_PROTO;
+    if (rc != 0)
+        c->version = old;
+    else if (n != sizeof(*out))
+        rc = -VC4D_E_PROTO;
+    return rc;
+}
+
+int vc4c_info(vc4c_conn *c, struct vc4d_hello_rsp *out)
+{
+    int rc = info_as(c, c->version, out);
+    if (rc == -VC4D_E_VERSION && c->version > VC4D_VERSION_MIN)
+        rc = info_as(c, VC4D_VERSION_MIN, out);
+    /* A daemon may accept a newer HELLO and answer with its own (older)
+     * version.  1.2.9 does exactly that: it serves HELLO 3 and then rejects
+     * any later request whose header says 3.  The reply version is what every
+     * subsequent request must carry. */
+    if (rc == 0 && out && out->version && out->version < c->version)
+        c->version = out->version;
     return rc;
 }
 
@@ -213,6 +236,7 @@ int vc4c_connect(vc4c_conn **out, const char *path)
     struct vc4c_conn *c = calloc(1, sizeof(*c));
     if (!c)
         return -VC4D_E_NOMEM;
+    c->version = VC4D_VERSION;
     c->fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (c->fd < 0) {
         free(c);
@@ -467,6 +491,72 @@ int vc4c_launch_wait_u(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
 {
     return launch_arena_impl(c, p, nqpu, uniforms, uni_off, timeout_ms, out,
                              uni_addr, 1, 1);
+}
+
+int vc4c_launch_batch(vc4c_conn *c, const vc4c_buf *uniforms,
+                      const vc4c_batch_ent *ent, unsigned count,
+                      struct vc4d_batch_item *out, unsigned *done)
+{
+    if (done)
+        *done = 0;
+    if (!c || !ent || count < 1 || count > VC4D_BATCH_MAX)
+        return -VC4D_E_INVAL;
+    struct vc4d_batch_ent wire[VC4D_BATCH_MAX];
+    memset(wire, 0, sizeof(wire));
+    for (unsigned i = 0; i < count; ++i) {
+        const vc4c_batch_ent *e = &ent[i];
+        struct vc4d_batch_ent *w = &wire[i];
+        w->kind = e->kind;
+        if (e->kind == VC4D_BENT_FENCE) {
+            if (e->dir > VC4D_SYNC_G2R)
+                return -VC4D_E_INVAL;
+            w->handle = e->handle;
+            w->dir = e->dir;
+            continue;
+        }
+        if (e->kind != VC4D_BENT_LAUNCH)
+            return -VC4D_E_INVAL;
+        if (!e->prog || !e->nqpu || e->nqpu > VC4D_MAX_QPU ||
+            !e->nuni || e->nuni > VC4D_MAX_UNI || (e->uni_off & 63u))
+            return -VC4D_E_INVAL;
+        if (!uniforms || !uniforms->map ||
+            (uint64_t)e->uni_off + 64ull * e->nqpu > uniforms->len)
+            return -VC4D_E_INVAL;
+        if ((e->uni_addr >> e->nuni) != 0)              /* bits >= nuni */
+            return -VC4D_E_INVAL;
+        if (e->flags & ~VC4D_LAUNCH_UNI_MASK)
+            return -VC4D_E_INVAL;
+        w->prog = e->prog;
+        w->timeout_ms = e->timeout_ms;
+        w->nqpu = e->nqpu;
+        w->nuni = e->nuni;
+        w->flags = (e->flags & VC4D_LAUNCH_UNI_MASK) | VC4D_LAUNCH_UNI_ARENA;
+        w->uni_handle = uniforms->handle;
+        w->uni_off = e->uni_off;
+        w->uni_addr = e->uni_addr;
+    }
+    size_t plen = sizeof(struct vc4d_batch_req) +
+                  (size_t)count * sizeof(struct vc4d_batch_ent);
+    if (plen > VC4D_MAX_MSG)
+        return -VC4D_E_TOOLARGE;
+    uint8_t *pl = malloc(plen);
+    if (!pl)
+        return -VC4D_E_NOMEM;
+    struct vc4d_batch_req q = { .count = count, .flags = 0 };
+    memcpy(pl, &q, sizeof(q));
+    memcpy(pl + sizeof(q), wire, (size_t)count * sizeof(wire[0]));
+    uint32_t d0 = 0, d1 = 0;
+    size_t n = 0;
+    int rc = xfer(c, VC4D_OP_LAUNCH_BATCH, pl, plen, -1, NULL,
+                  out, (size_t)count * sizeof(*out), &n, &d0, &d1);
+    free(pl);
+    if (done)
+        *done = d0;
+    if (rc == 0 && n != (size_t)count * sizeof(*out))
+        return -VC4D_E_PROTO;
+    /* A failing entry already carries its status in the payload; the header
+     * status is the same code, so callers get the first failure either way. */
+    return rc;
 }
 
 int vc4c_flush(vc4c_conn *c, const vc4c_buf *b, unsigned dir)

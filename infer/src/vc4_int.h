@@ -114,6 +114,8 @@ vc4_status vc4__remote_load(vc4_ctx *ctx, const char *name,
                             int nqpu, vc4_kernel **out);
 vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
                               uint64_t *wall_ns);
+void       vc4__remote_batch_begin(vc4_ctx *ctx);
+vc4_status vc4__remote_batch_end(vc4_ctx *ctx);
 vc4_status vc4__remote_upload(vc4_ctx *ctx, vc4_buf *b, const void *src,
                               size_t bytes);
 vc4_status vc4__remote_download(vc4_ctx *ctx, const vc4_buf *b, void *dst,

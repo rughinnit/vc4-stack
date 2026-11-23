@@ -3756,16 +3756,52 @@ class Runner:
         fn = self._op_table.get(op)
         if fn is None:
             raise UnsupportedNode(node.name, op, "unsupported op %s" % op)
+        # One batch scope per node: a node's launches are issued by several
+        # binding calls (conv pack + conv, the per-input concat copies, a
+        # reduction's chunks) and all of them belong to one point in the
+        # graph's order.  Anything that makes the CPU look at the arena - a
+        # download, an upload, a dirty mark, a scratch reset - still drains
+        # the queue inside the scope, so the device is never asked to run
+        # ahead of data the client is still changing.
+        hold = getattr(self.eng, "batch_hold", None)
+        release = getattr(self.eng, "batch_release", None)
+        if hold is not None:
+            hold()
         try:
-            return fn(node)
+            out = fn(node)
         except vc4infer.Unsupported as e:
+            if release is not None:
+                try:
+                    release()
+                except Exception:
+                    pass
             raise UnsupportedNode(node.name, op, str(e))
         except vc4infer.Error as e:
+            if release is not None:
+                try:
+                    release()
+                except Exception:
+                    pass
             raise UnsupportedNode(node.name, op, "engine error: %s" % e)
         except UnsupportedNode as e:
+            if release is not None:
+                try:
+                    release()
+                except Exception:
+                    pass
             # a deeper layer raised without the node context; add it
             raise UnsupportedNode(node.name if not e.node else e.node,
                                   op if not e.op else e.op, e.detail)
+        except BaseException:
+            if release is not None:
+                try:
+                    release()
+                except Exception:
+                    pass
+            raise
+        if release is not None:
+            release()
+        return out
 
     # ---------------------------------------------------------------- execute
     def _drop_garbage(self):

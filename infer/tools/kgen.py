@@ -61,6 +61,12 @@ from qenc import _ops, imm as _imm, W_VPM, W_VPW_SETUP, W_VPW_ADDR
 from gen import Prog
 import vpmwords as V
 
+# One kernel blob is loaded into one V3D code slot (VC4_CODE_SLOT in
+# infer/src/vc4_int.h, VC4D_MAX_PROG in vc4d/proto/vc4d_proto.h).  Checking
+# here, where the kernel is generated, names the kernel and the limit during a
+# build instead of a launch failing on a model.
+CODE_SLOT_BYTES = 16384
+
 MUL_V8MIN = 4
 
 # Prog.emit takes either encoded words or the dict form used everywhere below
@@ -3038,7 +3044,7 @@ def build_up2_nhwc(C):
     A = dict(SRC=16, DST=17, SGP=18, DGP=19, CNT=20, XCNT=21, KADDR=22,
              TMP=23)
     B = dict(C4=16, SROWSTR=17, DROWSTR=18, G4=19, NX4=20, SG2=21,
-             V4=22, V9=23, T=24, T2=25, CBT=26, L4=27)
+             V4=22, V9=23, T=24, T2=25, CBT=26, L4=27, LIM=28)
 
     b = Builder()
     p = b.p
@@ -3061,33 +3067,46 @@ def build_up2_nhwc(C):
     b.read_uni(B['DROWSTR'], ws=1)  # u8
     b.read_uni(B['NX4'], ws=1)      # u9
     b.e(add_(ADD_SHL, B['L4'], ws=1, a=areg(R_ELEM_NUM), b=imm(2)), nop())
+    # The channel-block loop is a runtime loop, not an unrolled one: at C=512
+    # the unrolled form was 21440 B against the 16384 B client code slot, and
+    # the instruction sequence per block does not depend on the block index.
+    # A['TMP'] becomes the 64 B step, B CBT the block's byte offset inside the
+    # pixel and ACC2 the end offset: the ALU reads one A and one B register
+    # per word, so a B-register address add needs both operands outside the A
+    # file, and the compare against the end offset needs a staged value.
+    b.e(ldi(C * 4, B['LIM'], ws=1))
+    b.e(add_(ADD_OR, 34, breg(B['LIM']), breg(B['LIM'])), nop(), nop())
+    b.e(ldi(64, A['TMP']))
 
     p.label('pair')
-    for cb in range(C // 16):
-        b.e(ldi(cb * 64, B['CBT'], ws=1))
-        if cb:
-            b.e(add_(ADD_ADD, A['SGP'], areg(A['SRC']), breg(B['CBT'])))
-            b.e(add_(ADD_ADD, A['DGP'], areg(A['DST']), breg(B['CBT'])))
-        else:
-            b.e(add_or(A['SGP'], areg(A['SRC']), areg(A['SRC'])))
-            b.e(add_or(A['DGP'], areg(A['DST']), areg(A['DST'])))
-        b.e(add_(ADD_ADD, A['SGP'], areg(A['SGP']), breg(B['L4'])), nop())
-        b.e(add_or(A['XCNT'], breg(B['NX4']), breg(B['NX4'])), nop(), nop())
-        p.label('g%d' % cb)
-        b.e(add_or(A['KADDR'], areg(A['SGP']), areg(A['SGP'])), nop())
-        _tmu_load_a(b, 0, A['KADDR'], 0)
-        b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['C4'])))
-        _tmu_load_a(b, 0, A['KADDR'], 2)
-        b.e(add_or(1, areg(0), areg(0)))
-        b.e(add_or(3, areg(2), areg(2)), nop(), nop())
-        _store4(b, B['V4'], B['V9'], A['DGP'], C * 4 - 64)
-        b.e(add_(ADD_ADD, A['KADDR'], areg(A['DGP']), breg(B['DROWSTR'])))
-        _store4(b, B['V4'], B['V9'], A['KADDR'], C * 4 - 64)
-        b.e(add_(ADD_ADD, A['SGP'], areg(A['SGP']), breg(B['SG2'])))
-        b.e(add_(ADD_ADD, A['DGP'], areg(A['DGP']), breg(B['G4'])))
-        b.e(add_(ADD_SUB, A['XCNT'], areg(A['XCNT']), imm(1), sf=1))
-        p.branch_to('g%d' % cb, cond=BR_ALL_Z_CLEAR)
-        b.e(nop(), nop(), nop())
+    # every row pair starts at channel block 0; the block loop leaves CBT at
+    # C*4, and a QPU that handles several pairs must not start the next one
+    # past the end of the pixel (the second pair then went unwritten)
+    b.e(add_or(B['CBT'], imm(0), imm(0), ws=1))
+    p.label('blk')
+    b.e(add_(ADD_ADD, A['SGP'], areg(A['SRC']), breg(B['CBT'])))
+    b.e(add_(ADD_ADD, A['DGP'], areg(A['DST']), breg(B['CBT'])))
+    b.e(add_(ADD_ADD, A['SGP'], areg(A['SGP']), breg(B['L4'])), nop())
+    b.e(add_or(A['XCNT'], breg(B['NX4']), breg(B['NX4'])), nop(), nop())
+    p.label('grp')
+    b.e(add_or(A['KADDR'], areg(A['SGP']), areg(A['SGP'])), nop())
+    _tmu_load_a(b, 0, A['KADDR'], 0)
+    b.e(add_(ADD_ADD, A['KADDR'], areg(A['KADDR']), breg(B['C4'])))
+    _tmu_load_a(b, 0, A['KADDR'], 2)
+    b.e(add_or(1, areg(0), areg(0)))
+    b.e(add_or(3, areg(2), areg(2)), nop(), nop())
+    _store4(b, B['V4'], B['V9'], A['DGP'], C * 4 - 64)
+    b.e(add_(ADD_ADD, A['KADDR'], areg(A['DGP']), breg(B['DROWSTR'])))
+    _store4(b, B['V4'], B['V9'], A['KADDR'], C * 4 - 64)
+    b.e(add_(ADD_ADD, A['SGP'], areg(A['SGP']), breg(B['SG2'])))
+    b.e(add_(ADD_ADD, A['DGP'], areg(A['DGP']), breg(B['G4'])))
+    b.e(add_(ADD_SUB, A['XCNT'], areg(A['XCNT']), imm(1), sf=1))
+    p.branch_to('grp', cond=BR_ALL_Z_CLEAR)
+    b.e(nop(), nop(), nop())
+    b.e(add_(ADD_ADD, B['CBT'], breg(B['CBT']), areg(A['TMP']), ws=1))
+    b.e(add_(ADD_SUB, A['KADDR'], breg(B['CBT']), acc(2), sf=1))
+    p.branch_to('blk', cond=BR_ALL_N_SET)
+    b.e(nop(), nop(), nop())
     b.e(add_(ADD_ADD, A['SRC'], areg(A['SRC']), breg(B['SROWSTR'])))
     b.e(add_(ADD_ADD, A['DST'], areg(A['DST']), breg(B['DROWSTR'])))
     b.e(add_(ADD_ADD, A['DST'], areg(A['DST']), breg(B['DROWSTR'])))
@@ -4086,6 +4105,15 @@ def main(argv):
               "generator cannot build, refusing to emit a silently different one"
               % (kind, ", ".join(sorted(unknown))), file=sys.stderr)
         return 2
+    # Size gate: a blob over one code slot cannot be uploaded, and the
+    # engine's loader would only say so after the graph reached the op.
+    nwords = len(p.finish()) if hasattr(p, 'finish') else len(p.words())
+    if nwords * 8 > CODE_SLOT_BYTES:
+        print("kgen: %s: %d instructions (%d B) exceed the %d B client code "
+              "slot; split the kernel or move work out of its generated "
+              "unrolling" % (kind, nwords, nwords * 8, CODE_SLOT_BYTES),
+              file=sys.stderr)
+        return 4
     if hasattr(p, '_builder'):
         n = p._builder.report(out)
         if n and os.environ.get('KGEN_STRICT'):

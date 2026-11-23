@@ -389,32 +389,38 @@ static void case_transpose(vc4_ctx *ctx)
 }
 
 /* ---- 7. nearest 2x resize, NHWC, C%16 == 0 ---------------------------- */
-static void case_resize2x(vc4_ctx *ctx)
+static void case_resize2x(vc4_ctx *ctx, int C, int H, int W, int nimg)
 {
-    const int C = 128, H = 5, W = 5;
     tensor s, d;
-    const size_t ns = (size_t)H * W * C;
-    const size_t nd = (size_t)2 * H * 16 * C;      /* opitch = align16(2W) */
+    const size_t ns = (size_t)nimg * H * W * C;
+    const size_t nd = (size_t)nimg * 2 * H * ((2 * W + 15) & ~15) * C;
     if (mk(ctx, &s, ns) || mk(ctx, &d, nd)) { free_t(&s); free_t(&d); return; }
     for (size_t i = 0; i < ns; ++i)
-        s.host[i] = (float)(i + 1);
+        s.host[i] = (float)((i % 8191) + 1);
     vc4_upload(ctx, &s.buf, s.host, ns * 4);
     int ho = 0, wo = 0, op = 0;
     uint64_t t0 = now_ns();
-    vc4_status st = vc4_upsample2x_nhwc(ctx, &s.buf, 1, C, H, W, W, &d.buf,
+    vc4_status st = vc4_upsample2x_nhwc(ctx, &s.buf, nimg, C, H, W, W, &d.buf,
                                         &ho, &wo, &op);
     uint64_t t1 = now_ns();
     CHECK(st == VC4_OK, "resize: %s", vc4_strerror(st));
     CHECK(ho == 2 * H && wo == 2 * W, "resize shape %dx%d", ho, wo);
     pull(ctx, &d);
     long bad = 0;
-    for (int y = 0; y < 2 * H; ++y)
-        for (int x = 0; x < 2 * W; ++x)
-            for (int c = 0; c < C; ++c) {
-                float want = s.host[((size_t)(y / 2) * W + x / 2) * C + c];
-                bad += d.host[((size_t)y * op + x) * C + c] != want;
-            }
-    report("resize nearest 2x [5][5][128] -> [10][10][128]", bad, nd, t1 - t0);
+    for (int n = 0; n < nimg; ++n)
+        for (int y = 0; y < 2 * H; ++y)
+            for (int x = 0; x < 2 * W; ++x)
+                for (int c = 0; c < C; ++c) {
+                    float want = s.host[((size_t)n * H + y / 2) * W * C +
+                                        (x / 2) * C + c];
+                    bad += d.host[(((size_t)n * 2 * H + y) * op + x) * C + c]
+                           != want;
+                }
+    char nm[80];
+    snprintf(nm, sizeof(nm),
+             "resize nearest 2x n%d [%d][%d][%d] -> [%d][%d][%d]",
+             nimg, H, W, C, 2 * H, 2 * W, C);
+    report(nm, bad, nd, t1 - t0);
     free_t(&s);
     free_t(&d);
 }
@@ -508,6 +514,50 @@ static void case_stem(vc4_ctx *ctx)
     free_t(&d);
 }
 
+/* ---- 9b. the same prologue at 640: lane stride 640*640*4 = 1638400 B ----
+ *
+ * The 16 lanes are the channels, so lane 15 reads 24576000 B past lane 0.
+ * That is a 24-bit mul (lane * slane) with a 32-bit result, not a 24-bit
+ * result: this case is the one the old "15 * slane overflows 24 bits" guard
+ * refused, and it checks the whole product is used, not just the lanes the
+ * 3-channel stem touches.
+ */
+static void case_stem_big(vc4_ctx *ctx)
+{
+    const int C = 16, CP = 16, H = 640, W = 640;
+    const int rows = 1, vpr = 4;              /* four pixels, one row */
+    tensor s, d;
+    const size_t ns = (size_t)C * H * W, nd = (size_t)vpr * CP;
+    if (mk(ctx, &s, ns) || mk(ctx, &d, nd)) { free_t(&s); free_t(&d); return; }
+    for (size_t i = 0; i < ns; ++i)
+        s.host[i] = (float)((i % 4093) + 1);
+    vc4_upload(ctx, &s.buf, s.host, ns * 4);
+    uint64_t t0 = now_ns();
+    vc4_status st = vc4_copy2d_x(ctx, &s.buf, &d.buf, (uint32_t)rows,
+                                 (uint32_t)vpr, 0, 0, 4, 64,
+                                 (uint32_t)H * W * 4, C, 1, 64, 64, 4, 16);
+    uint64_t t1 = now_ns();
+    CHECK(st == VC4_OK, "stem 640: %s", vc4_strerror(st));
+    pull(ctx, &d);
+    long bad = 0;
+    for (int v = 0; v < vpr; ++v)
+        for (int c = 0; c < CP; ++c) {
+            float want = c < C ? s.host[(size_t)c * H * W + v] : 0.0f;
+            bad += d.host[(size_t)v * CP + c] != want;
+        }
+    report("stem 640 16ch x 4 pixels (lane stride 1638400)", bad, nd,
+           t1 - t0);
+    /* the other side of the field: 2^24 truncates in mul24's operand */
+    st = vc4_copy2d_x(ctx, &s.buf, &d.buf, 1, 4, 0, 0, 4, 64, 1u << 24, C,
+                      1, 64, 64, 4, 16);
+    CHECK(st == VC4_ERR_UNSUPPORTED &&
+              strstr(vc4_last_error(ctx), "24-bit mul24 operand") != NULL,
+          "lane stride 2^24 should be refused by the operand field: %s [%s]",
+          vc4_strerror(st), vc4_last_error(ctx));
+    free_t(&s);
+    free_t(&d);
+}
+
 /* ---- 10. throughput on a 1 MiB copy ---------------------------------- */
 static void case_bulk(vc4_ctx *ctx, uint32_t units)
 {
@@ -563,7 +613,10 @@ int main(void)
     case_transpose(ctx);
     case_pool_border(ctx);
     case_stem(ctx);
-    case_resize2x(ctx);
+    case_stem_big(ctx);
+    case_resize2x(ctx, 128, 5, 5, 1);
+    case_resize2x(ctx, 512, 5, 5, 1);
+    case_resize2x(ctx, 512, 10, 10, 2);
     case_bulk(ctx, 4);
     case_bulk(ctx, 1);
     vc4_shutdown(ctx);

@@ -481,9 +481,20 @@ static vc4_status copy2d_run(vc4_ctx *ctx, const vc4_buf *a, vc4_buf *out,
                      "row stride)", dvec);
         return VC4_ERR_UNSUPPORTED;
     }
-    if (nlane && nlane != 16 && (uint64_t)15 * slane >= (1u << 24)) {
-        vc4__set_err(ctx, "vc4_copy2d: lane stride %u * 15 overflows the "
-                     "24-bit address multiply", slane);
+    /* mul24 truncates each *operand* to 24 bits and returns the low 32 bits
+     * of the product, so lane*slane is exact for any slane < 2^24 (lane <= 15
+     * then makes the product < 2^28).  The old guard demanded
+     * 15*slane < 2^24 and refused 1638400, the 640x640 first-conv lane
+     * stride, although that product (24576000) is well inside 32 bits; it was
+     * measured byte-exact on the board.  A slane of 2^24 or more *is* truncated
+     * by the operand, and a lane-strided copy then has to be restructured
+     * (one copy per lane plane, or a row/block form) rather than launched.
+     * nlane==16 is checked too: it was exempt, and lane 15 reads slane*15. */
+    if (nlane && slane >= (1u << 24)) {
+        vc4__set_err(ctx, "vc4_copy2d: lane stride %u B does not fit the "
+                     "24-bit mul24 operand (max %u B); split the lane "
+                     "dimension across launches or use a row copy", slane,
+                     (1u << 24) - 1u);
         return VC4_ERR_UNSUPPORTED;
     }
     if (ctx->dead)

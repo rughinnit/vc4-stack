@@ -404,7 +404,12 @@ for the window only: one private `vc4d` built from this tree ran on
 for 145 MiB, ARM was pinned at 1.0 GHz, every cell ran under
 `tools/thermal-guard.sh --max 75`, and no timeout, context reset or reboot
 occurred.  The packaged unit was restored and verified afterwards
-(`vc4d 1.2.9, protocol 2, 96 MiB`).
+(`vc4d 1.2.9, protocol 2, 96 MiB`).  The v8 s 160 and v8 n 640 rows were
+re-measured in a later 184 MiB window (`--arena-mb 184`, 181.0 MiB of client
+arena) with the 24-bit copy2d guard and the code-slot refusal fixed; the
+other three rows keep the 150 MiB conditions.  v8 n 640's plan (150.9 MiB)
+already exceeded the 145 MiB client, so even with the fix it needed the
+larger window to reach a run.
 
 "Plan" is the liveness plan's pool plus the engine's conv/elementwise scratch
 (`docs/OPTIMIZER.md`); "high-water" is `Engine.memory()["peak_mb"]` against the
@@ -415,16 +420,35 @@ in the rest of this section.
 | cell | plan MiB | runs | median ms | FPS | launches | high-water / pool MiB | max scaled | detections | status |
 |---|---:|---|---:|---:|---:|---|---:|---|---|
 | v5 s 160 | 83.0 | yes (raw graph) | 943.1 | 1.06 | 1488 | 7.32 of 84.45 (7) | 2.52 | 5/5, box 2.78 px | runs, accuracy off |
-| v8 s 160 | 98.2 | no | — | — | — | — | — | — | refusal: `up2_512` is 21440 B, over the 16384 B code slot |
+| v8 s 160 | 97.2 | yes (raw graph) | 972.6 | 1.03 | 1249 | 88.56 of 93.48 (2) | 3.87 | — | runs, accuracy far off |
 | v9 s 160 | 65.4 | yes (raw graph) | 2430.4 | 0.41 | 6512 | 4.57 of 64.37 (5) | 4.09 | 5/5, box 0.98 px | runs, accuracy off |
 | v8 n 320 | 52.2 | yes (raw graph) | 985.2 | 1.02 | 2060 | 8.98 of 41.30 (2) | 16.1 | 7 vs 5 | runs, accuracy off |
-| v8 n 640 | 131.6 | no | — | — | — | — | — | — | refusal: `copy2d` lane stride 1638400 x 15 overflows the 24-bit address multiply |
+| v8 n 640 | 150.9 | yes (raw graph) | 2835.6 | 0.35 | 6604 | 71.74 of 89.02 (2) | 34.0 | — | runs at 181.0 MiB client, accuracy far off |
 
-The plan accepts all five under 145 MiB; v5 s and v9 s also fit the old
-96 MiB figure and v8 n 320 had been refused there.  Fitting is not running:
-v8 s stops on a kernel whose blob is larger than the client code slot, and
-v8 n 640 stops in the first conv because the row copy's lane stride exceeds
-the 24-bit multiply, before any memory question is reached.
+The plan accepts v5 s, v9 s, v8 n 320 and v8 s under 145 MiB; v5 s and v9 s
+also fit the old 96 MiB figure and v8 n 320 had been refused there.  v8 n 640
+is 150.9 MiB on this tree (pool 63.0 + scratch 87.9) and needs a 184 MiB
+daemon, i.e. 181.0 MiB of client arena, because its pool grows one segment
+above the plan at the first conv.  The 131.6 MiB row the earlier plan
+recorded predates the scratch accounting this run used; the run is the
+measurement.
+
+The two former refusals are gone.  The 512-channel upsample kernel is 1240 B
+with the channel-block loop at run time (it was 21440 B unrolled), and the
+24-bit guard was testing the wrong field: `mul24` truncates each operand to 24
+bits and returns the low 32 bits of the product, so a lane stride of 1638400
+is exact even at lane 15 (24576000).  The guard now refuses only a stride that
+does not fit the operand, names it, and also covers `nlane == 16`, which it
+skipped before.
+
+Running is still not agreement.  On the fixed `rng(1234)` input, against an
+ONNX Runtime CPU reference for the same input, v8 s 160 measures 3.87 scaled
+raw and 1.50 on the optimiser's graph; v8 n 640 measures 34.0 raw and 16.5
+optimised, and its 324 anchors over 0.25 against the reference's zero are
+confident answers to noise.  The same harness on this tree measures 3.7e-4
+scaled for YOLOv8n-160 and 2.6e-4 for YOLOv8n-320, so the difference is in
+these graphs at these widths, not in the measurement.  No row here claims a
+correct answer for the two cells.
 
 **v8 n 320 is the cell that moved, but on the optimised path.**  The raw graph
 returns the right detections and the wrong values (16.1 scaled).  The same
@@ -435,6 +459,8 @@ magnitude below the raw graph, and fits the *default* 64 MiB arena:
 | cell | client arena | median ms | FPS | launches | pool + scratch MiB | max scaled |
 |---|---:|---:|---:|---:|---|---:|
 | v8 n 320, `--opt all` artifact | 60.0 | 836.7 | 1.20 | 512 | 22.96 + 22.20 | 8.6e-4 |
+| v8 s 160, `--opt all` | 181.0 | 877.6 | 1.14 | 368 | 91.87 + 5.76 | 1.50 |
+| v8 n 640, `--opt all` | 181.0 | 2420.8 | 0.41 | 1217 | 63.02 + 87.91 | 16.5 |
 
 That is the better result for the matrix: no private arena is needed, and the
 artifact is the shipping path.  The raw-graph row above is kept because the
@@ -457,7 +483,7 @@ here should be read as a speedup or slowdown against it.
 | v5 | l | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v5 | x | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v8 | n | 108.2 | 9.24 | 521.0 | 1.92 | 4.8× | 802 | 1.5e-02 / 3.1e-04; 4/4 det; box 0.00 px | ok (64 MiB arena) |
-| v8 | s | 272.2 | 3.67 | — | — | — | — | — | does not fit (needs 100 MiB) |
+| v8 | s | 272.2 | 3.67 | 972.6 | 1.03 | 3.6× | 1249 | 3.87 scaled (rng); 0 vs 0 anchors | runs (181 MiB client), accuracy far off |
 | v8 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v8 | l | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v8 | x | — | — | — | — | — | — | — | not exportable (memory limit) |
@@ -526,7 +552,7 @@ here should be read as a speedup or slowdown against it.
 | v5 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v5 | l | — | — | — | — | — | — | — | not attempted (optional) |
 | v5 | x | — | — | — | — | — | — | — | not attempted (optional) |
-| v8 | n | 1330.3 | 0.75 | — | — | — | — | — | does not fit (needs 126 MiB) |
+| v8 | n | 1330.3 | 0.75 | 2835.6 | 0.35 | 2.1× | 6604 | 34.0 scaled (rng); 324 vs 0 anchors | runs (181 MiB client), accuracy far off |
 | v8 | s | 3224.5 | 0.31 | — | — | — | — | — | does not fit (needs 194 MiB) |
 | v8 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v8 | l | — | — | — | — | — | — | — | not attempted (optional) |
@@ -551,6 +577,12 @@ here should be read as a speedup or slowdown against it.
 | v12 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v12 | l | — | — | — | — | — | — | — | not attempted (optional) |
 | v12 | x | — | — | — | — | — | — | — | not attempted (optional) |
+
+The v8 s 160 and v8 n 640 VC4 columns are from the fix/hard-caps re-run, on
+the fixed `rng(1234)` input rather than `bus.jpg`; their CPU columns and every
+other row are the earlier sweep's.  The status tables below still describe the
+64 MiB client arena: both cells need a private daemon (147 and 181 MiB of
+client arena) and neither is accurate.
 
 ### Status per cell
 

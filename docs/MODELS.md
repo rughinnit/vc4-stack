@@ -187,16 +187,18 @@ the numbers in the table.
 
 ## Detection
 
-Measured earlier, same board and protocol, from the 45-export sweep in
-[`BENCHMARKS.md`](BENCHMARKS.md) section 14; not re-run for this page.
+The YOLOv8n-160 and YOLOv8n-320 rows are from the 45-export sweep in
+[`BENCHMARKS.md`](BENCHMARKS.md) section 14.  The YOLOv8s-160 and YOLOv8n-640
+rows were re-measured on the fix/hard-caps tree at 147-181 MiB of client arena
+and the fixed `rng(1234)` input; their CPU column is the sweep's.
 
 | model | input | params | engine | CPU ms | VC4 ms | ratio | max scaled |
 |---|---|---|---:|---|---:|---:|---:|---:|
 | YOLOv8n | 3x160x160 | 3.2 M | **runs**, 802 launches | 108.2 | **521.0** | 4.8x | 3.1e-04 |
 | YOLOv8n | 3x320x320 | 3.2 M | **runs as an `--opt all` artifact in 60 MiB**, 512 launches; 8.6e-4 scaled | — | 836.7 | — | 8.6e-04 |
-| YOLOv8n | 3x640x640 | 3.2 M | refused at the first conv: `copy2d` lane stride overflows the 24-bit multiply | — | — | — | — |
+| YOLOv8n | 3x640x640 | 3.2 M | **runs** at 181.0 MiB client arena, 6604 launches; 34.0 scaled (rng input) | 1330.3 | 2835.6 | 2.1x | 34.0 |
 | YOLOv5s | 3x160x160 | — | runs at 150 MiB (raw graph), 1488 launches; accuracy off | — | 943.1 | — | 2.5 |
-| YOLOv8s | 3x160x160 | — | refused at run time: `up2_512` is 21440 B, over the 16384 B code slot | — | — | — | — |
+| YOLOv8s | 3x160x160 | — | **runs** at 147 MiB, 1249 launches; 3.87 scaled (1.50 optimised) | 272.2 | 972.6 | 3.6x | 3.87 |
 | YOLOv9s | 3x160x160 | — | runs at 150 MiB (raw graph), 6512 launches; accuracy off | — | 2430.4 | — | 4.1 |
 
 YOLOv8n at 160 is 0/44,100 elements over the 5e-4 tolerance against the CPU,

@@ -1,0 +1,64 @@
+=== wall/CPU, base vs after (20 frames, private daemon)
+=== window 10:56:57 frequency(48)=1000002000 temp=47.8'C throttled=0x0
+base: pad zeroing stashed
+vc4d: arena 96 MiB at phys 0x1e600000 bus 0xde600000 (requested 96 MiB)
+vc4d: prepared launches disabled (synchronous)
+=== base breakdown 10:57:32 temp=52.6'C
+base   96   wall  289.5  pad_zero  19.4 MB  0.01 ms  pad_copy  2.3 MB  0.00 ms  marked  35.9  cleaned  35.1  uniq  2.5  clean  0.00 ms  civac_off  3.6 MB  cpu 0.117
+base   128  wall  321.3  pad_zero  21.3 MB  0.01 ms  pad_copy  4.0 MB  0.00 ms  marked  41.6  cleaned  41.4  uniq  4.1  clean  0.00 ms  civac_off  5.0 MB  cpu 0.120
+base   160  wall  392.4  pad_zero  23.6 MB  0.01 ms  pad_copy  6.3 MB  0.01 ms  marked  63.1  cleaned  61.1  uniq  6.5  clean  0.01 ms  civac_off  9.1 MB  cpu 0.135
+=== base overlap 10:58:03
+client pid 99483, vc4d pid 99465, arm 1000 MHz, temp 49.4 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+96     sync         292.3    3.42    169.6   0.58   187.0    483.0    110.0     40.0      0.0      0.0   296.9  (pool 31.7/3.2 MiB of 64, 49-50 C)
+96     pipelined    287.9    3.47    169.5   0.59   187.0    483.0    120.0     40.0    174.9      0.3   287.9  (pool 31.7/3.2 MiB of 64, 49-49 C)
+       blocked at: depth 0.4 ms, invalidate 0.0, l2 flush 0.0, scratch 167.0, host 0.2, other 7.0
+128    sync         329.0    3.04    201.0   0.61   183.0    583.0    120.0     50.0      0.0      0.0   329.4  (pool 35.5/4.4 MiB of 64, 49-50 C)
+128    pipelined    320.8    3.12    200.9   0.63   183.0    583.0    120.0     50.0    206.5      0.3   321.1  (pool 35.5/4.4 MiB of 64, 49-49 C)
+       blocked at: depth 0.3 ms, invalidate 0.0, l2 flush 0.0, scratch 200.1, host 0.1, other 5.7
+160    sync         414.1    2.41    267.7   0.65   187.0    832.0    130.0     60.0      0.0      0.0   414.2  (pool 41.6/7.4 MiB of 64, 49-49 C)
+160    pipelined    404.2    2.47    268.0   0.66   187.0    832.0    140.0     60.0    274.1      0.4   404.6  (pool 41.6/7.4 MiB of 64, 49-49 C)
+       blocked at: depth 1.6 ms, invalidate 0.0, l2 flush 0.0, scratch 258.7, host 0.1, other 13.2
+=== base hashes
+0
+after: border-only zeroing restored
+vc4d: arena 96 MiB at phys 0x1e600000 bus 0xde600000 (requested 96 MiB)
+vc4d: prepared launches disabled (synchronous)
+=== after breakdown 11:00:20 temp=52.6'C
+after  96   wall  288.2  pad_zero  17.1 MB  0.01 ms  pad_copy  2.3 MB  0.00 ms  marked  35.9  cleaned  35.1  uniq  2.5  clean  0.00 ms  civac_off  3.6 MB  cpu 0.113
+after  128  wall  318.3  pad_zero  17.2 MB  0.01 ms  pad_copy  4.0 MB  0.00 ms  marked  41.6  cleaned  41.4  uniq  4.1  clean  0.00 ms  civac_off  5.0 MB  cpu 0.117
+after  160  wall  388.1  pad_zero  17.3 MB  0.01 ms  pad_copy  6.3 MB  0.01 ms  marked  63.1  cleaned  61.1  uniq  6.5  clean  0.01 ms  civac_off  9.1 MB  cpu 0.130
+=== after overlap 11:00:52
+client pid 99683, vc4d pid 99662, arm 1000 MHz, temp 49.9 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+96     sync         291.8    3.43    169.6   0.58   187.0    483.0    110.0     40.0      0.0      0.0   295.3  (pool 31.7/3.2 MiB of 64, 49-50 C)
+96     pipelined    287.8    3.47    169.6   0.59   187.0    483.0    120.0     40.0    175.3      0.3   287.9  (pool 31.7/3.2 MiB of 64, 49-49 C)
+       blocked at: depth 0.4 ms, invalidate 0.0, l2 flush 0.0, scratch 167.2, host 0.2, other 7.0
+128    sync         328.2    3.05    200.9   0.61   183.0    583.0    115.0     50.0      0.0      0.0   327.8  (pool 35.5/4.4 MiB of 64, 48-49 C)
+128    pipelined    319.9    3.13    200.9   0.63   183.0    583.0    120.0     50.0    206.8      0.3   319.9  (pool 35.5/4.4 MiB of 64, 48-49 C)
+       blocked at: depth 0.3 ms, invalidate 0.0, l2 flush 0.0, scratch 200.4, host 0.1, other 5.7
+160    sync         412.2    2.43    267.7   0.65   187.0    832.0    130.0     60.0      0.0      0.0   412.0  (pool 41.6/7.4 MiB of 64, 49-49 C)
+160    pipelined    401.8    2.49    268.2   0.67   187.0    832.0    130.0     60.0    274.5      0.6   401.2  (pool 41.6/7.4 MiB of 64, 49-49 C)
+       blocked at: depth 1.6 ms, invalidate 0.0, l2 flush 0.0, scratch 259.0, host 0.1, other 13.3
+=== after hashes
+0
+=== hash comparison
+Files /home/raspi/scratch/tmp/civacwin/base.hashes and /home/raspi/scratch/tmp/civacwin/after.hashes differ
+HASHES DIFFER
+=== end 11:02:36 temp=48.3'C throttled=0x0
+unit restored
+
+=== single-frame accounting, base vs after (probe)
+base stashed
+base 96  wall  316.5 ms | pad_zero 11.74 ms  19.4 MB | pad_copy  2.21 ms  2.3 MB | clean  3.91 ms  35.3 MB (uniq  2.5) | civac_off  0.37 ms  3.6 MB
+base 96  marks  36.0 MB in 633 calls (scratch  34.7, op   1.1, uni  0.3) | ranges 589 max  2.2 MB | ndirty 4 hull 0 | unpriced 298.29 ms | cpu -
+base 128  wall  361.0 ms | pad_zero 12.94 ms  21.3 MB | pad_copy  3.54 ms  4.0 MB | clean  4.51 ms  41.6 MB (uniq  4.1) | civac_off  0.51 ms  5.0 MB
+base 128  marks  41.8 MB in 709 calls (scratch  41.0, op   0.5, uni  0.3) | ranges 677 max  3.8 MB | ndirty 4 hull 0 | unpriced 339.53 ms | cpu -
+base 160  wall  465.5 ms | pad_zero 14.39 ms  23.6 MB | pad_copy  5.73 ms  6.3 MB | clean  6.65 ms  61.4 MB (uniq  6.8) | civac_off  0.88 ms  9.1 MB
+base 160  marks  63.4 MB in 982 calls (scratch  59.9, op   3.0, uni  0.5) | ranges 938 max  5.8 MB | ndirty 4 hull 0 | unpriced 437.84 ms | cpu -
+after 96  wall  313.1 ms | pad_zero 10.40 ms  17.1 MB | pad_copy  2.20 ms  2.3 MB | clean  3.80 ms  35.3 MB (uniq  2.5) | civac_off  0.38 ms  3.6 MB
+after 96  marks  36.0 MB in 633 calls (scratch  34.7, op   1.1, uni  0.3) | ranges 589 max  2.2 MB | ndirty 4 hull 0 | unpriced 296.33 ms | cpu -
+after 128  wall  358.3 ms | pad_zero 10.38 ms  17.2 MB | pad_copy  3.48 ms  4.0 MB | clean  4.46 ms  41.6 MB (uniq  4.1) | civac_off  0.51 ms  5.0 MB
+after 128  marks  41.8 MB in 709 calls (scratch  41.0, op   0.5, uni  0.3) | ranges 677 max  3.8 MB | ndirty 4 hull 0 | unpriced 339.47 ms | cpu -
+after 160  wall  460.1 ms | pad_zero 10.58 ms  17.3 MB | pad_copy  6.01 ms  6.3 MB | clean  6.63 ms  61.4 MB (uniq  6.8) | civac_off  0.87 ms  9.1 MB
+after 160  marks  63.4 MB in 982 calls (scratch  59.9, op   3.0, uni  0.5) | ranges 938 max  5.8 MB | ndirty 4 hull 0 | unpriced 436.03 ms | cpu -

@@ -72,6 +72,18 @@ struct vc4_prof {
      * 0 other, 1 scratch reset, 2 invalidate_off, 3 l2 flush, 4 host copy,
      * 5 pipeline depth.  Profiling only; it never changes a decision. */
     uint64_t wait_kind[6];
+    /* Dirty-range accounting (docs/CIVAC.md).  `clean_bytes` above counts the
+     * 64-byte lines cleaned; these count the bytes, how often the dirty list
+     * collapsed to a single hull, how much of the cleaned volume had not been
+     * cleaned before at all, and who marked it. */
+    uint64_t mk_bytes, mk_calls, mk_hull, mk_max, mk_ndirty_max;
+    uint64_t cl_bytes, cl_ranges, cl_max, cl_uniq;
+    uint64_t mk_op, mk_uni, mk_scratch;
+    uint64_t mk_scr_area, mk_pool_area;   /* MK_OP split by arena area */
+    /* The last frame's cleaned volume and the union of it (4 KiB pages):
+     * equal means every line was cleaned once, smaller means the same lines
+     * came back.  Reset by vc4_prof_frame_begin(). */
+    uint64_t cl_frame_bytes, cl_frame_uniq;
 };
 static int g_prof_in_pad;      /* set around nhwc_pad_image while profiling */
 static int g_wait_kind;        /* the barrier the current drain serves */
@@ -162,11 +174,14 @@ void vc4_prof_bytes(int which, uint64_t n)
     else if (which == 2) g_prof.civac_off_bytes += n;
 }
 
+void vc4_prof_frame_begin(void);   /* defined with the dirty-range accounting */
+
 void vc4_prof_reset(void)
 {
     int on = g_prof.on;
     memset(&g_prof, 0, sizeof(g_prof));
     g_prof.on = on;
+    vc4_prof_frame_begin();
 }
 
 void vc4_prof_report(void)
@@ -186,7 +201,14 @@ void vc4_prof_report(void)
             "\"n_launch\":%llu,\"n_upload\":%llu,\"n_download\":%llu,"
             "\"n_load\":%llu,\"n_flush\":%llu,"
             "\"n_batch\":%llu,\"n_batch_launch\":%llu,"
-            "\"clean_bytes\":%llu,\"up_bytes\":%llu,\"down_bytes\":%llu}\n",
+            "\"clean_bytes\":%llu,\"up_bytes\":%llu,\"down_bytes\":%llu,"
+            "\"mk_bytes\":%llu,\"mk_calls\":%llu,\"mk_hull\":%llu,"
+            "\"mk_max\":%llu,\"mk_ndirty_max\":%llu,"
+            "\"cl_bytes\":%llu,\"cl_ranges\":%llu,\"cl_max\":%llu,"
+            "\"cl_uniq\":%llu,"
+            "\"mk_op\":%llu,\"mk_uni\":%llu,\"mk_scratch\":%llu,"
+            "\"mk_scr_area\":%llu,\"mk_pool_area\":%llu,"
+            "\"cl_frame_bytes\":%llu,\"cl_frame_uniq\":%llu}\n",
             (unsigned long long)g_prof.pre, (unsigned long long)g_prof.mark,
             (unsigned long long)g_prof.clean, (unsigned long long)g_prof.mask,
             (unsigned long long)g_prof.rt, (unsigned long long)g_prof.tail,
@@ -211,13 +233,40 @@ void vc4_prof_report(void)
             (unsigned long long)g_prof.n_batch_launch,
             (unsigned long long)g_prof.clean_bytes,
             (unsigned long long)g_prof.up_bytes,
-            (unsigned long long)g_prof.down_bytes);
+            (unsigned long long)g_prof.down_bytes,
+            (unsigned long long)g_prof.mk_bytes,
+            (unsigned long long)g_prof.mk_calls,
+            (unsigned long long)g_prof.mk_hull,
+            (unsigned long long)g_prof.mk_max,
+            (unsigned long long)g_prof.mk_ndirty_max,
+            (unsigned long long)g_prof.cl_bytes,
+            (unsigned long long)g_prof.cl_ranges,
+            (unsigned long long)g_prof.cl_max,
+            (unsigned long long)g_prof.cl_uniq,
+            (unsigned long long)g_prof.mk_op,
+            (unsigned long long)g_prof.mk_uni,
+            (unsigned long long)g_prof.mk_scratch,
+            (unsigned long long)g_prof.mk_scr_area,
+            (unsigned long long)g_prof.mk_pool_area,
+            (unsigned long long)g_prof.cl_frame_bytes,
+            (unsigned long long)g_prof.cl_frame_uniq);
 }
 
 #define REMOTE_SOCKET      "/run/vc4d.sock"
 #define REMOTE_TIMEOUT_MS  10000u     /* vc4d's default --max-timeout-ms */
 #define REMOTE_MIN_ARENA   (8u << 20)
-#define REMOTE_DIRTY_MAX   24
+/* Dirty intervals held between two cleans.  It has to cover what one *request*
+ * marks, not one launch: a batch of 64 entries marks a uniform block and its
+ * scratch per entry, so 24 entries is reached inside a single request and the
+ * list then collapses to the hull of everything it holds - a range spanning
+ * the whole arena (measured: 22 MB) that is cleaned although most of it was
+ * never written.  A maximum 64-entry batch marks 129 intervals in the suite,
+ * so 256 covers it with room to spare. */
+#define REMOTE_DIRTY_MAX   256
+
+/* Who dirtied a range.  Only for the accounting: the clean path treats them
+ * all the same. */
+enum { MK_OP = 0, MK_UNI, MK_SCRATCH };
 /* Shadow uniform slots for batched launches.
  *
  * The arena has 128 kernel slots: code at 0x1000 + slot*16 KiB, uniforms at
@@ -368,11 +417,30 @@ void vc4__invalidate_off(vc4_ctx *ctx, uint32_t off, size_t n)
  * ranges that belong to the launch being queued (its shadow uniform block and
  * the scratch it is about to read), not for data another queued launch may
  * already be reading. */
-static void remote_mark_nb(vc4_ctx *ctx, uint32_t off, size_t bytes)
+static size_t remote_scratch_base(const vc4_ctx *ctx);
+
+static void remote_mark_nb(vc4_ctx *ctx, uint32_t off, size_t bytes, int tag)
 {
     struct vc4_remote *r = ctx ? ctx->remote : NULL;
     if (!r || !bytes)
         return;
+    if (prof_on()) {
+        g_prof.mk_bytes += bytes;
+        g_prof.mk_calls++;
+        if (bytes > g_prof.mk_max)
+            g_prof.mk_max = bytes;
+        if (tag == MK_UNI) {
+            g_prof.mk_uni += bytes;
+        } else if (tag == MK_SCRATCH) {
+            g_prof.mk_scratch += bytes;
+        } else {
+            g_prof.mk_op += bytes;
+            if ((uint64_t)off >= remote_scratch_base(ctx))
+                g_prof.mk_scr_area += bytes;
+            else
+                g_prof.mk_pool_area += bytes;
+        }
+    }
     uint64_t s = (uint64_t)off & ~63ull;
     uint64_t e = ((uint64_t)off + bytes + 63ull) & ~63ull;
     if (e > ctx->arena_bytes)
@@ -392,6 +460,8 @@ static void remote_mark_nb(vc4_ctx *ctx, uint32_t off, size_t bytes)
         }
     }
     if (r->ndirty == REMOTE_DIRTY_MAX) {       /* collapse to the hull */
+        if (prof_on())
+            g_prof.mk_hull++;
         uint64_t ds = s, de = e;
         for (int i = 0; i < r->ndirty; ++i) {
             if (r->dirty[i].off < ds)
@@ -407,6 +477,8 @@ static void remote_mark_nb(vc4_ctx *ctx, uint32_t off, size_t bytes)
     r->dirty[r->ndirty].off = (uint32_t)s;
     r->dirty[r->ndirty].len = (uint32_t)(e - s);
     r->ndirty++;
+    if (prof_on() && (uint64_t)r->ndirty > g_prof.mk_ndirty_max)
+        g_prof.mk_ndirty_max = (uint64_t)r->ndirty;
 }
 
 /* A CPU write that other queued launches may be reading: the batch must
@@ -416,7 +488,60 @@ static void remote_mark_nb(vc4_ctx *ctx, uint32_t off, size_t bytes)
 static void remote_mark(vc4_ctx *ctx, uint32_t off, size_t bytes)
 {
     remote_drain(ctx);
-    remote_mark_nb(ctx, off, bytes);
+    remote_mark_nb(ctx, off, bytes, MK_OP);
+}
+
+/* How much of the cleaned volume is new.  A 4 KiB page bitmap over the data
+ * region: bytes cleaned for a page that has never been cleaned before are
+ * unique to this run, and the rest is the same lines being cleaned again.  The
+ * difference is what "clean once per request instead of per barrier" could
+ * recover, and it costs one bit per page per clean. */
+static uint64_t *uniq_bits;
+static size_t    uniq_words;
+static uint64_t  frame_bytes, frame_uniq;
+
+/* Start a frame: forget which pages were cleaned, keep the cumulative totals.
+ * A tool that measures per frame calls this before each run. */
+void vc4_prof_frame_begin(void)
+{
+    frame_bytes = 0;
+    frame_uniq = 0;
+    if (uniq_bits && uniq_words)
+        memset(uniq_bits, 0, uniq_words * sizeof(uint64_t));
+    g_prof.cl_frame_bytes = 0;
+    g_prof.cl_frame_uniq = 0;
+}
+
+static void account_unique(vc4_ctx *ctx, uint32_t off, size_t len)
+{
+    size_t npages = (ctx->arena_bytes - VC4_DATA_BASE) / 4096u + 1;
+    size_t words = (npages + 63u) / 64u;
+    if (!uniq_bits || uniq_words < words) {
+        free(uniq_bits);
+        uniq_bits = calloc(words, sizeof(uint64_t));
+        uniq_words = words;
+        if (!uniq_bits) {
+            uniq_words = 0;
+            return;
+        }
+    }
+    frame_bytes += len;
+    uint64_t first = ((uint64_t)off > VC4_DATA_BASE ? (uint64_t)off
+                                                     : VC4_DATA_BASE);
+    uint64_t last = (uint64_t)off + len;
+    for (uint64_t a = first & ~4095ull; a < last; a += 4096) {
+        size_t p = (size_t)((a - VC4_DATA_BASE) >> 12);
+        if (p >= npages)
+            break;
+        uint64_t bit = 1ull << (p & 63);
+        if (!(uniq_bits[p >> 6] & bit)) {
+            uniq_bits[p >> 6] |= bit;
+            g_prof.cl_uniq += 4096;
+            frame_uniq += 4096;
+        }
+    }
+    g_prof.cl_frame_bytes = frame_bytes;
+    g_prof.cl_frame_uniq = frame_uniq;
 }
 
 /* Write every CPU-dirtied line back to DRAM before the GPU (or the daemon's
@@ -427,8 +552,14 @@ static void remote_clean(vc4_ctx *ctx)
     if (!r)
         return;
     for (int i = 0; i < r->ndirty; ++i) {
-        if (prof_on())
+        if (prof_on()) {
             g_prof.clean_bytes += (r->dirty[i].len + 63u) / 64u;
+            g_prof.cl_bytes += r->dirty[i].len;
+            g_prof.cl_ranges++;
+            if (r->dirty[i].len > g_prof.cl_max)
+                g_prof.cl_max = r->dirty[i].len;
+            account_unique(ctx, r->dirty[i].off, r->dirty[i].len);
+        }
         cache_civac(ctx->arena + r->dirty[i].off, r->dirty[i].len);
     }
     r->ndirty = 0;
@@ -896,7 +1027,7 @@ static vc4_status remote_queue_launch(vc4_ctx *ctx, const vc4_kernel *k,
         return VC4_ERR_INVAL;
     }
     memcpy(ctx->arena + off, ctx->arena + k->uni_off, 64u * (size_t)nqpu);
-    remote_mark_nb(ctx, off, 64u * (size_t)nqpu);
+    remote_mark_nb(ctx, off, 64u * (size_t)nqpu, MK_UNI);
     /* The scratch a launch is about to read was written before the call, so
      * preserve the high-water mark the synchronous path would have cleaned.
      * A window switch moves the watermark down to the new window's base. */
@@ -906,7 +1037,7 @@ static vc4_status remote_queue_launch(vc4_ctx *ctx, const vc4_kernel *k,
         r->scratch_clean = remote_scratch_base(ctx);
     if (ctx->scratch > r->scratch_clean) {
         remote_mark_nb(ctx, (uint32_t)r->scratch_clean,
-                       ctx->scratch - r->scratch_clean);
+                       ctx->scratch - r->scratch_clean, MK_SCRATCH);
         r->scratch_clean = ctx->scratch;
     }
     b->pend[b->npend].idx = (int)idx;
@@ -1425,14 +1556,14 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
      * the uniforms and before the QPUs read their inputs.  The uniform block
      * and the per-op scratch are not routed through vc4_upload(), so mark
      * them here; persistent buffers were marked where they were written. */
-    remote_mark(ctx, k->uni_off, 64u * (size_t)nqpu);
+    remote_mark_nb(ctx, k->uni_off, 64u * (size_t)nqpu, MK_UNI);
     r->scratch_clean = r->scratch_clean < ctx->arena_top
                            ? ctx->arena_top : r->scratch_clean;
     if (r->scratch_clean > ctx->scratch)
         r->scratch_clean = ctx->arena_top;      /* scratch was reset */
     if (ctx->scratch > r->scratch_clean) {
-        remote_mark(ctx, (uint32_t)r->scratch_clean,
-                    ctx->scratch - r->scratch_clean);
+        remote_mark_nb(ctx, (uint32_t)r->scratch_clean,
+                       ctx->scratch - r->scratch_clean, MK_SCRATCH);
         r->scratch_clean = ctx->scratch;
     }
     PROF_W(t2);

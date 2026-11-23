@@ -60,6 +60,7 @@ and every path below is relative to the repository root unless it starts with
 | `VC4D.md` | privileged helper: protocol, security model, 90/90 hostile cases, 5-13% overhead |
 | `DAEMON.md` | the daemon-backed engine: unprivileged client evidence, lock/arena sizing, measured launch overhead |
 | [`DAEMON-PIPE.md`](DAEMON-PIPE.md) | **can the daemon prepare request N+1 while N runs**: the single-threaded state machine and what must never overlap, the gates, and the measurement that says it buys nothing because the client keeps one request on the wire; where the frame's non-QPU 136 ms really is |
+| [`CIVAC.md`](CIVAC.md) | **the client's cache maintenance, counted**: dirty bytes marked and cleaned per frame, the unique pages under them, the producers, the border-only conv pad that removed 3.3 ms at 160, and what is irreducible |
 | `VC4MON.md` | read-only V3D sysfs module: 78 registers, no /dev/mem, exact parity with drm/vc4 debugfs, ioread32 vs memcpy_fromio |
 | `V3DLIB.md` | V3DLib build/correctness, KMS and gpu_mem blockers, verdict, how to measure on a dedicated board |
 | [`../infer/python/vc4infer/kgen/`](../infer/python/vc4infer/kgen) | QPU kernel generator (the Python package ships it; C clients use `infer/tools/kgen.py`) |

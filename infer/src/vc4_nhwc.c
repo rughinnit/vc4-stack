@@ -205,22 +205,23 @@ vc4_status vc4_conv_nhwc_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int Cin,
 
 /* The flat panel is refused, not merely defaulted off.  Its second form keeps
  * the row kernel's 16x16 transposing store and fills the 16 VPM rows from
- * four 4-row VDRs, so the only new shape is a load, and its block schedule
- * and VPM rows are proved against the row-padded panel on the host for 15
- * shapes (check_im2col_flat).  The store sequence itself has not run on
- * silicon yet; the first attempt's 4-word store is what failed there
- * (V3D_ERR_STAT=0x10, docs/KERNEL-EFF.md sec. 7).  Returning 0 here keeps a
- * panel no QPU has written unreachable until the silicon gate passes. */
+ * four 4-row VDRs: the store is accepted (no V3D_ERR_STAT, unlike the first
+ * form's 4-word store) but the panel is exact on one QPU and corrupt on two
+ * or more.  Uniform staging, distinct VPM windows, the load and store drains
+ * and the uniform count were each ruled out with a probe, which leaves four
+ * VPM loads ahead of one store as the untested difference; the constraint a
+ * future attempt must meet is in docs/KERNEL-EFF.md sec. 7.  Returning 0 here
+ * keeps a panel no QPU has written correctly unreachable. */
 static int conv_flat_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("VC4_CONV_FLAT");
         if (e && *e && strcmp(e, "0") != 0)
-            fprintf(stderr, "vc4infer: VC4_CONV_FLAT refused: the flat panel's "
-                            "4-row VDR fills have only a host-side proof; the "
-                            "silicon gate has not run, so the row-padded path "
-                            "is used (docs/KERNEL-EFF.md sec. 7)\n");
+            fprintf(stderr, "vc4infer: VC4_CONV_FLAT refused: the flat panel "
+                            "is exact on one QPU and corrupt on two or more, "
+                            "so the row-padded path is used "
+                            "(docs/KERNEL-EFF.md sec. 7)\n");
         on = 0;
     }
     return on;

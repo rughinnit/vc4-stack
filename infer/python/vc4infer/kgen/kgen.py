@@ -2429,6 +2429,20 @@ def build_im2col_nhwc_flat2(Cin, KH, KW, stride=1, dilation=1):
     stored: the store writes panel words for pixels the GEMM never keeps, and
     the loads over-read at most 12 pixels past the plane, the same order as
     the row kernel's 15-pixel pad read at the end of a row.
+
+    SILICON STATUS (2026-11-23): the panel is exact with one QPU on it and
+    corrupt with the committed four-QPU split.  One QPU reproduces the
+    schedule word for word (13,600/13,600 words on an 8x8x16 3x3 dump, and a
+    5x5 conv to 9.8e-05), and a QPU given a distinct window produces its own
+    tile, so the walk, the row fields, the store shape and the destination
+    are right.  Four QPUs read later taps and other QPUs' sources.  That is
+    not uniform staging (a probe reads each QPU's own 16 words back), not the
+    store wait (a second wait changes nothing) and not the uniform count (the
+    row kernel with 14 is exact across four).  The untested difference is
+    four VPM loads before one store where every proven kernel issues one, so
+    the next attempt should use a single 16-row load where the block lies in
+    one output row (every layer whose align4(wo) is a multiple of 16) or keep
+    one load in flight.  VC4_CONV_FLAT stays refused.
     """
     assert Cin % 16 == 0
     nseg = KH * KW
@@ -2534,8 +2548,11 @@ def build_im2col_nhwc_flat2(Cin, KH, KW, stride=1, dilation=1):
         b.e(add_or(W_VPW_SETUP, areg(A['VDWS']), areg(A['VDWS']), ws=1))
         b.e(add_or(W_VPW_ADDR, areg(A['DSTB']), areg(A['DSTB']), ws=1))
         b.e(add_or(W_NOP, breg(R_VPW_WAIT), breg(R_VPW_WAIT)))
+        # one k block on: the channel loop leaves the destination at the next
+        # tap's first block, and with a single channel block there is no loop
+        # to do it, so the advance belongs to every (tap, channel block)
+        b.e(add_(ADD_ADD, A['DSTB'], areg(A['DSTB']), breg(B['D1K'])))
         if ncb > 1:
-            b.e(add_(ADD_ADD, A['DSTB'], areg(A['DSTB']), breg(B['D1K'])))
             b.e(add_(ADD_ADD, A['Q0'], areg(A['Q0']), breg(B['C64'])))
             b.e(add_(ADD_SUB, A['KB'], areg(A['KB']), imm(1), sf=1))
             p.branch_to('cib%d' % s, cond=BR_ALL_Z_CLEAR)

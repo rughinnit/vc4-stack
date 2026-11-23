@@ -54,7 +54,7 @@ hashed by `Artifact.verify()` — `vc4infer verify` — and by
 | `keys.arch`, `keys.engine_version` | reported, not checked |
 | `model` | graph sha256, inline-or-referenced, `.pt` export record, pass list with per-rule records, input and output specs |
 | `shapes` | the static shape map `coverage.refine_shapes` computed at build |
-| `plan` | `pool_bytes`, `segment_bytes`, `scratch_bytes`, `estimate_bytes`, `floor_bytes`, `high_water_bytes`, and the allocation table |
+| `plan` | `pool_bytes`, `segment_bytes`, `scratch_bytes`, `estimate_bytes`, `floor_bytes`, `high_water_bytes`, the allocation table, and (optional) `frozen`, the execution plan |
 | `weights` | packed-panel entries (offset into the weights section, bytes, sha256, panel key, kind, layout, shape) and `dropped` initializers |
 | `kernels` | blob names, sizes and sha256, embedded or referenced; the generator digest again |
 | `tuning` | `{"autotune": "off", "records": []}` — a field for `Engine.autotune` choices; autotuning is off by default and the loader does not invent records |
@@ -86,6 +86,61 @@ workspaces) is not part of the pool: it is carved above the pool, reset by every
 op, and its required size is the recorded `scratch_bytes`; `check_arena()`
 refuses a plan whose pool plus scratch does not fit the client arena, before the
 first launch.
+
+### The frozen execution plan
+
+The arena plan says where the bytes live; the frozen plan says what the frame
+does with them.  Without it an artifact runs the Python executor for the whole
+frame and pays the per-node cost the plan removes (0.226 s of CPU per 160 frame
+against 0.182 s, measured below).  The build records the call sequence from the
+frame whose offsets the arena plan pins and stores it in the artifact:
+
+| key | contents |
+|---|---|
+| `plan.frozen.version` | the plan format (1); a reader refuses another |
+| `plan.frozen.abi_bytes` | `sizeof(vc4_plan_op)` at build; a reader refuses a different record size |
+| `plan.frozen.section` | the `plan_ops` section: the records, little-endian, `abi_bytes` each |
+| `plan.frozen.steps` | `["c", n]` for a run of *n* records, `["p", i]` for a node on the Python path, `["s", i]` for a node the optimiser accounted for |
+| `plan.frozen.nodes` | the node indices each step covers, aligned with `steps` |
+| `plan.frozen.desc` | every output name the plan can produce: offset, bytes, shape, layout, pitch |
+| `plan.frozen.feed_sig` | input name → shape and element count the recording was made for |
+| `plan.frozen.segment_bases`, `segment_bytes` | the recording pool's geometry |
+| `plan.frozen.kernels_sha256` | sha256 over the artifact's `(name, sha256, stamp)` kernel table |
+| `plan.frozen.launches` | the recorded frame's launch count, for the build's own check |
+
+Offsets are absolute arena addresses, so they are recorded with the build's
+segment bases and **rebased** on load by the difference between those and the
+segments the load receives.  A buffer never spans a segment, so each offset
+maps to exactly one segment.
+
+Refusals at load, each naming what disagrees and leaving the artifact on the
+Python path with the reason in `runner.plan_error`:
+
+* a plan format version this engine does not read;
+* a record size that differs from the loaded library's `vc4_plan_op_size()`;
+* a `plan_ops` section whose length disagrees with the step table, or a step
+  kind outside `c`/`p`/`s`;
+* a segment count or segment size that differs from the load's pool;
+* an offset outside every recorded segment;
+* a kernel-table digest that differs from the one the plan was recorded
+  against - the records name no kernel, the C entry points choose one from the
+  table, so a plan and a table that do not belong together are refused by
+  name;
+* a feed whose shape or element count differs from the recording (at run time;
+  the artifact falls back to Python rather than raising, because its own arena
+  plan is still valid).
+
+The recording follows the same safety rule as the ONNX path: a frame that
+allocated a buffer outliving it is not a recording, and a recording in which a
+per-frame allocation overlaps a panel or constant is refused.  At build time
+that refusal fails the build with the reason, rather than writing an artifact
+that would replay into another buffer.  Pass C of the build then loads the
+artifact exactly as a caller would, replays the frozen plan and checks the
+outputs bit-exact and the launch count against the recorded frame; an artifact
+whose plan does not reproduce the frame is deleted, not shipped.
+
+`VC4_NO_CPLAN=1` on load leaves the plan out and runs the Python path over the
+artifact's pinned arena, which is what this path did before the plan existed.
 
 ### Weights
 
@@ -129,6 +184,7 @@ stamps, and the first run took 1.47 s with no generator invocation.
 | weight packing | one GPU pack launch + host permutation per conv | panels uploaded from the artifact |
 | executor rewrite tables | `_find_silu` + `_collect_fused` | restored from `exec` |
 | kernel generation | JIT on a cold cache | embedded blobs seeded into the cache |
+| the frame's call sequence | the Python executor decides per node | replayed from `plan.frozen`, one C call per run of device operations |
 
 The graph is still parsed (it is protobuf, and the executor walks it) and
 constants are still uploaded.  The artifact is a plan, not an interpreter.
@@ -283,3 +339,47 @@ pass C, which every build runs.
 - The plan is a recording of the executor at one version.  A code change that
   reorders allocations changes `engine_digest` and forces a rebuild, which is
   the intended failure mode.
+
+### The frozen plan in the artifact (2026-11-23)
+
+The plan is recorded at build and replayed on load.  Numbers below are from
+`tools/cost/artifact_plan.py` on an idle board, one client through the packaged
+`vc4d` (1.2.9, protocol 2, 96 MiB), ARM pinned at 1.0 GHz, each cell under
+`tools/thermal-guard.sh --max 75`; steady state is the median of eight frames
+after the first run, client and daemon CPU from `/proc/<pid>/stat`.  "ONNX"
+is the same graph loaded from the `.onnx` file with the plan on; "no plan" is
+the same artifact with `VC4_NO_CPLAN=1`.
+
+| model | load s | first s | wall ms | client CPU | daemon CPU | total CPU | launches |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| yolov8n_96, artifact | 0.58 | 1.43 | 283.6 | 0.1037 | 0.0450 | **0.1487** | 279 |
+| yolov8n_96, ONNX plan on | 3.59 | 1.98 | 286.0 | 0.1063 | 0.0450 | 0.1513 | 279 |
+| yolov8n_96, artifact no plan | 0.48 | — | 328.1 | 0.1475 | 0.0450 | 0.1925 | 279 |
+| yolov8n_128, artifact | 0.50 | 1.34 | 314.4 | 0.1075 | 0.0475 | **0.1550** | 276 |
+| yolov8n_128, ONNX plan on | 3.42 | 1.89 | 315.0 | 0.1100 | 0.0487 | 0.1587 | 276 |
+| yolov8n_128, artifact no plan | 0.50 | — | 356.9 | 0.1487 | 0.0513 | 0.2000 | 276 |
+| yolov8n_160, artifact | 0.52 | 1.57 | 389.0 | 0.1213 | 0.0613 | **0.1825** | 332 |
+| yolov8n_160, ONNX plan on | 2.96 | 2.12 | 389.6 | 0.1212 | 0.0612 | 0.1825 | 332 |
+| yolov8n_160, artifact no plan | 0.44 | — | 432.6 | 0.1637 | 0.0625 | 0.2262 | 332 |
+
+Both claims hold.  The artifact keeps the startup gain: load 0.44-0.58 s
+against 2.96-3.59 s for the ONNX path, and time to first result (load + first
+run) 1.84-2.09 s against 5.08-5.57 s.  It gets the plan's CPU reduction: within
+the artifact itself the plan takes 0.1925/0.2000/0.2262 s down to
+0.1487/0.1550/0.1825 s, **-22.8 %, -22.5 % and -19.3 %**, and the steady state
+matches the ONNX path with the plan on within 1.7 % (the artifact cell is
+0.1487 against 0.1513 at 96, 0.1550 against 0.1587 at 128, and equal at 160).
+Wall time and launch counts are unchanged in every pair.
+
+The saving is smaller than the ONNX path's -30 % because the artifact's Python
+path is already cheaper than a plain ONNX Python frame: the panels are
+prepacked, the offsets are pinned, and the first frame does not pack.  At 160
+the artifact without the plan is 0.2262 s against 0.2875 s for the ONNX graph
+without it, so the plan removes 0.044 s of what is left rather than 0.086 s.
+
+Correctness: the artifact's frame is byte-identical to the ONNX path with the
+plan on for modelA, modelB, modelC and YOLOv8n at 96/128/160
+(`artifact_plan.py --check`), with the same launch count; the artifact with
+`VC4_NO_CPLAN=1` is byte-identical too and reports the refusal in `plan_error`.
+modelA and modelC have no representable node, so neither path freezes a plan;
+the loader says so and both run the Python executor.

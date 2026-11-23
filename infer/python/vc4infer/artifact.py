@@ -54,6 +54,7 @@ import struct
 import sys
 import time
 
+from . import _plan
 from ._errors import Vc4InferError
 
 MAGIC = b"VC4XART1"
@@ -527,6 +528,18 @@ class Artifact:
                 for e in self.manifest.get("plan", {}).get("allocations", [])}
         return self._alloc_map
 
+    def frozen_plan(self):
+        """(manifest block, op bytes) for the frozen execution plan, or None.
+
+        The block describes records over segment-relative offsets; the loader
+        rebases them onto the segments it received.  No plan is an old
+        artifact, not an error: the Python path is what it ran before.
+        """
+        fr = self.manifest.get("plan", {}).get("frozen")
+        if not fr:
+            return None
+        return fr, self._section(fr.get("section", "plan_ops"))
+
     @property
     def optimise_report(self):
         return _OptimiseReport(self.manifest.get("model", {}))
@@ -626,6 +639,14 @@ class Artifact:
             "weight_bytes": int(m.get("weights", {}).get("bytes", 0)),
             "kernels": len(m.get("kernels", {}).get("entries", [])),
             "kernel_bytes": int(m.get("kernels", {}).get("bytes", 0)),
+            "frozen_plan": (None if not plan.get("frozen") else {
+                "version": plan["frozen"].get("version"),
+                "c_ops": plan["frozen"].get("c_ops"),
+                "c_nodes": plan["frozen"].get("c_nodes"),
+                "py_nodes": len(plan["frozen"].get("py_nodes") or []),
+                "launches": plan["frozen"].get("launches"),
+                "bytes": plan["frozen"].get("bytes"),
+            }),
             "pool_bytes": int(plan.get("pool_bytes", 0)),
             "scratch_bytes": int(plan.get("scratch_bytes", 0)),
             "file_bytes": (os.path.getsize(self.path)
@@ -1041,8 +1062,18 @@ def build(model_path, out_path, *, opt="all", imgsz=None, opset=17,
         r2.run(feeds)
         mark1 = len(rec)
         s0 = eng.stats
+        # The frozen plan is recorded from the frame whose allocation offsets
+        # the artifact pins: the second run, not the first (the first frame's
+        # offsets come from a clean free list and are not in the plan below).
+        r2.begin_plan_capture()
         out_b = r2.run(feeds)
         s1 = eng.stats
+        try:
+            frozen, frozen_segs = r2.end_plan_capture()
+        except _plan.FrozenPlanError as e:
+            raise ArtifactError(
+                "the frozen execution plan cannot be recorded from this "
+                "build: %s" % e)
         # Init-time entries plus the steady-state run: the first run's
         # activation offsets are reachable only from a clean free list and are
         # not part of the plan.
@@ -1050,6 +1081,11 @@ def build(model_path, out_path, *, opt="all", imgsz=None, opset=17,
         run1_keys = {e["key"] for e in rec[mark0:mark1]}
         launches_b = int(s1.launches - s0.launches)
         kernels, blobs = _kernel_record(eng, cache)
+        frozen_block = frozen_ops = None
+        if frozen is not None:
+            frozen_block, frozen_ops = _plan.frozen_plan(
+                frozen, frozen_segs, _plan.op_abi(eng),
+                _plan.kernel_digest(kernels), launches_b)
         segment_bytes = [int(seg[1]) for seg in r2.pool.segs]
         pool_bytes = int(r2.pool.size)
         pool_plan = dict(r2.pool_plan)
@@ -1079,6 +1115,8 @@ def build(model_path, out_path, *, opt="all", imgsz=None, opset=17,
             f.write(graph_bytes)
     if entries:
         parts.append(("weights", bytes(payload)))
+    if frozen_ops:
+        parts.append(("plan_ops", frozen_ops))
     kern_entries, kern_payload = [], bytearray()
     if embed_kernels and kernels:
         for e in kernels:
@@ -1137,6 +1175,11 @@ def build(model_path, out_path, *, opt="all", imgsz=None, opset=17,
             "clamped": bool(pool_plan.get("clamped", False)),
             "high_water_bytes": high,
             "allocations": plan,
+            # The frozen execution plan, recorded from the same frame: the
+            # device calls, their buffers, the Python steps and the output
+            # descriptors.  Optional: an artifact built before it, or by a
+            # graph with no representable node, carries none.
+            "frozen": frozen_block,
         },
         "weights": {
             "section": "weights" if entries else None,

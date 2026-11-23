@@ -448,6 +448,17 @@ dictionary lookup per node; the daemon moves by 0.001-0.003 s because the same
 launches reach it.  Nothing in the graph, the kernels or the arena plan
 changed: the launch counts are equal in every pair.
 
+An engine artifact carries the same plan.  Its build records it and pass C
+replays it before the file is shipped; a load rebases the records onto the
+segments it receives and refuses a plan whose ABI, segment geometry, kernel
+table or feed do not match, leaving the artifact on the Python path with the
+reason in `plan_error`.  On the same artifact at 160 the plan takes 0.2262 s
+per frame down to 0.1825 s (-19.3 %), and the steady state matches the ONNX
+path with the plan on.  The saving is smaller there because an artifact's
+Python path is already cheaper than a plain ONNX frame: the panels are packed
+and the offsets pinned before the first run.  `docs/ENGINE-ARTIFACT.md` has
+the format and the three sizes.
+
 The numbers were taken under the conditions in 4.1: one packaged `vc4d` 1.2.9
 (protocol 2, 96 MiB, uptime 696 s, not restarted), load average 0.17 at the
 start and 0.88 immediately after the run, 43.5-47.2 C, `throttled=0x0`, ARM

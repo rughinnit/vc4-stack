@@ -1104,6 +1104,13 @@ class Runner:
         self.cplan_deferrals = 0      # frames that built a panel, not a plan
         self._plan_build = None
         self._plan_saved = None
+        # The artifact build records its frozen plan from the frame whose
+        # offsets the artifact will pin; see begin_plan_capture().
+        self._plan_capture_armed = False
+        self._plan_capture_mark = 0
+        self._plan_capture_error = None
+        self._plan_captured = None
+        self._plan_capture_segs = None
         # Default on: a non-profile frame is byte-identical to the Python
         # path on modelB/modelC and YOLOv8n at 96/128/160 (tests/
         # test_cplan_gpu.py).  The defect that made it opt-in was a weight
@@ -1114,6 +1121,53 @@ class Runner:
         self._cplan_enabled = (
             os.environ.get("VC4_NO_CPLAN", "") in ("", "0")
             and os.environ.get("VC4_CPLAN", "1") not in ("0", "false", "no"))
+        # An artifact may carry the plan its build recorded; install it before
+        # the first frame, or leave the artifact on the Python path with the
+        # reason in plan_error.
+        self._load_artifact_plan()
+
+    def _load_artifact_plan(self):
+        """Install the frozen plan an artifact carries, or say why not.
+
+        The artifact's pool is already pinned by its arena plan; the plan's
+        records are rebased onto the segments this load received, then checked
+        against the record ABI and the artifact's kernel table.  A refusal
+        leaves cplan None, which is the Python path this artifact ran before
+        frozen plans existed.
+        """
+        art = self.artifact
+        if art is None or not hasattr(art, "frozen_plan"):
+            return
+        try:
+            frozen = art.frozen_plan()
+        except Exception as e:                            # noqa: BLE001
+            self.plan_error = ("the artifact's frozen plan cannot be read: %s"
+                               % e)
+            return
+        if frozen is None:
+            self.plan_error = ("the artifact carries no frozen execution plan; "
+                               "rebuild it with this engine")
+            return
+        if not self._cplan_enabled:
+            self.plan_error = "the frozen plan is disabled by VC4_NO_CPLAN"
+            return
+        block, ops = frozen
+        abi = _plan.op_abi(self.eng)
+        if abi is None:
+            self.plan_error = "this libvc4infer has no vc4_plan_run"
+            return
+        try:
+            plan = _plan.plan_from_frozen(
+                block, ops, abi, self.pool.segs,
+                _plan.kernel_digest(art.kernels.get("entries", [])))
+        except _plan.FrozenPlanError as e:
+            self.plan_error = str(e)
+            return
+        # The C steps write recorded buffers the pinned allocator never sees,
+        # so the overlap check cannot describe a plan frame; the recording is
+        # the schedule.  The ONNX path turns it off for the same reason.
+        self.pool.check = False
+        self.cplan = plan
 
     def _apply_exec_state(self, st):
         """Restore the rewrite tables a build recorded, instead of rescanning.
@@ -3957,23 +4011,28 @@ class Runner:
         offsets, a profile run needs its per-node stats, and a hybrid run has
         a backend report that a C step could not fill in.
         """
+        capture = self._plan_capture_armed
         if (self.cplan is not None or self._plan_build is not None
                 or profile or self.mode != "strict"
                 or not self._cplan_enabled):
             return None
-        if getattr(self.pool, "pin", None) is not None:
-            return None
-        if getattr(self.pool, "record", None) is not None:
-            return None                      # an artifact build owns it
+        if not capture:
+            if getattr(self.pool, "pin", None) is not None:
+                return None
+            if getattr(self.pool, "record", None) is not None:
+                return None                  # an artifact build owns it
         if not _plan.supports(self.eng):
             return None
         build = _plan.Build(feeds)
         build.tracer = _plan.Trace(self.eng)
         self._plan_saved = (self.pool.labeler, self.pool.record, self._labels)
-        self.pool.labeler = self._next_alloc_key
-        self.pool.record = []
+        if self.pool.labeler is None:
+            self.pool.labeler = self._next_alloc_key
+        if self.pool.record is None:
+            self.pool.record = []
         self._labels = True
         self._plan_build = build
+        self._plan_capture_mark = len(self.pool.record) if capture else 0
         return build
 
     def _finish_plan_build(self, build, feeds):
@@ -3984,6 +4043,9 @@ class Runner:
         the allocator's behaviour changes, from bump/free to "hand back the
         offset this key had".
         """
+        if self._plan_capture_armed:
+            self._finish_plan_capture(build)
+            return
         records = self.pool.record or []
         # A frame that created a persistent buffer cannot be the recording:
         # the buffer took a range that an earlier node had used and released,
@@ -4028,7 +4090,9 @@ class Runner:
                 persistent.append((int(b.off), int(b.off) + int(b.bytes)))
         for name in self._consts:
             v = self.values.get(name)
-            if isinstance(v, Tensor):
+            # A dropped weight is a _PanelWeight: its shape is known and its
+            # bytes live in the artifact's panel, already in the list above.
+            if isinstance(v, Tensor) and getattr(v, "has_buf", True):
                 persistent.append((v.buf.off, v.buf.off + v.buf.bytes))
         for e in records:
             key = str(e.get("key", ""))
@@ -4045,6 +4109,68 @@ class Runner:
                             % (key, lo, hi, plo, phi))
         return None
 
+    def begin_plan_capture(self):
+        """Record the next strict frame as a frozen plan (artifact build).
+
+        The build calls this immediately before the frame whose allocation
+        offsets it will pin.  The frame runs exactly as it would without it;
+        the recording is added to whatever allocation record the build already
+        keeps.
+        """
+        if self.cplan is not None or self._plan_build is not None:
+            raise ValueError("a plan is already loaded or being recorded")
+        self._plan_capture_armed = True
+        self._plan_capture_error = None
+        self._plan_captured = None
+        self._plan_capture_segs = None
+
+    def end_plan_capture(self):
+        """(plan, [(base, size)]) for the frame just recorded, or raises.
+
+        A plan of None means the frame had no representable node; a recording
+        that is unsafe for replay raises FrozenPlanError with the reason, at
+        build time rather than at the first load.
+        """
+        self._plan_capture_armed = False
+        if self._plan_capture_error is not None:
+            raise _plan.FrozenPlanError(self._plan_capture_error)
+        return self._plan_captured, self._plan_capture_segs
+
+    def _finish_plan_capture(self, build):
+        """Freeze the capture frame without touching the pool.
+
+        An artifact build already records its allocations; this frame's slice
+        is what the artifact will pin, so the recording must be safe against
+        the panel and constant ranges that outlive the frame.  A persistent
+        allocation in the frame, or an overlap, is refused here - the build
+        fails with the reason instead of writing an artifact that replays into
+        another buffer.
+        """
+        self._plan_capture_armed = False
+        records = (self.pool.record or [])[self._plan_capture_mark:]
+        why = None
+        if any(str(e.get("key", "")).startswith("panel:")
+               for e in records):
+            why = ("the recording frame allocated a persistent buffer; the "
+                   "build must record the frame after the one that packs the "
+                   "panels")
+        if why is None:
+            why = self._replay_safe(records)
+        if why is not None:
+            self._plan_capture_error = why
+            self._plan_captured = None
+        else:
+            plan = build.finish(records)
+            self._plan_captured = plan
+            self._plan_capture_segs = (
+                [(int(seg[0]), int(seg[1])) for seg in self.pool.segs]
+                if plan is not None else None)
+        if self._plan_saved is not None:
+            self.pool.labeler, self.pool.record, self._labels = \
+                self._plan_saved
+        self._plan_saved = None
+        self._plan_build = None
+
     def _abort_plan_build(self):
         if self._plan_saved is not None:
             self.pool.labeler, self.pool.record, self._labels = \
@@ -4052,7 +4178,7 @@ class Runner:
         self._plan_saved = None
         self._plan_build = None
 
-    def _drop_plan(self, why):
+    def _drop_plan(self, why, keep_pin=None):
         """Abandon the plan after a frame that did not match its recording.
 
         The pinned pool is the tripwire: a node that allocated a different
@@ -4064,9 +4190,22 @@ class Runner:
         range check is one) can trigger this; it costs the plan, not the
         answer.
         """
+        if keep_pin is None:
+            keep_pin = bool(getattr(self.cplan, "from_artifact", False))
         self.cplan = None
         self._cplan_enabled = False
         self.plan_error = why
+        if keep_pin:
+            # The pool is pinned by the artifact's arena plan, not by this
+            # execution plan.  Unpinning would hand the artifact's recorded
+            # offsets out of a bump allocator that starts at the segment base,
+            # so the Python path below keeps the pin and its allocations; the
+            # ordinary liveness releases make the overlap check meaningful
+            # again.
+            self.pool.check = True
+            self._garbage = []
+            self._plan_saved = None
+            return
         pool = self.pool
         pool.pin = None
         pool.check = True
@@ -4091,7 +4230,13 @@ class Runner:
         produced.
         """
         plan = self.cplan
-        plan.check_feeds(feeds)
+        try:
+            plan.check_feeds(feeds)
+        except UnsupportedNode as e:
+            if not getattr(plan, "from_artifact", False):
+                raise
+            self._drop_plan(str(e))
+            return self._run_body(feeds, False, self._pipeline_run)
         try:
             return self._run_plan_steps(plan, feeds)
         except ArtifactPlanError as e:

@@ -187,15 +187,48 @@ CPU.  The gain is small because the removed calls are the cheapest in the
 frame; the case for it is that the cost is zero and the decision is now
 recorded instead of being re-derived per node.
 
-## 4. Result at the three sizes
+## 4. Result on an idle board, and the window before it
 
-Same protocol as the cost page: one GPU client, fan fitted,
-`tools/thermal-guard.sh --max 75`, median of 10 timed runs after three warm-ups.
-The ARM cap is **1.0 GHz** because of the board's marginal supply; the governor
-is `ondemand` with `scaling_min_freq = scaling_max_freq = 1.0 GHz`, so it cannot
-drop to 700 MHz between GPU waits (letting it do so changed client CPU by about
-20 % between repeats).  Each cell starts a fresh `vc4d` so the client gets the
-full 96 MiB arena.
+### 4.1 The plan, 2026-11-23
+
+One YOLOv8n frame at three sizes with the C execution plan (section 6) on and
+off, on an otherwise idle board.  Three interleaved rounds per size, plan off
+then on, eight timed frames after three warm-ups per cell, each cell under
+`tools/thermal-guard.sh --max 75`; median of the three rounds.  One client.
+
+Conditions: ARM pinned at 1.0 GHz (`scaling_min_freq = scaling_max_freq`);
+packaged `vc4d` 1.2.9, protocol 2, 96 MiB arena on `/run/vc4d.sock`, pid 82186,
+uptime 696 s at the start and **not restarted**, so every cell met the same
+daemon and the same arena; load average 0.17 at the start, 0.88 immediately
+after the run (the measurement itself), 0.16 sixty seconds later; 43.5 C
+before, 47.2 C peak, `throttled=0x0` throughout.  The cells come from
+`tools/cost/breakdown.py`, the instrumented harness of section 1;
+`tools/cost/baseline.py --check` is the precondition gate and
+`tools/cost/baseline.py --out ...` reproduces the run.
+
+| imgsz | plan | launches | wall ms | FPS | client CPU-s | daemon CPU-s | total CPU-s/frame |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 96 | off | 279 | 384.8 | 2.60 | 0.2037 | 0.0463 | 0.2513 |
+| 96 | **on** | 279 | 303.3 | 3.30 | 0.1225 | 0.0450 | **0.1675** |
+| 128 | off | 276 | 414.7 | 2.41 | 0.2063 | 0.0513 | 0.2575 |
+| 128 | **on** | 276 | 333.5 | 3.00 | 0.1262 | 0.0488 | **0.1750** |
+| 160 | off | 332 | 494.4 | 2.02 | 0.2250 | 0.0637 | 0.2875 |
+| 160 | **on** | 332 | 409.0 | 2.44 | 0.1388 | 0.0613 | **0.2013** |
+
+CPU per frame falls **33.3 %, 32.0 % and 30.0 %** and wall time 81.6, 81.1 and
+85.4 ms.  The Python column is the whole of it: 0.1395, 0.1404 and 0.1444 s
+off against 0.0671, 0.0679 and 0.0696 s on.  The client's C total falls
+0.0088, 0.0076 and 0.0114 s because one `plan_run` call replaces a ctypes call
+and a dictionary lookup per C node; the daemon moves by 0.001-0.003 s, because
+the same launches reach it.
+
+### 4.2 The 2026-11-22 window
+
+This is the measurement the two host-side changes of section 3 were made in,
+kept as the window the plan is compared against.  Its conditions are not
+4.1's: a fresh `vc4d` per cell (so the client always had the full 96 MiB
+arena), the tree of that day and the frame rates it delivered then (1.94-3.16
+FPS).  The ARM cap, the governor and the thermal guard are the same.
 
 | imgsz | launches | wall ms | FPS | client CPU-s | daemon CPU-s | total CPU-s/frame |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -218,11 +251,28 @@ within 4.8e-6 absolute and `yolov8n_160` is at max abs 2.04e-2, max rel
 2.23e-4, 0/44100 elements over the recorded tolerance - the same figures the
 shipped reference records.
 
+### 4.3 The plan against that window
+
+With the plan on, the current build is **13.2 %, 14.2 % and 16.5 % below** the
+2026-11-22 window at 96/128/160: 0.1675, 0.1750 and 0.2013 s against 0.193,
+0.204 and 0.241 s.  With it off it is **30.2 %, 26.2 % and 19.3 % above**:
+0.2513, 0.2575 and 0.2875 s.
+
+The plan-off gap is entirely client-side Python.  At 160 the breakdown splits
+0.1429 s of Python and 0.0798 s of C against the 0.092 and 0.078 recorded in
+section 2, and the daemon is lower (0.0613 against 0.066): what grew is the
+loop outside the per-node dispatch, not the engine.  It predates the c-plan,
+launch-batch and overlap merges - the pre-launch-batch tree at `06ed012` gives
+0.2125 s client and 0.2763 s total at 160 on this board, within a few percent
+of the current plan-off figure - and no bisect was spent on it.  It is not a
+cost of the plan: the plan removes 0.0838, 0.0825 and 0.0862 s from it.
+
 ## 5. What is left
 
-The goal was to halve the host CPU.  The measured reduction is 24-29 %, so it
-did not halve, and the remaining 0.235 s (0.241 s unprofiled) at 160 is
-dominated by four costs:
+The goal was to halve the host CPU.  The two host-side changes of section 3
+took 24-29 % and the plan of section 6 takes another 30 %, so at 160 the frame
+now costs 0.201 s with the plan on.  The four costs below are the pre-plan
+account of the 0.241 s window; the plan removes most of the last two.
 
 * **daemon, 0.065 s.**  Most of it is the poll loop: `vc4d` reads `SRQCS` and
   sleeps 10 us per iteration while the kernel runs.  On the previous build the
@@ -248,10 +298,11 @@ count further
 (Softmax still issues 40 launches, Add 38; the Reshape row was 41 before the
 layout pass and is 8 after it, sec. 3.3) would attack the first two.
 
-At these numbers the QPU path now spends less CPU per delivered frame than
-ncnn at 4 threads with passive waiting at 128 and 160, and is about level with
-ncnn at 3 threads at 160.  It is still 5-7 % above both at 96, where ncnn's
-own CPU per frame is smallest.
+At these numbers, at the rates the build delivers, the QPU path spends less
+CPU per delivered frame than ncnn at 4 passive threads at every size
+(16.5-32.9 % less), less than ncnn at 3 passive threads at 128 (-9.8 %) and
+160 (-16.1 %), and 8.8 % more at 96, where ncnn's own CPU per frame is
+smallest.
 
 ## 6. An execution plan in C
 
@@ -380,54 +431,33 @@ frame, which is exactly the host traffic that keeps its node in Python.
 
 ### 6.5 Measured on silicon
 
-The plan is default again.  Three interleaved rounds per size, plan off
-(`VC4_NO_CPLAN=1`) then on, median of the three; eight timed frames after
-three warm-ups per cell, one client, packaged `vc4d` at `/run/vc4d.sock`,
-ARM pinned at 1.0 GHz, `tools/thermal-guard.sh --max 75`, peak 49.4 C,
-`throttled=0x0`.  `tools/cost/breakdown.py` reads client and daemon CPU from
-`/proc/<pid>/stat` and the phases from the launch-path profiler.
+The absolute table is section 4.1.  With the plan on the frame costs 0.1675,
+0.1750 and 0.2013 CPU-s at 96/128/160 on an idle board; with it off, 0.2513,
+0.2575 and 0.2875.  The plan removes **33.3 %, 32.0 % and 30.0 %** of the CPU
+and 81-85 ms of wall time.
 
-| imgsz | plan | wall ms | client CPU-s | daemon CPU-s | total CPU-s | launches |
-|---:|---|---:|---:|---:|---:|---:|
-| 96 | off | 383.8 | 0.2025 | 0.0475 | 0.2500 | 279 |
-| 96 | on | 302.3 | 0.1225 | 0.0450 | **0.1675** | 279 |
-| 128 | off | 413.8 | 0.2050 | 0.0525 | 0.2575 | 276 |
-| 128 | on | 332.7 | 0.1263 | 0.0488 | **0.1750** | 276 |
-| 160 | off | 490.9 | 0.2225 | 0.0650 | 0.2875 | 332 |
-| 160 | on | 407.8 | 0.1400 | 0.0613 | **0.2013** | 332 |
+The mechanism is the Python column: 0.1395, 0.1404 and 0.1444 s off against
+0.0671, 0.0679 and 0.0696 s on.  The client's C total also falls 0.008-0.011 s,
+because a run of C nodes is one `plan_run` call instead of a ctypes call and a
+dictionary lookup per node; the daemon moves by 0.001-0.003 s because the same
+launches reach it.  Nothing in the graph, the kernels or the arena plan
+changed: the launch counts are equal in every pair.
 
-CPU per frame falls **33.0 %, 32.0 % and 30.0 %**, wall time falls 81-83 ms.
-The Python side is where it comes from: the same breakdown splits 160 into
-0.1421 s of node Python work on the Python path and 0.0694 s through the
-plan, and the executor skeleton (everything outside the per-node dispatch)
-from 0.0830 s to 0.0402 s.  C time falls by 0.009 s as well, because one
-`plan_run` call replaces a ctypes call and a dictionary lookup per C node.
-The daemon changes by only -0.002 to -0.004 s: the same 332 launches reach it.
-
-Two caveats about the absolute column.  The 160 baseline here is 0.2875 s, not
-the 0.241 s of section 4.  The measurement ran against the daemon that was
-already serving the board rather than a fresh one per cell, with idle
-processes from an unrelated pipeline experiment on the same ARM (load average
-1.3 of 4 cores), so the client figure is inflated.  The on/off delta is
-measured inside the same environment, cell by cell, which is the comparable
-number; the absolute baseline has to be re-taken on an idle board before it
-replaces section 4.
-
-The command for that window is:
+The numbers were taken under the conditions in 4.1: one packaged `vc4d` 1.2.9
+(protocol 2, 96 MiB, uptime 696 s, not restarted), load average 0.17 at the
+start and 0.88 immediately after the run, 43.5-47.2 C, `throttled=0x0`, ARM
+pinned at 1.0 GHz.  The run-to-run spread is 0.6-0.8 % of the total.  The
+precondition gate and the reproducing command are:
 
 ```
 tools/cost/baseline.py --check      # preconditions only, opens no device
 tools/cost/baseline.py --out ~/scratch/logs/baseline-plan.json
 ```
 
-`baseline.py` repeats the three-round A/B above (plan off then on, eight timed
-frames after three warm-ups per cell) with each cell under the thermal guard,
-and refuses to start until one ARM clock at 1.0 GHz, no other Python process,
-load average <= 0.20, <= 55 C, `throttled=0x0` and the packaged `vc4d` on
-`/run/vc4d.sock` all hold.  It prints the daemon's uptime and leaves a
-restart to the window owner: a long-lived daemon may hand the client a
-smaller arena than a fresh one, which is the remaining difference from the
-section 4 protocol.
+`baseline.py` refuses to start until one ARM clock at 1.0 GHz, no other Python
+process, load average <= 0.20, <= 55 C, `throttled=0x0` and the packaged
+`vc4d` on `/run/vc4d.sock` all hold.  It prints the daemon's uptime and leaves
+a restart to the window owner.
 
 ### 6.6 The first run on silicon, and what it found
 

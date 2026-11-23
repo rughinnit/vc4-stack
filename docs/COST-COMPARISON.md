@@ -18,11 +18,12 @@ cores free; per frame it did not.
 Two host-side changes followed from breaking that 0.313 s down by phase (see
 [CPU-BREAKDOWN.md](CPU-BREAKDOWN.md)): one launch per concat input instead of
 one per 16-channel block, and a per-run node plan in the Python executor.  They
-remove 24–29 % of the CPU and 16–21 % of the wall time.  After them the QPU
-path uses **0.193–0.241 CPU-s per frame** and 2.31–3.16 FPS.  At equal delivered
-FPS that is below ncnn at 4 threads with passive waiting at 128 and 160, level
-with ncnn at 3 threads at 160, and still 5–7 % above both at 96.  Both row sets
-are below; §2 and §3 label which is which.
+remove 24–29 % of the CPU and 16–21 % of the wall time.  With the C execution
+plan of [CPU-BREAKDOWN.md](CPU-BREAKDOWN.md) §6 on top, the path now uses
+**0.1675–0.2013 CPU-s per frame** at the 3.30/3.00/2.44 FPS it delivers.  At
+equal delivered rate that is 16.5–32.9 % below ncnn at 4 passive threads at
+every size, 9.8 % and 16.1 % below ncnn at 3 threads at 128 and 160, and 8.8 %
+above it at 96.
 
 ## 1. Conditions
 
@@ -33,10 +34,12 @@ are below; §2 and §3 label which is which.
 | GPU clock | VideoCore core 400 MHz throughout (`vcgencmd measure_clock core`) |
 | ARM clock | **1.0 GHz**, governor `ondemand`, `scaling_min_freq = scaling_max_freq = 1.0 GHz` |
 | thermal guard | `tools/thermal-guard.sh --max 75 --interval 1`, every cell |
-| peak temperature | 53.2 °C over the suite; phase-A cells 47.2–51.5 °C; the after cells 44.0–50.5 °C |
+| peak temperature | 53.2 °C over the suite; phase-A cells 47.2–51.5 °C; the 2026-11-22 cells 44.0–50.5 °C; the 2026-11-23 cells 43.5–47.2 °C |
 | throttling | `throttled=0x50000` sticky (under-voltage and throttling occurred before the suite); current bits clear, `in0_lcrit_alarm=0` |
-| GPU client | one at a time; `vc4d` 96 MiB arena on `/run/vc4d.sock`, restarted before each cell |
-| engine | vc4infer 1.2.10 from this tree, daemon backend, `VC4_OPT=all`; the after rows add the two host-side changes in [CPU-BREAKDOWN.md](CPU-BREAKDOWN.md) |
+| GPU client | one at a time; `vc4d` 96 MiB arena on `/run/vc4d.sock`; the 2026-11-22 cells restart it per cell, the 2026-11-23 cells do not |
+| engine | vc4infer 1.2.10 from this tree, daemon backend, `VC4_OPT=all`; the 2026-11-22 rows add the two host-side changes in [CPU-BREAKDOWN.md](CPU-BREAKDOWN.md), and the 2026-11-23 rows add its execution plan |
+| 2026-11-23 run | one packaged `vc4d` 1.2.9 (protocol 2), 96 MiB arena on `/run/vc4d.sock`, uptime 696 s at the start and not restarted; load average 0.17 at the start, 0.88 immediately after the run (the measurement itself), 0.16 sixty seconds later; 43.5–47.2 °C; `throttled=0x0`; ARM pinned at 1.0 GHz |
+| ncnn cells | 15 delivered frames after three warm-ups, five cells per configuration, median; `OMP_WAIT_POLICY=passive`, one thread count per cell |
 | CPU engine | ncnn 1.0.20261020 wheel, 4 threads and a 3-thread control |
 | model | official Ultralytics `yolov8n.pt`, same checkpoint at 96, 128 and 160 |
 
@@ -87,24 +90,24 @@ and the gap is much smaller, or reversed: 0.255–0.313 against 0.219–0.337, a
 against 0.175–0.260 for ncnn at 3 threads.  The next section holds the frame
 rate constant and asks the question that matters.
 
-### The same table on the current build
+### The same table with the plan on (2026-11-23)
 
 The vc4 rows above are the build the page was written around.  The current
-build adds the two host-side changes from [CPU-BREAKDOWN.md](CPU-BREAKDOWN.md);
-nothing about the graph, the kernels or the arena plan moved, so the memory
-columns stand.  These cells restart `vc4d` before the cell, so the client gets
-the full 96 MiB arena.
+build adds the two host-side changes of [CPU-BREAKDOWN.md](CPU-BREAKDOWN.md)
+§3 and its C execution plan (§6).  Neither changes the graph, the kernels or
+the arena plan, so the memory columns stand.  These cells are on an idle
+board with one packaged `vc4d`; §4.1 of that page has the preconditions, the
+load and the spread.
 
 | runtime | imgsz | wall ms | FPS | client CPU-s/frame | daemon CPU-s/frame | total CPU-s/frame | share of 4 cores |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| vc4 | 96 | 315.7 | 3.16 | 0.146 | 0.047 | **0.193** | 15.3 % |
-| vc4 | 128 | 348.2 | 2.86 | 0.151 | 0.053 | **0.204** | 14.7 % |
-| vc4 | 160 | 432.5 | 2.31 | 0.175 | 0.066 | **0.241** | 13.9 % |
+| vc4 | 96 | 303.3 | 3.30 | 0.1225 | 0.0450 | **0.1675** | 13.8 % |
+| vc4 | 128 | 333.5 | 3.00 | 0.1262 | 0.0488 | **0.1750** | 13.1 % |
+| vc4 | 160 | 409.0 | 2.44 | 0.1388 | 0.0613 | **0.2013** | 12.3 % |
 
-The share of the four cores is about the same, because both the CPU and the
-wall time fell: the path is not cheaper per second, it is cheaper per frame and
-delivers more frames.  Per frame the client moves 0.062–0.066 s less and
-`vc4d` 0.012–0.014 s less than the rows above, which is 24–29 % of the total.
+The share of the four cores falls a little because the CPU falls faster than
+the wall: the path is not cheaper per second, it is cheaper per frame and
+delivers more frames.
 
 ### Memory
 
@@ -144,40 +147,43 @@ client spent 0.196–0.231 s marshalling 462–536 launches and `vc4d` spent
 another 0.059–0.082 s launching them: 0.255–0.313 CPU-seconds of host work, for
 0.157–0.265 CPU-seconds of ncnn inference.
 
-### After the host-overhead work
+### At the rates this build delivers (2026-11-23)
 
-The current build delivers 3.16, 2.86 and 2.31 FPS, so ncnn is throttled to
-those rates for the comparison.  These are fresh ncnn cells, not the numbers
-scaled: an ncnn frame's CPU per frame depends slightly on how deeply its worker
-threads sleep between frames, and at the higher rates the passive cells cost
-more per frame than they did at the old rates.
+The current build delivers 3.30, 3.00 and 2.44 FPS (the wall medians above).
+ncnn is throttled to 3.31, 3.01 and 2.45 FPS, the rates the build delivers,
+and each cell delivers exactly that; the achieved rate is in the table.  The
+vc4 column is the instrumented `breakdown.py` run of
+[CPU-BREAKDOWN.md](CPU-BREAKDOWN.md) §4.1; its per-call wrappers add a small
+cost to the client, so the margins below are, if anything, conservative for
+the QPU path.
 
 | imgsz | delivered FPS | vc4infer | ncnn 4t passive | ncnn 3t passive |
 |---:|---:|---:|---:|---:|
-| 96 | 3.16 | 0.193 (15.3 %) | 0.184 (14.5 %) | **0.181 (14.3 %)** |
-| 128 | 2.86 | **0.204 (14.6 %)** | 0.250 (17.9 %) | 0.196 (14.0 %) |
-| 160 | 2.31 | **0.241 (13.9 %)** | 0.303 (17.5 %) | 0.243 (14.0 %) |
+| 96 | 3.31 | 0.1675 (13.8 %) | 0.2007 (16.6 %) | **0.1540 (12.7 %)** |
+| 128 | 3.01 | **0.1750 (13.1 %)** | 0.2447 (18.4 %) | 0.1940 (14.6 %) |
+| 160 | 2.45 | **0.2013 (12.3 %)** | 0.3000 (18.4 %) | 0.2400 (14.7 %) |
 
 Cells are total CPU seconds per delivered frame, share of four cores in
-brackets, bold the cheapest in each row.  At equal delivered frames the QPU
-path is now cheaper than ncnn at 4 threads with passive waiting at 128
-(−18 %) and 160 (−20 %), and still 5 % above it at 96.  Against ncnn at 3
-threads it is 7 % above at 96, 4 % above at 128 and level at 160 (−1 %).
+brackets, bold the cheapest in each row.  At equal delivered rate the QPU path
+uses 8.8 % more host CPU per frame than ncnn at 3 passive threads at 96, and
+9.8 % and 16.1 % less at 128 and 160; against ncnn at 4 passive threads it is
+16.5 %, 28.5 % and 32.9 % less.  The smallest margin, 8.8 % at 96, is more than
+three times the largest run-to-run spread in either side of that row (0.8 % over
+the three vc4 rounds, 0.8 % over the five ncnn cells), so no margin here is
+inside the spread.
 
-The offload case therefore holds where it was weakest before.  A frame
-delivered by the QPUs no longer costs more host CPU than the same frame
-delivered by ncnn's passive workers at 128 and 160, while the QPU path still
-leaves 3.4–3.5 cores free for the whole 0.32–0.43 s frame instead of ncnn's
-1.8–2.3 under one competing thread.  At 96 it does not hold: ncnn's CPU per
-frame is at its smallest there (0.181 CPU-s), and the engine's launch count
-barely shrinks with resolution (291 launches at 96 against 365 at 160), so the
-fixed per-launch cost dominates a smaller tensor.
+The offload case holds at 128 and 160, where a frame delivered by the QPUs
+costs less host CPU than the same frame delivered by ncnn's workers, and it
+does not hold at 96, where ncnn's own CPU per frame is at its smallest
+(0.1540 CPU-s) and the engine's launch count barely shrinks with resolution
+(279 launches at 96 against 332 at 160), so the fixed per-launch cost dominates
+a smaller tensor.
 
 The shares tell the same story from the other side.  At equal FPS the engine
-uses 13.9–15.3 % of the cores and ncnn at 3 threads uses 14.0–14.3 %.  It
-leaves a large block of each *second* idle because its frame takes 0.32–0.43 s;
-ncnn leaves small gaps between 0.05–0.09 s frames.  Co-work sees the gaps, not
-the average.
+uses 12.3–13.8 % of the cores and ncnn at 3 threads 12.7–14.7 %.  It leaves a
+large block of each *second* idle because its frame takes 0.30–0.41 s; ncnn
+leaves small gaps between 0.05–0.09 s frames.  Co-work sees the gaps, not the
+average.
 
 ### Batch launch submission
 
@@ -190,8 +196,8 @@ call and node dispatch; the absolute CPU figures are therefore higher than the
 `measure.py` rows above and the table is an A/B, not a replacement for them.
 Conditions are §3's: ARM pinned at 1.0 GHz, `thermal-guard.sh --max 75`, three
 interleaved rounds per size, a fresh 96 MiB `vc4d` per cell, and
-`VC4_NO_CPLAN=1` because the C execution plan's first silicon run fails on
-`main` (see [CPU-BREAKDOWN.md](CPU-BREAKDOWN.md) §6.7).
+`VC4_NO_CPLAN=1` so that both sides are the batch measurement alone with the
+plan held out.  It is a protocol A/B, not the shipping path of §3.
 
 | imgsz | requests before → after | wall ms before → after | FPS before → after | total CPU-s before → after |
 |---:|---|---|---|---|
@@ -201,10 +207,10 @@ interleaved rounds per size, a fresh 96 MiB `vc4d` per cell, and
 
 Client CPU falls 3.4–3.6 % and the daemon's 9.4–10.6 %; the socket round trip
 falls from 13.0/13.0/15.2 ms per frame to 8.6/8.6/9.1 ms.  Wall moves less
-(2.4–2.8 %) because the frame is GPU-bound at these sizes.  The equal-FPS
-comparison in §3 was not re-run at the new frame rates: ncnn would need fresh
-cells at 2.69, 2.48 and 2.09 FPS to restate the breakeven, and no claim is made
-from the scaled numbers.
+(2.4–2.8 %) because the frame is GPU-bound at these sizes.  That A/B ran at
+2.69, 2.48 and 2.09 FPS and is kept as the batch measurement; the equal-rate
+cells in §3 are fresh ones on the shipping build at 3.31, 3.01 and 2.45 FPS,
+not scaled from it.
 
 A whole-graph request is not attempted.  A 160 frame performs 8 uploads, 2
 downloads and 17 explicit L2 flushes, and its handlers read arena data between
@@ -325,8 +331,9 @@ equivalently that workload had to be worth 8.7–17.1 frames per CPU-second it
 consumes.**  A detector frame is the unit here; if the co-work is worth less
 than that per CPU-second, running ncnn and accepting its CPU demand delivered
 more frames and more co-work at the same time.  At equal FPS on the current
-build the required value is negative at 128 and 160, because the QPU path now
-uses less CPU per frame there; at 96 it is still positive and small.
+build the required value is negative at 128 and 160, because the QPU path uses
+less CPU per frame there (-9.8 % and -16.1 % against ncnn at 3 threads); at 96
+it is still positive and small (+8.8 %).
 
 The one regime where the engine wins on its own terms is a workload that needs
 cores in a contiguous burst and cannot be scheduled around ncnn's 50–90 ms
@@ -334,7 +341,7 @@ frames: the engine leaves 3.4–3.5 cores free for the whole 0.32–0.43 s frame
 while ncnn at 4 threads leaves 0.15 cores across its run and then sleeps.  That
 is a latency-shape argument, not a CPU-cost argument, and it comes with a
 five-fold frame-rate penalty (unconstrained ncnn at 4 threads is 17.42, 14.15
-and 11.44 FPS at 96/128/160 against 3.16, 2.86 and 2.31 for the engine).
+and 11.44 FPS at 96/128/160 against 3.30, 3.00 and 2.44 for the engine).
 
 ## 6. Limits of these numbers
 
@@ -346,15 +353,24 @@ and 11.44 FPS at 96/128/160 against 3.16, 2.86 and 2.31 for the engine).
   cap.  Unpinned, `ondemand` drops to 700 MHz between a frame's GPU waits and
   client CPU moves by about 20 % between repeats.  `vcgencmd measure_clock arm`
   read 999.998–1000.002 MHz in every after cell.
-- The after cells restart `vc4d` before the cell.  The daemon can come up with a
-  degraded (48 MiB) arena while the previous block is still held, then replaces
-  itself with a fresh one; a client that connects in that window falls back to a
-  16 MiB region and refuses the 160 graph.  Every tabulated after cell had the
-  full 96 MiB arena and a 64 MiB client region.
+- The 2026-11-22 after cells restart `vc4d` before the cell.  The daemon can
+  come up with a degraded (48 MiB) arena while the previous block is still
+  held, then replaces itself with a fresh one; a client that connects in that
+  window falls back to a 16 MiB region and refuses the 160 graph.  Every
+  tabulated cell of that window had the full 96 MiB arena and a 64 MiB client
+  region.
+- The 2026-11-23 cells do not restart it: one packaged `vc4d` 1.2.9 (protocol
+  2), 96 MiB arena, uptime 696 s at the start, so every cell met the same
+  daemon and the same arena.  Load average read 0.17 at the start and 0.88
+  immediately after the run (the run itself); 60 s later it was 0.16.  The
+  cells are `breakdown.py` (profiled and instrumented) for vc4infer and
+  `measure.py` for ncnn.
 - The account in [CPU-BREAKDOWN.md](CPU-BREAKDOWN.md) was taken with the
   launch-path profiler enabled (`VC4INFER_PROF=1`).  The profiled 160 cell reads
   0.169 s client CPU against 0.175 s unprofiled, so the instrument is inside the
-  repeat-to-repeat spread; the tables here are unprofiled.
+  repeat-to-repeat spread.  The 2026-11-22 tables here are unprofiled; the
+  2026-11-23 vc4 cells are `breakdown.py` (profiled and instrumented, which
+  makes them, if anything, pessimistic) and its ncnn cells are `measure.py`.
 - The fan keeps the peak at 53.2 °C, so none of the cells throttled thermally
   (`in0_lcrit_alarm=0`, current throttle bits clear).  Under-voltage history is
   sticky in `0x50000`; it does not indicate a cap during the cells.
@@ -369,8 +385,9 @@ and 11.44 FPS at 96/128/160 against 3.16, 2.86 and 2.31 for the engine).
   client were discarded.
 - CPU time includes the Python client and, for the engine, `vc4d`; it excludes
   GPU time by construction.  Per-frame CPU varies by about 5–10 % between
-  repeats, mostly because the fixed-point tick is 10 ms and the run lengths are
-  a few seconds.
+  repeats in the long ncnn cells, mostly because the fixed-point tick is 10 ms
+  and the run lengths are a few seconds.  In the 2026-11-23 cells it varies by
+  0.6–1.7 %: three vc4 rounds per size and five ncnn cells per configuration.
 
 ## Conclusion
 
@@ -383,16 +400,17 @@ executor loop, 35 % in per-node host code and 41 % in the C op and launch
 paths, and showed that 43 % of all launches were concat copies issued one
 16-channel block at a time.
 
-The current build removes those copies and most of the per-node planning.  It
-uses **0.193–0.241 CPU-s per frame** (24–29 % less) at **2.31–3.16 FPS** (16–21 %
-less wall).  At the rates it now delivers, that is below ncnn at 4 threads with
-passive waiting at 128 (−18 %) and 160 (−20 %), 5 % above it at 96, and within
-±7 % of ncnn at 3 threads at all three sizes.  **The offload case therefore
-holds at 128 and 160 and does not yet hold at 96**, where the engine's
-launch-bound fixed cost dominates the smallest tensor: 291 launches at 96
-against 365 at 160, and ncnn's own CPU per frame is at its lowest.
+The current build removes those copies, most of the per-node planning and, with
+the execution plan of CPU-BREAKDOWN §6, the per-node Python itself.  It uses
+**0.1675–0.2013 CPU-s per frame** at **3.30/3.00/2.44 FPS**.  At the rates it
+delivers that is below ncnn at 4 passive threads at every size (−16.5 %, −28.5 %
+and −32.9 %), below ncnn at 3 passive threads at 128 (−9.8 %) and 160
+(−16.1 %), and 8.8 % above ncnn at 3 threads at 96.  **The offload case
+therefore holds at 128 and 160 and does not hold at 96**, where the engine's
+launch-bound fixed cost dominates the smallest tensor.
 
-The remaining 0.235 s at 160 is the daemon's poll loop (0.065 s), the padded
-images and GEMM operand padding (0.055 s), per-node host code (0.045 s) and the
-executor (0.035 s).  Halving the original 0.313 s would need a C-side execution
-plan that removes the last two together; this change does not attempt it.
+The 0.201 s frame at 160 is the daemon's poll loop, the padded images and GEMM
+operand padding, the remaining per-node host code and the launch path.  The
+plan removes the per-node Python; what it does not touch is the daemon and the
+C setup, which are the next two rows in [CPU-BREAKDOWN.md](CPU-BREAKDOWN.md)
+§5.

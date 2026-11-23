@@ -845,6 +845,24 @@ static int remote_batch_max_outstanding(const struct vc4_remote *r)
     return (r->pipe_on && r->have_submit) ? REMOTE_BATCH_SETS : 0;
 }
 
+/* Hand a finished request to the socket even while the previous one is still
+ * executing.  With this off (the default) remote_submit() reaps the previous
+ * request before sending, so the connection never carries more than one
+ * request at a time and the daemon has nothing to prepare while the QPU runs:
+ * the client's own build is hidden, the daemon's per-request work is not.  With
+ * it on the request is sent first and the wait for its window moves to
+ * remote_open_batch(), which already waits for the set two submissions back
+ * before it writes into it - so no buffer is reused while in flight, and the
+ * daemon can validate request N+1 during request N's kernels (vc4d, see
+ * docs/DAEMON-PIPE.md). */
+static int remote_eager_submit(const struct vc4_remote *r)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("VC4INFER_SUBMIT_EAGER") ? 1 : 0;
+    return on && r->have_submit;
+}
+
 /* Queue one launch: snapshot its uniforms into a private shadow slot and
  * remember the program.  Nothing is sent here.  The snapshot is what makes
  * deferral safe with kernels whose uniform block is rewritten for the next
@@ -922,6 +940,21 @@ static vc4_status remote_open_batch(vc4_ctx *ctx)
     struct vc4_batch *b = &r->b[r->cur];
     if (b->state == VC4_BATCH_FILLING)
         return VC4_OK;
+    if (b->state != VC4_BATCH_EMPTY) {
+        /* With eager submission the batch we are opening can still be the one
+         * that is executing: the previous send did not wait for it, and this
+         * is where the wait belongs - before the CPU writes into its window
+         * and its uniform set.  It is always the oldest in flight, because the
+         * other set was sent after it. */
+        if (remote_eager_submit(r) && b->state == VC4_BATCH_IN_FLIGHT &&
+            r->depth > 0 && r->order[0] == r->cur) {
+            wait_reason(WAIT_DEPTH);
+            vc4_status st = remote_reap_one(ctx);
+            wait_reason_clear();
+            if (st != VC4_OK)
+                return st;
+        }
+    }
     if (b->state != VC4_BATCH_EMPTY) {
         vc4__set_err(ctx, "pipeline: batch %d is in flight during open",
                      r->cur);
@@ -1113,7 +1146,7 @@ static vc4_status remote_submit(vc4_ctx *ctx)
     int defer = remote_batch_max_outstanding(r) > 0;
     if (defer) {
         int other = r->cur ^ 1;
-        if (r->b[other].state != VC4_BATCH_EMPTY) {
+        if (r->b[other].state != VC4_BATCH_EMPTY && !remote_eager_submit(r)) {
             /* Both batches are in flight: the depth-2 limit.  Reaping the
              * oldest frees the other one, and its window is the next set. */
             wait_reason(WAIT_DEPTH);

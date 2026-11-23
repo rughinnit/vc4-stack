@@ -1,0 +1,23 @@
+=== default [] eager=0 10:31:04 temp=45.1'C
+client pid 95705, vc4d pid 95699, arm 1000 MHz, temp 45.1 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+160    pipelined    402.4    2.48    268.0   0.67   187.0    832.0    130.0     60.0    274.1      0.5   403.4  (pool 41.6/7.4 MiB of 64, 46-47 C)
+       blocked at: depth 1.7 ms, invalidate 0.0, l2 flush 0.0, scratch 258.7, host 0.1, other 13.2
+vc4d: prefetch: 0 datagram(s) read early, 0 prepared under a launch
+vc4d: launch timing: 20032 launch(es), kernel 322231 ns, gap 223218 ns, period 545449 ns (34 gap(s) over 20 ms not counted)
+=== prefetch [--prefetch] eager=0 10:31:21 temp=46.2'C
+client pid 95730, vc4d pid 95724, arm 1000 MHz, temp 46.2 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+160    pipelined    405.3    2.47    269.6   0.67   187.0    832.0    135.0     70.0    276.3      0.5   406.1  (pool 41.6/7.4 MiB of 64, 47-48 C)
+       blocked at: depth 1.7 ms, invalidate 0.0, l2 flush 0.0, scratch 260.5, host 0.1, other 13.4
+vc4d: prefetch: 0 datagram(s) read early, 0 prepared under a launch
+vc4d: launch timing: 20032 launch(es), kernel 324218 ns, gap 224182 ns, period 548400 ns (35 gap(s) over 20 ms not counted)
+=== prefetch_eager [--prefetch] eager=1 10:31:38 temp=47.2'C
+client pid 95756, vc4d pid 95750, arm 1000 MHz, temp 47.2 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+160    pipelined    404.0    2.48    269.5   0.67   187.0    832.0    140.0     70.0    275.1      0.5   406.5  (pool 41.6/7.4 MiB of 64, 48-49 C)
+       blocked at: depth 0.6 ms, invalidate 0.0, l2 flush 0.0, scratch 261.1, host 0.6, other 12.3
+vc4d: prefetch: 66 datagram(s) read early, 66 prepared under a launch
+vc4d: launch timing: 20032 launch(es), kernel 324044 ns, gap 223678 ns, period 547722 ns (34 gap(s) over 20 ms not counted)
+=== end 10:31:55 temp=47.8'C
+unit restored

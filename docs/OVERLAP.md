@@ -61,6 +61,17 @@ pinned until it runs, which is the class of bug the batch work just removed
 ordered queue with flow control; using it keeps the daemon stateless per
 request.
 
+**What the wire actually carries (measured later, `feat/daemon-pipe`).**  The
+second bullet above is the design; the shipped `remote_submit()` reaps the
+previous request *before* it sends the next one, so the connection carries one
+request at a time.  Request N+1 is built during N's execution and handed over
+after N's reply.  Over 107 652 launches a daemon that checks the socket during
+every launch found a datagram there **zero** times.  `VC4INFER_SUBMIT_EAGER=1`
+(off by default) sends before reaping and makes the connection depth 2; even
+then, daemon-side preparation of the next request is worth 0.5 % of wall,
+because the daemon's whole share of the per-request period is about 30 µs.  See
+[DAEMON-PIPE.md](DAEMON-PIPE.md).
+
 The version bump is 4 with `VC4D_VERSION_MIN` still 2.  A version-4 client
 descends one version at a time when HELLO is refused, so it settles on 3
 against a version-3 daemon and keeps the batch op; `vc4_pipeline_begin()`
@@ -217,6 +228,13 @@ That changes the answer to the question this branch was asked to settle:
   per frame at 160 over 187 requests, plus the idle gaps between launches
   while it prepares the next one.  Removing it needs a daemon that builds
   launch N+1 while launch N runs, which is a larger change than this branch.
+
+  That daemon exists now (`vc4d --prefetch`, `feat/daemon-pipe`) and it
+  measures as no change: of the 0.79 ms per request that is not the kernel,
+  about 0.03 ms is the daemon's register sequence, about 0.13 ms is its
+  completion notice, and the rest is the client's own host work.  The frame at
+  160 is 404 ms = 268 ms of QPU + ~25 ms of daemon tail + ~111 ms of client CPU.
+  [DAEMON-PIPE.md](DAEMON-PIPE.md) §6 has the counters and the explanation.
 
 **Single-frame latency: no cost.**  The pipelined cell is 5.2/4.3/8.8 ms
 *faster* on one frame after an idle gap (96/128/160), because the frame's own

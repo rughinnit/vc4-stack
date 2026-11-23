@@ -18,8 +18,9 @@ CMAHOLD = $(B)/cmahold
 ARENASZ = $(B)/arena_size
 BATCH   = $(B)/test_batch
 SUBMIT  = $(B)/test_submit
+PREFETCH = $(B)/test_prefetch
 
-all: $(DAEMON) $(LIB) $(SOLIB) $(DEMO) $(HOSTILE) $(LRU) $(UNIMASK) $(CMAHOLD) $(ARENASZ) $(BATCH) $(SUBMIT)
+all: $(DAEMON) $(LIB) $(SOLIB) $(DEMO) $(HOSTILE) $(LRU) $(UNIMASK) $(CMAHOLD) $(ARENASZ) $(BATCH) $(SUBMIT) $(PREFETCH)
 
 $(B):
 	mkdir -p $(B)
@@ -54,6 +55,9 @@ $(ARENASZ): test/arena_size.c $(LIB) include/vc4client.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
 $(BATCH): test/test_batch.c $(LIB) include/vc4client.h | $(B)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
+
+$(PREFETCH): test/test_prefetch.c $(LIB) include/vc4client.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
 $(SUBMIT): test/test_submit.c $(LIB) test/fake_daemon.py | $(B)

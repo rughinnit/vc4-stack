@@ -167,13 +167,37 @@ before the next is kicked, and the reply is one `vc4d_batch_item` per entry.
 connection contract.  A version-4 client may have `VC4D_SUBMIT_MAX` (2)
 `SUBMIT`s outstanding and must reap them in submission order, so it can prepare
 request N+1 while request N is being executed - the only overlap the hardware
-allows, since two daemons still serialise on the GPU lock.  A daemon that
-receives a second request while executing the first has it in its socket
-buffer already; it reads it when it is idle.  There is no id table and no
-accepted-but-unrun state in the daemon.  `HELLO` sets `VC4D_F_ASYNC_SUBMIT`
-for a client that may use it; a client may not mix an outstanding `SUBMIT`
-with a synchronous op, because the reply order would no longer identify the
-completion.  See [../docs/OVERLAP.md](../docs/OVERLAP.md).
+allows, since two daemons still serialise on the GPU lock.  `HELLO` sets
+`VC4D_F_ASYNC_SUBMIT` for a client that may use it; a client may not mix an
+outstanding `SUBMIT` with a synchronous op, because the reply order would no
+longer identify the completion.  See [../docs/OVERLAP.md](../docs/OVERLAP.md).
+
+### Prepared requests (`--prefetch`, opt-in)
+
+With `--prefetch` the daemon validates the next request while the current
+launch is executing, so that when that launch completes the only work between
+two kernels is the GPU lock and the register sequence.  It is the same code
+split in two: `launch_prepare()`/`batch_prepare()` (reads the message, the
+arena and the tables; no MMIO, no lock, no allocation) and
+`launch_kick()`/`batch_run()` (the GPU).  A prepared request is *prepared, not
+accepted*: it owns no reply, no launch id and no client-visible status until
+the previous request has completed and it is its turn, and it is dropped
+rather than replied to if the daemon exits instead.  While a plan is staged its
+program slots are pinned (`struct prog.pins`) so nothing can evict them, and
+the plan re-checks the slot generation and the region offset before the kick.
+
+It is off by default because it buys nothing for the client this tree ships:
+`remote_submit()` reaps the previous request before it sends the next one, so
+the connection carries one request at a time and the socket check finds
+nothing.  Measured at YOLOv8n-160: 3 requests prepared under a launch in a
+whole run, +0.9 ms of wall and +10 ms of daemon CPU per frame.
+[../docs/DAEMON-PIPE.md](../docs/DAEMON-PIPE.md) has the design, the rules on
+what must never run concurrently, and the numbers.
+
+`--poll-us N` (default 10) sets the completion poll interval; `--poll-us 1`
+saves 7 ms of a 407 ms frame and `--poll-us 0` (yield instead of sleep) saves
+21 ms, at 0.27 instead of 0.08 CPU-seconds per frame.  The default is the
+shipped behaviour.
 
 **ALLOC** also returns `bus`, the GPU bus address of the region's first byte;
 a client that builds pointer uniforms itself needs it.
@@ -234,6 +258,7 @@ listener is the unix socket.
 | the arena is retried, then degraded loudly, and restored when idle | `arena_open`, `arena_maybe_restore` |
 | `nqpu ≤ declared max_qpu`, `nuni == declared nuni` | `handle_launch` |
 | one launch in flight; `WAIT` only by the owner | `handle_launch`/`wait` |
+| a prepared request performs no MMIO, takes no lock, allocates nothing, and is pinned before it can be run | `launch_prepare`, `batch_prepare`, `prog_slot_for` |
 | timeout bounded by `--max-timeout-ms`; then a context reset that must pass a probe launch, or the daemon exits 75 | `try_recover`, `gpu_recover` |
 | a client's regions are released when its **peer pid** is gone, not only when its socket closes | `peer_alive`, `reap_dead_clients` |
 | register writes only to the allowlist | `gpu_wreg` |

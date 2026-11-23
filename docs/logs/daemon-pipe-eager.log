@@ -1,0 +1,25 @@
+=== baseline eager=0 daemon=prefetch 10:14:17
+client pid 94771, vc4d pid 94766, arm 1000 MHz, temp 49.4 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+160    sync         416.7    2.40    271.4   0.65   187.0    832.0    130.0     75.0      0.0      0.0   416.9  (pool 41.6/7.4 MiB of 64, 49-51 C)
+160    pipelined    407.8    2.45    271.6   0.67   187.0    832.0    135.0     75.0    278.1      0.5   407.0  (pool 41.6/7.4 MiB of 64, 49-50 C)
+       blocked at: depth 1.8 ms, invalidate 0.0, l2 flush 0.0, scratch 262.0, host 0.1, other 13.6
+vc4d: prefetch: 0 datagram(s) read early, 0 prepared under a launch
+vc4d: launch timing: 40064 launch(es), kernel 326515 ns, gap 230867 ns, period 557382 ns (66 gap(s) over 20 ms not counted)
+=== eager_pf eager=1 daemon=prefetch 10:14:48
+client pid 94795, vc4d pid 94790, arm 1000 MHz, temp 49.4 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+160    sync         417.1    2.40    271.5   0.65   187.0    832.0    130.0     75.0      0.0      0.0   417.2  (pool 41.6/7.4 MiB of 64, 49-49 C)
+160    pipelined    405.9    2.46    271.4   0.67   187.0    832.0    130.0     75.0    277.1      0.5   406.8  (pool 41.6/7.4 MiB of 64, 49-50 C)
+       blocked at: depth 0.7 ms, invalidate 0.0, l2 flush 0.0, scratch 262.6, host 0.7, other 12.6
+vc4d: prefetch: 66 datagram(s) read early, 66 prepared under a launch
+vc4d: launch timing: 40064 launch(es), kernel 326535 ns, gap 229568 ns, period 556103 ns (67 gap(s) over 20 ms not counted)
+=== eager_sync eager=1 daemon=--no-prefetch 10:15:19
+client pid 94820, vc4d pid 94815, arm 1000 MHz, temp 48.9 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+160    sync         412.0    2.43    267.5   0.65   187.0    832.0    130.0     60.0      0.0      0.0   412.9  (pool 41.6/7.4 MiB of 64, 49-49 C)
+160    pipelined    401.3    2.49    268.0   0.67   187.0    832.0    130.0     60.0    273.1      0.5   402.0  (pool 41.6/7.4 MiB of 64, 49-49 C)
+       blocked at: depth 0.6 ms, invalidate 0.0, l2 flush 0.0, scratch 259.3, host 0.7, other 12.1
+vc4d: prefetch: 0 datagram(s) read early, 0 prepared under a launch
+vc4d: launch timing: 40064 launch(es), kernel 321974 ns, gap 228626 ns, period 550599 ns (66 gap(s) over 20 ms not counted)
+=== end 10:15:48 temp=48.9'C throttled=0x0

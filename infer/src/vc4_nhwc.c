@@ -70,7 +70,42 @@ static int nhwc_pad_image(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
         return 0;
     }
     uint64_t pz0 = prof ? vc4_prof_now() : 0;
-    memset((uint8_t *)p, 0, per * (size_t)nimg + NHWC_SLACK);
+    /* Zero only what the copy below does not write: the border strips of each
+     * image and the slack the im2col over-read needs.  Zeroing the whole
+     * padded image first (the old form) wrote the interior twice; at 160 the
+     * first 64-channel conv zeroes 5.9 MB per call to keep 1.4 % of it, and
+     * the pads together were 23.6 MB of the 61 MB the client cleaned per
+     * frame, for 14 ms of memset.  Same bytes afterwards, because the interior
+     * is copied over the same addresses. */
+    size_t zeroed = 0;
+    for (int n = 0; n < nimg; ++n) {
+        uint8_t *dst = (uint8_t *)p + (size_t)n * per;
+        if (pt) {
+            memset(dst, 0, (size_t)pt * wp * (size_t)C * 4u);
+            zeroed += (size_t)pt * wp * (size_t)C * 4u;
+        }
+        if (pb) {
+            memset(dst + (size_t)(pt + H) * wp * (size_t)C * 4u, 0,
+                   (size_t)pb * wp * (size_t)C * 4u);
+            zeroed += (size_t)pb * wp * (size_t)C * 4u;
+        }
+        if (pl || pr) {
+            for (int y = 0; y < H; ++y) {
+                uint8_t *row = dst + ((size_t)(y + pt) * wp) * (size_t)C * 4u;
+                if (pl) {
+                    memset(row, 0, (size_t)pl * (size_t)C * 4u);
+                    zeroed += (size_t)pl * (size_t)C * 4u;
+                }
+                if (pr) {
+                    memset(row + (size_t)(W + pl) * (size_t)C * 4u, 0,
+                           (size_t)pr * (size_t)C * 4u);
+                    zeroed += (size_t)pr * (size_t)C * 4u;
+                }
+            }
+        }
+    }
+    memset((uint8_t *)p + per * (size_t)nimg, 0, NHWC_SLACK);
+    zeroed += NHWC_SLACK;
     uint64_t pz1 = prof ? vc4_prof_now() : 0;
     if (nimg)
         vc4__invalidate_off(ctx, in->off, (size_t)nimg * H * in_pitch * C * 4u);
@@ -88,7 +123,7 @@ static int nhwc_pad_image(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
         vc4_prof_in_pad(0);
         vc4_prof_add(0, pz1 - pz0);
         vc4_prof_add(1, pc1 - pc0);
-        vc4_prof_bytes(0, per * (size_t)nimg + NHWC_SLACK);
+        vc4_prof_bytes(0, zeroed);
         vc4_prof_bytes(1, (uint64_t)nimg * H * W * C * 4u);
     }
     pd->bus = ctx->gpu_bus + (uint32_t)((uint8_t *)p - ctx->arena);

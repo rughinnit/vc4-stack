@@ -27,6 +27,14 @@ INSTALL_MODELS = "/usr/share/vc4infer/models"
 SOCKET = "/run/vc4d.sock"
 
 
+def socket_path():
+    """The socket the client will connect to: VC4D_SOCKET overrides the
+    default, exactly as libvc4client's remote_socket() does.  The precheck
+    below has to look at the same path, or a test daemon on another socket is
+    reported as "vc4d is not running"."""
+    return os.environ.get("VC4D_SOCKET") or SOCKET
+
+
 def default_cache_dir():
     """Per-user kernel blob cache ($VC4INFER_CACHE, else ~/.cache/vc4infer)."""
     env = os.environ.get("VC4INFER_CACHE")
@@ -137,7 +145,7 @@ def prepare_env():
 
 
 def daemon_reachable():
-    return os.path.exists(SOCKET)
+    return os.path.exists(socket_path())
 
 
 def open_engine(cache_dir=None, arena_mb=None, retry_s=3.0):
@@ -163,7 +171,7 @@ def open_engine(cache_dir=None, arena_mb=None, retry_s=3.0):
     if daemon and not daemon_reachable():
         raise Error(
             "vc4d is not running (no %s). Start it with `sudo systemctl start "
-            "vc4d`, or run as root with VC4INFER_DAEMON=0." % SOCKET)
+            "vc4d`, or run as root with VC4INFER_DAEMON=0." % socket_path())
     deadline = time.monotonic() + max(0.0, float(retry_s))
     while True:
         try:

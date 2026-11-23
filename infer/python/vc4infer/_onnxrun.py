@@ -466,6 +466,13 @@ class Pool:
         self.free = []                  # [(off, size)] engine-global offsets
         self.live = {}                  # off -> aligned bytes, the owner
         self.high = 0                   # high-water of used_bytes
+        # Blocks freed while a pipelined request was in flight.  A request
+        # reads and writes arena memory until its reply arrives; handing the
+        # same bytes to the next node's allocation while that request runs
+        # would let the CPU overwrite an input the QPU has not read yet.  Each
+        # entry is released to `free` once the engine has reaped every request
+        # that was outstanding when it was freed (see _reap_held).
+        self.held = []                  # [(off, aligned_size, epoch)]
         # An engine artifact substitutes a recorded plan for this allocator:
         # `pin` is key -> (segment, offset inside it, aligned bytes) and every
         # allocation must find its key.  `record` collects the same triples
@@ -539,11 +546,55 @@ class Pool:
         return seg
 
     # -- allocation --------------------------------------------------------
+    def _watermarks(self):
+        """(newest submitted epoch, newest reaped epoch), or None.
+
+        Only asked when the caller armed the pipeline, so the default path
+        does not pay a ctypes call per allocation.
+        """
+        if not getattr(self.eng, "pipeline_armed", False):
+            return None
+        fn = getattr(self.eng, "pipeline_watermarks", None)
+        return fn() if fn is not None else None
+
+    def _free_range(self, off, n):
+        lo, hi = off, off + n
+        merged = []
+        for o, sz in self.free:                 # sorted, so one pass coalesces
+            if o + sz >= lo and o <= hi:
+                lo = min(lo, o)
+                hi = max(hi, o + sz)
+            else:
+                merged.append((o, sz))
+        merged.append((lo, hi - lo))
+        merged.sort()
+        self.free = merged
+
+    def _reap_held(self):
+        """Return the blocks whose request has completed to the free list.
+
+        A block freed at epoch E is safe once the engine has reaped request E
+        and everything submitted before it, which is exactly
+        ``reaped >= E``: the C backend reaps in submit order.
+        """
+        w = self._watermarks()
+        if w is None or not self.held:
+            return
+        _epoch, reaped = w
+        keep = []
+        for off, n, e in self.held:
+            if e <= reaped:
+                self._free_range(off, n)
+            else:
+                keep.append((off, n, e))
+        self.held = keep
+
     def alloc(self, nbytes):
         n = _align(nbytes)
         key = self.labeler() if self.labeler is not None else None
         if self.pin is not None:
             return self._alloc_pinned(key, n, int(nbytes))
+        self._reap_held()
         for i, (off, sz) in enumerate(self.free):
             if sz >= n:
                 if sz == n:
@@ -636,17 +687,14 @@ class Pool:
             # freeing it again would hand the same bytes to two allocations
             return
         del self.live[off]
-        lo, hi = off, off + n
-        merged = []
-        for o, sz in self.free:                 # sorted, so one pass coalesces
-            if o + sz >= lo and o <= hi:
-                lo = min(lo, o)
-                hi = max(hi, o + sz)
-            else:
-                merged.append((o, sz))
-        merged.append((lo, hi - lo))
-        merged.sort()
-        self.free = merged
+        w = self._watermarks()
+        if w is not None and w[0] > w[1]:
+            # A request is in flight: the bytes must not be reused until it
+            # has been reaped, because that request may still read or write
+            # them.  Hold the range, keyed by the epoch current now.
+            self.held.append((off, n, w[0]))
+            return
+        self._free_range(off, n)
 
     def reset(self):
         if self.pin is not None:
@@ -658,6 +706,7 @@ class Pool:
             seg[2] = 0
         self.free = []
         self.live = {}
+        self.held = []
         self.high = 0
 
     def begin_run(self):
@@ -4143,13 +4192,38 @@ class Runner:
                 self._release_buf(t.buf)
         self._garbage = []
 
-    def run(self, feeds, profile=False):
+    def run(self, feeds, profile=False, pipeline=False):
         self.check_policy()
         if isinstance(self.eng, _plan.Trace):
             # the build frame raised; drop the half-recorded plan and unwrap
             self.eng = self.eng._eng
             self._abort_plan_build()
-        if (self.cplan is not None and not profile
+        if pipeline:
+            # The throughput path: arm depth-2 request pipelining for this run
+            # and take it down (flushing) on the way out.  A daemon without
+            # protocol 4 is an error here rather than a silent fall back to the
+            # synchronous path: a caller that asks for the pipelined run and
+            # gets the old one would measure the wrong thing.
+            st = self.eng.pipeline_begin()
+            if st != vc4infer.VC4_OK:
+                raise vc4infer.Error(
+                    "pipelined run needs protocol 4 (VC4D_F_ASYNC_SUBMIT) and "
+                    "this daemon does not advertise it: rebuild vc4d from "
+                    "this tree, and do not set VC4INFER_NO_PIPE", st)
+        try:
+            return self._run_body(feeds, profile, pipeline)
+        finally:
+            if pipeline:
+                st = self.eng.pipeline_end()
+                if st != vc4infer.VC4_OK:
+                    # the outputs have already been copied out; report the
+                    # failure rather than losing it
+                    raise vc4infer.Error(
+                        "pipeline: %s" % self.eng.lib.vc4_strerror(st).decode(),
+                        st)
+
+    def _run_body(self, feeds, profile, pipeline):
+        if (self.cplan is not None and not profile and not pipeline
                 and self.mode == "strict"):
             return self._run_plan(feeds)
         self.pool.begin_run()

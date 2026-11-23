@@ -192,6 +192,71 @@ vc4_status vc4_batch_end(vc4_ctx *ctx)
     return VC4_OK;
 }
 
+/*
+ * Throughput path: two requests in flight.
+ *
+ * vc4_batch_begin/end submit one graph node's launches as one request and wait
+ * for it.  With the pipeline armed, vc4_batch_end returns as soon as the
+ * request is in the socket, so the next node's launch list can be built while
+ * the QPU is still executing this one.  Two requests may be in flight; the
+ * third submit reaps the oldest first.
+ *
+ * The catch, stated plainly because it decides how much this buys: a caller
+ * may keep preparing while a request runs only if the memory it is writing is
+ * not the memory that request is reading.  The backend enforces this at every
+ * point it knows about (uploads, downloads, explicit invalidates, a re-load,
+ * the L2 flush an op asks for, a scratch reset that would reuse a live window)
+ * by completing the outstanding requests first, and it keeps two disjoint
+ * uniform sets and two scratch windows so that an ordinary op does not trip
+ * those barriers.  Buffers that live in the graph pool are the caller's
+ * responsibility, because only the caller knows which allocation a node is
+ * about to overwrite: vc4_pipeline_epoch() and vc4_pipeline_reaped() are the
+ * watermarks a pool needs to hold a freed block back until the request that
+ * was in flight when it was freed has completed.  vc4infer's Pool does exactly
+ * that.
+ *
+ * These calls are no-ops (begin reports VC4_ERR_UNSUPPORTED) when the daemon
+ * does not advertise protocol 4's SUBMIT, and the synchronous API is unchanged
+ * while the pipeline is off.  A single frame's latency is not improved by
+ * arming it; throughput is.
+ */
+vc4_status vc4_pipeline_begin(vc4_ctx *ctx)
+{
+    if (!ctx)
+        return VC4_ERR_INVAL;
+    if (!ctx->remote)
+        return VC4_ERR_UNSUPPORTED;
+    return vc4__remote_pipeline_begin(ctx);
+}
+
+vc4_status vc4_pipeline_flush(vc4_ctx *ctx)
+{
+    if (!ctx)
+        return VC4_ERR_INVAL;
+    if (!ctx->remote)
+        return VC4_OK;
+    return vc4__remote_pipeline_flush(ctx);
+}
+
+vc4_status vc4_pipeline_end(vc4_ctx *ctx)
+{
+    if (!ctx)
+        return VC4_ERR_INVAL;
+    if (!ctx->remote)
+        return VC4_OK;
+    return vc4__remote_pipeline_end(ctx);
+}
+
+uint64_t vc4_pipeline_epoch(vc4_ctx *ctx)
+{
+    return (ctx && ctx->remote) ? vc4__remote_pipeline_epoch(ctx) : 0;
+}
+
+uint64_t vc4_pipeline_reaped(vc4_ctx *ctx)
+{
+    return (ctx && ctx->remote) ? vc4__remote_pipeline_reaped(ctx) : 0;
+}
+
 const vc4_op_info *vc4_supported_ops(size_t *count)
 {
     if (count)

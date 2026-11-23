@@ -32,6 +32,13 @@ struct vc4c_conn {
     uint32_t seq;
     int last;
     struct vc4d_hello_rsp info;
+    /* Protocol 4: SUBMIT requests whose replies have not been read.  The
+     * socket preserves order and so does the daemon, so the oldest entry is
+     * always the next reply; a reap that names any other one is a caller bug
+     * and is refused rather than answered with someone else's data. */
+    uint32_t pending[VC4D_SUBMIT_MAX];
+    int      npending;
+    int      broken;       /* a failure left replies unreadable */
     uint8_t rbuf[VC4D_MAX_MSG];
 };
 
@@ -86,20 +93,16 @@ const char *vc4c_strerror(int rc)
 }
 
 /*
- * Send one request and read one reply.  outfd, when non-NULL, receives the
- * SCM_RIGHTS fd from an ALLOC reply.  d0/d1 receive the reply header details.
- * Returns 0 or a negative VC4D_E_* code.
+ * Send one request.  Split from the reply because protocol 4 lets a client
+ * have more than one SUBMIT outstanding: the request goes out here and the
+ * completion is collected later by recv_rsp().  `seq_out` receives the
+ * header sequence number the reply must echo.
  */
-static int xfer(vc4c_conn *c, uint16_t op, const void *payload, size_t plen,
-                int pass_fd, int *outfd, void *out, size_t outcap,
-                size_t *outlen, uint32_t *d0, uint32_t *d1)
+static int send_req(vc4c_conn *c, uint16_t op, const void *payload, size_t plen,
+                    int pass_fd, uint32_t *seq_out)
 {
     if (sizeof(struct vc4d_hdr) + plen > VC4D_MAX_MSG)
         return -VC4D_E_TOOLARGE;
-    if (outlen)
-        *outlen = 0;
-    if (outfd)
-        *outfd = -1;
 
     struct vc4d_hdr h;
     memset(&h, 0, sizeof(h));
@@ -108,6 +111,8 @@ static int xfer(vc4c_conn *c, uint16_t op, const void *payload, size_t plen,
     h.op = op;
     h.version = c->version;
     h.seq = ++c->seq;
+    if (seq_out)
+        *seq_out = h.seq;
 
     struct iovec iov[2] = {
         { .iov_base = &h, .iov_len = sizeof(h) },
@@ -131,12 +136,35 @@ static int xfer(vc4c_conn *c, uint16_t op, const void *payload, size_t plen,
     }
     for (;;) {
         if (sendmsg(c->fd, &m, MSG_NOSIGNAL) >= 0)
-            break;
+            return 0;
         if (errno == EINTR)
             continue;
         c->last = -VC4D_E_IO;
         return c->last;
     }
+}
+
+/*
+ * Read the reply to the request whose sequence number is `seq`.  outfd, when
+ * non-NULL, receives the SCM_RIGHTS fd from an ALLOC reply.  d0/d1 receive the
+ * reply header details.
+ *
+ * A reply whose status is not VC4D_OK is returned as -status before the
+ * seq/op comparison: the daemon's version-mismatch reply deliberately carries
+ * op=0/seq=0, and the HELLO fallback is what turns that into a supported
+ * version.  The payload is copied before either check, so a batch caller can
+ * read the per-entry statuses of a failed request.
+ */
+static int recv_rsp(vc4c_conn *c, uint16_t op, uint32_t seq, int *outfd,
+                    void *out, size_t outcap, size_t *outlen,
+                    uint32_t *d0, uint32_t *d1)
+{
+    if (outlen)
+        *outlen = 0;
+    if (outfd)
+        *outfd = -1;
+    if (c->broken)
+        return c->last;
 
     struct iovec riov = { .iov_base = c->rbuf, .iov_len = sizeof(c->rbuf) };
     char rcbuf[CMSG_SPACE(sizeof(int))];
@@ -151,12 +179,14 @@ static int xfer(vc4c_conn *c, uint16_t op, const void *payload, size_t plen,
         got = -1;
     if (got < (ssize_t)sizeof(struct vc4d_hdr)) {
         c->last = -VC4D_E_IO;
+        c->broken = 1;
         return c->last;
     }
     struct vc4d_hdr rh;
     memcpy(&rh, c->rbuf, sizeof(rh));
     if (rh.magic != VC4D_MAGIC || rh.len != (uint32_t)got) {
         c->last = -VC4D_E_PROTO;
+        c->broken = 1;
         return c->last;
     }
     c->last = rh.status;
@@ -184,15 +214,37 @@ static int xfer(vc4c_conn *c, uint16_t op, const void *payload, size_t plen,
 
     if (rh.status != VC4D_OK)
         return -rh.status;
-    if (rh.seq != h.seq || rh.op != op) {
+    if (rh.seq != seq || rh.op != op) {
         c->last = -VC4D_E_PROTO;
+        c->broken = 1;
         return c->last;
     }
     if (out && n > outcap) {
         c->last = -VC4D_E_TOOLARGE;
+        c->broken = 1;
         return c->last;
     }
     return 0;
+}
+
+/*
+ * Send one request and read one reply.  All the synchronous calls use this;
+ * SUBMIT uses send_req/recv_rsp directly.
+ */
+static int xfer(vc4c_conn *c, uint16_t op, const void *payload, size_t plen,
+                int pass_fd, int *outfd, void *out, size_t outcap,
+                size_t *outlen, uint32_t *d0, uint32_t *d1)
+{
+    uint32_t seq = 0;
+    int rc = send_req(c, op, payload, plen, pass_fd, &seq);
+    if (rc != 0) {
+        if (outlen)
+            *outlen = 0;
+        if (outfd)
+            *outfd = -1;
+        return rc;
+    }
+    return recv_rsp(c, op, seq, outfd, out, outcap, outlen, d0, d1);
 }
 
 /* HELLO.  A version-3 client starts with 3 and drops to 2 when the daemon
@@ -216,9 +268,17 @@ static int info_as(vc4c_conn *c, uint32_t version,
 
 int vc4c_info(vc4c_conn *c, struct vc4d_hello_rsp *out)
 {
-    int rc = info_as(c, c->version, out);
-    if (rc == -VC4D_E_VERSION && c->version > VC4D_VERSION_MIN)
-        rc = info_as(c, VC4D_VERSION_MIN, out);
+    /* Descend one version at a time, not straight to VC4D_VERSION_MIN: a
+     * version-4 client talking to a version-3 daemon must settle on 3 and keep
+     * the batch op.  The old code dropped to 2 and lost it. */
+    uint32_t v = c->version;
+    int rc = info_as(c, v, out);
+    while (rc == -VC4D_E_VERSION && v > VC4D_VERSION_MIN) {
+        v--;
+        rc = info_as(c, v, out);
+        if (rc == 0)
+            c->version = v;
+    }
     /* A daemon may accept a newer HELLO and answer with its own (older)
      * version.  1.2.9 does exactly that: it serves HELLO 3 and then rejects
      * any later request whose header says 3.  The reply version is what every
@@ -269,9 +329,24 @@ void vc4c_close(vc4c_conn *c)
 {
     if (!c)
         return;
+    /* A token that was submitted and never polled still has a reply in the
+     * socket; read them so CLOSE is not answered by the oldest one. */
+    while (c->npending > 0 && !c->broken) {
+        struct vc4d_batch_item junk[VC4D_BATCH_MAX];
+        unsigned done = 0;
+        vc4c_token t = { .seq = c->pending[0] };
+        if (vc4c_poll_batch(c, t, junk, VC4D_BATCH_MAX, &done) != 0 &&
+            !c->broken)
+            break;
+    }
     (void)xfer(c, VC4D_OP_CLOSE, NULL, 0, -1, NULL, NULL, 0, NULL, NULL, NULL);
     close(c->fd);
     free(c);
+}
+
+int vc4c_submits_outstanding(const vc4c_conn *c)
+{
+    return c ? c->npending : 0;
 }
 
 int vc4c_alloc(vc4c_conn *c, size_t bytes, unsigned flags, vc4c_buf *out)
@@ -493,13 +568,13 @@ int vc4c_launch_wait_u(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
                              uni_addr, 1, 1);
 }
 
-int vc4c_launch_batch(vc4c_conn *c, const vc4c_buf *uniforms,
-                      const vc4c_batch_ent *ent, unsigned count,
-                      struct vc4d_batch_item *out, unsigned *done)
+/* Build the wire payload of a batch/submit request: the header struct
+ * followed by one entry per launch or fence.  Shared so the sync and async
+ * forms cannot drift apart in what they validate or how they encode it. */
+static int batch_wire(const vc4c_buf *uniforms, const vc4c_batch_ent *ent,
+                      unsigned count, uint8_t **out, size_t *plen)
 {
-    if (done)
-        *done = 0;
-    if (!c || !ent || count < 1 || count > VC4D_BATCH_MAX)
+    if (!ent || count < 1 || count > VC4D_BATCH_MAX)
         return -VC4D_E_INVAL;
     struct vc4d_batch_ent wire[VC4D_BATCH_MAX];
     memset(wire, 0, sizeof(wire));
@@ -535,20 +610,42 @@ int vc4c_launch_batch(vc4c_conn *c, const vc4c_buf *uniforms,
         w->uni_off = e->uni_off;
         w->uni_addr = e->uni_addr;
     }
-    size_t plen = sizeof(struct vc4d_batch_req) +
-                  (size_t)count * sizeof(struct vc4d_batch_ent);
-    if (plen > VC4D_MAX_MSG)
+    size_t n = sizeof(struct vc4d_batch_req) +
+               (size_t)count * sizeof(struct vc4d_batch_ent);
+    if (n > VC4D_MAX_MSG)
         return -VC4D_E_TOOLARGE;
-    uint8_t *pl = malloc(plen);
+    uint8_t *pl = malloc(n);
     if (!pl)
         return -VC4D_E_NOMEM;
     struct vc4d_batch_req q = { .count = count, .flags = 0 };
     memcpy(pl, &q, sizeof(q));
     memcpy(pl + sizeof(q), wire, (size_t)count * sizeof(wire[0]));
+    *out = pl;
+    *plen = n;
+    return 0;
+}
+
+int vc4c_launch_batch(vc4c_conn *c, const vc4c_buf *uniforms,
+                      const vc4c_batch_ent *ent, unsigned count,
+                      struct vc4d_batch_item *out, unsigned *done)
+{
+    if (done)
+        *done = 0;
+    if (!c)
+        return -VC4D_E_INVAL;
+    /* The synchronous form cannot be mixed with outstanding SUBMITs: the
+     * reply it reads would be the oldest submit's. */
+    if (c->npending)
+        return -VC4D_E_BUSY;
+    uint8_t *pl = NULL;
+    size_t plen = 0;
+    int rc = batch_wire(uniforms, ent, count, &pl, &plen);
+    if (rc != 0)
+        return rc;
     uint32_t d0 = 0, d1 = 0;
     size_t n = 0;
-    int rc = xfer(c, VC4D_OP_LAUNCH_BATCH, pl, plen, -1, NULL,
-                  out, (size_t)count * sizeof(*out), &n, &d0, &d1);
+    rc = xfer(c, VC4D_OP_LAUNCH_BATCH, pl, plen, -1, NULL,
+              out, (size_t)count * sizeof(*out), &n, &d0, &d1);
     free(pl);
     if (done)
         *done = d0;
@@ -556,6 +653,55 @@ int vc4c_launch_batch(vc4c_conn *c, const vc4c_buf *uniforms,
         return -VC4D_E_PROTO;
     /* A failing entry already carries its status in the payload; the header
      * status is the same code, so callers get the first failure either way. */
+    return rc;
+}
+
+int vc4c_submit_batch(vc4c_conn *c, const vc4c_buf *uniforms,
+                      const vc4c_batch_ent *ent, unsigned count,
+                      vc4c_token *tok)
+{
+    if (!c || !tok)
+        return -VC4D_E_INVAL;
+    if (c->broken)
+        return c->last;
+    if (c->npending >= (int)VC4D_SUBMIT_MAX)
+        return -VC4D_E_BUSY;
+    uint8_t *pl = NULL;
+    size_t plen = 0;
+    int rc = batch_wire(uniforms, ent, count, &pl, &plen);
+    if (rc != 0)
+        return rc;
+    uint32_t seq = 0;
+    rc = send_req(c, VC4D_OP_SUBMIT, pl, plen, -1, &seq);
+    free(pl);
+    if (rc != 0)
+        return rc;
+    c->pending[c->npending++] = seq;
+    tok->seq = seq;
+    return 0;
+}
+
+int vc4c_poll_batch(vc4c_conn *c, vc4c_token tok,
+                    struct vc4d_batch_item *out, unsigned count,
+                    unsigned *done)
+{
+    if (done)
+        *done = 0;
+    if (!c || !count || count > VC4D_BATCH_MAX)
+        return -VC4D_E_INVAL;
+    if (c->npending <= 0 || c->pending[0] != tok.seq)
+        return -VC4D_E_INVAL;       /* reaped out of order */
+    c->npending--;
+    memmove(&c->pending[0], &c->pending[1],
+            (size_t)c->npending * sizeof(c->pending[0]));
+    uint32_t d0 = 0, d1 = 0;
+    size_t n = 0;
+    int rc = recv_rsp(c, VC4D_OP_SUBMIT, tok.seq, NULL,
+                      out, (size_t)count * sizeof(*out), &n, &d0, &d1);
+    if (done)
+        *done = d0;
+    if (rc == 0 && n != (size_t)count * sizeof(*out))
+        return -VC4D_E_PROTO;
     return rc;
 }
 

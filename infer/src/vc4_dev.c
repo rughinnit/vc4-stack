@@ -641,6 +641,14 @@ vc4_status vc4_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out)
        whatever scratch is still live, or it would hand out the panel's
        memory. */
     size_t base = ctx->scratch > ctx->arena_top ? ctx->scratch : ctx->arena_top;
+    /* With the pipeline armed the scratch windows sit directly above
+     * arena_top, so a persistent buffer has to start above both of them.
+     * Growing the pool during a pipelined run is therefore refused rather than
+     * placed inside a window a request may be reading; the caller gets the
+     * same "arena exhausted" message it would get from a full arena, and the
+     * fix is the same (a larger client arena). */
+    if (ctx->pipe_top && base < ctx->pipe_top)
+        base = ctx->pipe_top;
     size_t off = (base + 63u) & ~(size_t)63u;
     if (off + bytes > ctx->arena_bytes) {
         vc4__set_err(ctx, "arena exhausted: need %zu B, have %zu B "
@@ -664,8 +672,14 @@ void *vc4__scratch_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out)
     if (!ctx || !bytes)
         return NULL;
     size_t off = (ctx->scratch + 63u) & ~(size_t)63u;
-    if (off + bytes > ctx->arena_bytes)
+    size_t top = ctx->scratch_top ? ctx->scratch_top : ctx->arena_bytes;
+    if (off + bytes > top) {
+        if (ctx->scratch_top)
+            vc4__set_err(ctx, "scratch window exhausted: one op needs %zu B "
+                         "at %zu B, the window ends at %zu B (arena %zu B)",
+                         bytes, off, top, ctx->arena_bytes);
         return NULL;
+    }
     if (out) {
         out->off = (uint32_t)off;
         out->bytes = bytes;
@@ -679,9 +693,12 @@ void *vc4__scratch_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out)
 void vc4__scratch_reset(vc4_ctx *ctx)
 {
     if (ctx) {
-        ctx->scratch = ctx->arena_top;
+        /* The remote backend decides which window an op's scratch lives in and
+         * may reap a request that is still reading the one it moves to, so it
+         * goes first; the cursor then starts at that window's base. */
         if (ctx->remote)
             vc4__remote_scratch_reset(ctx);
+        ctx->scratch = ctx->scratch_base ? ctx->scratch_base : ctx->arena_top;
     }
 }
 
@@ -705,6 +722,8 @@ size_t vc4__ws_free(const vc4_ctx *ctx)
 {
     size_t floor = ctx->arena_top > ctx->scratch ? ctx->arena_top
                                                  : ctx->scratch;
+    if (ctx->pipe_top > floor)
+        floor = ctx->pipe_top;
     size_t top = ctx->ws_top ? ctx->ws_top : ctx->arena_bytes;
     return top > floor ? top - floor : 0;
 }
@@ -717,6 +736,8 @@ void *vc4__ws_alloc(vc4_ctx *ctx, size_t bytes, vc4_buf *out)
         ctx->ws_top = ctx->arena_bytes;
     size_t floor = ctx->arena_top > ctx->scratch ? ctx->arena_top
                                                  : ctx->scratch;
+    if (ctx->pipe_top > floor)
+        floor = ctx->pipe_top;
     size_t need = (bytes + 63u) & ~(size_t)63u;
     if (ctx->ws_top < floor + need) {
         vc4__set_err(ctx, "workspace exhausted: need %zu B, have %zu B "

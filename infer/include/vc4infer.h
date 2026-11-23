@@ -203,6 +203,42 @@ uint32_t   vc4_bus_addr(const vc4_ctx *ctx, const vc4_buf *b);
 void       vc4_batch_begin(vc4_ctx *ctx);
 vc4_status vc4_batch_end(vc4_ctx *ctx);
 
+/*
+ * Throughput path: overlap the client's preparation with the daemon's
+ * execution.
+ *
+ * vc4_pipeline_begin() arms depth-2 request pipelining (protocol 4's SUBMIT):
+ * vc4_batch_end() then returns when the request has been sent, not when it has
+ * completed, and up to two requests may be outstanding.  Every call that
+ * touches memory a request may still be using - vc4_upload, vc4_download,
+ * vc4_invalidate_buf, a kernel load, and the internal barriers an op hits when
+ * it reads its input - completes the outstanding requests first, so the
+ * synchronous semantics of the API are unchanged; what changes is that work
+ * between those points runs while the QPUs are busy.
+ *
+ * That also states the limit: a graph whose CPU-side setup reads the previous
+ * node's output (the NHWC conv's zero-padded image does) still serialises at
+ * that read.  docs/OVERLAP.md measures the resulting duty cycle.
+ *
+ * vc4_pipeline_flush() completes everything without disarming.
+ * vc4_pipeline_end() disarms after flushing.  begin() returns
+ * VC4_ERR_UNSUPPORTED when the daemon does not advertise SUBMIT (a version
+ * 2 or 3 daemon): the caller should then fall back to the batch path rather
+ * than report pipelined numbers.  With the pipeline disarmed every call above
+ * behaves exactly as it did before and a single frame's latency is unchanged.
+ *
+ * Pool watermarks, for a caller that recycles arena buffers itself: a block
+ * freed while requests are in flight must not be handed out again until
+ * vc4_pipeline_reaped() reaches the vc4_pipeline_epoch() that was current when
+ * it was freed.  Epochs are 0 before the first request and increase by one per
+ * submitted request; both are monotonic and cheap (they read a counter).
+ */
+vc4_status vc4_pipeline_begin(vc4_ctx *ctx);
+vc4_status vc4_pipeline_flush(vc4_ctx *ctx);
+vc4_status vc4_pipeline_end(vc4_ctx *ctx);
+uint64_t   vc4_pipeline_epoch(vc4_ctx *ctx);
+uint64_t   vc4_pipeline_reaped(vc4_ctx *ctx);
+
 /* --------------------------------------------------------------------- ops */
 /*
  * C = A * B, all f32 row-major, A is MxK, B is KxN, C is MxN, ld = K/N/N.

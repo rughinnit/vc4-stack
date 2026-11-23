@@ -249,6 +249,23 @@ class Engine:
         L.vc4_batch_begin.restype = None
         L.vc4_batch_end.argtypes = [ctypes.c_void_p]
         L.vc4_batch_end.restype = ctypes.c_int
+        # Protocol 4: depth-2 request pipelining.  A library that predates it
+        # makes this Optional below, and pipeline_begin() then reports
+        # unsupported instead of pretending.
+        try:
+            L.vc4_pipeline_begin.argtypes = [ctypes.c_void_p]
+            L.vc4_pipeline_begin.restype = ctypes.c_int
+            L.vc4_pipeline_flush.argtypes = [ctypes.c_void_p]
+            L.vc4_pipeline_flush.restype = ctypes.c_int
+            L.vc4_pipeline_end.argtypes = [ctypes.c_void_p]
+            L.vc4_pipeline_end.restype = ctypes.c_int
+            L.vc4_pipeline_epoch.argtypes = [ctypes.c_void_p]
+            L.vc4_pipeline_epoch.restype = ctypes.c_uint64
+            L.vc4_pipeline_reaped.argtypes = [ctypes.c_void_p]
+            L.vc4_pipeline_reaped.restype = ctypes.c_uint64
+            self.pipeline_supported = True
+        except AttributeError:
+            self.pipeline_supported = False
         L.vc4_invalidate_buf.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf)]
         L.vc4_invalidate_buf.restype = None
         L.vc4_download.argtypes = [ctypes.c_void_p, ctypes.POINTER(Buf),
@@ -445,6 +462,9 @@ class Engine:
         # >0 while a caller (the executor's node loop) holds one batch scope
         # open; see batch_hold()/batch_release().
         self._batch_hold = 0
+        # True between pipeline_begin() and pipeline_end(); Pool reads it to
+        # decide whether a freed block has to be held back for a request.
+        self.pipeline_armed = False
         if not arena_bytes:
             # A 320x320 YOLO needs ~91 MiB (activations + weights + the
             # per-conv im2col scratch); the daemon's default 72 MiB is too
@@ -541,6 +561,43 @@ class Engine:
     @property
     def arena_bytes(self):
         return self.lib.vc4_arena_bytes(self.ctx)
+
+    # ---- pipelined throughput path
+    def pipeline_begin(self):
+        """Arm depth-2 request pipelining; returns 0 or a VC4 error code.
+
+        With it armed, batch_release() sends a node's launches without waiting
+        for them, so the next node's setup runs while the QPUs are busy.  Every
+        barrier (upload, download, invalidate, load) still completes the
+        outstanding requests first, so the API stays synchronous where it
+        matters.  A version-2 or version-3 daemon returns ERR_UNSUPPORTED, and
+        nothing is armed.
+        """
+        if not getattr(self, "pipeline_supported", False):
+            return ERR_UNSUPPORTED
+        st = self.lib.vc4_pipeline_begin(self.ctx)
+        if st == VC4_OK:
+            self.pipeline_armed = True
+        return st
+
+    def pipeline_flush(self):
+        """Complete every request in flight; stays armed."""
+        if not self.pipeline_armed:
+            return VC4_OK
+        return self.lib.vc4_pipeline_flush(self.ctx)
+
+    def pipeline_end(self):
+        """Flush and disarm; returns the first failure, VC4_OK when clean."""
+        if not self.pipeline_armed:
+            return VC4_OK
+        st = self.lib.vc4_pipeline_end(self.ctx)
+        self.pipeline_armed = False
+        return st
+
+    def pipeline_watermarks(self):
+        """(newest submitted epoch, newest reaped epoch), for the pool."""
+        return (int(self.lib.vc4_pipeline_epoch(self.ctx)),
+                int(self.lib.vc4_pipeline_reaped(self.ctx)))
 
     def loaded_kernels(self):
         """Names of the blobs this context has loaded (see the C API)."""

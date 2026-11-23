@@ -72,8 +72,10 @@ struct vc4d_hdr {
 } __attribute__((packed));
 ```
 
-A reply always echoes magic/op/version/seq.  One request is outstanding per
-connection (the client library is synchronous).
+A reply always echoes magic/op/version/seq.  Up to version 3 one request is
+outstanding per connection (the client library is synchronous).  Version 4
+adds `SUBMIT`, of which a client may have two outstanding; see the op table
+and the note below it.
 
 | op | name | request payload | reply payload |
 |---|---|---|---|
@@ -157,6 +159,21 @@ counters and L2 write-back, all in one round trip.  The reply is
 `struct vc4d_wait_rsp` instead of `vc4d_launch_rsp`; no `WAIT` follows.  This
 is what the engine uses (`UNI_IN_ARENA | WAIT`), so a kernel costs one
 message.  The poll interval is 10 µs.
+
+**LAUNCH_BATCH** (13) and **SUBMIT** (14) carry an ordered list of launches and
+one completion: one entry is a launch or a device fence, every entry completes
+before the next is kicked, and the reply is one `vc4d_batch_item` per entry.
+`SUBMIT` executes exactly as `LAUNCH_BATCH` does; the difference is the
+connection contract.  A version-4 client may have `VC4D_SUBMIT_MAX` (2)
+`SUBMIT`s outstanding and must reap them in submission order, so it can prepare
+request N+1 while request N is being executed - the only overlap the hardware
+allows, since two daemons still serialise on the GPU lock.  A daemon that
+receives a second request while executing the first has it in its socket
+buffer already; it reads it when it is idle.  There is no id table and no
+accepted-but-unrun state in the daemon.  `HELLO` sets `VC4D_F_ASYNC_SUBMIT`
+for a client that may use it; a client may not mix an outstanding `SUBMIT`
+with a synchronous op, because the reply order would no longer identify the
+completion.  See [../docs/OVERLAP.md](../docs/OVERLAP.md).
 
 **ALLOC** also returns `bus`, the GPU bus address of the region's first byte;
 a client that builds pointer uniforms itself needs it.

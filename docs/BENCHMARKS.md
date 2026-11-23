@@ -258,10 +258,15 @@ runs on the QPU.
 | activation epilogue (relu/clip/silu folded into the GEMM store) | 1,003 → 536 launches; 550.0 → 468–473 ms; 1.82 → 2.13 FPS; the 467 removed launches price at 0.168 ms each, 79 ms |
 | one launch per concat input, node plan built once per run | 536 → 365 launches at 160 (468 → 297 at 128, 462 → 291 at 96); 432.5 ms, 2.31 FPS; 24–29 % less CPU per frame |
 
-Each pair is measured within its own window.  The launch counts here and the
-ones in §3 do not line up for the same change — §3 records 784 launches at
-1.2.4, while the epilogue was measured from 1,003 on a later tree — and that
-gap is left open rather than reconciled by guesswork.
+Each pair is measured within its own window, and launch counts are not
+comparable across the windows because they record different optimiser states and
+different counting methods.  §3's 784 belongs to a 1.2.4 package whose default
+fused SiLU at graph level; the epilogue's 1,003 is the plan of an unoptimised
+graph; a modelled count and a measured launch count are also not the same
+quantity.  The current figures, measured on silicon at 160, are **832 launches
+with no optimiser** and **332 with `passes="all"`** — the same graph, a 2.5x
+range, which is why a bare launch number in this document always names its
+state.
 
 
 ## 14. YOLO matrix: six families × five sizes × three resolutions

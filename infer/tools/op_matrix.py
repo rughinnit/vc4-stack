@@ -2663,11 +2663,18 @@ def main(argv=None):
     if gpu:
         require_checkout(__file__, allow_installed=args.allow_installed)
     repo = os.path.dirname(os.path.dirname(here))
-    out_dir = args.out_dir or os.path.join(repo, "docs")
-    os.makedirs(out_dir, exist_ok=True)
-
     tmp_root = os.environ.get("TMPDIR") or os.path.expanduser("~/scratch/tmp")
     os.makedirs(tmp_root, exist_ok=True)
+    # A side run must not rewrite the committed evidence: a partial sweep used
+    # to leave docs/completeness.json truncated to the rows it happened to run,
+    # which reads as a regression in the repository rather than in the runner.
+    out_dir = args.out_dir
+    if not out_dir:
+        out_dir = os.path.join(tmp_root, "opmatrix-out")
+        print("op_matrix: writing under %s; pass --out-dir %s to update the "
+              "repository evidence"
+              % (out_dir, os.path.join(repo, "docs")))
+    os.makedirs(out_dir, exist_ok=True)
     if args.work_dir:
         workdir = args.work_dir
         os.makedirs(workdir, exist_ok=True)

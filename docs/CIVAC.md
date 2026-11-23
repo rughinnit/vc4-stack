@@ -60,11 +60,32 @@ three warm-up frames, packaged daemon on `/run/vc4d.sock`, ARM 1.0 GHz,
 
 The pad allocates `per*nimg + NHWC_SLACK` and zeroes the whole `NHWC_SLACK`
 tail after the image, as an over-read guard for the im2col.  `NHWC_SLACK` is a
-flat 256 KiB per call, whatever the image.  YOLOv8n-160 makes 64 pad calls per
-frame (its conv and pool nodes, from shape inference), so the guard is
-**16.0 MB of the 17.3 MB** of zero fill; the border strips are 0.6 MB, and the
-interiors 4.9 MB (6.3 MB measured, the difference is the pool calls and the
-engine's decomposition).
+flat 256 KiB per call, whatever the image.
+
+**The three numbers this page has quoted about the zero fill are consistent,
+and the split is not what the first of them said.**  Per frame at 160, from the
+counters and from the node counts in the same run (`Conv` 64, `MaxPool` 3, so
+67 pad calls):
+
+| zero fill, YOLOv8n-160, per frame | guard | border | interior | total | ms |
+|---|---:|---:|---:|---:|---:|
+| original: whole padded image memset | 16.75 | 0.59 | 6.28 | **23.62** | 14.34 |
+| after border-only zeroing | 16.75 | 0.59 | 0 | **17.34** | 10.56 |
+| after sizing the guard (not built) | 1.39 | 0.59 | 0 | **1.98** | ~1.2 |
+
+The guard is `67 x 256 KiB`.  What identifies the rest is an exact identity:
+`23.62 - 17.34 = 6.28 MB`, and `pad_copy_bytes` in the same runs is 6.280 MB.
+So the border-only change removed **the interior pass** - the old form zeroed
+the whole image and then copied the interior over it - and the border itself
+was always about 0.6 MB, which is what shape inference says for these shapes
+(0.56 MB over 64 convs, plus the pools' small borders).
+
+The earlier text said "border-only writes removed 6.3 MB of border writes".
+That was wrong, twice: the 6.3 MB was interior, and the border is 0.6 MB.  Both
+23.62 and 17.34 were single-frame measurements at 160, not suite totals; the
+difference is the interior, not a different shape set.  The 3.3 ms that change
+bought was real, but it was buying back an interior pass that the old code
+wrote and immediately overwrote - not a border cost.
 
 What the im2col can actually read past the image is bounded: the last block of
 a row starts 16 output pixels before the end of the 16-aligned row, so its
@@ -72,7 +93,8 @@ source pixels reach `(Wg-1)*stride`; with `Wg <= wo+15` and `wo*stride <= wp`
 the read ends at most `15*stride+1` pixels past the row, and the taps of the
 last output row stay inside the padded image by construction.  One block step
 plus one padded row covers it.  Sized that way the same frame's guard is
-**1.27 MB** instead of 16.0 MB (largest single guard 78 KiB, C=512 at 7x7).
+**1.39 MB** instead of 16.75 MB (1.27 MB over the 64 convs, 0.12 MB over the 3
+pools; largest single guard 78 KiB, C=512 at 7x7).
 
 Host measurement of the two patterns (64 calls each, on a faulted-in anonymous
 mapping, `memset` through libc - no compiler, no QPU):
@@ -83,13 +105,14 @@ mapping, `memset` through libc - no compiler, no QPU):
 | 64 x bound guard | 1.27 MB | 0.74 | 1.72 |
 | plain `memset`, 17.3 MB | 17.3 MB | 10.35 | 1.75 |
 
-So the guard's 14.7 MB costs **8.5 ms per frame** at the memset rate the board
-delivers, and the firmware's `memset` is already at that rate for both the old
-and the new pattern - this is volume, not the store instruction.  8.50 ms of a
-404 ms frame is 2.1 %, i.e. 2.47 to 2.53 FPS at 160 if nothing else moves.  The
-smaller allocation also removes the same bytes from the scratch high-water
-mark, which is cleaned every request, so the dirty volume should fall with it
-(not measured yet).
+So the guard's 15.36 MB (67 calls, the frame's own count) costs **9.4 ms per
+frame** at the 1.64 GB/s the frame's zero fill actually delivers, and the
+firmware's `memset` is already at that rate for both the old and the new
+pattern - this is volume, not the store instruction.  9.4 ms of a 404 ms frame
+is 2.3 %, i.e. 2.47 to 2.53 FPS at 160 if nothing else moves.  The smaller
+allocation also removes the same bytes from the scratch high-water mark, which
+is cleaned every request, so the dirty volume should fall with it (not measured
+yet).
 
 The copy is at the plain `memcpy` rate for its sizes and has no headroom:
 per-shape, 0.72-1.8 GB/s against a plain `memcpy` of 1.17 GB/s, with the
@@ -111,18 +134,24 @@ and the CPU-write volume inside that:
 
 | writer | MB/frame | ms/frame |
 |---|---:|---:|
-| conv pad: zero-fill | 23.6 | 14.39 |
-| conv pad: interior copy | 6.3 | 5.73 |
+| conv pad: over-read guard (before §2.1) | 16.75 | 10.6 |
+| conv pad: border strips | 0.59 | 0.4 |
+| conv pad: interior copy | 6.28 | 5.7 |
 | weight panels, layout copies, elementwise | 3.5 | (inside the op times) |
 
-So of the 63.4 MB marked, 23.6 MB is the pad's zero-fill, 6.3 MB the pad's own
-copy, ~3.5 MB other CPU writes - and **~30 MB is the scratch high-water mark
-covering bytes the CPU never wrote** (GPU scratch: GEMM panels, im2col
-outputs).  Those 30 MB are cleaned too, at ~3 ms per frame, for nothing.
+So of the 63.4 MB marked, 23.6 MB was the pad's zero-fill at the time of this
+measurement - 16.75 of it the guard, 0.59 the border, 6.28 the interior pass
+that §2.1 explains - 6.3 MB the pad's own copy, ~3.5 MB other CPU writes, and
+**~30 MB is the scratch high-water mark covering bytes the CPU never wrote**
+(GPU scratch: GEMM panels, im2col outputs).  Those 30 MB are cleaned too, at
+~3 ms per frame, for nothing.  Sizing the guard also removes its 15.4 MB from
+that high-water mark, so the cleaned volume should fall with it (not measured).
 
-The pad is 73 % zeros: at 160 one pad writes 5.8 MB of which the border is
-4.2 MB.  The im2col kernel reads the whole padded image, so the bytes have to
-exist - but they do not have to be *stored* per conv node.
+Most of the pad's *stores* were zeros, but not because the border was large:
+at 160 one pad writes 256 KiB of guard plus its border, and the image itself is
+copied.  The im2col kernel reads the whole padded image, so the interior has to
+exist - but the guard does not have to be 256 KiB, and the interior does not
+have to be zeroed before it is copied over.
 
 ## 4. What was changed
 
@@ -132,6 +161,10 @@ im2col over-read needs) and then copy the interior over it.  It now zeroes only
 the strips the copy does not write: the top and bottom rows, the left and right
 columns of the middle rows, and the slack.  Same bytes afterwards, because the
 interior is copied over the same addresses.
+
+What this removed was the interior pass, not the border: 6.28 MB of the 23.62
+(§2.1).  The border strips it leaves behind are 0.59 MB.  The remaining 16.75
+MB of the zero fill is the guard, which is §2.1's second change.
 
 | imgsz | pad zero-fill base | after | wall, single frame base | after |
 |---:|---:|---:|---:|---:|

@@ -127,6 +127,9 @@ TMPDIR=${TMPDIR:-$HOME/scratch/tmp}
 mkdir -p "$TMPDIR"
 TMPDIR="$TMPDIR" python3 tests/test_artifact.py
 
+echo "=== test_runtime_env (no GPU: the daemon socket override)"
+TMPDIR="$TMPDIR" python3 tests/test_runtime_env.py
+
 echo "=== test_model_sums (no GPU: the shipped model manifest, a corrupted copy)"
 TMPDIR="$TMPDIR" python3 tests/test_model_sums.py
 

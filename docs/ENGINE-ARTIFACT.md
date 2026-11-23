@@ -54,7 +54,7 @@ hashed by `Artifact.verify()` — `vc4infer verify` — and by
 | `keys.arch`, `keys.engine_version` | reported, not checked |
 | `model` | graph sha256, inline-or-referenced, `.pt` export record, pass list with per-rule records, input and output specs |
 | `shapes` | the static shape map `coverage.refine_shapes` computed at build |
-| `plan` | `pool_bytes`, `segment_bytes`, `scratch_bytes`, `estimate_bytes`, `floor_bytes`, `high_water_bytes`, the allocation table, and (optional) `frozen`, the execution plan |
+| `plan` | `pool_bytes`, `segment_bytes`, `scratch_bytes`, `plan_bytes`, `permanent_bytes`, `temp_bytes`, `activation_bytes`, `reused_bytes`, `margin_bytes`, `floor_bytes`, `high_water_bytes`, the allocation table, `memory` (the liveness table), and (optional) `frozen`, the execution plan |
 | `weights` | packed-panel entries (offset into the weights section, bytes, sha256, panel key, kind, layout, shape) and `dropped` initializers |
 | `kernels` | blob names, sizes and sha256, embedded or referenced; the generator digest again |
 | `tuning` | `{"autotune": "off", "records": []}` — a field for `Engine.autotune` choices; autotuning is off by default and the loader does not invent records |
@@ -78,6 +78,23 @@ an allocation that is absent, a size that changed, an offset outside its
 segment, or two keys whose recorded offsets overlap while both are live.  That
 last check is the difference between a frozen plan and an unchecked recording:
 a plan whose lifetimes no longer match cannot quietly produce wrong numbers.
+
+The *size* of the pool is not taken from the recording.  It comes from the
+plan-time liveness pass (`plan.memory`): one live range per tensor, static
+offsets with reuse, and a peak known before the run.  The split is recorded as
+`permanent_bytes` (constants and panels), `temp_bytes` (one shared block for
+the per-node temporaries the graph cannot name), `activation_bytes` (the reused
+activation region) and `reused_bytes` (the bytes reuse saves against the sum of
+all ranges).  `margin_bytes` is the recorded run's furthest byte minus the
+plan; a negative value is the plan's headroom, a positive one is the part the
+graph could not name and the build measured.  `docs/OPTIMIZER.md` has the
+algorithm and the peak table.
+
+`plan.memory.ranges` is a row per placed buffer:
+`[name, kind, bytes, first_node, last_node, offset]`, sorted by offset.  It is
+data for a reader (`Artifact.memory_plan`) and for `vc4infer build`'s log; the
+loader does not need it, because the allocation table above is what pins the
+buffers.
 
 Segment bases come from the library's arena allocator, so the plan stores
 offsets *inside* a segment and rebases onto whatever base the load gets.  The

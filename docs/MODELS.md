@@ -193,12 +193,24 @@ Measured earlier, same board and protocol, from the 45-export sweep in
 | model | input | params | engine | CPU ms | VC4 ms | ratio | max scaled |
 |---|---|---|---:|---|---:|---:|---:|---:|
 | YOLOv8n | 3x160x160 | 3.2 M | **runs**, 802 launches | 108.2 | **521.0** | 4.8x | 3.1e-04 |
-| YOLOv8n | 3x320x320 | 3.2 M | refused at a 96 MiB arena (needs ~150) | — | — | — | — |
-| YOLOv8n | 3x640x640 | 3.2 M | no fit at 150 MiB either: 91 MiB working set plus conv pitch | — | — | — | — |
+| YOLOv8n | 3x320x320 | 3.2 M | **runs as an `--opt all` artifact in 60 MiB**, 512 launches; 8.6e-4 scaled | — | 836.7 | — | 8.6e-04 |
+| YOLOv8n | 3x640x640 | 3.2 M | refused at the first conv: `copy2d` lane stride overflows the 24-bit multiply | — | — | — | — |
+| YOLOv5s | 3x160x160 | — | runs at 150 MiB (raw graph), 1488 launches; accuracy off | — | 943.1 | — | 2.5 |
+| YOLOv8s | 3x160x160 | — | refused at run time: `up2_512` is 21440 B, over the 16384 B code slot | — | — | — | — |
+| YOLOv9s | 3x160x160 | — | runs at 150 MiB (raw graph), 6512 launches; accuracy off | — | 2430.4 | — | 4.1 |
 
 YOLOv8n at 160 is 0/44,100 elements over the 5e-4 tolerance against the CPU,
 max abs 1.5e-2, which is the logit range; the scaled figure is the meaningful
-one.  Detection coverage beyond YOLO is untouched by this page: no non-YOLO
+one.  The 320 row is the optimised artifact at a 60 MiB client arena; the raw
+graph returns the right detections with wrong values (16.1 scaled), so the
+artifact is the path that is recorded.  Its 8.6e-4 scaled is above the 5e-4
+gate used for the 160 row; it is the measured figure, not a pass claim.  The 640 row fits the memory plan
+(43.7 MiB pool plus 87.9 MiB scratch) but the row copy cannot address a 640
+input.  The v5s and v9s rows run on the raw graph at 150 MiB and fail the
+accuracy gate (2.5 and 4.1 scaled); they are recorded as runnable but not
+accepted, not as passes.  Their frame rates are not comparable with YOLOv8n's:
+different graphs, different work.  CPU timing was not re-measured for these
+cells.  Detection coverage beyond YOLO is untouched by this page: no non-YOLO
 detector was measured.
 
 ## Other tasks

@@ -50,13 +50,12 @@ bisected to one rewrite.
 3 | epilogue fusion | bias and activation folded into the GEMM/conv that produces the tile | 2-3 launches per conv |
 4 | layout assignment | keep packed NHWC between compatible nodes; convert only at boundaries | removes copy/transpose bandwidth |
 5 | weight prepacking | pack weights once at plan time into the arena layout | removes per-launch host work and repeated packing |
-6 | memory planning | one arena plan with buffer reuse and liveness, replacing per-op scratch growth | lowers peak arena; more models fit |
+6 | memory planning | plan-time live ranges per tensor, static offsets with reuse, one arena plan | lowers peak arena; more models fit |
 7 | launch batching | several kernels per daemon round-trip, or a persistent work queue | attacks the 222 ms directly |
 8 | kernel autotuning | QPU counts per shape (GEMM and its packer), recorded per generator | recorded per shape; see "Pass 8" |
 
-Passes 1-3 are graph rewrites on the Python side; 4 decides tensor layout in
-the graph and is read by the executor; 5 and 6 touch weight packing and arena
-planning; 7 needs runtime work in `vc4d` and the client; 8 is
+Passes 1-3 are graph rewrites on the Python side; 4 and 6 touch tensor layout
+and arena planning; 7 needs runtime work in `vc4d` and the client; 8 is
 measurement-driven and must be recorded per shape.
 
 ## Correctness gates
@@ -255,9 +254,9 @@ because the digest changes.
 - no change to the operator semantics or the coverage denominator;
 - no hidden host computation.
 
-## Implementation: phases A to C
+## Implementation: phases A and B
 
-Phases A to C are in `infer/python/vc4infer/optimizer/`.  Every pass is off by
+Phases A and B are in `infer/python/vc4infer/optimizer/`.  Every pass is off by
 default; the pipeline is selected with `VC4_OPT` or `Engine(..., passes=...)`:
 
     VC4_OPT=canonicalise        # one pass
@@ -348,18 +347,10 @@ YOLOv8n-160, modelled:
 
 | | nodes | dispatches | launches |
 |---|---:|---:|---:|
-| baseline | 263 | 206 | 785 (679 exact + 106 copy over 36 nodes) |
-| after canonicalise | 252 | 195 | 785 |
-| after ew | 252 | 195 | 785 |
-| after epilogue | 252 | 138 | 318 (212 exact + 106 copy) |
-| after layout | 252 | 138 | 285 (212 exact + 73 copy over 35 nodes) |
-
-The copy class is priced per node from the executor's own conversion rules:
-a `Reshape` on a pitched NHWC tensor costs the `_to_nchw_buf` calls its stored
-extent needs (33 for the 1-channel DFL plane, 2 for 20 columns, 1 for 10), not
-a flat one.  That is why the baseline is 785 here rather than the 752 quoted
-before the layout pass existed: the old model undercounted the six box-head
-conversions by 33 launches, and the layout pass removes exactly those.
+| baseline | 263 | 206 | 752 (679 exact + 73 copy) |
+| after canonicalise | 252 | 195 | 752 |
+| after ew | 252 | 195 | 752 |
+| after epilogue | 252 | 138 | 285 (212 exact + 73 copy) |
 
 Two honest notes on that table:
 
@@ -368,15 +359,15 @@ Two honest notes on that table:
   is a startup and debugging win, not a speed win;
 - the ew pass changes no launch *because the executor already fused SiLU*
   (`Runner._find_silu`).  With `VC4_NO_SILU_FUSE=1` and no pass the same graph
-  plans 1252 launches; with the pass the plan stays at 785 and the rewrite is
+  plans 1219 launches; with the pass the plan stays at 752 and the rewrite is
   recorded in the graph, which is what makes it switchable and bisectable.
   With the pass on, the 467 SiLU launch sets are a recorded graph rewrite
   instead of a special case in `Runner._find_silu`;
 - the epilogue pass then moves those 57 pairs into the conv that produces
   them.  It needs the ew pass: the pattern it matches is a `Mul` carrying the
   `silu` record, because that is what names the tensor the activation reads.
-  `VC4_OPT=all,-epilogue` and `VC4_OPT=all,-ew` both stay at 752 launches
-  (785 minus the layout pass's 33), which is the bisection switch.
+  `VC4_OPT=all,-epilogue` and `VC4_OPT=all,-ew` both stay at 752 launches,
+  which is the bisection switch.
 
 ### The activation epilogue
 
@@ -452,98 +443,6 @@ scale with the launch count).  In FPS terms: **1.82 -> 2.13**.
 The projection therefore over-stated the gain.  The read/write saving from not
 materialising the activation plane twice is included in the 79 ms; it is not
 separable from the launch cost with this measurement.
-
-### Pass 4: layout assignment
-
-ONNX has no tensor-format field: the graph is NCHW by definition, while the
-executor stores a conv's output packed NHWC (`[n][h][pitch][c]`) and converts
-at the use site.  `layout` makes that choice explicit instead of leaving it to
-each node: one forward walk assigns every tensor `nhwc/<pitch>` or `nchw`,
-records the map on one line of the model doc_string, and names every edge
-where a reader still needs the other form.
-
-The rules are the executor's dispatch table, not ONNX's semantics:
-
-| tensor | layout |
-|---|---|
-| `Conv` on the NHWC path | NHWC, pitch `align16(Wo)` (`Wo` when Cout is trimmed back) |
-| elementwise/unary, `Split`, `Slice`, `Resize` | the operand's form, unchanged |
-| `Reshape`, `Flatten`, `Squeeze`, `Unsqueeze`, `Transpose`, `MatMul`, `Gemm`, `GlobalAveragePool`, `Softmax`, `Cast`, `Div`, `Gather*` | NCHW; an NHWC operand is converted once, at that node |
-| `Concat` | NHWC only when every input is NHWC, else the host path |
-| `MaxPool` | NHWC only for the kxk stride-1 ring kernel |
-| graph input and output | NCHW, the ONNX boundary |
-
-A conversion is not inserted as an ONNX node.  A `Transpose` is defined on the
-logical NCHW shape, so inserting one would permute the values as well as
-relabel them and would change every consumer's shape; the engine's conversion
-is `to_nhwc`/`_to_nchw_buf` inside the consuming node.  The pass therefore
-records where that copy happens, and removes it where the two forms are the
-same bytes.
-
-That equivalence is what pays on YOLOv8n: a 1-channel NHWC plane with
-`pitch == W` is byte-identical to NCHW, so the pass names it NCHW at the
-producer and the executor relabels the buffer after the node instead of
-converting it at the consumer.  `Runner._collect_layout` reads the record;
-`_relabel_outputs` changes the label only when the runtime tensor really is
-`[n][1][h][w]` with `pitch == w`, so a stale or wrong record cannot move a
-byte.  A model without the record runs exactly as before.
-
-Measured on the board (2026-11-23, rebased tree `920a683` plus this pass, 96
-MiB client arena, one client, three interleaved rounds):
-
-| imgsz | `all,-layout` | `all` | removed |
-|---:|---:|---:|---:|
-| 96 | 291 | 279 | 12 |
-| 128 | 297 | 276 | 21 |
-| 160 | 365 | 332 | 33 |
-
-The count is `ceil(anchors/16)`: the DFL plane is 4x189, 4x336 and 4x525
-anchors at the three sizes.  Outputs are **bit-identical** at every size in
-every round (`np.array_equal`), and against the shipped references the corpus
-is 0 over tolerance: modelA/B/C at 4.8e-6, 4.4e-6 and 4.1e-7 max abs, YOLOv8n
-at 2.04e-2 / 2.24e-4 and 0/44,100, `bus.jpg` with 4/4 detections, the same
-classes, 2.2e-4 px box difference.
-
-At 160 the frame goes from 470.5 to 465.9 ms (**-1.0 %**) and total CPU from
-0.264 to 0.260 s (**-1.4 %**, daemon CPU -1.9 %); at 96 and 128 the wall and
-CPU delta is inside the run-to-run spread.  The per-size table, the protocol
-and the copy-row accounting are in `docs/CPU-BREAKDOWN.md` sec. 3.3.
-
-**Default: included in `all`.**  It removes launches at every size, its output
-is bit-identical, and it is free at 96/128 and 1 % faster at 160.  The gain is
-small because these are the cheapest copies in the frame -- four rows by 16
-words -- and the 73 copy launches that remain are concat/split/head-reshape
-data movement, not relabels.
-
-The copy-row table at 160, modelled from the executor's own conversion rules.
-The pass removes one row and 33 launches; every other row is unchanged:
-
-| copy row | before | after | what it is |
-|---|---:|---:|---|
-| `/model.22/dfl/Reshape_1` (from `dfl/conv`) | 33 | 0 | NHWC->NCHW of a 1x1x4x525 plane; identical bytes |
-| 13 C2f/SPPF `Concat` | 38 | 38 | channel concat, a real copy |
-| 8 `Split` | 16 | 16 | channel split, a real copy |
-| 3 SPPF `MaxPool` | 6 | 6 | border fill + interior copy |
-| 2 `Resize` | 2 | 2 | nearest upsample |
-| 6 box-head `Reshape` | 8 | 8 | NHWC->NCHW before the anchor concat |
-| `dfl/Transpose` | 1 | 1 | permute before the class softmax |
-| 2 `Slice` | 2 | 2 | box-coordinate slices |
-| **total** | **106** | **73** | 36 copy nodes -> 35 |
-
-Conversions that stay, with the reason:
-
-| edge | calls | reason |
-|---|---:|---|
-| `images -> /model.0/conv/Conv` | 1 | the graph input is ONNX NCHW at the boundary |
-| 6 box-head `Conv -> Reshape` | 8 | the anchor concat is written on `[1,64,525]`; the conv GEMM writes pixel-major, so the reorder is real |
-| `dfl/Softmax -> dfl/conv` | 1 | the 1x1 GEMM's im2col wants packed channels |
-| `dfl/conv -> dfl/Reshape_1` | 33 | removed: 1-channel plane, byte-identical order |
-
-On the other shipped models the pass plans no change (modelA, modelB,
-modelC): their graphs have no equivalent-layout conversion and no elementwise
-chain that would otherwise convert.  Its gate is therefore the launch delta
-above, the corpus parity and the operator sweep, not a corpus-wide launch
-count.
 
 ### Gates on silicon
 
@@ -657,11 +556,10 @@ launch-accounting gate.
 | merging two independent elementwise launches | they are sequential in the graph; batching them is phase D (daemon round-trips), not a graph rewrite |
 | `MatMul/Gemm + Add` -> `Gemm` with C | `Runner._gemm` materialises C and adds it with a separate `vc4_elementwise` call, so the rewrite saves no launch; not implemented rather than sold as one |
 | silu in the asm10 matmul epilogue | the 8x64 tile has one B register left after the k loop and silu needs twelve (`docs/KERNELS.md` sec. 7.4); the conv GEMM has 19, which is where every YOLOv8n pair lives |
-| anchor-major DFL head | the box-head `Reshape`/`Concat`/`Transpose` copies are structural: keeping the anchor axis outer would change the ONNX shapes the head is written in (and the exported output), so it is a head rewrite rather than a layout assignment |
-| autotuning | phase E; not part of this merge |
+| layout assignment, autotuning | phases C-E; not part of this merge |
 | weight prepacking and the arena plan | delivered as the engine artifact (`docs/ENGINE-ARTIFACT.md`): packed panels, fixed offsets and the kernel list are built once and loaded, which removes the packing work from every process start |
 
-## Passes 5 and 6: the engine artifact
+## Passes 5 and 6: prepacking, liveness and the arena plan
 
 Passes 5 and 6 are not graph rewrites and do not change what a node computes:
 they decide where the bytes live and when they are packed.  They are delivered
@@ -672,73 +570,164 @@ useful if it can be written once and loaded:
   build time and stored; the loader uploads it into its recorded slot.  The
   pack launch and the host permutation run once per build, not once per
   process;
-- **memory planning**: one keyed allocation table replaces the per-run bump
-  allocator and free list.  Every constant, panel, input and node buffer has a
-  recorded offset and size; the loader pins them and refuses a plan whose
-  lifetimes no longer match.
+- **memory planning**: a plan-time liveness pass (`optimizer/memory.py`)
+  computes a live range per tensor - first definition to last *consumer* - and
+  assigns static, non-overlapping offsets with reuse.  The plan's peak sizes
+  the graph pool and is carried in the artifact (`plan.memory`); the artifact's
+  keyed allocation table pins the run to the offsets the build recorded.
 
 Measured on YOLOv8n at 160 (bit-exact outputs, same 536 steady-state launches):
 load 3.21 s -> 0.48 s, first run 1.78 s -> 1.46 s, steady state unchanged.
 `docs/ENGINE-ARTIFACT.md` has the format, the key checks and the full table.
 
 The artifact is additional to the pass pipeline in this document: the graph it
-contains is the graph these passes produced.  Autotuning remains phase E.
+contains is the graph these passes produced.  Layout assignment and autotuning
+remain phases C-E.
 
+### Pass 6: live ranges and static offsets
 
-## Pass 7: the frozen execution plan
+`optimizer/memory.py` is the pass.  It reads the graph and nothing else:
 
-Passes 1 to 4 rewrite the graph; passes 5 and 6 decide where its bytes live.
-What none of them removes is the per-node Python that *executes* the result:
-the dispatch table, the attribute reads, the Tensor and pool bookkeeping, the
-liveness pass.  That work is a decision about the graph, and the graph does
-not change between frames, so it is made once and replayed.
+    plan = optimizer.plan_memory(model, shapes)
+    plan.peak_bytes                 # the pool the next run needs
+    plan.offsets["/model.0/..."]    # the tensor's static offset
+    print(plan.format())
 
-This is not a graph pass and it does not change a node: it records the device
-calls the optimised graph makes and replays them in C.  It lives in
-`infer/python/vc4infer/_plan.py` and `infer/src/vc4_plan.c`; the design, the
-boundary and the coverage on YOLOv8n-160 are in
-[CPU-BREAKDOWN.md](CPU-BREAKDOWN.md) section 6.
+    python3 infer/tools/mem_plan.py MODEL --legacy --verbose
 
-What matters here is how it consumes this pipeline.  The recording is taken
-from a frame that has already honoured every marker:
+It plans four kinds of buffer:
 
-* a node in `_skip` (a fused activation, the Sigmoid of a SiLU pair) is
-  recorded as a zero-cost step, exactly as the loop skipped it;
-* an `_alias` entry (the fused activation's output name moved onto the
-  producer's buffer) becomes an `ALIAS` record, so the output name still
-  resolves to the right buffer without a copy;
-* the layout map (`_collect_layout`) is already applied, so a relabelled
-  1-channel plane is an alias rather than a conversion;
-* the epilogue's activation is inside the conv's `act` argument, so the
-  activation is part of the Python conv step, not a separate record.
+| kind | live range | notes |
+|---|---|---|
+| `const:` | whole run | float initialisers; an artifact's panel-backed weights are excluded |
+| `panel:` | whole run | the k-major NHWC conv panel, `align16(Cout) * (align16(align16(Cin)*kh*kw) + 16) * 4` |
+| `input:` | start .. last consumer | a graph input |
+| `activation:` | producer .. last consumer | a graph output lives to the end |
 
-The plan does not re-derive any of those decisions, which is the point: a
-pass that changes what the executor does changes the recording automatically,
-and a node whose new call is not on the representable list falls back to the
-Python path by itself.
+Three things make the peak a property of the graph rather than of a run:
 
-The relationship to the engine artifact (passes 5 and 6) is that the two
-freeze different things.  The artifact freezes the graph, the panels and the
-arena offsets into a file that a later process loads; the plan freezes the
-sequence of calls one process makes over those offsets.  A loaded artifact
-already pins its arena plan, so the runner does not build a plan on that path:
-two pinned allocators describing the same buffer would be one too many.  A
-plain ONNX run builds the plan on its first frame, which is why the build cost
-(+107 ms on the 160 graph, measured with the device calls stubbed) is paid
-once per `Runner` and not once per process start.
+- **real last use.**  The old estimator recorded a tensor's *producer* in the
+  last-use map as well, so nothing was ever freed by the walk and the "peak"
+  was the sum of every activation.  The pass records only consumers, so a
+  tensor dies at the node that reads it and its bytes are free for the next.
+- **views are aliases.**  `Reshape`/`Flatten`/`Squeeze`/`Unsqueeze`/`Identity`/
+  `Cast` hand the input buffer on; planning a buffer for their output would
+  double-count it.  A fused activation's output aliases the conv's buffer, and
+  a fused SiLU's `Sigmoid` output is not allocated at all.
+- **one shared scratch block.**  The graph does not name the temporary a node
+  allocates while it runs (a layout copy, a GEMM operand pack, the raw weight
+  upload while a conv panel is built).  The pass reserves one block for it:
+  the larger of the largest raw conv weight and the largest copy-size of an op
+  that copies (a layout conversion, a gather, a softmax row copy).  The block
+  is shared by every node because the executor releases every per-node
+  temporary when it finishes; it is a maximum, not a sum.  A graph with no
+  copy op and no conv reserves nothing.
 
-A plan is only recorded from a frame that allocates no buffer outliving it.
-A panel packed in the middle of a frame can take a range an earlier node has
-released; replaying that node then writes over the panel.  This is the
-`dfl/Softmax` failure of the first silicon run, and it is why the recording
-frame for a conv model is the second one (`runner.cplan_deferrals` counts the
-deferred frames) and why `Runner._replay_safe` refuses a recording in which a
-per-frame allocation overlaps a persistent buffer (`runner.plan_error`).
+Offsets are assigned by a linear scan sorted by first definition.  Ranges whose
+last use is behind the scan are released into a free list, a range takes the
+first gap that fits, and the bump pointer moves only when no gap does.  That is
+the runtime free list's own first-fit policy applied once, to a known set of
+ranges, so the layout is deterministic.  The peak is the furthest planned byte.
+The pool asks for the peak plus a headroom of one eighth of it, capped at 1 MiB
+(64 KiB floor), for the executor's unnameable temporary and alignment; the
+build records how far the real run differed (`plan.margin_bytes`).
 
-Correctness and the measured delta are in CPU-BREAKDOWN.md 6.5-6.7.  The
-byte-for-byte gate on the real models is `tools/cost/check_plan_equiv.py` and
-`infer/tests/test_cplan_gpu.py`, both on the board; the CPU-side gates are
-`infer/tests/test_cplan.py` (build, the panel-deferral and overlap rule,
-fallback boundary, equivalence on synthetic graphs, and the structure of the
-real 160 graph) and `infer/build/test_plan` (the C walker's decoding and
-stop-on-error rule, with a hook instead of the device).
+#### Peak before and after
+
+MiB, measured on the board with the raw graph (`Engine(path)`, no `VC4_OPT`),
+which is the graph the matrix and the A/B use.  "before" is the old pool
+(`VC4_NO_MEM_PLAN=1`); "peak" is the liveness plan's modelled steady-state
+peak; "pool" is what the run actually allocated, first segment plus the
+increment the allocator added when a request no longer fitted a gap; "board"
+is `Engine.memory()["peak_mb"]`; "seg" is `pool_segments`.
+
+| model | before | peak | pool | board | seg |
+|---|---:|---:|---:|---:|---:|
+| YOLOv8n 96 | 31.69 | 25.82 | 26.82 | 25.07 | 1 |
+| YOLOv8n 128 | 35.48 | 26.06 | 28.06 | 25.59 | 2 |
+| YOLOv8n 160 | 41.60 | 26.81 | 29.37 | 26.65 | 2 |
+| modelA | 0.80 | 0.87 | 0.98 | — | — |
+| modelB | 0.65 | 0.74 | 0.83 | — | — |
+| modelC | 0.04 | 0.04 | 0.10 | — | — |
+
+The plan is an upper bound on the steady-state peak at every size (0.16-0.75
+MiB of slack).  A plain load can still add one second segment at 128 and 160:
+the plan is right about the peak, but the runtime's first-fit free list can
+leave no single gap for the next 1-1.6 MiB request even when the live total
+fits.  The increment is now the request (`Pool._ensure`), not the fixed 4 MiB
+it used to be, so the penalty is 1.0-1.6 MiB rather than 4 MiB.  The engine
+artifact does not pay it: its offsets are pinned, so YOLOv8n-160 loads in one
+15.01 MiB segment.
+
+On the graph the passes produce, the plan peaks are 25.93/26.25/27.00 MiB at
+96/128/160 (first segment 26.93/27.25/28.00).  The three shipped selftest
+models are small: their copy block is bigger than the old estimate's slack, so
+the plan is a few KiB larger, not smaller.  Planning changes capacity, not
+speed: no launch or kernel moves, and the A/B FPS is unchanged within the
+board's run-to-run variation.
+
+The 24.39 MiB of permanent weights and panels dominates every YOLO row: the
+largest saving available from liveness alone is the 8.7 MiB of activation
+bytes that reuse removes at 160 (12.2 MiB on the unoptimised graph).  One
+additional buffer the old estimate missed is the conv's padded NHWC input
+copy: 1.56 MiB at 160 for the 3-channel image, because `to_nhwc` pads Cin and
+W to 16.  An artifact drops the raw weight copies (the panels replace them),
+so its plan is 14.97 MiB instead of 27.00 and its pool is one 15.01 MiB
+segment.
+
+#### What the plan is used for
+
+- a plain ONNX load sizes its first pool segment from `plan.pool_bytes` (the
+  peak plus the capped headroom, `_plan_pool_bytes`); a short plan grows by
+  another segment, which `Engine.memory()["pool_segments"]` reports rather than
+  hides;
+- `vc4infer build` records the table under `plan.memory` (`peak_bytes`,
+  `permanent_bytes`, `temp_bytes`, `activation_bytes`, `reused_bytes`, and a
+  `[name, kind, bytes, first, last, offset]` row per buffer), and records the
+  run's furthest byte as `plan.margin_bytes` against the plan;
+- `vc4infer build` and `vc4infer verify` print the peak and its split;
+- `Engine.memory()` reports `plan_mb`, `permanent_bytes`, `temp_bytes`,
+  `activation_bytes` and `reused_bytes` beside the measured peak.
+
+#### The 150 MiB question
+
+The 35 matrix cells the old estimate refused were re-planned; the five that
+were measured at 150 MiB have pool-plus-scratch totals of 52.2 (v8n320), 65.4
+(v9s160), 83.0 (v5s160), 98.2 (v8s160) and 131.6 MiB (v8n640), and all five
+plan under a 145 MiB client.  Capacity is not correctness:
+
+- **v8n320** is the cell that moved.  Its raw graph returns the right
+  detections with wrong values (16.1 scaled against ONNX Runtime CPU); the
+  `--opt all` artifact is within 8.6e-4 and needs 22.96 MiB of pool plus 22.20
+  of scratch, so it runs in the default 64 MiB arena with no private daemon.
+- **v5s160** and **v9s160** run on the raw graph at 150 MiB (943 ms and
+  2430 ms, 1.06 and 0.41 FPS) but fail the accuracy gate at 2.52 and 4.09
+  scaled.  The plan made them fit; it did not make them right.
+- **v8s160** plans at 98.2 MiB and then refuses at run time because the
+  512-channel upsample kernel is 21440 B and the client code slot is 16384 B.
+- **v8n640** plans at 131.6 MiB and then refuses in the first conv because
+  `copy2d`'s lane stride, 1638400 x 15, overflows the 24-bit address
+  multiply.
+
+The measured table is in `docs/BENCHMARKS.md` sec. 14.  The reduction is a
+capacity result: the FPS of these larger graphs is not comparable with
+YOLOv8n-160 and no row claims it is.
+
+#### Limits
+
+- the plan assigns offsets and sizes the pool; the offsets that pin a run are
+  the ones the build *recorded*, checked against the plan's peak.  Making the
+  planned offsets the pinned ones would require naming every per-node temporary
+  from the graph, which is the same model the scratch block approximates;
+- the plan is a capacity change only.  It does not move a launch, a copy or a
+  kernel, and no FPS number in `docs/BENCHMARKS.md` is claimed from it;
+- the scratch block is a model, not a measurement: it is two largest tensors
+  or the largest raw conv weight, whichever is bigger, and the build records
+  the margin by which the real run differed.  On YOLOv8n-160 the run's furthest
+  byte is within the plan; on a model with an op the block does not describe,
+  the pool grows by a segment rather than failing.
+- a graph output is conservatively live to the end of the graph, so a model
+  that produces several large outputs pays for all of them at once;
+- the plan does not model the engine's own scratch (the conv padded image and
+  im2col panel), which lives above the pool and is sized separately by
+  `estimate_scratch_bytes`.

@@ -304,6 +304,47 @@ def test_pinned_pool(tmp):
     check(ok and "in the plan" in text,
           "plan: a size that changed since the build is refused", text)
 
+    # two tensors with disjoint lifetimes may share one offset: the plan
+    # releases a's range, then c is placed at the same bytes
+    reuse = {"a#0": (0, 0, 128), "c#0": (0, 0, 128)}
+    keys[:] = []
+    pool = Pool(eng, 4096, pin=reuse, segment_bytes=[4096], labeler=label)
+    keys[:] = ["a#0"]
+    a = pool.alloc(100)
+    pool.release(a)
+    keys[:] = ["c#0"]
+    c = pool.alloc(100)
+    check(c.off == a.off,
+          "plan: a released buffer is reused at the same offset")
+
+
+def test_memory_plan_carried(tmp):
+    p = os.path.join(tmp, "mem.vc4x")
+    make_container(p)
+
+    def add(m):
+        m["plan"].update({
+            "plan_bytes": 8192, "permanent_bytes": 4096,
+            "temp_bytes": 1024, "activation_bytes": 3072,
+            "reused_bytes": 4096, "margin_bytes": -128,
+            "memory": {"planner": "liveness", "peak_bytes": 8192,
+                       "permanent_bytes": 4096, "temp_bytes": 1024,
+                       "activation_bytes": 3072, "reused_bytes": 4096,
+                       "ranges": [["A", "activation", 2048, 0, 1, 4096],
+                                  ["B", "activation", 2048, 0, 1, 4096]]}})
+
+    tamper(p, add)
+    a = art.Artifact.load(p)
+    check(a.memory_plan.get("planner") == "liveness",
+          "memory: the liveness table is carried in the manifest")
+    check(a.pool_plan["plan_bytes"] == 8192 and
+          a.pool_plan["activation_bytes"] == 3072,
+          "memory: the plan's split survives pool_plan", a.pool_plan)
+    check(a.pool_plan["memory"]["ranges"][0][0] == "A",
+          "memory: per-tensor offsets are readable from the artifact")
+    check(art.Artifact.load(os.path.join(tmp, "ok.vc4x")).memory_plan == {},
+          "memory: an older artifact reports no table instead of guessing")
+
 
 # ----------------------------------------------------- dropped initializers
 def conv_model(shared=False):
@@ -477,8 +518,8 @@ def main():
     try:
         for fn in (test_roundtrip, test_container_damage, test_section_hash,
                    test_keys, test_referenced_graph, test_pinned_pool,
-                   test_dropped, test_seed_cache, test_exec_state,
-                   test_frozen_plan):
+                   test_memory_plan_carried, test_dropped, test_seed_cache,
+                   test_exec_state, test_frozen_plan):
             print("-- %s" % fn.__name__)
             fn(tmp)
     finally:

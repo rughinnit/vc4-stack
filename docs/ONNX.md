@@ -273,10 +273,15 @@ the only things that compute on the ARM, and they compute *integers* (shape
 bookkeeping), never activation values.
 
 **A graph memory planner.**  `libvc4infer` has no `free()`, so the runner
-carves every activation out of one pool allocation and recycles it by ONNX
-liveness (last consumer).  YOLOv8n's peak pool use at 160x160 is **26.6 MiB**
-of a 40 MiB pool (12.3 MiB of that is the weights) instead of growing past the
-64 MiB arena.
+carves every activation out of one pool allocation and recycles it by live
+range (first definition to last consumer).  A plan-time pass
+(`optimizer/memory.py`) computes those ranges, assigns static offsets with
+reuse and sizes the pool from the peak: YOLOv8n at 160x160 plans a **26.81
+MiB** steady-state peak (24.39 MiB of that is weights and packed panels, and
+1.56 MiB is the conv's padded NHWC input copy) instead of the 41.6 MiB the old
+estimate reserved; the measured peak is 26.65 MiB.  The plan is carried in the
+engine artifact, where the raw weights are replaced by panels and the plan is
+14.97 MiB; `docs/OPTIMIZER.md` has the table at 96/128/160.
 
 ### 7.2 Engine bugs found and fixed on the way
 

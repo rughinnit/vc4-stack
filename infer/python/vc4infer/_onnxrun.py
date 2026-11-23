@@ -233,86 +233,27 @@ def _init_shape_map(graph):
     return out
 
 
-def estimate_pool_bytes(model, shapes=None):
-    """The graph pool's peak demand in bytes, computed from the graph itself.
+def estimate_pool_bytes(model, shapes=None, dropped=()):
+    """The graph pool's peak demand in bytes, from the plan-time liveness pass.
 
     The pool holds three things at once:
 
       * every float initialiser, uploaded once and kept for the whole run
-        (``Runner.values``);
-      * the live activations of the moment with the largest fan-out, from an
-        ONNX liveness walk (first use .. last use);
+        (``Runner.values``) - minus the ones the artifact path stores only as
+        packed panels (``dropped``);
       * the packed NHWC weight panels, built on a conv's first use and cached
-        in ``Runner._panels`` (never freed), plus the transient copy of a
-        weight while its panel is built.
+        in ``Runner._panels`` (never freed);
+      * the live activations of the moment with the widest simultaneous
+        fan-out, from a live range per tensor (first definition .. last
+        consumer), plus one two-tensor scratch block for the per-node copies
+        the graph cannot name.
 
-    It is a plan-time *estimate*: good to within a few percent on the selftest
-    models, and the pool grows by another segment if it was short (Pool.alloc),
-    so an under-estimate costs a reallocation, not a failure.  The point is
-    that the pool is sized from the model instead of from the arena with an
-    8 MiB floor (G10).
+    ``optimizer.memory.plan_memory`` computes the ranges, assigns offsets with
+    reuse and returns the peak.  This function is the size, not the layout; a
+    caller that wants the table calls ``plan_memory`` directly.
     """
-    from . import coverage
-
-    graph = model.graph
-    if shapes is None:
-        shapes, _ = coverage._shape_map(model)
-    init = _init_shape_map(graph)
-
-    def shp(name):
-        s = shapes.get(name)
-        return s if s else init.get(name)
-
-    perma = 0
-    for init_t in graph.initializer:
-        if _is_float_init(init_t):
-            perma += _align(_numel_proto(init_t) * 4) + 64
-
-    # conv panels + the transient weight upload they need
-    panels = 0
-    transient = 0
-    for n in graph.node:
-        if n.op_type != "Conv" or len(n.input) < 2:
-            continue
-        ws = shp(n.input[1])
-        if not ws or len(ws) != 4 or any(d <= 0 for d in ws):
-            continue
-        ks, st, pd, dl, gp = _conv_attrs(n)
-        cout, cin = int(ws[0]), int(ws[1]) * gp
-        kh, kw = (int(ks[0]), int(ks[1])) if ks else (int(ws[2]), int(ws[3]))
-        cpad, opad = _align16(cin), _align16(cout)
-        panels += opad * (_align16(cpad * kh * kw) + 16) * 4
-        transient = max(transient, _align(opad * cpad * kh * kw * 4) + 64)
-
-    first, last = {}, {}
-    for idx, n in enumerate(graph.node):
-        for t in n.input:
-            if t:
-                first.setdefault(t, idx)
-        for t in n.output:
-            if t:
-                last[t] = idx
-
-    live = 0
-    peak = perma
-    sizes = {}
-    for idx, n in enumerate(graph.node):
-        for t in n.input:                       # free what dies here
-            if t and last.get(t) == idx:
-                live -= sizes.pop(t, 0)
-        extra = 0
-        for t in n.output:
-            if not t or t in init:
-                continue        # an initialiser is already in `perma`
-            b = _tensor_bytes(shapes.get(t), nhwc=(n.op_type == "Conv"))
-            if not b:
-                continue
-            sizes[t] = b
-            live += b
-        if n.op_type == "Conv" and len(n.input) > 1:
-            extra = transient
-        peak = max(peak, perma + live + extra)
-    return int(peak + panels)
+    from .optimizer.memory import plan_memory
+    return int(plan_memory(model, shapes, dropped=dropped).peak_bytes)
 
 
 def estimate_pool_floor(model, shapes=None):
@@ -539,7 +480,7 @@ class Pool:
                 return seg
         # short estimate: grow by at least the request (halved inside
         # _add_segment if the arena cannot give that much at once)
-        self._add_segment(max(n, 4 << 20))
+        self._add_segment(max(n, self.MIN_SEG))
         seg = self.segs[-1]
         if len(self.segs) and seg[1] < n:
             raise self._exhausted(n)
@@ -981,6 +922,7 @@ class Runner:
         self._folded = {}             # name -> numpy, plan-time resolved
         self._folded_idx = set()
         self._prepared = False
+        self.memory_plan = None      # optimizer.memory.MemoryPlan, when planned
         self._host_eval = None
         self._coverage_report = None
         self._backends = None
@@ -1576,20 +1518,42 @@ class Runner:
 
     # ------------------------------------------------------------- rewrites
     def _plan_pool_bytes(self):
-        """Bytes the graph pool must be able to hold, from the graph itself.
+        """Bytes the graph pool must be able to hold, from the liveness plan.
 
         Returns (need, plan).  `need` is the size of the first pool segment:
-        the model's estimated peak (weights + live activations + cached conv
-        panels), clamped to what the arena can give beside the engine's own
-        scratch.  A model that cannot fit at all is refused *here*, at plan
-        time, with both numbers - that is the difference between
-        "graph pool exhausted ... of 8388608 B" (which looks like a model
-        problem) and "needs 30.2 MiB, arena is 24.0 MiB".
+        the peak of ``optimizer.memory.plan_memory`` (permanent constants and
+        panels + the live activations + one per-node scratch block), clamped
+        to what the arena can give beside the engine's own scratch.  A model
+        that cannot fit at all is refused *here*, at plan time, with both
+        numbers - that is the difference between "graph pool exhausted ... of
+        8388608 B" (which looks like a model problem) and "needs 30.2 MiB,
+        arena is 24.0 MiB".
+
+        The plan is kept on the runner: ``self.memory_plan`` is the full table
+        (live range and static offset per tensor) and ``plan["memory"]`` is its
+        manifest form.  Sizing counts every initialiser: a build's recording
+        run then shrinks the artifact's single segment to the furthest byte it
+        actually used, after the artifact's own (weight-dropped) plan is
+        recorded in the manifest.
         """
+        from .optimizer.memory import legacy_pool_bytes, plan_memory
+
         shapes = getattr(self, "shapes", None)
         if shapes is None:
             shapes = coverage.refine_shapes(self.model)
-        peak = estimate_pool_bytes(self.model, shapes)
+        if os.environ.get("VC4_NO_MEM_PLAN"):
+            # A/B control: the pre-liveness estimate, which counts every
+            # tensor to the end of the graph (docs/OPTIMIZER.md).
+            peak = legacy_pool_bytes(self.model, shapes)
+            pool_need = int(peak)
+            self.memory_plan = None
+            memory = {"planner": "legacy", "peak_bytes": int(peak)}
+        else:
+            mem = plan_memory(self.model, shapes)
+            self.memory_plan = mem
+            peak = int(mem.peak_bytes)
+            pool_need = int(mem.pool_bytes)
+            memory = mem.as_dict()
         floor = estimate_pool_floor(self.model, shapes)
         scratch = estimate_scratch_bytes(self.model, shapes)
         env = os.environ.get("VC4_POOL_RESERVE_MB")
@@ -1610,11 +1574,18 @@ class Runner:
                 "VC4_POOL_RESERVE_MB"
                 % (_mib(floor), _mib(peak), _mib(arena), _mib(scratch),
                    _mib(floor + scratch + (8 << 20))))
-        need = min(int(peak), avail) if avail else int(peak)
+        need = min(int(pool_need), avail) if avail else int(pool_need)
         need = max(need, 1 << 20)
         plan = {"pool_bytes": need, "estimate_bytes": int(peak),
-                "floor_bytes": int(floor), "scratch_bytes": int(scratch),
-                "arena_bytes": arena, "clamped": need < int(peak)}
+                "plan_bytes": int(peak), "headroom_bytes": int(pool_need - peak),
+                "floor_bytes": int(floor),
+                "scratch_bytes": int(scratch), "arena_bytes": arena,
+                "clamped": need < int(peak),
+                "permanent_bytes": int(memory.get("permanent_bytes", 0)),
+                "temp_bytes": int(memory.get("temp_bytes", 0)),
+                "activation_bytes": int(memory.get("activation_bytes", 0)),
+                "reused_bytes": int(memory.get("reused_bytes", 0)),
+                "memory": memory}
         return need, plan
 
     def _find_silu(self):

@@ -458,9 +458,13 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
     r->have_uni_mask = (info.flags & VC4D_F_UNI_MASK) != 0;
     r->have_batch = (info.flags & VC4D_F_LAUNCH_BATCH) != 0;
     /* A/B switch for correctness comparisons and for a daemon whose batch
-     * path is suspect: the single-launch path is unchanged. */
-    if (getenv("VC4INFER_NO_BATCH"))
-        r->have_batch = 0;
+     * path is suspect: the single-launch path is unchanged.  Like the other
+     * VC4 switches, an empty value or "0" leaves the feature on. */
+    {
+        const char *nb = getenv("VC4INFER_NO_BATCH");
+        if (nb && *nb && *nb != '0')
+            r->have_batch = 0;
+    }
     if (getenv("VC4INFER_DEBUG"))
         fprintf(stderr, "[vc4] HELLO flags=0x%x batch=%d uni_mask=%d\n",
                 info.flags, r->have_batch, r->have_uni_mask);

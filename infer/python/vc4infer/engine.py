@@ -304,12 +304,32 @@ class Engine:
         decoding, thresholding or NMS happens here.  ``profile=True`` also
         stores per-node timings in :attr:`last_profile`.
         """
+        return self._run(feeds, profile=profile, pipeline=False)
+
+    def run_pipelined(self, feeds):
+        """The throughput path: the same graph and the same outputs as
+        :meth:`run`, with the client's preparation overlapped with the QPUs.
+
+        Two daemon requests are kept in flight (protocol 4 SUBMIT), so a node's
+        launch list is built while the previous one executes.  The result is
+        the same array :meth:`run` returns; the difference is wall time, and
+        only where the CPU is not waiting for the previous node's output (see
+        ``docs/OVERLAP.md`` for what does and does not overlap).
+
+        A single frame's latency is not improved by this call; if the daemon
+        does not advertise protocol 4 it raises ``UnsupportedNode`` naming the
+        reason, because silently running the synchronous path while reporting a
+        pipelined measurement would be the wrong answer.
+        """
+        return self._run(feeds, profile=False, pipeline=True)
+
+    def _run(self, feeds, *, profile, pipeline):
         x = self._check_feeds(feeds)
         with self._lock:
             if self._closed:
                 raise RuntimeError("engine is closed")
             s0 = self._eng.stats
-            outs = self._runner.run(x, profile=profile)
+            outs = self._runner.run(x, profile=profile, pipeline=pipeline)
             s1 = self._eng.stats
         if profile:
             self.last_profile = list(self._runner.profile)

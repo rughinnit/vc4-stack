@@ -61,7 +61,35 @@ struct vc4_prof {
     uint64_t n_launch, n_upload, n_download, n_load, n_flush;
     uint64_t n_batch, n_batch_launch;
     uint64_t clean_bytes, up_bytes, down_bytes;
+    /* wall spent blocked in poll(), i.e. waiting for a request that was
+     * already submitted to finish.  This is the un-overlapped part of the
+     * pipelined path, and the number docs/OVERLAP.md reports as the residual.
+     * `wait_pad` is the part of it spent inside nhwc_pad_image, which cannot
+     * start until the previous node's launches have written its input: that is
+     * the dependency the pad puts in the middle of a frame. */
+    uint64_t wait, wait_pad, wait_other, n_reap, n_wait_pad;
+    /* wait_other split by the barrier that asked for the completion:
+     * 0 other, 1 scratch reset, 2 invalidate_off, 3 l2 flush, 4 host copy,
+     * 5 pipeline depth.  Profiling only; it never changes a decision. */
+    uint64_t wait_kind[6];
 };
+static int g_prof_in_pad;      /* set around nhwc_pad_image while profiling */
+static int g_wait_kind;        /* the barrier the current drain serves */
+
+enum {
+    WAIT_OTHER = 0, WAIT_SCRATCH, WAIT_INVAL, WAIT_FLUSH, WAIT_HOST, WAIT_DEPTH
+};
+
+static void wait_reason(int kind)
+{
+    if (!g_wait_kind)
+        g_wait_kind = kind;
+}
+
+static void wait_reason_clear(void)
+{
+    g_wait_kind = WAIT_OTHER;
+}
 static struct vc4_prof g_prof;
 
 static void prof_init(void)
@@ -104,6 +132,11 @@ int vc4_prof_enabled(void)
 uint64_t vc4_prof_now(void)
 {
     return mono_ns();
+}
+
+void vc4_prof_in_pad(int on)
+{
+    g_prof_in_pad = on;
 }
 
 /* 0 pad zero, 1 pad copy, 2 invalidate_off, 3 panel zero */
@@ -190,17 +223,53 @@ void vc4_prof_report(void)
  * The arena has 128 kernel slots: code at 0x1000 + slot*16 KiB, uniforms at
  * 0x210000 + slot*4 KiB, so the uniform areas end at 0x290000 and the data
  * heap starts at 0x300000.  The 448 KiB between them is unused in both
- * backends; the 48 KiB this needs sits at its start.  (The first attempt put
+ * backends; the 96 KiB this needs sits at its start.  (The first attempt put
  * this at 0x230000, which is kernel slot 32's uniform block - it corrupted
  * uniforms of larger graphs and hung the QPU.)
  *
  * One 12-QPU block per queued launch means a launch's uniforms can never be
- * overwritten by the next launch while it waits in the queue. */
+ * overwritten by the next launch while it waits in the queue.  With protocol
+ * 4 there are two requests outstanding, so there are two disjoint sets of
+ * blocks: set 0 at slot 0, set 1 at slot VC4D_BATCH_MAX.  A request writes its
+ * uniforms while the other set is being executed, which is why the sets cannot
+ * share slots. */
 #define REMOTE_BATCH_UNI_BASE   0x290000u
 #define REMOTE_BATCH_UNI_STRIDE 768u
+#define REMOTE_BATCH_SETS       2
 _Static_assert(REMOTE_BATCH_UNI_BASE +
-               VC4D_BATCH_MAX * REMOTE_BATCH_UNI_STRIDE <= VC4_DATA_BASE,
+               REMOTE_BATCH_SETS * VC4D_BATCH_MAX * REMOTE_BATCH_UNI_STRIDE
+               <= VC4_DATA_BASE,
                "batch uniform shadows must stay below the data heap");
+
+/* One request's worth of launches, from the first queued launch to the reply
+ * that reaps it.  Two exist because protocol 4 allows two requests to be
+ * outstanding: while b[cur] is being filled the other one is executing, and
+ * its uniform shadow, program names and scratch window must stay untouched.
+ *
+ * The state is explicit because an in-flight batch is *not* free: its pend[]
+ * and its uniform shadow are exactly what the reply will be matched against,
+ * so appending to it (which is what happens if "npend != 0" is taken to mean
+ * "in use") silently drops the appended launches. */
+enum {
+    VC4_BATCH_EMPTY = 0,      /* no request, no launches                     */
+    VC4_BATCH_FILLING,        /* b[cur]: launches are being queued           */
+    VC4_BATCH_IN_FLIGHT,      /* sent, reply not yet reaped                  */
+};
+
+struct vc4_batch {
+    int      state;               /* VC4_BATCH_*                              */
+    int      set;                 /* shadow + scratch window 0/1              */
+    uint64_t epoch;               /* assigned at submit, 0 when not sent      */
+    int      npend;               /* launches queued, not yet reaped          */
+    vc4c_token tok;               /* SUBMIT token, valid while in flight      */
+    struct {
+        int      idx;             /* slot in ctx->k[] / r->prog[]             */
+        unsigned nqpu;
+        uint32_t uni_off;         /* shadow uniform block                     */
+        uint32_t mask;
+        uint32_t timeout_ms;
+    } pend[VC4D_BATCH_MAX];
+};
 
 struct vc4_remote {
     vc4c_conn *conn;
@@ -210,16 +279,17 @@ struct vc4_remote {
     int        have_named;            /* daemon keys slots by program name */
     int        have_uni_mask;         /* daemon takes the address mask     */
     int        have_batch;            /* daemon takes LAUNCH_BATCH         */
+    int        have_submit;           /* daemon takes SUBMIT (protocol 4)  */
     int        batch_on;              /* between vc4_batch_begin/end       */
-    int        npend;                 /* launches queued, not submitted    */
+    int        pipe_on;               /* depth-2 request pipelining armed  */
+    struct vc4_batch b[REMOTE_BATCH_SETS];
+    int        cur;                   /* batch the next launch goes into   */
+    int        order[REMOTE_BATCH_SETS]; /* in-flight batches, oldest first */
+    int        depth;                 /* requests in flight, 0..2          */
+    uint64_t   epoch;                 /* id of the newest submitted batch   */
+    uint64_t   reaped;                /* id of the newest fully reaped batch */
+    uint64_t   set_epoch[REMOTE_BATCH_SETS]; /* last batch to use a window  */
     int        batch_err;             /* latched failure from a barrier    */
-    struct {
-        int      idx;                 /* slot in ctx->k[] / r->prog[]      */
-        unsigned nqpu;
-        uint32_t uni_off;             /* shadow uniform block              */
-        uint32_t mask;
-        uint32_t timeout_ms;
-    } pend[VC4D_BATCH_MAX];
     /* byte intervals the CPU has written since the last clean */
     struct { uint32_t off, len; } dirty[REMOTE_DIRTY_MAX];
     int        ndirty;
@@ -270,6 +340,7 @@ void vc4__invalidate(void *p, size_t n)
 
 vc4_status vc4__remote_batch_end(vc4_ctx *ctx);
 static void remote_drain(vc4_ctx *ctx);
+static vc4_status remote_open_batch(vc4_ctx *ctx);
 
 /* Same, by arena offset, for the C code that fills a persistent buffer with
  * memset + partial memcpys before a launch (weight panels, padded images,
@@ -280,7 +351,9 @@ void vc4__invalidate_off(vc4_ctx *ctx, uint32_t off, size_t n)
         /* The CPU is about to rewrite this range.  A queued launch may still
          * read it, so the queue goes first: this is the barrier that lets
          * batching stay correct without per-launch dependency information. */
+        wait_reason(WAIT_INVAL);
         remote_drain(ctx);
+        wait_reason_clear();
         uint64_t t = g_prof.on ? mono_ns() : 0;
         cache_civac(ctx->arena + off, n);
         if (g_prof.on) {
@@ -370,10 +443,28 @@ void vc4__remote_scratch_reset(vc4_ctx *ctx)
 {
     struct vc4_remote *r = ctx ? ctx->remote : NULL;
     if (r) {
-        /* The scratch cursor is about to hand out memory a queued launch may
-         * still be reading, so the queue has to drain first. */
-        remote_drain(ctx);
-        r->scratch_clean = ctx->arena_top;   /* rewritten from the base */
+        if (r->pipe_on) {
+            /* A reset while launches are queued means the next allocation
+             * reuses this window from its base: the request that reads it has
+             * to complete first.  Between requests this is the point where the
+             * window alternates and the one it is moving to may be reaped. */
+            if (r->b[r->cur].state == VC4_BATCH_FILLING &&
+                r->b[r->cur].npend) {
+                wait_reason(WAIT_SCRATCH);
+                remote_drain(ctx);
+                wait_reason_clear();
+            }
+            vc4_status st = remote_open_batch(ctx);
+            if (st != VC4_OK && !r->batch_err)
+                r->batch_err = (int)st;
+            r->scratch_clean = ctx->scratch_base
+                                   ? ctx->scratch_base : ctx->arena_top;
+        } else {
+            /* The scratch cursor is about to hand out memory a queued launch
+             * may still be reading, so the queue has to drain first. */
+            remote_drain(ctx);
+            r->scratch_clean = ctx->arena_top;   /* rewritten from the base */
+        }
     }
 }
 
@@ -457,6 +548,7 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
     r->have_named = (info.flags & VC4D_F_NAMED_PROGS) != 0;
     r->have_uni_mask = (info.flags & VC4D_F_UNI_MASK) != 0;
     r->have_batch = (info.flags & VC4D_F_LAUNCH_BATCH) != 0;
+    r->have_submit = (info.flags & VC4D_F_ASYNC_SUBMIT) != 0;
     /* A/B switch for correctness comparisons and for a daemon whose batch
      * path is suspect: the single-launch path is unchanged.  Like the other
      * VC4 switches, an empty value or "0" leaves the feature on. */
@@ -464,10 +556,15 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
         const char *nb = getenv("VC4INFER_NO_BATCH");
         if (nb && *nb && *nb != '0')
             r->have_batch = 0;
+        /* Nor the pipelined path: with this set, vc4_pipeline_begin() reports
+         * unsupported and the caller runs exactly the batch path. */
+        const char *np = getenv("VC4INFER_NO_PIPE");
+        if (np && *np && *np != '0')
+            r->have_submit = 0;
     }
     if (getenv("VC4INFER_DEBUG"))
-        fprintf(stderr, "[vc4] HELLO flags=0x%x batch=%d uni_mask=%d\n",
-                info.flags, r->have_batch, r->have_uni_mask);
+        fprintf(stderr, "[vc4] HELLO flags=0x%x batch=%d submit=%d uni_mask=%d\n",
+                info.flags, r->have_batch, r->have_submit, r->have_uni_mask);
 
     /* The daemon hands out regions from its data heap only. */
     size_t max = info.arena_bytes > info.data_base
@@ -597,7 +694,9 @@ vc4_status vc4__remote_load(vc4_ctx *ctx, const char *name,
 {
     struct vc4_remote *r = ctx ? ctx->remote : NULL;
     /* A load can evict the program slot a queued launch names. */
+    wait_reason(WAIT_HOST);
     remote_drain(ctx);
+    wait_reason_clear();
     if (!ctx || !r || !words || !out)
         return VC4_ERR_INVAL;
     if (bytes < 8 || (bytes & 7u) || bytes > VC4_CODE_SLOT) {
@@ -708,6 +807,44 @@ static uint32_t remote_uni_mask(vc4_ctx *ctx, const vc4_kernel *k, int nqpu)
 }
 
 
+/* -------------------------------------------------------- request pipeline
+ *
+ * Protocol 3 sends a graph node's launches as one request and waits for its
+ * reply; protocol 4 (SUBMIT) lets the next request be sent first and its
+ * completion collected later.  This backend keeps at most two requests in
+ * flight - the one the daemon is executing and the one this client is filling -
+ * and every unit that a request reads while it runs is duplicated per depth:
+ *
+ *   uniform shadows   two sets of VC4D_BATCH_MAX slots (48 KiB each)
+ *   scratch           two windows of the arena (see ctx->pipe_*)
+ *
+ * A pool buffer is not covered here: libvc4infer cannot free, so the Python
+ * pool owns recycling and holds a block back until the request that was in
+ * flight when it was freed has been reaped (Pool.hold/reap there).
+ *
+ * With the pipeline armed, a request is submitted and not waited for.  Every
+ * point where the CPU touches memory a request could be using - upload,
+ * download, an explicit invalidate, a re-load, the L2 flush an op asks for
+ * after reading scratch - calls remote_drain(), which reaps everything.  Those
+ * are the same points that drained the queue before; the difference is that
+ * between them the client is free to work while the QPU is busy.
+ *
+ * The win when this helps is the client's own work between two barriers.  It
+ * does not help an op whose CPU-side setup reads the previous op's output (the
+ * NHWC conv's zero-padded image does), because that read has to wait for the
+ * result: such an op calls send_invalidate()/the barrier path and finishes the
+ * pipeline first.  docs/OVERLAP.md measures how much of a frame that leaves.
+ */
+static size_t remote_scratch_base(const vc4_ctx *ctx)
+{
+    return ctx->scratch_base ? ctx->scratch_base : ctx->arena_top;
+}
+
+static int remote_batch_max_outstanding(const struct vc4_remote *r)
+{
+    return (r->pipe_on && r->have_submit) ? REMOTE_BATCH_SETS : 0;
+}
+
 /* Queue one launch: snapshot its uniforms into a private shadow slot and
  * remember the program.  Nothing is sent here.  The snapshot is what makes
  * deferral safe with kernels whose uniform block is rewritten for the next
@@ -717,161 +854,365 @@ static vc4_status remote_queue_launch(vc4_ctx *ctx, const vc4_kernel *k,
 {
     struct vc4_remote *r = ctx->remote;
     ptrdiff_t idx = k - ctx->k;
-    if (r->npend == (int)VC4D_BATCH_MAX) {
+    struct vc4_batch *b = &r->b[r->cur];
+    if (b->state != VC4_BATCH_FILLING) {
+        /* First launch of a request: pick its window and uniform set, and
+         * wait for the request that used them two behind, if it still runs. */
+        vc4_status st = remote_open_batch(ctx);
+        if (st != VC4_OK)
+            return st;
+        b = &r->b[r->cur];
+    }
+    if (b->npend == (int)VC4D_BATCH_MAX) {
         vc4_status st = vc4__remote_batch_end(ctx);
         if (st != VC4_OK)
             return st;
+        b = &r->b[r->cur];
     }
-    int slot = r->npend;
+    int slot = b->set * (int)VC4D_BATCH_MAX + b->npend;
     uint32_t off = REMOTE_BATCH_UNI_BASE +
                    (uint32_t)slot * REMOTE_BATCH_UNI_STRIDE;
     uint32_t mask = r->have_uni_mask ? remote_uni_mask(ctx, k, nqpu) : 0;
-    if ((uint64_t)off + 64ull * (unsigned)nqpu > ctx->arena_bytes) {
+    if ((uint64_t)off + 64ull * (unsigned)nqpu > VC4_DATA_BASE) {
         vc4__set_err(ctx, "launch: batch uniform area is outside the arena");
         return VC4_ERR_INVAL;
     }
     memcpy(ctx->arena + off, ctx->arena + k->uni_off, 64u * (size_t)nqpu);
     remote_mark_nb(ctx, off, 64u * (size_t)nqpu);
     /* The scratch a launch is about to read was written before the call, so
-     * preserve the high-water mark the synchronous path would have cleaned. */
-    r->scratch_clean = r->scratch_clean < ctx->arena_top
-                           ? ctx->arena_top : r->scratch_clean;
+     * preserve the high-water mark the synchronous path would have cleaned.
+     * A window switch moves the watermark down to the new window's base. */
+    r->scratch_clean = r->scratch_clean < remote_scratch_base(ctx)
+                           ? remote_scratch_base(ctx) : r->scratch_clean;
     if (r->scratch_clean > ctx->scratch)
-        r->scratch_clean = ctx->arena_top;
+        r->scratch_clean = remote_scratch_base(ctx);
     if (ctx->scratch > r->scratch_clean) {
         remote_mark_nb(ctx, (uint32_t)r->scratch_clean,
                        ctx->scratch - r->scratch_clean);
         r->scratch_clean = ctx->scratch;
     }
-    r->pend[slot].idx = (int)idx;
-    r->pend[slot].nqpu = (unsigned)nqpu;
-    r->pend[slot].uni_off = off;
-    r->pend[slot].mask = mask;
-    r->pend[slot].timeout_ms = remote_timeout_ms();
-    r->npend++;
+    b->pend[b->npend].idx = (int)idx;
+    b->pend[b->npend].nqpu = (unsigned)nqpu;
+    b->pend[b->npend].uni_off = off;
+    b->pend[b->npend].mask = mask;
+    b->pend[b->npend].timeout_ms = remote_timeout_ms();
+    b->npend++;
     if (wall_ns)
         *wall_ns = 0;          /* completion time is known at the flush */
     return VC4_OK;
 }
 
-/* Submit the queued launches as one request and account for the completions.
+static vc4_status remote_reap_one(vc4_ctx *ctx);
+static vc4_status remote_reap_until(vc4_ctx *ctx, uint64_t epoch);
+
+/*
+ * Open the batch under construction.  Called by the first launch of a request
+ * and by every scratch reset, so an op that allocates scratch before it queues
+ * anything gets the same window its launches will run from.
+ *
+ * The window alternates per submitted request.  Re-opening the window that the
+ * request two behind used must wait for that request: that is the "no buffer
+ * reused while in flight" rule at the scratch level, and it is the only reason
+ * this ever blocks.  With the pipeline off the window is always 0 and the old
+ * drain-everything behaviour is kept, bit for bit.
+ */
+static vc4_status remote_open_batch(vc4_ctx *ctx)
+{
+    struct vc4_remote *r = ctx->remote;
+    struct vc4_batch *b = &r->b[r->cur];
+    if (b->state == VC4_BATCH_FILLING)
+        return VC4_OK;
+    if (b->state != VC4_BATCH_EMPTY) {
+        vc4__set_err(ctx, "pipeline: batch %d is in flight during open",
+                     r->cur);
+        return VC4_ERR_INVAL;
+    }
+    if (!r->pipe_on) {
+        ctx->scratch_base = 0;
+        ctx->scratch_top = 0;
+        b->state = VC4_BATCH_FILLING;
+        b->npend = 0;
+        return VC4_OK;
+    }
+    if (!ctx->pipe_win) {
+        vc4__set_err(ctx, "pipeline: the scratch windows were never sized");
+        return VC4_ERR_INVAL;
+    }
+    /* This batch is empty, so its window and uniform set are free - but the
+     * request that used them may still be running (that is the batch two
+     * submissions back).  Wait for it before the CPU writes here. */
+    uint64_t e = r->set_epoch[b->set];
+    if (e) {
+        wait_reason(WAIT_DEPTH);
+        vc4_status st = remote_reap_until(ctx, e);
+        wait_reason_clear();
+        if (st != VC4_OK)
+            return st;
+    }
+    ctx->scratch_base = ctx->pipe_base + (size_t)b->set * ctx->pipe_win;
+    ctx->scratch_top = ctx->scratch_base + ctx->pipe_win;
+    if (r->scratch_clean < ctx->scratch_base ||
+        r->scratch_clean > ctx->scratch_top)
+        r->scratch_clean = ctx->scratch_base;
+    b->state = VC4_BATCH_FILLING;
+    b->npend = 0;
+    return VC4_OK;
+}
+
+/* Build the entries for launches [from, npend) and send them.  defer=1 hands
+ * the request to the socket and returns; defer=0 waits for its completion and
+ * fills item/done. */
+static int remote_send(vc4_ctx *ctx, struct vc4_batch *b, int from, int defer,
+                       struct vc4d_batch_item *item, unsigned *done)
+{
+    struct vc4_remote *r = ctx->remote;
+    int n = b->npend;
+    PROF_W(bc0);
+    remote_clean(ctx);
+    PROF_W(bc1);
+    PROF_ADD(clean, bc0, bc1);
+    vc4c_batch_ent ent[VC4D_BATCH_MAX];
+    memset(ent, 0, sizeof(ent));
+    for (int i = from; i < n; ++i) {
+        const vc4c_prog *p = &r->prog[b->pend[i].idx];
+        ent[i - from].kind = VC4D_BENT_LAUNCH;
+        ent[i - from].prog = p->handle;
+        ent[i - from].timeout_ms = b->pend[i].timeout_ms;
+        ent[i - from].nqpu = b->pend[i].nqpu;
+        ent[i - from].nuni = p->nuni;
+        ent[i - from].flags = r->have_uni_mask ? VC4D_LAUNCH_UNI_MASK : 0;
+        ent[i - from].uni_off = b->pend[i].uni_off;
+        ent[i - from].uni_addr = b->pend[i].mask;
+    }
+    if (prof_on()) {
+        g_prof.n_batch++;
+        g_prof.n_batch_launch += (unsigned)(n - from);
+    }
+    if (defer) {
+        PROF_T(br0);
+        int rc = vc4c_submit_batch(r->conn, &r->region, ent,
+                                   (unsigned)(n - from), &b->tok);
+        PROF_T(br1);
+        PROF_ADD(rt, br0, br1);
+        return rc;
+    }
+    PROF_T(br0);
+    int rc = vc4c_launch_batch(r->conn, &r->region, ent, (unsigned)(n - from),
+                               item, done);
+    PROF_T(br1);
+    PROF_ADD(rt, br0, br1);
+    return rc;
+}
+
+/* Account for one reply.  *fail is the index of the failing entry in the
+ * batch, or -1 when the request itself was refused. */
+static vc4_status remote_reply(vc4_ctx *ctx, struct vc4_batch *b, int from,
+                               int rc, const struct vc4d_batch_item *item,
+                               unsigned done, int *fail)
+{
+    *fail = -1;
+    for (unsigned i = 0; i < done; ++i) {
+        if (item[i].status != VC4D_OK)
+            continue;
+        int j = from + (int)i;
+        ctx->st.launches++;
+        ctx->st.kernel_ns += item[i].wall_ns;
+        ctx->st.gpu_cycles += item[i].cycles;
+        if (item[i].errs) {
+            const vc4_kernel *k = &ctx->k[b->pend[j].idx];
+            vc4__set_err(ctx, "launch %s: V3D_ERR_STAT=0x%08x",
+                         k->name, item[i].errs);
+            if (!getenv("VC4INFER_IGNORE_ERRSTAT"))
+                return VC4_ERR_GPU;
+        }
+    }
+    if (rc == 0) {
+        if (done != (unsigned)(b->npend - from)) {
+            vc4__set_err(ctx, "batch: %u of %d entries completed",
+                         done, b->npend - from);
+            return VC4_ERR_IO;
+        }
+        return VC4_OK;
+    }
+    /* done includes the entry that failed (its status is the failure), so
+     * execution stopped there and the entries after it never ran. */
+    if ((int)done - 1 >= 0)
+        *fail = from + (int)done - 1;
+    return remote_status(ctx, rc, "LAUNCH");
+}
+
+/* Re-upload the program whose slot the daemon evicted and resend the tail of a
+ * request synchronously.  Bounded like the original retry loop.  `rc` is the
+ * failure that brought us here, so the recovery (an UPLOAD, or a one-second
+ * wait for the GPU lock) happens before the first resend rather than as a
+ * guaranteed-to-fail request of its own. */
+static vc4_status remote_resume(vc4_ctx *ctx, struct vc4_batch *b, int from,
+                                int rc, unsigned *busy_tries,
+                                unsigned *noent_tries)
+{
+    struct vc4_remote *r = ctx->remote;
+    struct vc4d_batch_item item[VC4D_BATCH_MAX];
+    for (;;) {
+        if (rc == -VC4D_E_NOENT && *noent_tries < 2) {
+            (*noent_tries)++;
+            int idx = b->pend[from].idx;
+            if (getenv("VC4INFER_DEBUG"))
+                fprintf(stderr, "[vc4] %s: program slot evicted, re-uploading\n",
+                        ctx->k[idx].name);
+            if (remote_reupload(r, &ctx->k[idx], idx) != 0)
+                return remote_status(ctx, rc, "LAUNCH");
+        } else if (rc == -VC4D_E_BUSY && *busy_tries < 60) {
+            (*busy_tries)++;
+            usleep(1000000);
+        } else if (rc != 0) {
+            return remote_status(ctx, rc, "LAUNCH");
+        }
+
+        int fail = -1;
+        memset(item, 0, sizeof(item));
+        unsigned done = 0;
+        int src = remote_send(ctx, b, from, 0, item, &done);
+        vc4_status st = remote_reply(ctx, b, from, src, item, done, &fail);
+        if (src == 0)
+            return st;
+        rc = src;
+        if (fail >= 0)
+            from = fail;
+        else if (rc == -VC4D_E_BUSY) {
+            from = 0;
+        } else {
+            return st;
+        }
+    }
+}
+
+/* Submit what is queued in the current batch.
  *
  * Retries mirror the single-launch path: E_NOENT means the daemon evicted a
  * program slot (re-upload it and resume at that entry), E_BUSY means another
  * process holds the GPU lock (wait and resume at that entry).  Entries before
  * the failing one have run and are never resent, which is why the resume index
- * comes from the reply's per-entry statuses and not from a guess. */
-/* Submit what is queued.  The public vc4__remote_batch_end() reports the
- * result to its caller; the hazard barriers call remote_drain(), which latches
- * a failure for the next checked call instead of discarding it.  That matters
- * because a mid-node barrier (a dirty mark, a download) flushes launches whose
- * caller is not the one that will see the return value. */
+ * comes from the reply's per-entry statuses and not from a guess.
+ *
+ * With the pipeline armed the request is only sent; its completion is reaped
+ * by remote_drain()/the next submit.  The public vc4__remote_batch_end()
+ * reports the result to its caller; the hazard barriers call remote_drain(),
+ * which latches a failure for the next checked call instead of discarding it.
+ * That matters because a mid-node barrier (a dirty mark, a download) flushes
+ * launches whose caller is not the one that will see the return value. */
 static vc4_status remote_submit(vc4_ctx *ctx)
 {
     struct vc4_remote *r = ctx->remote;
-    if (!r->npend)
+    struct vc4_batch *b = &r->b[r->cur];
+    if (b->state != VC4_BATCH_FILLING || b->npend == 0) {
+        if (b->state == VC4_BATCH_FILLING)
+            b->state = VC4_BATCH_EMPTY;
         return VC4_OK;
-
-    int n = r->npend;
-    vc4_status ret = VC4_OK;
-    int from = 0;
-    unsigned busy_tries = 0, noent_tries = 0;
-
-    while (from < n) {
-        PROF_W(bc0);
-        remote_clean(ctx);
-        PROF_W(bc1);
-        PROF_ADD(clean, bc0, bc1);
-        vc4c_batch_ent ent[VC4D_BATCH_MAX];
-        memset(ent, 0, sizeof(ent));
-        for (int i = from; i < n; ++i) {
-            const vc4c_prog *p = &r->prog[r->pend[i].idx];
-            ent[i - from].kind = VC4D_BENT_LAUNCH;
-            ent[i - from].prog = p->handle;
-            ent[i - from].timeout_ms = r->pend[i].timeout_ms;
-            ent[i - from].nqpu = r->pend[i].nqpu;
-            ent[i - from].nuni = p->nuni;
-            ent[i - from].flags = r->have_uni_mask ? VC4D_LAUNCH_UNI_MASK : 0;
-            ent[i - from].uni_off = r->pend[i].uni_off;
-            ent[i - from].uni_addr = r->pend[i].mask;
-        }
-        struct vc4d_batch_item item[VC4D_BATCH_MAX];
-        memset(item, 0, sizeof(item));
-        unsigned done = 0;
-        PROF_T(br0);
-        int rc = vc4c_launch_batch(r->conn, &r->region, ent, (unsigned)(n - from),
-                                   item, &done);
-        PROF_T(br1);
-        PROF_ADD(rt, br0, br1);
-        if (prof_on()) {
-            g_prof.n_batch++;
-            g_prof.n_batch_launch += (unsigned)(n - from);
-        }
-        for (unsigned i = 0; i < done && i < (unsigned)(n - from); ++i) {
-            if (item[i].status != VC4D_OK)
-                continue;
-            int j = from + (int)i;
-            ctx->st.launches++;
-            ctx->st.kernel_ns += item[i].wall_ns;
-            ctx->st.gpu_cycles += item[i].cycles;
-            if (item[i].errs) {
-                const vc4_kernel *k = &ctx->k[r->pend[j].idx];
-                vc4__set_err(ctx, "launch %s: V3D_ERR_STAT=0x%08x",
-                             k->name, item[i].errs);
-                if (!getenv("VC4INFER_IGNORE_ERRSTAT")) {
-                    ret = VC4_ERR_GPU;
-                    goto out;
-                }
-            }
-        }
-        if (rc == 0) {
-            if (done != (unsigned)(n - from)) {
-                vc4__set_err(ctx, "batch: %u of %d entries completed",
-                             done, n - from);
-                ret = VC4_ERR_IO;
-            }
-            break;
-        }
-        /* done includes the entry that failed (its status is the failure),
-         * so execution stopped there and the entries after it never ran. */
-        int fail = (int)done - 1;
-        if (fail < 0) {
-            /* Nothing ran: the daemon refused the request itself (another
-             * launch is in flight).  Same bounded wait as the single path. */
-            if (rc == -VC4D_E_BUSY && busy_tries < 60) {
-                busy_tries++;
-                usleep(1000000);
-                continue;
-            }
-            ret = remote_status(ctx, rc, "LAUNCH");
-            break;
-        }
-        fail += from;
-        if (rc == -VC4D_E_NOENT && noent_tries < 2) {
-            noent_tries++;
-            int idx = r->pend[fail].idx;
-            if (getenv("VC4INFER_DEBUG"))
-                fprintf(stderr, "[vc4] %s: program slot evicted, re-uploading\n",
-                        ctx->k[idx].name);
-            if (remote_reupload(r, &ctx->k[idx], idx) != 0) {
-                ret = remote_status(ctx, rc, "LAUNCH");
-                break;
-            }
-            from = fail;
-            continue;
-        }
-        if (rc == -VC4D_E_BUSY && busy_tries < 60) {
-            busy_tries++;
-            from = fail;
-            usleep(1000000);
-            continue;
-        }
-        ret = remote_status(ctx, rc, "LAUNCH");
-        break;
     }
-out:
-    r->npend = 0;
-    return ret;
+
+    int defer = remote_batch_max_outstanding(r) > 0;
+    if (defer) {
+        int other = r->cur ^ 1;
+        if (r->b[other].state != VC4_BATCH_EMPTY) {
+            /* Both batches are in flight: the depth-2 limit.  Reaping the
+             * oldest frees the other one, and its window is the next set. */
+            wait_reason(WAIT_DEPTH);
+            vc4_status st = remote_reap_one(ctx);
+            wait_reason_clear();
+            if (st != VC4_OK)
+                return st;
+            if (r->b[other].state != VC4_BATCH_EMPTY) {
+                vc4__set_err(ctx, "pipeline: no batch free after a reap");
+                return VC4_ERR_INVAL;
+            }
+        }
+        int rc = remote_send(ctx, b, 0, 1, NULL, NULL);
+        if (rc != 0)
+            return remote_status(ctx, rc, "SUBMIT");
+        b->epoch = ++r->epoch;
+        b->state = VC4_BATCH_IN_FLIGHT;
+        r->set_epoch[b->set] = b->epoch;
+        r->order[r->depth++] = r->cur;
+        r->cur = other;
+        return VC4_OK;
+    }
+
+    unsigned busy_tries = 0, noent_tries = 0;
+    vc4_status st = remote_resume(ctx, b, 0, 0, &busy_tries, &noent_tries);
+    b->state = VC4_BATCH_EMPTY;
+    b->npend = 0;
+    b->epoch = 0;
+    return st;
+}
+
+/* Reap the oldest in-flight request, account for it and free its window. */
+static vc4_status remote_reap_one(vc4_ctx *ctx)
+{
+    struct vc4_remote *r = ctx->remote;
+    if (r->depth <= 0)
+        return VC4_OK;
+    int bi = r->order[0];
+    struct vc4_batch *b = &r->b[bi];
+    if (b->state != VC4_BATCH_IN_FLIGHT) {
+        vc4__set_err(ctx, "pipeline: reaping batch %d, which is not in flight",
+                     bi);
+        return VC4_ERR_INVAL;
+    }
+    struct vc4d_batch_item item[VC4D_BATCH_MAX];
+    memset(item, 0, sizeof(item));
+    unsigned done = 0;
+    PROF_W(rw0);
+    int rc = vc4c_poll_batch(r->conn, b->tok, item, (unsigned)b->npend, &done);
+    PROF_W(rw1);
+    PROF_T(br0);
+    if (prof_on()) {
+        g_prof.wait += rw1 - rw0;
+        if (g_prof_in_pad) {
+            g_prof.wait_pad += rw1 - rw0;
+            g_prof.n_wait_pad++;
+        } else {
+            g_prof.wait_other += rw1 - rw0;
+            int k = g_wait_kind;
+            if (k < 0 || k > WAIT_DEPTH)
+                k = WAIT_OTHER;
+            g_prof.wait_kind[k] += rw1 - rw0;
+        }
+        g_prof.n_reap++;
+    }
+    PROF_T(br1);
+    PROF_ADD(rt, br0, br1);
+    int fail = -1;
+    vc4_status st = remote_reply(ctx, b, 0, rc, item, done, &fail);
+    if (rc == -VC4D_E_BUSY || (rc == -VC4D_E_NOENT && fail >= 0)) {
+        /* A recoverable failure is handled where the caller is blocked: the
+         * batch's own entries are still in b->pend, and its shadow uniforms
+         * are still in this set (the next request uses the other one). */
+        unsigned busy_tries = 0, noent_tries = 0;
+        st = remote_resume(ctx, b, fail >= 0 ? fail : 0, rc,
+                           &busy_tries, &noent_tries);
+    }
+    r->depth--;
+    memmove(&r->order[0], &r->order[1],
+            (size_t)r->depth * sizeof(r->order[0]));
+    b->state = VC4_BATCH_EMPTY;
+    b->npend = 0;
+    b->epoch = 0;
+    r->reaped = r->epoch - (uint64_t)r->depth;   /* newest fully reaped */
+    return st;
+}
+
+/* Reap until the request with this epoch (and therefore every older one) is
+ * complete.  Epochs are assigned in submit order and reaped in the same
+ * order, so "the newest reaped epoch" is enough to decide. */
+static vc4_status remote_reap_until(vc4_ctx *ctx, uint64_t epoch)
+{
+    struct vc4_remote *r = ctx->remote;
+    while (r->depth > 0 && r->reaped < epoch) {
+        vc4_status st = remote_reap_one(ctx);
+        if (st != VC4_OK)
+            return st;
+    }
+    return VC4_OK;
 }
 
 vc4_status vc4__remote_batch_end(vc4_ctx *ctx)
@@ -887,14 +1228,116 @@ vc4_status vc4__remote_batch_end(vc4_ctx *ctx)
     return st;
 }
 
+/* Everything the CPU is about to touch may be in a request that is still
+ * running: finish all of them, in order, and latch a failure for the caller
+ * that will see it. */
 static void remote_drain(vc4_ctx *ctx)
 {
     struct vc4_remote *r = ctx ? ctx->remote : NULL;
-    if (!r || !r->npend)
+    if (!r)
         return;
     vc4_status st = remote_submit(ctx);
+    while (st == VC4_OK && r->depth > 0)
+        st = remote_reap_one(ctx);
     if (st != VC4_OK && !r->batch_err)
         r->batch_err = (int)st;
+}
+
+vc4_status vc4__remote_pipeline_begin(vc4_ctx *ctx)
+{
+    struct vc4_remote *r = ctx ? ctx->remote : NULL;
+    if (!ctx || !r)
+        return VC4_ERR_INVAL;
+    if (!r->have_submit)
+        return VC4_ERR_UNSUPPORTED;
+    if (ctx->dead)
+        return VC4_ERR_TIMEOUT;
+    remote_drain(ctx);                 /* start from an empty pipeline */
+    if (!ctx->pipe_win) {
+        /* Split the free arena three ways: one window per in-flight request
+         * and one third left above them for the training workspace (which is
+         * carved down from the top) and for a pool that grows later.  Two
+         * windows and no reserve is what made a Softmax's workspace fail with
+         * "need 64 B, have 0 B". */
+        size_t free_bytes = ctx->arena_top < ctx->arena_bytes
+                                ? ctx->arena_bytes - ctx->arena_top : 0;
+        size_t win = (free_bytes / 3) & ~(size_t)63;
+        if (win < (1u << 20)) {
+            vc4__set_err(ctx, "pipeline: %.1f MiB of arena free is not enough "
+                         "for two scratch windows and a workspace reserve",
+                         (double)free_bytes / 1048576.0);
+            return VC4_ERR_NOMEM;
+        }
+        ctx->pipe_base = ctx->arena_top;
+        ctx->pipe_win = win;
+        ctx->pipe_top = ctx->arena_top + 2 * win;
+    }
+    r->pipe_on = 1;
+    r->cur = 0;
+    for (int i = 0; i < REMOTE_BATCH_SETS; ++i) {
+        r->b[i].set = i;
+        r->b[i].state = VC4_BATCH_EMPTY;
+        r->b[i].npend = 0;
+        r->b[i].epoch = 0;
+        r->set_epoch[i] = 0;
+    }
+    r->depth = 0;
+    r->epoch = 0;
+    r->reaped = 0;
+    ctx->scratch_base = ctx->pipe_base;
+    ctx->scratch_top = ctx->pipe_base + ctx->pipe_win;
+    r->scratch_clean = ctx->pipe_base;
+    return VC4_OK;
+}
+
+vc4_status vc4__remote_pipeline_flush(vc4_ctx *ctx)
+{
+    struct vc4_remote *r = ctx ? ctx->remote : NULL;
+    if (!r)
+        return VC4_OK;
+    vc4_status st = remote_submit(ctx);
+    while (st == VC4_OK && r->depth > 0)
+        st = remote_reap_one(ctx);
+    if (st == VC4_OK && r->batch_err) {
+        st = (vc4_status)r->batch_err;
+        r->batch_err = 0;
+    }
+    return st;
+}
+
+vc4_status vc4__remote_pipeline_end(vc4_ctx *ctx)
+{
+    struct vc4_remote *r = ctx ? ctx->remote : NULL;
+    if (!r)
+        return VC4_OK;
+    vc4_status st = vc4__remote_pipeline_flush(ctx);
+    r->pipe_on = 0;
+    for (int i = 0; i < REMOTE_BATCH_SETS; ++i) {
+        r->b[i].state = VC4_BATCH_EMPTY;
+        r->b[i].npend = 0;
+        r->b[i].epoch = 0;
+        r->set_epoch[i] = 0;
+    }
+    r->depth = 0;
+    r->cur = 0;
+    ctx->scratch_base = 0;
+    ctx->scratch_top = 0;
+    ctx->pipe_win = 0;
+    ctx->pipe_top = 0;
+    r->scratch_clean = ctx->arena_top;
+    return st;
+}
+
+uint64_t vc4__remote_pipeline_epoch(vc4_ctx *ctx)
+{
+    struct vc4_remote *r = ctx ? ctx->remote : NULL;
+    return r ? r->epoch : 0;
+}
+
+uint64_t vc4__remote_pipeline_reaped(vc4_ctx *ctx)
+{
+    struct vc4_remote *r = ctx ? ctx->remote : NULL;
+    return r ? r->reaped : 0;
 }
 
 /* Arm/disarm explicit batching (public vc4_batch_begin/vc4_batch_end).  A
@@ -904,7 +1347,7 @@ static void remote_drain(vc4_ctx *ctx)
 void vc4__remote_batch_begin(vc4_ctx *ctx)
 {
     struct vc4_remote *r = ctx ? ctx->remote : NULL;
-    if (r && r->have_batch)
+    if (r && (r->have_batch || r->pipe_on))
         r->batch_on = 1;
 }
 
@@ -941,6 +1384,8 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
         return st;
     }
 
+    /* The synchronous form: finish anything the pipeline left running. */
+    remote_drain(ctx);
     vc4c_result res;
     memset(&res, 0, sizeof(res));
     /* Put every CPU-written line in DRAM before the daemon's uncached read of
@@ -1044,7 +1489,9 @@ vc4_status vc4__remote_upload(vc4_ctx *ctx, vc4_buf *b, const void *src,
     if (bytes > b->bytes)
         return VC4_ERR_INVAL;
     /* The CPU is about to write memory a queued launch may read. */
+    wait_reason(WAIT_HOST);
     remote_drain(ctx);
+    wait_reason_clear();
     /* no stale line of ours may survive into the range we are writing: the
      * clean before the next launch writes whole lines back */
     PROF_W(u0);
@@ -1073,7 +1520,9 @@ vc4_status vc4__remote_download(vc4_ctx *ctx, const vc4_buf *b, void *dst,
     if (bytes > b->bytes)
         return VC4_ERR_INVAL;
     /* The CPU is about to read memory a queued launch may write. */
+    wait_reason(WAIT_HOST);
     remote_drain(ctx);
+    wait_reason_clear();
     /* Drop the CPU's stale (clean) copies of this range before reading the
      * GPU's result out of DRAM. */
     PROF_W(d0);

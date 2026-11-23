@@ -136,6 +136,10 @@ echo "=== test_plan (no GPU: the frozen-plan walker decodes and stops on error)"
 echo "=== test_cplan (no GPU: plan build, fallback boundary, replay equivalence)"
 TMPDIR="$TMPDIR" python3 tests/test_cplan.py
 
+echo "=== test_pipeline (no GPU: SUBMIT ordering, per-request freshness, pool hold)"
+TMPDIR="$TMPDIR" python3 tests/test_pipeline.py \
+    --models "${VC4INFER_ONNX:-$HOME/work/onnx/models}"
+
 echo "=== test_dispatch (no GPU)"
 ./build/test_dispatch
 

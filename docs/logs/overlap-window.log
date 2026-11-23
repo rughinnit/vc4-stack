@@ -1,0 +1,111 @@
+# Overlap window, 2026-11-23. Branch feat/overlap on main 2689a76.
+# One client, ARM 1.0 GHz, thermal guard 75 C (peak 49.4 C, throttled 0x0).
+# Daemon: built vc4d, protocol 4, --socket /run/vc4d-overlap.sock,
+#         --arena-mb 96, --group vc4 --drop-user nobody, --gpu-lock.
+#         The packaged vc4d.service was stopped for the window only.
+#
+# run 1: byte-identical gate at 96, then 20 frames per cell at 96/128/160
+== packaged unit: inactive
+srw-rw---- 1 root vc4 0 Nov 23 08:56 /run/vc4d-overlap.sock
+== private daemon pid 80240, protocol:
+   connect rc=0 info rc=0: protocol 4, flags 0x7d, arena 96 MiB, SUBMIT yes
+vc4d: arena 96 MiB at phys 0x1e600000 bus 0xde600000 (requested 96 MiB)
+vc4d: V3D IDENT0=0x02443356 IDENT1=0xc1102431 errstat=0x00001000
+== gate: byte-identical frames (96)
+thermal-guard: start 46.2 C, limit 75 C
+client pid 80251, vc4d pid 80243, arm 1000 MHz, temp 46.2 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+96     sync         346.4    2.89    174.2   0.50   187.0    483.0    150.0     70.0      0.0      0.0   534.4  (pool 31.7/3.2 MiB of 64, 48-48 C)
+  outputs byte-identical
+96     pipelined    292.8    3.42    169.6   0.58   187.0    483.0    120.0     50.0    181.1      0.4   294.9  (pool 31.7/3.2 MiB of 64, 48-48 C)
+thermal-guard: peak 48.3 C, end 47.8 C, core 400000000 Hz, throttled=0x0
+== gate exit 0
+== measurement: sync vs pipelined, 96/128/160, 20 frames
+thermal-guard: start 47.2 C, limit 75 C
+client pid 80382, vc4d pid 80243, arm 1000 MHz, temp 47.8 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+96     sync         296.1    3.38    169.5   0.57   187.0    483.0    110.0     50.0      0.0      0.0   295.5  (pool 31.7/3.2 MiB of 64, 47-48 C)
+96     pipelined    290.7    3.44    169.5   0.58   187.0    483.0    120.0     50.0    180.5      0.4   290.3  (pool 31.7/3.2 MiB of 64, 47-48 C)
+128    sync         333.7    3.00    200.8   0.60   183.0    583.0    110.0     60.0      0.0      0.0   334.4  (pool 35.5/4.4 MiB of 64, 48-48 C)
+128    pipelined    325.9    3.07    200.8   0.62   183.0    583.0    120.0     60.0    213.6      0.3   330.1  (pool 35.5/4.4 MiB of 64, 48-49 C)
+160    sync         424.4    2.36    267.5   0.63   187.0    832.0    130.0     80.0      0.0      0.0   426.1  (pool 41.6/7.4 MiB of 64, 48-49 C)
+160    pipelined    416.0    2.40    268.2   0.64   187.0    832.0    140.0     80.0    286.5      0.8   417.3  (pool 41.6/7.4 MiB of 64, 48-49 C)
+thermal-guard: peak 49.4 C, end 47.8 C, core 400000000 Hz, throttled=0x0
+== measure exit 0
+== daemon log (tail):
+vc4d: arena 96 MiB at phys 0x1e600000 bus 0xde600000 (requested 96 MiB)
+vc4d: V3D IDENT0=0x02443356 IDENT1=0xc1102431 errstat=0x00001000
+vc4d: probe program in slot 127: code bus 0xde7fd000 uni bus 0xde88f000
+vc4d: listening on /run/vc4d-overlap.sock (mode 0660 group vc4 gid 1001)
+vc4d: dropped to uid=65534 gid=65534, capabilities cleared
+== dmesg vc4/cma/oom since boot (last 10):
+[ 1441.603507] wpa_supplicant invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=0
+[ 1441.603650]  oom_kill_process+0x2a8/0x338
+                free:9268 free_pcp:495 free_cma:5602
+[ 1441.603965] Node 0 DMA free:37072kB boost:16384kB min:32768kB low:36864kB high:40960kB reserved_highatomic:0KB free_highatomic:0KB active_anon:768kB inactive_anon:276kB active_file:7380kB inactive_file:7440kB unevictable:0kB writepending:120kB zspages:619800kB present:970752kB managed:926764kB mlocked:0kB bounce:0kB free_pcp:1980kB local_pcp:0kB free_cma:22408kB
+[ 1441.604145] 65536 pages cma reserved
+[ 1441.604903] [  pid  ]   uid  tgid total_vm      rss rss_anon rss_file rss_shmem pgtables_bytes swapents oom_score_adj name
+[ 1441.605248] [   6138] 65534  6138    25180       68        0       68         0   229376        0             0 vc4d
+[ 1441.605300] [   8745] 65534  8745    16988      132       32      100         0   163840        0             0 vc4d
+[ 1441.605723] oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/,task=python3,pid=12927,uid=1000
+[ 1441.605781] Out of memory: Killed process 12927 (python3) total-vm:684912kB, anon-rss:92kB, file-rss:1084kB, shmem-rss:0kB, UID:1000 pgtables:1368kB oom_score_adj:0
+== restore: systemctl start vc4d
+== vc4-query after restore:
+vc4-query 1.0.2 -- VideoCore IV device query
+--------------------------------------------------------------
+engine:          libvc4infer.so.1 (API 1.2.3)
+daemon:          not reachable (/run/vc4d.sock)
+== systemctl is-active vc4d: active
+
+# run 2: 20 frames at 96 and 160, wait split by the barrier that caused it
+== packaged unit: inactive
+srw-rw---- 1 root vc4 0 Nov 23 09:03 /run/vc4d-overlap.sock
+== private daemon pid 81857, protocol:
+   connect rc=0 info rc=0: protocol 4, flags 0x7d, arena 96 MiB, SUBMIT yes
+vc4d: arena 96 MiB at phys 0x1e600000 bus 0xde600000 (requested 96 MiB)
+vc4d: V3D IDENT0=0x02443356 IDENT1=0xc1102431 errstat=0x00001000
+== diagnostic: where the blocked time goes, 96 and 160
+thermal-guard: start 46.7 C, limit 75 C
+client pid 81868, vc4d pid 81860, arm 1000 MHz, temp 47.2 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+96     sync         294.6    3.39    169.6   0.58   187.0    483.0    110.0     50.0      0.0      0.0   294.8  (pool 31.7/3.2 MiB of 64, 47-48 C)
+96     pipelined    289.6    3.45    169.5   0.59   187.0    483.0    120.0     50.0    180.4      0.4   288.9  (pool 31.7/3.2 MiB of 64, 47-48 C)
+       blocked at: depth 0.5 ms, invalidate 0.0, l2 flush 0.0, scratch 171.7, host 0.5, other 7.4
+160    sync         421.8    2.37    267.5   0.63   187.0    832.0    120.0     80.0      0.0      0.0   420.7  (pool 41.6/7.4 MiB of 64, 47-48 C)
+160    pipelined    410.9    2.43    267.9   0.65   187.0    832.0    130.0     80.0    285.3      0.7   410.9  (pool 41.6/7.4 MiB of 64, 48-48 C)
+       blocked at: depth 1.9 ms, invalidate 0.0, l2 flush 0.0, scratch 268.3, host 0.1, other 14.2
+thermal-guard: peak 49.4 C, end 47.2 C, core 400000000 Hz, throttled=0x0
+== measure exit 0
+== daemon log (tail):
+vc4d: arena 96 MiB at phys 0x1e600000 bus 0xde600000 (requested 96 MiB)
+vc4d: V3D IDENT0=0x02443356 IDENT1=0xc1102431 errstat=0x00001000
+vc4d: probe program in slot 127: code bus 0xde7fd000 uni bus 0xde88f000
+vc4d: listening on /run/vc4d-overlap.sock (mode 0660 group vc4 gid 1001)
+vc4d: dropped to uid=65534 gid=65534, capabilities cleared
+== dmesg vc4/cma/oom since boot (last 10):
+[19066.075651] cma: range 0: +29@1027+29@1219+128@1408+39424@26112
+[19066.075685] cma: 
+[19066.307614] cma: __cma_alloc: linux,cma: alloc failed, req-size: 24576 pages, ret: -16
+[19066.307645] cma: number of available pages: 
+[19066.307649] cma: range 0: +29@1027+29@1219+128@1408+39424@26112
+[19066.307683] cma: 
+[19066.736717] cma: __cma_alloc: linux,cma: alloc failed, req-size: 24576 pages, ret: -16
+[19066.736755] cma: number of available pages: 
+[19066.736760] cma: range 0: +29@1027+29@1219+128@1408+39424@26112
+[19066.736794] cma: 
+== restore: systemctl start vc4d
+== vc4-query after restore:
+vc4-query 1.0.2 -- VideoCore IV device query
+--------------------------------------------------------------
+engine:          libvc4infer.so.1 (API 1.2.3)
+daemon:          vc4d 1.2.9, protocol 2, arena 100663296 bytes (96.0 MiB)
+== systemctl is-active vc4d: active
+
+# after the window: packaged unit restored
+active
+vc4-query 1.0.2 -- VideoCore IV device query
+--------------------------------------------------------------
+engine:          libvc4infer.so.1 (API 1.2.3)
+daemon:          vc4d 1.2.9, protocol 2, arena 100663296 bytes (96.0 MiB)
+backend:         vc4d (/run/vc4d.sock)
+kernel:          6.18.50+rpt-rpi-v8 (aarch64)

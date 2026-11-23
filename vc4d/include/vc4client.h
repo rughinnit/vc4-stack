@@ -122,6 +122,37 @@ int  vc4c_launch_batch(vc4c_conn *c, const vc4c_buf *uniforms,
                        const vc4c_batch_ent *ent, unsigned count,
                        struct vc4d_batch_item *out, unsigned *done);
 
+/*
+ * SUBMIT (protocol 4): the same request as vc4c_launch_batch, sent without
+ * waiting for its completion.  Up to VC4D_SUBMIT_MAX may be outstanding on one
+ * connection, and they must be polled in the order they were submitted: the
+ * daemon serves requests in arrival order, so the oldest token owns the next
+ * reply.
+ *
+ *   vc4c_token t;
+ *   vc4c_submit_batch(c, &region, ent, n, &t);   // queued, not run yet
+ *   ... prepare the next request, in different buffers ...
+ *   vc4c_poll_batch(c, t, items, n, &done);      // completion + per-entry status
+ *
+ * Only the daemon's VC4D_F_ASYNC_SUBMIT says it will serve more than one
+ * outstanding request; a client that submits to a daemon without it is
+ * talking to something that will read the second request only after the first
+ * reply, which is correct but pointless.  Mixing an outstanding SUBMIT with a
+ * synchronous call (launch_batch, flush, upload, ...) is refused: the reply
+ * arrows no longer line up.  `count` in the poll is the size of `out` in
+ * entries and must match the submitted count.
+ */
+typedef struct { uint32_t seq; } vc4c_token;
+
+int  vc4c_submit_batch(vc4c_conn *c, const vc4c_buf *uniforms,
+                       const vc4c_batch_ent *ent, unsigned count,
+                       vc4c_token *tok);
+int  vc4c_poll_batch(vc4c_conn *c, vc4c_token tok,
+                     struct vc4d_batch_item *out, unsigned count,
+                     unsigned *done);
+/* Number of submitted-but-unpolled batches; 0..VC4D_SUBMIT_MAX. */
+int  vc4c_submits_outstanding(const vc4c_conn *c);
+
 /* Like vc4c_sync(), but only asks the daemon to flush the GPU L2: the
  * dma-buf mapping is write-combining, so there is no CPU cache to maintain
  * and walking a 60 MiB mapping per launch would dominate the launch. */

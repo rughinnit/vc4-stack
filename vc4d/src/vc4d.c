@@ -452,7 +452,7 @@ static int handle_hello(struct client *c, const struct vc4d_hdr *h,
     r.flags = (opt.raw_srq ? VC4D_F_RAW_SRQ : 0) |
               (opt.allowlist ? VC4D_F_ALLOWLIST : 0) |
               VC4D_F_NAMED_PROGS | VC4D_F_UNI_MASK | VC4D_F_ARENA_RESTORE |
-              VC4D_F_LAUNCH_BATCH;
+              VC4D_F_LAUNCH_BATCH | VC4D_F_ASYNC_SUBMIT;
     r.ident0 = G.regs[R_IDENT0 / 4];
     r.ident1 = G.regs[R_IDENT1 / 4];
     return reply(c->fd, h, VC4D_OK, &r, sizeof(r), -1, 0, 0);
@@ -1097,6 +1097,21 @@ static int handle_batch(struct client *c, const struct vc4d_hdr *h,
     return reply(c->fd, h, first, item, plen_out, -1, done, fail_idx);
 }
 
+/* SUBMIT (protocol 4) is LAUNCH_BATCH with a looser connection contract: the
+ * client may have VC4D_SUBMIT_MAX of them outstanding and the daemon serves
+ * them in arrival order.  The execution is identical - the same handler, the
+ * same validation, the same completion - because the overlap happens on the
+ * client's side of the socket, not the daemon's.  Anything else here (an id
+ * table, an accepted-but-unrun queue) would add state that the arena and
+ * program-slot lifetimes would then have to cover, and would buy nothing: a
+ * single-threaded daemon cannot start a second request while the first is
+ * executing anyway. */
+static int handle_submit(struct client *c, const struct vc4d_hdr *h,
+                         const uint8_t *pl, size_t plen)
+{
+    return handle_batch(c, h, pl, plen);
+}
+
 static int handle_wait(struct client *c, const struct vc4d_hdr *h,
                        const uint8_t *pl, size_t plen)
 {
@@ -1242,6 +1257,7 @@ static int dispatch(struct client *c, const struct vc4d_hdr *h,
     case VC4D_OP_UPLOAD:    return handle_upload(c, h, pl, plen);
     case VC4D_OP_LAUNCH:    return handle_launch(c, h, pl, plen);
     case VC4D_OP_LAUNCH_BATCH: return handle_batch(c, h, pl, plen);
+    case VC4D_OP_SUBMIT:    return handle_submit(c, h, pl, plen);
     case VC4D_OP_WAIT:      return handle_wait(c, h, pl, plen);
     case VC4D_OP_READ_REGS: return handle_read_regs(c, h, pl, plen);
     case VC4D_OP_WRITEREG:  return handle_writereg(c, h, pl, plen);

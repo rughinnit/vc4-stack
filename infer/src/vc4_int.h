@@ -64,6 +64,16 @@ struct vc4_ctx {
     size_t   arena_bytes;
     size_t   arena_top;      /* persistent bump cursor                 */
     size_t   scratch;        /* scratch bump cursor, reset per op      */
+    /* Remote depth-2 pipeline: the two scratch windows are carved from the
+     * free arena when the pipeline is armed, and every op's scratch lives in
+     * the window of the request it belongs to.  pipe_win == 0 means "not
+     * armed", and then scratch_base/scratch_top are 0 and scratch starts at
+     * arena_top exactly as it always did. */
+    size_t   scratch_base;   /* base of the current window (0 = arena_top) */
+    size_t   scratch_top;    /* end of the current window (0 = arena end)  */
+    size_t   pipe_base;      /* arena_top when the windows were sized      */
+    size_t   pipe_win;       /* bytes in each window                       */
+    size_t   pipe_top;       /* end of window 1: no persistent alloc above */
     size_t   ws_top;         /* workspace cursor, carved *down* from the
                               * end of the arena by a bwd composition    */
     size_t   dirty_top;      /* remote: high-water of CPU-written bytes */
@@ -116,6 +126,14 @@ vc4_status vc4__remote_launch(vc4_ctx *ctx, const vc4_kernel *k, int nqpu,
                               uint64_t *wall_ns);
 void       vc4__remote_batch_begin(vc4_ctx *ctx);
 vc4_status vc4__remote_batch_end(vc4_ctx *ctx);
+/* Depth-2 request pipelining over protocol 4's SUBMIT.  begin() reports
+ * VC4_ERR_UNSUPPORTED when the daemon does not advertise it, so a caller can
+ * fall back to the batch path without guessing. */
+vc4_status vc4__remote_pipeline_begin(vc4_ctx *ctx);
+vc4_status vc4__remote_pipeline_flush(vc4_ctx *ctx);
+vc4_status vc4__remote_pipeline_end(vc4_ctx *ctx);
+uint64_t   vc4__remote_pipeline_epoch(vc4_ctx *ctx);
+uint64_t   vc4__remote_pipeline_reaped(vc4_ctx *ctx);
 vc4_status vc4__remote_upload(vc4_ctx *ctx, vc4_buf *b, const void *src,
                               size_t bytes);
 vc4_status vc4__remote_download(vc4_ctx *ctx, const vc4_buf *b, void *dst,
@@ -128,6 +146,8 @@ void       vc4_prof_report(void);
 int        vc4_prof_enabled(void);
 uint64_t   vc4_prof_now(void);
 void       vc4_prof_add(int which, uint64_t ns);
+/* Attribute blocked wall inside the profiler to the conv input pad. */
+void       vc4_prof_in_pad(int on);
 void       vc4_prof_bytes(int which, uint64_t n);
 void       vc4__remote_mark(vc4_ctx *ctx, uint32_t off, size_t bytes);
 void       vc4__remote_scratch_reset(vc4_ctx *ctx);

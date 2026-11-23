@@ -56,10 +56,19 @@ static int nhwc_pad_image(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
 {
     const int hp = H + pt + pb, wp = W + pl + pr;
     const size_t per = (size_t)hp * wp * C * 4u;
+    /* Attribute the wall this pad makes the CPU wait for to the pad itself:
+     * vc4__invalidate_off below has to complete the previous launch (its
+     * output is the input this copy reads), and that wait is the residual the
+     * pipelined path cannot hide.  docs/OVERLAP.md reports it. */
+    const int prof = vc4_prof_enabled();
+    if (prof)
+        vc4_prof_in_pad(1);
     float *p = vc4__scratch_alloc(ctx, per * (size_t)nimg + NHWC_SLACK, NULL);
-    if (!p)
+    if (!p) {
+        if (prof)
+            vc4_prof_in_pad(0);
         return 0;
-    int prof = vc4_prof_enabled();
+    }
     uint64_t pz0 = prof ? vc4_prof_now() : 0;
     memset((uint8_t *)p, 0, per * (size_t)nimg + NHWC_SLACK);
     uint64_t pz1 = prof ? vc4_prof_now() : 0;
@@ -76,6 +85,7 @@ static int nhwc_pad_image(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
     }
     if (prof) {
         uint64_t pc1 = vc4_prof_now();
+        vc4_prof_in_pad(0);
         vc4_prof_add(0, pz1 - pz0);
         vc4_prof_add(1, pc1 - pc0);
         vc4_prof_bytes(0, per * (size_t)nimg + NHWC_SLACK);

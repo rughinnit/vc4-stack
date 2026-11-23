@@ -18,17 +18,36 @@
 #define VC4D_MAGIC      0x44344356u   /* "VC4D" */
 /* 2: launch_req grew flags/uni_handle/uni_off (UNI_IN_ARENA mode).
  *
- * Version 3 adds the batch launch below.  HELLO accepts both 2 and 3: a
+ * Version 3 adds the batch launch below.  HELLO accepts 2, 3 and 4: a
  * version-2 client gets the same daemon it always had (the batch op is simply
  * never sent, and the HELLO flag says so), and a version-3 client checks
  * VC4D_F_LAUNCH_BATCH before using it.  The single-launch message, its
  * validation and its replies are byte-for-byte unchanged.
  *
+ * Version 4 adds SUBMIT, the same ordered list as LAUNCH_BATCH with one
+ * difference in the *client's* obligations: a version-4 client may have up to
+ * VC4D_SUBMIT_MAX SUBMIT requests outstanding on one connection at a time.
+ * The daemon serves requests one at a time in arrival order and replies to
+ * each SUBMIT with that request's completion, so replies complete in request
+ * order; there is no id table and no accepted-but-not-run state in the daemon.
+ * What the client gains is not a faster completion, it is the ability to keep
+ * preparing the next request while this one is being executed: the request is
+ * already in the socket buffer, and the daemon picks it up when it is idle.
+ * The execution, validation, ordering, timeout and reply payload of SUBMIT are
+ * exactly LAUNCH_BATCH's; a client that does not pipeline never sends it.
+ *
  * Version 2 is also where the G3/G4 additions live: they are opt-in, so a
  * client that sends neither a program name nor a uniform address mask sees
  * exactly the old behaviour. */
-#define VC4D_VERSION    3u
+#define VC4D_VERSION    4u
 #define VC4D_VERSION_MIN 2u           /* oldest HELLO version still served  */
+/* How many SUBMIT requests one connection may have outstanding.  Two is what
+ * the engine's depth-2 pipeline needs: the request being executed and the one
+ * being prepared.  The limit exists so a client cannot fill the daemon's
+ * receive queue with a frame's worth of launches it will never reap: the
+ * client library enforces it before sendmsg, and the daemon does not need to
+ * (a third request simply waits in the socket). */
+#define VC4D_SUBMIT_MAX 2u
 
 #define VC4D_MAX_MSG    (64u * 1024u) /* hard cap on one message             */
 #define VC4D_MAX_QPU    12u
@@ -66,6 +85,9 @@ enum {
 #define VC4D_F_ARENA_RESTORE (1u << 4) /* a degraded arena is restored when
                                         * CMA recovers and the daemon is idle */
 #define VC4D_F_LAUNCH_BATCH  (1u << 5) /* VC4D_OP_LAUNCH_BATCH is supported */
+#define VC4D_F_ASYNC_SUBMIT  (1u << 6) /* VC4D_OP_SUBMIT and more than one
+                                        * outstanding request per connection
+                                        * are supported (version 4) */
 
 /* UPLOAD flags.  NAMED: the payload is
  *     struct vc4d_upload_req, code bytes, name bytes (no NUL)
@@ -101,6 +123,7 @@ enum {
     VC4D_OP_CLOSE     = 11,
     VC4D_OP_PING      = 12,
     VC4D_OP_LAUNCH_BATCH = 13,
+    VC4D_OP_SUBMIT    = 14,
 };
 
 struct vc4d_hdr {
@@ -274,6 +297,32 @@ struct vc4d_batch_item {
     uint32_t cycles;       /* LAUNCH: PCTR0 exec cycles                    */
     uint32_t pad2;
 };
+
+/*
+ * SUBMIT (protocol 4): LAUNCH_BATCH whose completion the client may collect
+ * later.  The payload is struct vc4d_batch_req + count struct vc4d_batch_ent,
+ * the reply payload is count struct vc4d_batch_item, and the status rules are
+ * the batch's: the header status is the first failure, detail0 the number of
+ * entries that ran and detail1 the failing index.  The daemon executes the
+ * list when it reads the request, exactly as it would for LAUNCH_BATCH.
+ *
+ * The difference is the connection contract.  A version-4 client may send up
+ * to VC4D_SUBMIT_MAX SUBMIT requests before reading a reply; the daemon reads
+ * and serves them in arrival order, so the nth reply belongs to the nth
+ * outstanding request and hdr.seq is what the client matches it against.  A
+ * client must therefore reap in the order it submitted.  A LAUNCH or a
+ * LAUNCH_BATCH request may not be interleaved with outstanding SUBMITs: those
+ * are the synchronous forms, and a client that mixes them has lost track of
+ * which reply is whose.
+ *
+ * What this buys: the client can prepare the next request (build uniforms,
+ * write buffers, decide shapes) while the daemon is executing this one,
+ * instead of alternating.  It does not make a single request finish sooner,
+ * and it does not let the daemon execute two requests at once - the daemon is
+ * one thread and the QPU is one queue.  Overlap that needs a second execution
+ * engine (two daemons) is refused by the GPU lock, so this is the only form
+ * of overlap the hardware allows.
+ */
 
 /* READ_REGS: count == 0 -> snapshot (payload = struct vc4d_regs),
  * count >  0 -> raw words [off, off+count), payload = vc4d_regs_req + words */

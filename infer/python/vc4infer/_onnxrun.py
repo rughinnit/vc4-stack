@@ -4096,7 +4096,10 @@ class Runner:
             return self._run_plan_steps(plan, feeds)
         except ArtifactPlanError as e:
             self._drop_plan(str(e))
-            return self.run(feeds)
+            # The plan is gone; run the frame on the ordinary path with the
+            # pipeline state exactly as the caller asked for it.  Calling
+            # run() here would re-arm (or not disarm) around a nested call.
+            return self._run_body(feeds, False, self._pipeline_run)
 
     def _run_plan_steps(self, plan, feeds):
         self.pool.begin_run()
@@ -4223,8 +4226,14 @@ class Runner:
                         st)
 
     def _run_body(self, feeds, profile, pipeline):
-        if (self.cplan is not None and not profile and not pipeline
-                and self.mode == "strict"):
+        # The frozen plan is the shipping path and replays the same C entry
+        # points the executor calls, so the request pipeline applies to it
+        # unchanged: a plan step's launches are submitted without waiting, and
+        # the next step's CPU work (or its first barrier) proceeds while they
+        # run.  Keeping the plan out of the pipelined path would have meant
+        # measuring a build that does not ship.
+        self._pipeline_run = pipeline
+        if self.cplan is not None and not profile and self.mode == "strict":
             return self._run_plan(feeds)
         self.pool.begin_run()
         for name in self._prev_outputs:

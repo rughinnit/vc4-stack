@@ -146,6 +146,8 @@ void       vc4_prof_report(void);
 int        vc4_prof_enabled(void);
 uint64_t   vc4_prof_now(void);
 void       vc4_prof_add(int which, uint64_t ns);
+/* Attribute blocked wall inside the profiler to the conv input pad. */
+void       vc4_prof_in_pad(int on);
 void       vc4_prof_bytes(int which, uint64_t n);
 void       vc4__remote_mark(vc4_ctx *ctx, uint32_t off, size_t bytes);
 void       vc4__remote_scratch_reset(vc4_ctx *ctx);

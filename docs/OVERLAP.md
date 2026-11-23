@@ -3,10 +3,12 @@
 A YOLOv8n-160 frame takes 433 ms of wall time and 250-263 ms of QPU time: a
 57-61 % duty cycle.  The rest is the ARM preparing the next launch while the
 GPU sits idle.  This page describes the protocol and the engine changes that
-let the client prepare request N+1 while the daemon executes request N, states
-what that can and cannot hide, and the CPU-side gates it passes before it is
-allowed near the QPUs.  Silicon numbers are the next section to be filled in;
-the first-run checklist and the stop conditions are at the end.
+let the client prepare request N+1 while the daemon executes request N, the
+CPU-side gates it passes, and the silicon measurement.  The short version: it
+is correct and it is worth 1.8-2.6 % of wall on the tree that ships, because
+the frozen plan already removed most of the host work it was built to hide and
+the residual sits at the pipeline's own two-window depth, not at the conv input
+pad.  The numbers and the attribution are in section 6.
 
 ## 1. The arithmetic
 
@@ -127,56 +129,106 @@ above them) is what keeps a Softmax's training workspace from failing with
 "need 64 B, have 0 B": the windows are capped at two thirds of the free arena
 and everything above them is still the workspace, exactly as before.
 
-## 5. What this can hide, and what it cannot
+## 5. What it was expected to hide, and what it hides
 
 Between two barriers of one graph node the client does work that does not
-depend on any GPU result: the executor's liveness and bookkeeping, attribute
-parsing, the next node's allocations, kernel choice, uniform fill, the
-dirty-range clean, the address mask and the `sendmsg`.  All of that is
-hideable.  Per frame at 160 it is about 0.080 s (Python), 0.023 s (launch
-path) and part of the 0.055 s of C op setup.
+depend on any GPU result: the executor's bookkeeping, attribute parsing, the
+next node's allocations, kernel choice, uniform fill, the dirty-range clean,
+the address mask and the `sendmsg`.  That is the work the pipeline was built
+for.
 
-What is not hideable is the part of the CPU's work that reads the previous
-node's output.  The NHWC conv path zero-pads its whole input into scratch with
-a `memcpy` on the CPU (`nhwc_pad_image`, 24.8 MB zeroed and 6.6 MB copied per
-frame, 0.020 s), and that input is the previous launch's result.  Every conv
-node therefore has to wait for the node before it, whatever the pipeline
-depth; the same is true of an elementwise op whose element count is not a
-multiple of 256, which pads its operands on the CPU.  This is the single
-reason the frame cannot reach `max(QPU, host)` on this build, and it is worth
-being explicit about the sizes: 171 ms of host time at 160, of which the
-measured drag is the pad image plus the Python that runs after the last
-barrier of each node.
+The analysis that set the target was: the NHWC conv zero-pads its whole input
+into scratch with a `memcpy` on the CPU (`nhwc_pad_image`, 24.8 MB zeroed and
+6.6 MB copied per frame), and that input is the previous launch's result, so
+every conv node must wait for the node before it and the frame cannot reach
+`max(QPU, host)`.  From the pre-plan host time of 171 ms at 160 it predicted
+335-375 ms pipelined, against 433 ms serial.
 
-The expectation to measure, not a promise:
+**The measurement refutes that.**  On the shipping tree the conv input pad is
+not where the pipeline waits: 0.4 ms of 180.5 ms blocked at 96, 0.8 ms of
+286.5 ms at 160.  Section 6 has the numbers and the attribution; the residual
+is the scratch-window boundary, and the ceiling is the two-window depth, not
+the pad.
 
-* pipelined 160: 335-375 ms, 2.7-3.0 FPS, duty 0.70-0.78;
-* pipelined 96 and 128: similar gains in absolute milliseconds, so less in
-  duty, because their QPU time is smaller and the fixed pad cost is the same;
-* single-frame latency: unchanged (the synchronous path is untouched) or
-  +1-2 ms (one extra flush at the end of a pipelined frame).
+## 6. The silicon run
 
-Two levers would move it past that, in increasing order of work:
+Measured on `2689a76` + this branch, private protocol-4 daemon (96 MiB arena,
+`--gpu-lock`), one client, ARM 1.0 GHz, thermal guard at 75 C (peak 49.4 C,
+throttled 0x0), 20 frames per cell after 3 warm-up frames.  "QPU" is the sum of
+per-launch GPU time, "req/f" the daemon requests per frame, "wait" the wall
+spent blocked in `poll()`, "pad" the part of that wait spent inside
+`nhwc_pad_image`, "lat" a single frame after an idle gap:
 
-1. **Border-aware `im2col_nhwc`** (or the flat panel kernel that was refused
-   until it passes silicon).  Reading the unpadded input with bounds in the
-   gather removes the CPU copy, and with it the per-conv dependency.  The frame
-   then approaches `QPU + daemon launch gaps`.  This is a kernel change, not an
-   engine change.
-2. **A GPU-side pad** (`fill2d` + `copy2d_x`, both existing) instead of the
-   CPU copy.  It breaks the dependency the same way and costs two launches per
-   conv, about +0.18 s of daemon dispatch per 100 convs at the measured
-   per-launch cost - probably a wash, which is why the kernel change is the
-   better lever.
+| imgsz | path | wall ms | FPS | QPU ms | duty | req/f | launch/f | cli CPU ms | dmn CPU ms | wait ms | pad ms | lat ms |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 96 | sync | 296.1 | 3.38 | 169.5 | 0.573 | 187 | 483 | 110 | 50 | 0 | 0 | 295.5 |
+| 96 | pipelined | 290.7 | 3.44 | 169.5 | 0.583 | 187 | 483 | 120 | 50 | 180.5 | 0.4 | 290.3 |
+| 128 | sync | 333.7 | 3.00 | 200.8 | 0.602 | 183 | 583 | 110 | 60 | 0 | 0 | 334.4 |
+| 128 | pipelined | 325.9 | 3.07 | 200.8 | 0.616 | 183 | 583 | 120 | 60 | 213.6 | 0.3 | 330.1 |
+| 160 | sync | 424.4 | 2.36 | 267.5 | 0.630 | 187 | 832 | 130 | 80 | 0 | 0 | 426.1 |
+| 160 | pipelined | 416.0 | 2.40 | 268.2 | 0.645 | 187 | 832 | 140 | 80 | 286.5 | 0.8 | 417.3 |
 
-Even with either, the floor is not 250 ms: the daemon builds launch N+1 only
-after launch N has completed, so the QPU idles for the daemon's per-launch
-setup (validation, register writes, kick, L2 write-back) between launches.
-That cost is inside the 0.065 s of daemon CPU per frame and is serial with the
-GPU.  Removing it needs a daemon that pre-builds the next launch while the
-current one runs, which is a larger change than this branch.
+The launch counts are higher than the 365 in [ACCURACY-FPS.md] because that
+table ran the optimiser (`passes="all"`); this window ran the shipping default,
+which is no optimisation, and that is the graph the plan replays.  More
+launches is the harder case for the pipeline (more requests to overlap), so
+the gain above is not an artefact of a cheaper graph.
 
-## 6. The CPU-side gates
+A second 160 cell, with the wait split by the barrier that caused it:
+
+| path | wall ms | QPU ms | duty | wait ms | at scratch | at depth | at invalidate | at l2 flush | at host | other |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| sync | 421.8 | 267.5 | 0.634 | 0 | - | - | - | - | - | - |
+| pipelined | 410.9 | 267.9 | 0.652 | 285.3 | 268.3 | 1.9 | 0.0 | 0.0 | 0.1 | 14.2 |
+
+The byte-identical gate passed: `tools/overlap.py --sizes 96 --frames 1
+--warmup 1 --check` printed "outputs byte-identical" for the plan-path frame,
+sync against pipelined.
+
+**The gain is 1.1-1.8 points of duty, 1.8-2.6 % of wall, and it does not pass
+the two-point rule set for this run.**  The numbers above are recorded as a
+measurement, not as a throughput result: `run_pipelined()` stays an explicit
+opt-in that nothing in the engine calls by default.
+
+Where the blocked time is: 99 % of it is at the **scratch-window boundary**,
+not at the pad and not at a data dependency.  An op opens its batch, and to
+write its scratch it must reuse the window of the request two submissions
+back, so it waits for that request (`remote_open_batch` -> `remote_reap_until`,
+attributed as `scratch`).  At 160 that wait is 268 ms over 187 requests, 1.43
+ms per request, which is the per-request QPU time: the client is waiting for
+the QPU, which is the intended steady state, but with only two windows it
+cannot *submit* op N before it has waited, so its own preparation of op N+1
+cannot start either.  The wall is therefore `QPU + the preparation that two
+windows cannot hide + the daemon's per-request serial cost`, and the pipeline
+hides only the small part that fits in the other window's flight.
+
+That changes the answer to the question this branch was asked to settle:
+
+* the pad is **not** the pipeline's residual (0.4-0.8 ms of 180-286 ms), so
+  the flat-panel or border-aware `im2col` path would not be a pipeline fix.  It
+  remains a panel-row and CPU saving on its own merits, against a CPU cost that
+  is largely hidden already.
+* what would move the wall is more depth, and depth is bought with scratch: a
+  third window needs another 5.76 MiB at 160, and only 19.4 MiB is free beside
+  the 41.6 MiB pool plan.  Depth 3 fits at 96 (free 29.3 MiB, 2.24 MiB per
+  window) and would need a larger arena at 160 - or a smaller pool estimate,
+  or a smaller scratch footprint per op.
+* the daemon's per-request serial cost is the other half: 80 ms of daemon CPU
+  per frame at 160 over 187 requests, plus the idle gaps between launches
+  while it prepares the next one.  Removing it needs a daemon that builds
+  launch N+1 while launch N runs, which is a larger change than this branch.
+
+**Single-frame latency: no cost.**  The pipelined cell is 5.2/4.3/8.8 ms
+*faster* on one frame after an idle gap (96/128/160), because the frame's own
+early preparation is hidden under its first launches, and the final flush is
+one request deep.  A reader gets both numbers in the table; neither path is
+made slower.
+
+CPU per frame: the client costs 10 ms more with the pipeline (the extra
+`poll`/reap syscalls), the daemon is unchanged.  Total host CPU per frame is
+therefore unchanged at 160 and +10 ms at 96 and 128, for 1.8-2.6 % of wall.
+
+## 7. The CPU-side gates
 
 `infer/tests/test_pipeline.py` drives the whole engine through a protocol
 stand-in for vc4d (`vc4d/test/fake_daemon.py`: real wire protocol, memfd arena
@@ -189,17 +241,24 @@ request).  No QPU is touched.
   and every non-pointer uniform word as the synchronous run.  Pointer words are
   wildcarded: the two paths place buffers at different offsets on purpose (the
   pipeline reserves its windows above the pool), and no consumer reads an
-  offset from anywhere but its uniform block.  Result: 45/22/10/547/647/896
-  launches identical, 21/17/10/304/294/308 requests on both sides.
+  offset from anywhere but its uniform block.  The frame that is compared is a
+  **frozen-plan replay**, because the plan is the shipping path and replays
+  from the second frame; a single frame would only exercise the recording.
+  Result: 43/19/9/483/583/832 launches identical, 13/10/6/187/183/187 requests
+  on both sides.  A2 repeats the check on the executor path
+  (`VC4_NO_CPLAN=1`): 43 launches, 13/13 requests, identical.
 * **B. Nothing changes under a running request.**  With a 20 ms delay per
   request, the fake snapshots each request's uniform shadow and 4 KiB at every
-  address its launches name, and compares after the delay.  ModelA, modelB,
-  modelC and YOLO-96: 0 shadow changes and 0 probe changes over 352 requests.
-  This is the direct test of the two-set rule and of the pool quarantine.
+  address its launches name, and compares after the delay.  Three frames per
+  model, so the replay is covered.  ModelA, modelB, modelC and YOLO-96: 0
+  shadow changes and 0 probe changes over 786 requests.  This is the direct
+  test of the two-set rule; on the plan path it is also the test of the barrier
+  set, because a pinned pool cannot hold a block back.
 * **C. The quarantine.**  A block freed while an epoch is outstanding is not
   handed out again, and is handed out once that epoch is reaped; held bytes
   count as used; three live blocks never overlap.
-* **D. Accounting.**  After a pipelined run nothing is left on the hold list,
+* **D. Accounting** (executor path, `VC4_NO_CPLAN=1`, because only an
+  unpinned pool has a hold list).  After a pipelined run nothing is left on the hold list,
   `used_bytes` equals the sum of live blocks, no free range holds a live block,
   and runs two and three reach the same high-water.  The pipeline's pool cost
   at YOLOv8n is +0.06/+0.11/+0.17 MiB at 96/128/160 against the synchronous
@@ -216,47 +275,48 @@ its offset, and the two paths deliberately choose different offsets.  Byte
 identity is the silicon gate (`tools/overlap.py --check`), and it is the first
 thing the window below runs.
 
-## 7. The first silicon run
+## 8. The window as run
 
-Preconditions: no other client on the board, the replay debugging that owns it
-finished, `systemctl is-active vc4d` for the packaged daemon, ARM pinned to
-1.0 GHz, starting temperature below 60 C.  Nothing is installed.
+The packaged unit and a protocol-4 daemon cannot share `/run/vc4d.sock`, so the
+window used a private one.  Nothing is installed and nothing is copied into
+`/usr/sbin`.
 
-1. Record the packaged unit's command line (`systemctl cat vc4d`), build
-   `vc4d/` and `infer/` in `~/work/vc4-overlap`, then `systemctl stop vc4d` and
-   start the built daemon on the same socket and `--arena-mb`.  Acceptance:
-   `vc4d/build/test_submit` passes against it, and `test_batch` still passes
-   (protocol 3 is still served).
-2. Wire smoke with one graph: `tools/overlap.py --sizes 96 --frames 1
-   --warmup 1 --check`.  Acceptance: "byte-identical", and the pipelined cell
-   reports a duty above the synchronous one.
-3. Correctness at the other sizes, one frame each: `--sizes 128,160 --frames 1
-   --warmup 1 --check`.
-4. Timing, under `tools/thermal-guard.sh --max 75`: `tools/overlap.py --sizes
-   96,128,160 --frames 20 --warmup 3`.  This prints wall, FPS, QPU ms, duty,
-   requests and launches per frame, client and daemon CPU per frame, wall
-   blocked in `poll()` (the un-overlapped residual) and single-frame latency,
-   for both paths.
-5. A/B the old path: `VC4INFER_NO_BATCH=1` (protocol-2 style, no batch, no
-   submit) for one cell, to confirm the fallback still runs and to have the
-   pre-batch wall on the same build.
+1. Record `systemctl cat vc4d` (the packaged unit runs `--socket
+   /run/vc4d.sock --arena-mb 96 --group vc4 --drop-user nobody
+   --max-timeout-ms 10000` with `VC4D_GPU_LOCK=1`).  Check that no client is
+   connected (`ss -xp | grep /run/vc4d.sock`), `systemctl stop vc4d`, and start
+   the built daemon:
+   `sudo vc4d/build/vc4d --socket /run/vc4d-overlap.sock --arena-mb 96
+   --group vc4 --drop-user nobody --max-timeout-ms 10000 --gpu-lock`.
+   Acceptance: a `vc4c_connect`/`vc4c_info` against that socket reports
+   protocol 4, `VC4D_F_ASYNC_SUBMIT` set and a 96 MiB arena.  The output of the
+   run's transcript is `docs/logs/overlap-window.log`.
+2. Byte-identical gate: `tools/overlap.py --sizes 96 --frames 1 --warmup 1
+   --check`, under `tools/thermal-guard.sh --max 75`.  Acceptance:
+   "byte-identical".
+3. Measurement: `tools/overlap.py --sizes 96,128,160 --frames 20 --warmup 3`
+   under the guard.  The table in section 6 is that run.
+4. Restore, unconditionally, from a shell trap: **kill the private daemon
+   first**, wait for it to exit so its arena is released, then `systemctl start
+   vc4d` and poll `vc4-query` until it prints `daemon: vc4d 1.2.9, protocol 2,
+   arena 100663296 bytes (96.0 MiB)`.  Polling `vc4-query`'s exit status is not
+   enough: it exits 0 while printing "daemon: not reachable", so the check has
+   to match the daemon line.  Leaving the private daemon running while the unit
+   starts costs the unit its arena: the first window did that, the unit's 96 MiB
+   request failed with `-16` twice and its ladder fell back before recovering.
 
-Stop, discard the cell and report rather than retry:
+What the window establishes:
 
-* any `V3D_ERR_STAT` bit, any `E_GPU`, any timeout, any daemon
-  "restart"/"TIMEOUT" line, any `E_BUSY` that is not a transient GPU-lock wait;
-* any output byte different in the `--check` step (that is a wrong answer, and
-  it means the uniform or pool rule above is incomplete - the next step is the
-  fake daemon's per-request snapshot, not a retry);
-* dmesg showing a CMA allocation failure, OOM or a vc4 reset;
-* the guard firing or 75 C reached;
-* single-frame latency up by more than 2 % against the synchronous path;
-* the pipelined duty not above the synchronous duty by at least two points on
-  the first size: that would mean the dependency analysis in section 5 is
-  wrong, and the next step is profiler attribution (`wait_ms`, `pad_zero`,
-  `pad_copy`, `rt`), not a deeper pipeline.
-
-What the window is expected to establish, honestly: how much of the 171 ms of
-host time at 160 is hideable on this engine, and therefore whether the 260 ms
-target is reachable by overlap alone (it is not, by the analysis above) or only
-after the pad image leaves the CPU.
+* the pipeline is correct on the shipping path (byte-identical, and the fake's
+  per-request snapshots are clean on the replay frame);
+* it is worth 1.1-1.8 points of duty on this tree, which does not pass the
+  two-point rule.  The 335-375 ms prediction is not what happened: the frame is
+  416 ms at 160, and the prediction's premise - that the pad is the serialising
+  edge - is refuted by the attribution;
+* the residual is the two-window depth at the scratch boundary (268 of 285 ms
+  of blocked time at 160), plus the daemon's serial per-request cost.  Depth 3
+  is the next thing to try, and at 160 it needs ~5.8 MiB more scratch than the
+  arena has beside a 41.6 MiB pool estimate: it fits at 96, not at 160, without
+  a larger arena or a smaller scratch footprint;
+* there is no single-frame latency cost: the pipelined path is 4-9 ms faster on
+  one frame after an idle gap, and 1.8-2.6 % faster over 20.

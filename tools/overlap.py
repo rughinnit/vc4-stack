@@ -56,7 +56,9 @@ class Prof(ctypes.Structure):
         ("n_batch", ctypes.c_uint64), ("n_batch_launch", ctypes.c_uint64),
         ("clean_bytes", ctypes.c_uint64), ("up_bytes", ctypes.c_uint64),
         ("down_bytes", ctypes.c_uint64),
-        ("wait", ctypes.c_uint64), ("n_reap", ctypes.c_uint64),
+        ("wait", ctypes.c_uint64), ("wait_pad", ctypes.c_uint64),
+        ("wait_other", ctypes.c_uint64), ("n_reap", ctypes.c_uint64),
+        ("n_wait_pad", ctypes.c_uint64), ("wait_kind", ctypes.c_uint64 * 6),
     ]
 
 
@@ -99,6 +101,8 @@ def cell(model, frames, warmup, pipeline, check, feeds=None):
         pid_d = common.vc4d_pid()
         walls, qpu, req, launches, cpu_c, cpu_d, temps = [], [], [], [], [], [], []
         wait = []
+        padwait = []
+        kinds = []
         prof = prof_of(eng) if os.environ.get("VC4INFER_PROF") else None
         if prof is None:
             raise SystemExit("set VC4INFER_PROF=1: requests per frame are read "
@@ -108,6 +112,8 @@ def cell(model, frames, warmup, pipeline, check, feeds=None):
             d0 = common.proc_cpu_s(pid_d) if pid_d else 0.0
             b0 = prof.n_batch
             w0 = prof.wait
+            wp0 = prof.wait_pad
+            wk0 = [prof.wait_kind[i] for i in range(6)]
             t0 = time.monotonic()
             run(x)
             walls.append(time.monotonic() - t0)
@@ -117,6 +123,8 @@ def cell(model, frames, warmup, pipeline, check, feeds=None):
             launches.append(eng.stats["launches"])
             req.append(prof.n_batch - b0)
             wait.append((prof.wait - w0) / 1e9)
+            padwait.append((prof.wait_pad - wp0) / 1e9)
+            kinds.append([(prof.wait_kind[i] - wk0[i]) / 1e9 for i in range(6)])
             cpu_c.append(common.proc_cpu_s() - c0)
             cpu_d.append((common.proc_cpu_s(pid_d) - d0) if pid_d else 0.0)
             temps.append(common.temp_c())
@@ -127,6 +135,9 @@ def cell(model, frames, warmup, pipeline, check, feeds=None):
             "qpu_ms": statistics.median(qpu) * 1000.0,
             "duty": statistics.median(qpu) / wall,
             "wait_ms": statistics.median(wait) * 1000.0,
+            "padwait_ms": statistics.median(padwait) * 1000.0,
+            "kinds_ms": [statistics.median(k[i] for k in kinds) * 1000.0
+                         for i in range(6)],
             "latency_ms": latency * 1000.0,
             "requests": statistics.median(req),
             "launches": statistics.median(launches),
@@ -156,9 +167,9 @@ def main():
     pid = common.vc4d_pid()
     print("client pid %d, vc4d pid %s, arm %.0f MHz, temp %.1f C"
           % (os.getpid(), pid, common.arm_hz() / 1e6, common.temp_c()))
-    print("%-6s %-9s %8s %7s %8s %6s %7s %8s %8s %8s %8s %7s"
+    print("%-6s %-9s %8s %7s %8s %6s %7s %8s %8s %8s %8s %8s %7s"
           % ("size", "path", "wall ms", "FPS", "QPU ms", "duty", "req/f",
-             "launch/f", "cli CPU", "dmn CPU", "wait ms", "lat ms"))
+             "launch/f", "cli CPU", "dmn CPU", "wait ms", "pad ms", "lat ms"))
     for size in [int(s) for s in args.sizes.split(",") if s.strip()]:
         model = os.path.join(args.models, "yolov8n_%d.onnx" % size)
         if not os.path.exists(model):
@@ -172,13 +183,20 @@ def main():
                       "pipelined" if pipeline else "sync", e))
                 continue
             print("%-6d %-9s %8.1f %7.2f %8.1f %6.2f %7.1f %8.1f %8.1f "
-                  "%8.1f %8.1f %7.1f  (pool %.1f/%.1f MiB of %.0f, %d-%d C)"
+                  "%8.1f %8.1f %8.1f %7.1f  (pool %.1f/%.1f MiB of %.0f, "
+                  "%d-%d C)"
                   % (size, "pipelined" if pipeline else "sync",
                      c["wall_ms"], c["fps"], c["qpu_ms"], c["duty"],
                      c["requests"], c["launches"], c["client_cpu_ms"],
-                     c["daemon_cpu_ms"], c["wait_ms"], c["latency_ms"],
+                     c["daemon_cpu_ms"], c["wait_ms"], c["padwait_ms"],
+                     c["latency_ms"],
                      c["pool_mb"], c["pool_peak_mb"], c["arena_used_mb"],
                      c["temp"][0], c["temp"][1]))
+            if pipeline:
+                k = c["kinds_ms"]
+                print("       blocked at: depth %.1f ms, invalidate %.1f, "
+                      "l2 flush %.1f, scratch %.1f, host %.1f, other %.1f"
+                      % (k[5], k[2], k[3], k[1], k[4], k[0]))
     return 0
 
 

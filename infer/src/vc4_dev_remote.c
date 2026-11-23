@@ -63,9 +63,33 @@ struct vc4_prof {
     uint64_t clean_bytes, up_bytes, down_bytes;
     /* wall spent blocked in poll(), i.e. waiting for a request that was
      * already submitted to finish.  This is the un-overlapped part of the
-     * pipelined path, and the number docs/OVERLAP.md reports as the residual. */
-    uint64_t wait, n_reap;
+     * pipelined path, and the number docs/OVERLAP.md reports as the residual.
+     * `wait_pad` is the part of it spent inside nhwc_pad_image, which cannot
+     * start until the previous node's launches have written its input: that is
+     * the dependency the pad puts in the middle of a frame. */
+    uint64_t wait, wait_pad, wait_other, n_reap, n_wait_pad;
+    /* wait_other split by the barrier that asked for the completion:
+     * 0 other, 1 scratch reset, 2 invalidate_off, 3 l2 flush, 4 host copy,
+     * 5 pipeline depth.  Profiling only; it never changes a decision. */
+    uint64_t wait_kind[6];
 };
+static int g_prof_in_pad;      /* set around nhwc_pad_image while profiling */
+static int g_wait_kind;        /* the barrier the current drain serves */
+
+enum {
+    WAIT_OTHER = 0, WAIT_SCRATCH, WAIT_INVAL, WAIT_FLUSH, WAIT_HOST, WAIT_DEPTH
+};
+
+static void wait_reason(int kind)
+{
+    if (!g_wait_kind)
+        g_wait_kind = kind;
+}
+
+static void wait_reason_clear(void)
+{
+    g_wait_kind = WAIT_OTHER;
+}
 static struct vc4_prof g_prof;
 
 static void prof_init(void)
@@ -108,6 +132,11 @@ int vc4_prof_enabled(void)
 uint64_t vc4_prof_now(void)
 {
     return mono_ns();
+}
+
+void vc4_prof_in_pad(int on)
+{
+    g_prof_in_pad = on;
 }
 
 /* 0 pad zero, 1 pad copy, 2 invalidate_off, 3 panel zero */
@@ -322,7 +351,9 @@ void vc4__invalidate_off(vc4_ctx *ctx, uint32_t off, size_t n)
         /* The CPU is about to rewrite this range.  A queued launch may still
          * read it, so the queue goes first: this is the barrier that lets
          * batching stay correct without per-launch dependency information. */
+        wait_reason(WAIT_INVAL);
         remote_drain(ctx);
+        wait_reason_clear();
         uint64_t t = g_prof.on ? mono_ns() : 0;
         cache_civac(ctx->arena + off, n);
         if (g_prof.on) {
@@ -418,8 +449,11 @@ void vc4__remote_scratch_reset(vc4_ctx *ctx)
              * to complete first.  Between requests this is the point where the
              * window alternates and the one it is moving to may be reaped. */
             if (r->b[r->cur].state == VC4_BATCH_FILLING &&
-                r->b[r->cur].npend)
+                r->b[r->cur].npend) {
+                wait_reason(WAIT_SCRATCH);
                 remote_drain(ctx);
+                wait_reason_clear();
+            }
             vc4_status st = remote_open_batch(ctx);
             if (st != VC4_OK && !r->batch_err)
                 r->batch_err = (int)st;
@@ -660,7 +694,9 @@ vc4_status vc4__remote_load(vc4_ctx *ctx, const char *name,
 {
     struct vc4_remote *r = ctx ? ctx->remote : NULL;
     /* A load can evict the program slot a queued launch names. */
+    wait_reason(WAIT_HOST);
     remote_drain(ctx);
+    wait_reason_clear();
     if (!ctx || !r || !words || !out)
         return VC4_ERR_INVAL;
     if (bytes < 8 || (bytes & 7u) || bytes > VC4_CODE_SLOT) {
@@ -907,7 +943,9 @@ static vc4_status remote_open_batch(vc4_ctx *ctx)
      * submissions back).  Wait for it before the CPU writes here. */
     uint64_t e = r->set_epoch[b->set];
     if (e) {
+        wait_reason(WAIT_DEPTH);
         vc4_status st = remote_reap_until(ctx, e);
+        wait_reason_clear();
         if (st != VC4_OK)
             return st;
     }
@@ -1078,7 +1116,9 @@ static vc4_status remote_submit(vc4_ctx *ctx)
         if (r->b[other].state != VC4_BATCH_EMPTY) {
             /* Both batches are in flight: the depth-2 limit.  Reaping the
              * oldest frees the other one, and its window is the next set. */
+            wait_reason(WAIT_DEPTH);
             vc4_status st = remote_reap_one(ctx);
+            wait_reason_clear();
             if (st != VC4_OK)
                 return st;
             if (r->b[other].state != VC4_BATCH_EMPTY) {
@@ -1127,6 +1167,16 @@ static vc4_status remote_reap_one(vc4_ctx *ctx)
     PROF_T(br0);
     if (prof_on()) {
         g_prof.wait += rw1 - rw0;
+        if (g_prof_in_pad) {
+            g_prof.wait_pad += rw1 - rw0;
+            g_prof.n_wait_pad++;
+        } else {
+            g_prof.wait_other += rw1 - rw0;
+            int k = g_wait_kind;
+            if (k < 0 || k > WAIT_DEPTH)
+                k = WAIT_OTHER;
+            g_prof.wait_kind[k] += rw1 - rw0;
+        }
         g_prof.n_reap++;
     }
     PROF_T(br1);
@@ -1439,7 +1489,9 @@ vc4_status vc4__remote_upload(vc4_ctx *ctx, vc4_buf *b, const void *src,
     if (bytes > b->bytes)
         return VC4_ERR_INVAL;
     /* The CPU is about to write memory a queued launch may read. */
+    wait_reason(WAIT_HOST);
     remote_drain(ctx);
+    wait_reason_clear();
     /* no stale line of ours may survive into the range we are writing: the
      * clean before the next launch writes whole lines back */
     PROF_W(u0);
@@ -1468,7 +1520,9 @@ vc4_status vc4__remote_download(vc4_ctx *ctx, const vc4_buf *b, void *dst,
     if (bytes > b->bytes)
         return VC4_ERR_INVAL;
     /* The CPU is about to read memory a queued launch may write. */
+    wait_reason(WAIT_HOST);
     remote_drain(ctx);
+    wait_reason_clear();
     /* Drop the CPU's stale (clean) copies of this range before reading the
      * GPU's result out of DRAM. */
     PROF_W(d0);

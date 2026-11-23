@@ -143,22 +143,31 @@ class Fake:
                 os.unlink(p)
 
 
-def engine_for(model, fake, cache):
+def engine_for(model, fake, cache, nocplan=False):
     os.environ["VC4D_SOCKET"] = fake.sock
     os.environ["VC4INFER_DAEMON"] = "1"
     os.environ.pop("VC4INFER_NO_PIPE", None)
+    if nocplan:
+        os.environ["VC4_NO_CPLAN"] = "1"
+    else:
+        os.environ.pop("VC4_NO_CPLAN", None)
     return Engine(model, cache_dir=cache, arena_mb=64)
 
 
-def stream(fake, model, cache, pipeline, feeds):
-    """Run one frame and return (launch stream, outputs, counts)."""
-    before = len(fake.records())
-    eng = engine_for(model, fake, cache)
+def stream(fake, model, cache, pipeline, feeds, frames=3, nocplan=False):
+    """Run `frames` frames and return the launch stream of the last one.
+
+    The frozen plan is on by default and replays from the second frame, so a
+    single frame would only ever exercise the recording (Python) path.  The
+    frame that is compared is therefore a replay, which is what ships.
+    """
+    eng = engine_for(model, fake, cache, nocplan)
     try:
-        if pipeline:
-            out = eng.run_pipelined(feeds)
-        else:
-            out = eng.run(feeds)
+        run = eng.run_pipelined if pipeline else eng.run
+        for _ in range(max(1, frames - 1)):
+            run(feeds)
+        before = len(fake.records())
+        out = run(feeds)
     finally:
         eng.close()
     recs = fake.records()[before:]
@@ -266,6 +275,7 @@ def gate_quarantine():
 
 def gate_stream(models, cache, full):
     print("A. the request stream is the same with and without the pipeline")
+    print("   (the compared frame is a frozen-plan replay, the shipping path)")
     for p in model_paths(models, full):
         name = os.path.basename(p)[:-5]
         fake = Fake("a-" + name)
@@ -302,6 +312,28 @@ def gate_stream(models, cache, full):
             fake.close()
 
 
+def gate_executor_stream(models, cache):
+    print("A2. the same, on the executor path (VC4_NO_CPLAN=1, modelA)")
+    p = os.path.join(models, "modelA.onnx")
+    if not os.path.exists(p):
+        check(True, "modelA missing: skipped")
+        return
+    fake = Fake("a2-modelA")
+    try:
+        eng = engine_for(p, fake, cache)
+        feeds = feed_for(eng, models)
+        eng.close()
+        sync_launches, _o, sync_reqs = stream(fake, p, cache, False, feeds,
+                                             frames=2, nocplan=True)
+        pipe_launches, _o, pipe_reqs = stream(fake, p, cache, True, feeds,
+                                             frames=2, nocplan=True)
+        check(sync_launches == pipe_launches,
+              "executor path: %d launches, %d/%d requests, same order+uniforms",
+              len(sync_launches), pipe_reqs, sync_reqs)
+    finally:
+        fake.close()
+
+
 def gate_freshness(models, cache, full):
     print("B. no request's inputs changed while it was outstanding (20 ms/x)")
     for p in model_paths(models, full):
@@ -335,7 +367,10 @@ def gate_accounting(models, cache):
     fake = Fake("d-modelB")
     try:
         os.environ["VC4D_SOCKET"] = fake.sock
-        eng = engine_for(p, fake, cache)
+        # The quarantine only exists for the ordinary (unpinned) pool, so this
+        # gate runs with the frozen plan off; the plan's own lifetime rule is
+        # the barrier set, which gate B checks.
+        eng = engine_for(p, fake, cache, nocplan=True)
         feeds = feed_for(eng, models)
         runner = eng._runner
         pool = runner.pool
@@ -365,7 +400,7 @@ def gate_accounting(models, cache):
 
         # What the pipeline costs in pool bytes: the same three frames on the
         # synchronous path, where nothing is held back.
-        eng = engine_for(p, fake, cache)
+        eng = engine_for(p, fake, cache, nocplan=True)
         sync_high = 0
         for _ in range(3):
             eng.run(feeds)
@@ -422,6 +457,8 @@ def main():
         gate_quarantine()
     if not only or "A" in only:
         gate_stream(args.models, args.cache, args.full)
+    if not only or "A" in only:
+        gate_executor_stream(args.models, args.cache)
     if not only or "B" in only:
         gate_freshness(args.models, args.cache, args.full)
     if not only or "D" in only:

@@ -406,12 +406,28 @@ The daemon changes by only -0.002 to -0.004 s: the same 332 launches reach it.
 
 Two caveats about the absolute column.  The 160 baseline here is 0.2875 s, not
 the 0.241 s of section 4.  The measurement ran against the daemon that was
-already serving the board rather than a fresh one per cell, with four idle
-fake-daemon processes from an unrelated pipeline experiment on the same ARM
-(load average 1.3 of 4 cores), so the client figure is inflated.  The on/off
-delta is measured inside the same environment, cell by cell, which is the
-comparable number; the absolute baseline should be re-taken on an idle board
-before it replaces section 4.
+already serving the board rather than a fresh one per cell, with idle
+processes from an unrelated pipeline experiment on the same ARM (load average
+1.3 of 4 cores), so the client figure is inflated.  The on/off delta is
+measured inside the same environment, cell by cell, which is the comparable
+number; the absolute baseline has to be re-taken on an idle board before it
+replaces section 4.
+
+The command for that window is:
+
+```
+tools/cost/baseline.py --check      # preconditions only, opens no device
+tools/cost/baseline.py --out ~/scratch/logs/baseline-plan.json
+```
+
+`baseline.py` repeats the three-round A/B above (plan off then on, eight timed
+frames after three warm-ups per cell) with each cell under the thermal guard,
+and refuses to start until one ARM clock at 1.0 GHz, no other Python process,
+load average <= 0.20, <= 55 C, `throttled=0x0` and the packaged `vc4d` on
+`/run/vc4d.sock` all hold.  It prints the daemon's uptime and leaves a
+restart to the window owner: a long-lived daemon may hand the client a
+smaller arena than a fresh one, which is the remaining difference from the
+section 4 protocol.
 
 ### 6.6 The first run on silicon, and what it found
 

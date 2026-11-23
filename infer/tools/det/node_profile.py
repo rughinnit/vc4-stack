@@ -5,12 +5,22 @@
         python3 infer/tools/det/profile.py MODEL OUT.json
 
 One warm-up, one profiled run.  The rows are the engine's own counters, so the
-wall/GPU split per node is what the runner measured, not a model.
+wall/GPU split per node is what the runner measured, not a model.  The tool
+refuses an engine outside this checkout; ``--allow-installed`` tests an
+installed one on purpose.
 """
 import json
 import sys
 
 import numpy as np
+
+import os as _os
+import sys as _sys
+_ROOT = _os.path.dirname(
+    _os.path.dirname(_os.path.dirname(
+        _os.path.dirname(_os.path.abspath(__file__)))))
+_sys.path.insert(0, _os.path.join(_ROOT, "tools"))
+from checkout_guard import require_checkout                # noqa: E402
 import vc4infer
 
 
@@ -40,4 +50,13 @@ def main(model, out):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    _argv = [a for a in sys.argv[1:] if a != "--allow-installed"]
+    if "--allow-installed" in sys.argv[1:]:
+        require_checkout(_os.path.abspath(__file__), allow_installed=True)
+    else:
+        require_checkout(_os.path.abspath(__file__))
+    if len(_argv) != 2:
+        print("usage: node_profile.py MODEL OUT.json [--allow-installed]",
+              file=sys.stderr)
+        sys.exit(2)
+    main(_argv[0], _argv[1])

@@ -4008,13 +4008,42 @@ class Runner:
                 self.values[name] = self.upload(arr)
             finally:
                 self._alloc_scope = None
-        for kind, item in plan.steps:
+        steps = plan.steps
+        i = 0
+        while i < len(steps):
+            kind, item = steps[i]
             if kind == "c":
-                self.eng.plan_run(item)
-            elif kind == "p":
+                # A frozen plan segment is a straight run of device calls with
+                # no host read between records, so one batch scope covers the
+                # whole run: consecutive "c" steps queue together and flush
+                # once, at the next barrier or at the segment's end.  For a
+                # plan whose c steps alternate with Python nodes this is one
+                # node's scope, which is what per-node batching already gave;
+                # for a plan that replays several nodes in a row it is the
+                # composition that matters.
+                hold = getattr(self.eng, "batch_hold", None)
+                release = getattr(self.eng, "batch_release", None)
+                if hold is not None:
+                    hold()
+                try:
+                    while i < len(steps) and steps[i][0] == "c":
+                        self.eng.plan_run(steps[i][1])
+                        i += 1
+                except BaseException:
+                    if release is not None:
+                        try:
+                            release()
+                        except Exception:
+                            pass
+                    raise
+                if release is not None:
+                    release()
+                continue
+            if kind == "p":
                 self._run_plan_node(item)
             # "s": the optimiser skipped the node; its output names already
             # describe the buffer the recording produced
+            i += 1
         res = []
         for o in self.graph.output:
             v = self.values.get(o.name)

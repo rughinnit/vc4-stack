@@ -180,6 +180,20 @@ class Trace:
                            (int(rows), int(cols))))
         return self._eng.cumsum(a, out, rows, cols)
 
+    # -- control, not a device call ----------------------------------------
+    # The executor brackets each node with a batch scope.  Without these two
+    # methods the proxy records ("other", "batch_hold") as a device call and
+    # every node becomes unrepresentable, so no plan is ever built.
+    def batch_hold(self):
+        fn = getattr(self._eng, "batch_hold", None)
+        if fn is not None:
+            fn()
+
+    def batch_release(self):
+        fn = getattr(self._eng, "batch_release", None)
+        if fn is not None:
+            fn()
+
 
 def _convert(call):
     """A trace entry as (kind, a, b, out, n, p), or None if unrepresentable."""

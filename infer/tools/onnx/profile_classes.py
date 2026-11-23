@@ -33,6 +33,14 @@ import json
 import os
 import sys
 import time
+
+import os as _os
+import sys as _sys
+_ROOT = _os.path.dirname(
+    _os.path.dirname(_os.path.dirname(
+        _os.path.dirname(_os.path.abspath(__file__)))))
+_sys.path.insert(0, _os.path.join(_ROOT, "tools"))
+from checkout_guard import require_checkout                # noqa: E402
 from collections import OrderedDict
 
 import numpy as np
@@ -54,8 +62,12 @@ def main(argv=None):
     ap.add_argument("--cache", default=None, help="kernel cache directory")
     ap.add_argument("--conv", action="store_true",
                     help="print the per-layer conv panel/GEMM split")
+    ap.add_argument("--allow-installed", action="store_true",
+                    help="test the installed vc4infer package instead of "
+                         "this checkout")
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
+    require_checkout(__file__, allow_installed=args.allow_installed)
 
     inp = args.input
     if inp is None:

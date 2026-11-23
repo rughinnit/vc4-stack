@@ -40,9 +40,15 @@ never conflated:
 
 Usage
 -----
-    TMPDIR=$HOME/scratch/tmp python3 infer/tools/op_matrix.py
+    PYTHONPATH=infer/python TMPDIR=$HOME/scratch/tmp \
+        python3 infer/tools/op_matrix.py
     python3 infer/tools/op_matrix.py --skip-gpu          # no device needed
     python3 infer/tools/op_matrix.py --only Conv,Resize --skip-gpu
+
+The GPU phase refuses to run when ``import vc4infer`` resolves outside this
+checkout (``tools/checkout_guard.py``), because a tool started from its
+directory otherwise tests the installed wheel.  ``--allow-installed`` is the
+explicit way to test that wheel on purpose.
     python3 infer/tools/op_matrix.py --opset 17 --out-dir /tmp/out
 
 The tool never calls the GPU for an operator the policy refuses: ``check_policy``
@@ -65,6 +71,13 @@ import tempfile
 import time
 import traceback
 import zlib
+
+import os as _os
+import sys as _sys
+_ROOT = _os.path.dirname(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+_sys.path.insert(0, _os.path.join(_ROOT, "tools"))
+from checkout_guard import require_checkout                # noqa: E402
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -2611,6 +2624,9 @@ def main(argv=None):
     ap.add_argument("--skip", default="")
     ap.add_argument("--stage", choices=("synth", "all"), default="all",
                     help="synth: build+validate graphs only (no vc4)")
+    ap.add_argument("--allow-installed", action="store_true",
+                    help="test the installed vc4infer package instead of "
+                         "this checkout")
     ap.add_argument("--skip-gpu", action="store_true",
                     help="alias for --stage synth; the vc4 import is optional "
                          "and no device is opened")
@@ -2637,12 +2653,15 @@ def main(argv=None):
         return 3
     if gpu and vc4infer is None:
         print("ERROR: the vc4infer package is not importable (%s).\n"
-              "Run the graph-validity pass with --skip-gpu; run the GPU "
-              "sweep only when the installed stack is stable."
-              % VC4_IMPORT_ERROR, file=sys.stderr)
+              "Run the graph-validity pass with --skip-gpu.  For the GPU "
+              "sweep, put this checkout first: PYTHONPATH=<checkout>/"
+              "infer/python.  The tool refuses an engine outside the "
+              "checkout." % VC4_IMPORT_ERROR, file=sys.stderr)
         return 3
 
     here = os.path.dirname(os.path.abspath(__file__))
+    if gpu:
+        require_checkout(__file__, allow_installed=args.allow_installed)
     repo = os.path.dirname(os.path.dirname(here))
     out_dir = args.out_dir or os.path.join(repo, "docs")
     os.makedirs(out_dir, exist_ok=True)

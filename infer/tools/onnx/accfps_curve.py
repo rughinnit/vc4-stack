@@ -30,6 +30,14 @@ import time
 import numpy as np
 from PIL import Image
 
+import os as _os
+import sys as _sys
+_ROOT = _os.path.dirname(
+    _os.path.dirname(_os.path.dirname(
+        _os.path.dirname(_os.path.abspath(__file__)))))
+_sys.path.insert(0, _os.path.join(_ROOT, "tools"))
+from checkout_guard import require_checkout                # noqa: E402
+
 REPEAT = 5
 WARMUP = 3
 
@@ -45,6 +53,9 @@ def parse(argv):
     ap.add_argument("--model", help="one ONNX file instead of the curve")
     ap.add_argument("--tag", help="output tag for --model (default: imgsz)")
     ap.add_argument("--repeat", type=int, default=REPEAT)
+    ap.add_argument("--allow-installed", action="store_true",
+                    help="test the installed vc4infer package instead of "
+                         "this checkout")
     ap.add_argument("--conf", type=float, default=0.25)
     return ap.parse_args(argv)
 
@@ -220,6 +231,8 @@ def report(args, pts):
 
 def main(argv):
     args = parse(argv)
+    if args.mode in ("points", "all"):
+        require_checkout(__file__, allow_installed=args.allow_installed)
     os.makedirs(args.out, exist_ok=True)
     pts = []
     for imgsz, model, tag in points_of(args):

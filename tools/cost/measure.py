@@ -19,6 +19,13 @@ import statistics
 import sys
 import time
 
+import os as _os
+import sys as _sys
+_ROOT = _os.path.dirname(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+_sys.path.insert(0, _os.path.join(_ROOT, "tools"))
+from checkout_guard import require_checkout                # noqa: E402
+
 import common
 
 
@@ -38,10 +45,15 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--threads", type=int, default=4,
                     help="ncnn intra-op threads")
+    ap.add_argument("--allow-installed", action="store_true",
+                    help="test the installed vc4infer package instead of "
+                         "this checkout")
     ap.add_argument("--rate", type=float, default=None,
                     help="deliver frames at this rate (FPS), sleeping "
                          "between runs")
     args = ap.parse_args()
+    if args.runtime == "vc4":
+        require_checkout(__file__, allow_installed=args.allow_installed)
 
     # Import before the RSS baseline so the model, not the interpreter, is the
     # delta that the load column reports.

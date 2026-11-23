@@ -14,6 +14,9 @@ Usage
         python3 infer/tools/resize_matrix.py [--sizes]
     python3 infer/tools/resize_matrix.py --skip-gpu     # graph validity only
 
+The GPU phase refuses an engine outside this checkout (``--allow-installed``
+tests an installed one on purpose); see tools/checkout_guard.py.
+
 Exit status is 0 only when every accepted combination is within tolerance.
 """
 from __future__ import annotations
@@ -22,6 +25,13 @@ import argparse
 import os
 import sys
 import tempfile
+
+import os as _os
+import sys as _sys
+_ROOT = _os.path.dirname(
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+_sys.path.insert(0, _os.path.join(_ROOT, "tools"))
+from checkout_guard import require_checkout                # noqa: E402
 
 import numpy as np
 import onnx
@@ -80,9 +90,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-gpu", action="store_true",
                     help="only build/validate the graphs (no device)")
+    ap.add_argument("--allow-installed", action="store_true",
+                    help="test the installed vc4infer package instead of "
+                         "this checkout")
     ap.add_argument("--sizes", action="store_true",
                     help="use the sizes form instead of scales")
     args = ap.parse_args()
+    if not args.skip_gpu:
+        require_checkout(__file__, allow_installed=args.allow_installed)
 
     x = np.random.RandomState(11).uniform(-1, 1, X_SHAPE).astype(np.float32)
     sizes = SIZES if args.sizes else None

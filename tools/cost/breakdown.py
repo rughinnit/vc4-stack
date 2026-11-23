@@ -49,15 +49,28 @@ class Prof(ctypes.Structure):
         ("load", ctypes.c_uint64), ("flush", ctypes.c_uint64),
         ("pad_zero", ctypes.c_uint64), ("pad_copy", ctypes.c_uint64),
         ("civac_off", ctypes.c_uint64), ("panel_zero", ctypes.c_uint64),
-        ("pad_zero_bytes", ctypes.c_uint64),
-        ("pad_copy_bytes", ctypes.c_uint64),
+        ("pad_zero_bytes", ctypes.c_uint64), ("pad_copy_bytes", ctypes.c_uint64),
         ("civac_off_bytes", ctypes.c_uint64),
         ("n_launch", ctypes.c_uint64), ("n_upload", ctypes.c_uint64),
         ("n_download", ctypes.c_uint64), ("n_load", ctypes.c_uint64),
         ("n_flush", ctypes.c_uint64),
         ("n_batch", ctypes.c_uint64), ("n_batch_launch", ctypes.c_uint64),
-        ("clean_bytes", ctypes.c_uint64),
-        ("up_bytes", ctypes.c_uint64), ("down_bytes", ctypes.c_uint64),
+        ("clean_bytes", ctypes.c_uint64), ("up_bytes", ctypes.c_uint64),
+        ("down_bytes", ctypes.c_uint64),
+        ("wait", ctypes.c_uint64), ("wait_pad", ctypes.c_uint64),
+        ("wait_other", ctypes.c_uint64), ("n_reap", ctypes.c_uint64),
+        ("n_wait_pad", ctypes.c_uint64), ("wait_kind", ctypes.c_uint64 * 6),
+        # dirty-range accounting (infer/src/vc4_dev_remote.c, docs/CIVAC.md)
+        ("mk_bytes", ctypes.c_uint64), ("mk_calls", ctypes.c_uint64),
+        ("mk_hull", ctypes.c_uint64), ("mk_max", ctypes.c_uint64),
+        ("mk_ndirty_max", ctypes.c_uint64),
+        ("cl_bytes", ctypes.c_uint64), ("cl_ranges", ctypes.c_uint64),
+        ("cl_max", ctypes.c_uint64), ("cl_uniq", ctypes.c_uint64),
+        ("mk_op", ctypes.c_uint64), ("mk_uni", ctypes.c_uint64),
+        ("mk_scratch", ctypes.c_uint64),
+        ("mk_scr_area", ctypes.c_uint64), ("mk_pool_area", ctypes.c_uint64),
+        ("cl_frame_bytes", ctypes.c_uint64),
+        ("cl_frame_uniq", ctypes.c_uint64),
     ]
 
 
@@ -88,6 +101,7 @@ def main():
     lib = bind.lib
     lib.vc4_prof_ptr.restype = ctypes.POINTER(Prof)
     lib.vc4_prof_reset.argtypes = []
+    lib.vc4_prof_frame_begin.argtypes = []
 
     # --- C-time wrappers: every method that calls into the library
     c_calls = {"n": 0, "cpu": 0.0, "by": {}}
@@ -169,10 +183,14 @@ def main():
     d0 = common.proc_cpu_s(dp) if dp else 0.0
     t0 = time.thread_time()
     walls = []
+    fb = fu = 0
     for _ in range(args.runs):
+        lib.vc4_prof_frame_begin()
         t = time.perf_counter()
         eng.run(x)
         walls.append((time.perf_counter() - t) * 1e3)
+        fb += lib.vc4_prof_ptr().contents.cl_frame_bytes
+        fu += lib.vc4_prof_ptr().contents.cl_frame_uniq
     run_thread = time.thread_time() - t0
     c1 = common.proc_cpu_s()
     d1 = common.proc_cpu_s(dp) if dp else 0.0
@@ -230,6 +248,22 @@ def main():
             "downloads_per_frame": pr.n_download / n,
             "loads_per_frame": pr.n_load / n,
             "clean_lines_per_frame": pr.clean_bytes / n,
+            "dirty_marked_bytes_per_frame": pr.mk_bytes / n,
+            "dirty_marked_calls_per_frame": pr.mk_calls / n,
+            "dirty_hull_collapses_per_frame": pr.mk_hull / n,
+            "dirty_ndirty_max": pr.mk_ndirty_max,
+            "dirty_mark_max_bytes": pr.mk_max,
+            "clean_bytes_per_frame": pr.cl_bytes / n,
+            "clean_ranges_per_frame": pr.cl_ranges / n,
+            "clean_max_range_bytes": pr.cl_max,
+            "clean_unique_bytes_per_frame": pr.cl_uniq / n,
+            "frame_clean_bytes": fb / n,
+            "frame_clean_uniq": fu / n,
+            "dirty_by_op_per_frame": pr.mk_op / n,
+            "dirty_by_uni_per_frame": pr.mk_uni / n,
+            "dirty_by_scratch_per_frame": pr.mk_scratch / n,
+            "dirty_by_op_scratch_area_per_frame": pr.mk_scr_area / n,
+            "dirty_by_op_pool_area_per_frame": pr.mk_pool_area / n,
             "up_bytes_per_frame": pr.up_bytes / n,
             "down_bytes_per_frame": pr.down_bytes / n,
         },

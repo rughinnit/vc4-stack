@@ -59,6 +59,17 @@ class Prof(ctypes.Structure):
         ("wait", ctypes.c_uint64), ("wait_pad", ctypes.c_uint64),
         ("wait_other", ctypes.c_uint64), ("n_reap", ctypes.c_uint64),
         ("n_wait_pad", ctypes.c_uint64), ("wait_kind", ctypes.c_uint64 * 6),
+        # dirty-range accounting (infer/src/vc4_dev_remote.c, docs/CIVAC.md)
+        ("mk_bytes", ctypes.c_uint64), ("mk_calls", ctypes.c_uint64),
+        ("mk_hull", ctypes.c_uint64), ("mk_max", ctypes.c_uint64),
+        ("mk_ndirty_max", ctypes.c_uint64),
+        ("cl_bytes", ctypes.c_uint64), ("cl_ranges", ctypes.c_uint64),
+        ("cl_max", ctypes.c_uint64), ("cl_uniq", ctypes.c_uint64),
+        ("mk_op", ctypes.c_uint64), ("mk_uni", ctypes.c_uint64),
+        ("mk_scratch", ctypes.c_uint64),
+        ("mk_scr_area", ctypes.c_uint64), ("mk_pool_area", ctypes.c_uint64),
+        ("cl_frame_bytes", ctypes.c_uint64),
+        ("cl_frame_uniq", ctypes.c_uint64),
     ]
 
 

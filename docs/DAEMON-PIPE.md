@@ -243,12 +243,16 @@ So the 148 ms of "daemon work and launch gap" is not 148 ms of daemon work:
 * ~2 ms is the daemon's request preparation, which is what this branch set out
   to hide;
 * the remaining ~110 ms of the 407 ms frame that is not QPU is the **client's
-  own host work**: 130-135 ms of client CPU per frame, of which the per-frame
-  dirty-range cache maintenance (`clean_ns` in the launch-path profile) is
-  70-95 ms at 160 — `dc civac` over roughly 15 MiB of dirty ranges per frame.
-  It is on the critical path because the client cannot build request N+1 until
-  the scratch window of request N-2 is free, which is the 262 ms it spends
-  blocked at `scratch` in the same run.
+  own host work**: 130-135 ms of client CPU per frame.  It is on the critical
+  path because the client cannot build request N+1 until the scratch window of
+  request N-2 is free, which is the 262 ms it spends blocked at `scratch` in
+  the same run.  Measured afterwards ([CIVAC.md](CIVAC.md)): the two largest
+  pieces are the conv pad, 20.1 ms per frame at 160 (14.4 ms zero-filling the
+  padded image and 5.7 ms copying into it), and the dirty-range cache
+  maintenance, 6.7 ms per frame over 61 MB of dirty ranges.  The 70-95 ms this
+  page originally attributed to `dc civac` was a misreading of the cumulative
+  `VC4PROF` line, which runs over a whole suite rather than one frame; the
+  per-frame measurement is the one above.
 
 That is the honest answer to the question the branch was asked: **the daemon
 is not the remaining serial cost, and neither is the launch gap.**  At 160 the
@@ -277,9 +281,12 @@ Landed, all measured here:
 
 Not done, and now known to be the next thing that matters:
 
-* the client's cache maintenance volume (70-95 ms/frame at 160).  Coalescing
-  the dirty ranges, cleaning only what the GPU will read, or pushing the clean
-  into the launch that consumes it are the candidates;
+* the conv pad (20.1 ms/frame at 160, 73 % of the bytes it stores are zeros):
+  a border-aware im2col that never materialises the padded image.  The
+  zero-fill part of it is done ([CIVAC.md](CIVAC.md), 3.3 ms);
+* the scratch over-mark (~3 ms/frame at 160): 30 MB of scratch is cleaned that
+  the CPU never wrote.  Letting each op mark what it writes, and dropping the
+  high-water mark, is the change;
 * the scratch-window serialisation (262 ms blocked at 160).  A third window
   does not fit at 160 ([OVERLAP.md](OVERLAP.md) §6), so this is a footprint
   question, not a pipeline one;

@@ -691,10 +691,12 @@ segment.
 
 #### The 150 MiB question
 
-The 35 matrix cells the old estimate refused were re-planned; the five that
-were measured at 150 MiB have pool-plus-scratch totals of 52.2 (v8n320), 65.4
-(v9s160), 83.0 (v5s160), 98.2 (v8s160) and 131.6 MiB (v8n640), and all five
-plan under a 145 MiB client.  Capacity is not correctness:
+The 35 matrix cells the old estimate refused were re-planned.  The five that
+were measured then have pool-plus-scratch totals of 52.2 (v8n320), 65.4
+(v9s160), 83.0 (v5s160), 98.2 (v8s160) and 131.6 MiB (v8n640).  Re-measured on
+this tree, v8s160 is 91.5 + 5.8 = 97.2 MiB and v8n640 is 63.0 + 87.9 =
+150.9 MiB: the 640 figure in the earlier table predates the scratch
+accounting used here.  Capacity is not correctness:
 
 - **v8n320** is the cell that moved.  Its raw graph returns the right
   detections with wrong values (16.1 scaled against ONNX Runtime CPU); the
@@ -703,11 +705,22 @@ plan under a 145 MiB client.  Capacity is not correctness:
 - **v5s160** and **v9s160** run on the raw graph at 150 MiB (943 ms and
   2430 ms, 1.06 and 0.41 FPS) but fail the accuracy gate at 2.52 and 4.09
   scaled.  The plan made them fit; it did not make them right.
-- **v8s160** plans at 98.2 MiB and then refuses at run time because the
-  512-channel upsample kernel is 21440 B and the client code slot is 16384 B.
-- **v8n640** plans at 131.6 MiB and then refuses in the first conv because
-  `copy2d`'s lane stride, 1638400 x 15, overflows the 24-bit address
-  multiply.
+- **v8s160** runs on the raw graph at 147 MiB (972.6 ms, 1.03 FPS, 1249
+  launches) and on the optimiser's graph (877.6 ms, 1.14 FPS, 368 launches).
+  Both are wrong against ONNX Runtime on the fixed input: 3.87 and 1.50
+  scaled.  The 512-channel upsample kernel is now 1240 B, not 21440 B: the
+  channel-block loop runs at run time, so the code slot no longer refuses it.
+- **v8n640** runs on the raw graph in a 184 MiB daemon (181.0 MiB of client
+  arena; 2835.6 ms, 0.35 FPS, 6604 launches) and on the optimiser's graph
+  (2420.8 ms, 0.41 FPS, 1217 launches).  Both are wrong: 34.0 and 16.5
+  scaled, and 324 anchors over 0.25 against the reference's zero.  The
+  lane-stride guard that refused it was testing the product; `mul24` truncates
+  the operand, and 1638400 is inside the 24-bit operand, so the copy is
+  exact.  The cell does not fit 150 MiB: its plan is 150.9 MiB of pool and
+  scratch and the pool grows one segment at the first conv.
+
+The accuracy harness is sound on the same tree: YOLOv8n-160 and YOLOv8n-320
+measure 3.7e-4 and 2.6e-4 scaled, raw and optimised.
 
 The measured table is in `docs/BENCHMARKS.md` sec. 14.  The reduction is a
 capacity result: the FPS of these larger graphs is not comparable with

@@ -1787,6 +1787,15 @@ class Runner:
             # a partial store moves `depth` words, so only that many lanes may
             # be read (the rest are clamped to the vector base)
             nlane = depth
+        # mul24 is 24x24 -> low 32 bits, so the operand is the field that
+        # limits a lane-strided copy, not the product (15 * 1638400 is exact
+        # and is what the 640-wide first conv uses).  Refuse the stride that
+        # truncates here, where the copy is composed, and name the limit.
+        if nlane and slane >= (1 << 24):
+            raise UnsupportedNode(
+                "copy2d: lane stride %d B does not fit the 24-bit mul24 "
+                "operand (max %d B); split the lane dimension across calls "
+                "or use a row copy" % (slane, (1 << 24) - 1))
         self.eng.copy2d_x(src, dst, rows, vpr, srow, drow, svec, dvec, slane,
                           nlane, nblk, sbstep, dbstep, units, depth)
 

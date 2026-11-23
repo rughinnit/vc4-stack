@@ -25,7 +25,31 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define NHWC_SLACK (256u * 1024u)     /* over-read guard for the DMA windows */
+#define NHWC_SLACK (256u * 1024u)     /* cap on the over-read guard, see below */
+
+/* Bytes the im2col can read past the padded image, i.e. what the guard after it
+ * has to have zeroed.
+ *
+ * The last block of a row starts 16 output pixels before the end of the
+ * 16-aligned row, so its source pixels reach (Wg-1)*stride; Wg <= wo+15 and
+ * wo*stride <= wp, so the read ends at most 15*stride+1 pixels past the row.
+ * The taps of the last output row stay inside the padded image by construction
+ * ((ho-1)*stride + (KH-1)*dilation <= hp-1), so nothing is read past the last
+ * row except that horizontal overhang.  A block step (16*stride*C*4) plus one
+ * padded row covers the overhang and the QPU's row granularity.
+ *
+ * The guard used to be a flat 256 KiB per pad call whatever the image, which at
+ * YOLOv8n-160 is 16.0 MB of the frame's 17.3 MB of zero fill over 64 convs
+ * (docs/CIVAC.md).  The bound is 1.27 MB for the same frame. */
+static size_t nhwc_guard(int C, int wp, int stride)
+{
+    size_t block = 16u * (size_t)stride * (size_t)C * 4u;
+    size_t row = (size_t)wp * (size_t)C * 4u;
+    size_t g = block + row + 64u;
+    if (g > NHWC_SLACK)
+        g = NHWC_SLACK;
+    return (g + 63u) & ~(size_t)63u;
+}
 #define NHWC_MAX_QPU 12
 #define NHWC_IM2COL_QPU 4             /* 16 VPM rows per QPU, 64 rows total   */
 
@@ -52,7 +76,7 @@ typedef struct {
 
 static int nhwc_pad_image(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
                           int H, int W, int in_pitch, int pt, int pl, int pb,
-                          int pr, nhwc_pad *pd)
+                          int pr, size_t guard, nhwc_pad *pd)
 {
     const int hp = H + pt + pb, wp = W + pl + pr;
     const size_t per = (size_t)hp * wp * C * 4u;
@@ -63,7 +87,7 @@ static int nhwc_pad_image(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
     const int prof = vc4_prof_enabled();
     if (prof)
         vc4_prof_in_pad(1);
-    float *p = vc4__scratch_alloc(ctx, per * (size_t)nimg + NHWC_SLACK, NULL);
+    float *p = vc4__scratch_alloc(ctx, per * (size_t)nimg + guard, NULL);
     if (!p) {
         if (prof)
             vc4_prof_in_pad(0);
@@ -104,8 +128,8 @@ static int nhwc_pad_image(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
             }
         }
     }
-    memset((uint8_t *)p + per * (size_t)nimg, 0, NHWC_SLACK);
-    zeroed += NHWC_SLACK;
+    memset((uint8_t *)p + per * (size_t)nimg, 0, guard);
+    zeroed += guard;
     uint64_t pz1 = prof ? vc4_prof_now() : 0;
     if (nimg)
         vc4__invalidate_off(ctx, in->off, (size_t)nimg * H * in_pitch * C * 4u);
@@ -468,7 +492,8 @@ static vc4_status conv_nhwc_common(vc4_ctx *ctx, const vc4_buf *in, int nimg,
     vc4__scratch_reset(ctx);
     nhwc_pad pd;
     if (!nhwc_pad_image(ctx, in, nimg, Cin, H, W, in_pitch, padt, padl,
-                        padb, padr, &pd)) {
+                        padb, padr,
+                        nhwc_guard(Cin, W + padl + padr, stride), &pd)) {
         vc4__scratch_reset(ctx);
         return VC4_ERR_NOMEM;
     }
@@ -706,7 +731,7 @@ vc4_status vc4_maxpool_nhwc(vc4_ctx *ctx, const vc4_buf *in, int nimg, int C,
     vc4__scratch_reset(ctx);
     nhwc_pad pd;
     if (!nhwc_pad_image(ctx, in, nimg, C, H, W, in_pitch, pad, pad, pad, pad,
-                        &pd)) {
+                        nhwc_guard(C, W + 2 * pad, 1), &pd)) {
         vc4__scratch_reset(ctx);
         return VC4_ERR_NOMEM;
     }

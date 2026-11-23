@@ -15,6 +15,11 @@
 #include "gpu_gate.h"
 #include "util.h"
 
+/* The executor holds one batch scope per graph node.  The C tests normally
+ * leave it off (one synchronous LAUNCH per launch); the multi-batch case sets
+ * it so the batch-boundary path is actually exercised. */
+static int g_batch;
+
 static int run(vc4_ctx *ctx, vc4_op op, const char *name, size_t n, int reps,
                int binary, double tol, int exact, int rel)
 {
@@ -51,7 +56,14 @@ static int run(vc4_ctx *ctx, vc4_op op, const char *name, size_t n, int reps,
     for (int r = 0; r < reps; ++r) {
         memset(o, 0xCD, n * 4);
         vc4_upload(ctx, &bo, o, n * 4);
+        if (g_batch)
+            vc4_batch_begin(ctx);
         vc4_status st = vc4_elementwise(ctx, op, &ba, binary ? &bb : NULL, &bo, n);
+        if (g_batch) {
+            vc4_status bst = vc4_batch_end(ctx);
+            if (st == VC4_OK)
+                st = bst;
+        }
         if (st != VC4_OK) {
             printf("FAIL: %s -> %s (%s)\n", name, vc4_strerror(st), vc4_last_error(ctx));
             return 1;
@@ -131,6 +143,17 @@ int main(int argc, char **argv)
     rc |= run(ctx, VC4_OP_DIV, "div+tail", 1000, reps, 1, 5e-7, 0, 1);
     rc |= run(ctx, VC4_OP_SIGMOID, "sigmoid", 4096, reps, 0, 1e-5, 0, 0);
     rc |= run(ctx, VC4_OP_SILU, "silu", 4096, reps, 0, 1e-5, 0, 0);
+    /* One launch covers 12 groups of 256 floats.  An op over 64 launches is
+     * 196,608 floats; 1,638,400 (the 640-wide first-conv NHWC shape) is the
+     * one whose second and later requests lost their first launch.  Run under
+     * a batch-capable daemon (protocol 4) this case fails before the batch
+     * re-open fix and passes after it; the packaged daemon has no batch and
+     * passes either way, so the private-daemon run is the one that gates it.
+     */
+    g_batch = 1;
+    rc |= run(ctx, VC4_OP_SIGMOID, "sigmoid 1638400 multi-batch", 1638400, 1,
+              0, 1e-5, 0, 0);
+    g_batch = 0;
 
     vc4_print_supported_ops(stdout);
     vc4_shutdown(ctx);

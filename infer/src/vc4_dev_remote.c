@@ -1017,6 +1017,20 @@ static vc4_status remote_queue_launch(vc4_ctx *ctx, const vc4_kernel *k,
         if (st != VC4_OK)
             return st;
         b = &r->b[r->cur];
+        /* The end left this batch EMPTY with npend 0.  Re-open it before
+         * queueing: an EMPTY-state batch accepts this entry, but the next
+         * launch sees state != FILLING, calls remote_open_batch(), and that
+         * open resets npend to 0 and drops the entry.  The dropped launch was
+         * the first of every new batch: its uniform shadow was overwritten by
+         * the following launch, its groups were never computed, and an
+         * elementwise op longer than one 64-launch request lost one launch
+         * (12 groups, 48 store chunks) per batch.  Measured as 384 bad 64-float
+         * chunks in a single Sigmoid over 1,638,400 floats, and as the first
+         * divergence of v8n320/v8s160/v8n640. */
+        st = remote_open_batch(ctx);
+        if (st != VC4_OK)
+            return st;
+        b = &r->b[r->cur];
     }
     int slot = b->set * (int)VC4D_BATCH_MAX + b->npend;
     uint32_t off = REMOTE_BATCH_UNI_BASE +

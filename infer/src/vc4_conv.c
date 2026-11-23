@@ -181,6 +181,7 @@ vc4_status vc4__conv2d_tuned(vc4_ctx *ctx,
            tap).  Permute the weights into the panel's k order first; this is a
            byte copy, not arithmetic. */
         uint32_t wt_bus = vc4_bus_addr(ctx, wt);
+        const float *srcf = (const float *)(ctx->arena + wt->off);
         if (KH * KW > 1) {
             float *wr = vc4__scratch_alloc(ctx, (size_t)Cout * K * 4, NULL);
             if (!wr) { vc4__scratch_reset(ctx); return VC4_ERR_NOMEM; }
@@ -192,13 +193,25 @@ vc4_status vc4__conv2d_tuned(vc4_ctx *ctx,
                     for (int t = 0; t < taps; ++t)
                         wr[(size_t)co * K + (size_t)t * Cin + ci] =
                             src[(size_t)co * K + (size_t)ci * taps + t];
+            srcf = wr;
             wt_bus = ctx->gpu_bus + (uint32_t)((uint8_t *)wr - ctx->arena);
         }
         /* one column block of the k-major B panel is nk*16 floats = 64*nk
            (nk includes the folded bias k-block) */
-        vc4_status st = vc4__pack3_run(ctx, wt_bus, K, 64u * K,
-                                      ctx->gpu_bus + wb.off, 64u * nk,
-                                      (uint32_t)Cout / 16u);
+        vc4_status st;
+        if ((uint64_t)K * 4u > 8191u) {
+            /* pack3's VDR pitch K*4 is a 13-bit field; see vc4_nhwc.c. */
+            for (uint32_t cb = 0; cb < (uint32_t)Cout / 16u; ++cb)
+                for (uint32_t k = 0; k < K; ++k)
+                    for (uint32_t r = 0; r < 16u; ++r)
+                        wpanel[((size_t)cb * nk + k) * 16u + r] =
+                            srcf[((size_t)cb * 16u + r) * K + k];
+            st = VC4_OK;
+        } else {
+            st = vc4__pack3_run(ctx, wt_bus, K, 64u * K,
+                                ctx->gpu_bus + wb.off, 64u * nk,
+                                (uint32_t)Cout / 16u);
+        }
         (void)Kp;
         if (st != VC4_OK) {
             vc4__scratch_reset(ctx);

@@ -378,6 +378,13 @@ vc4_status vc4__pack3_run(vc4_ctx *ctx, uint32_t src_bus, uint32_t rowlen,
 {
     if (rowlen % 16 || rowblocks < 1)
         return VC4_ERR_INVAL;
+    if ((uint64_t)rowlen * 4u > 8191u) {
+        vc4__set_err(ctx, "pack3: source row %u floats (%llu B) exceeds the "
+                     "13-bit VDR pitch field (8191 B); pack this K on the CPU "
+                     "or in K-aligned chunks", rowlen,
+                     (unsigned long long)rowlen * 4u);
+        return VC4_ERR_UNSUPPORTED;
+    }
     const uint32_t tr = rowblocks;
     const int pnq = pack3_qpus(tr);
     const uint32_t per = tr / (uint32_t)pnq;

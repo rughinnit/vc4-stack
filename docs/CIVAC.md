@@ -56,6 +56,46 @@ three warm-up frames, packaged daemon on `/run/vc4d.sock`, ARM 1.0 GHz,
   must be cleaned once per write.  The redundancy is in the writing, not in the
   cleaning.
 
+### 2.1 The zero fill is the over-read guard, not the border
+
+The pad allocates `per*nimg + NHWC_SLACK` and zeroes the whole `NHWC_SLACK`
+tail after the image, as an over-read guard for the im2col.  `NHWC_SLACK` is a
+flat 256 KiB per call, whatever the image.  YOLOv8n-160 makes 64 pad calls per
+frame (its conv and pool nodes, from shape inference), so the guard is
+**16.0 MB of the 17.3 MB** of zero fill; the border strips are 0.6 MB, and the
+interiors 4.9 MB (6.3 MB measured, the difference is the pool calls and the
+engine's decomposition).
+
+What the im2col can actually read past the image is bounded: the last block of
+a row starts 16 output pixels before the end of the 16-aligned row, so its
+source pixels reach `(Wg-1)*stride`; with `Wg <= wo+15` and `wo*stride <= wp`
+the read ends at most `15*stride+1` pixels past the row, and the taps of the
+last output row stay inside the padded image by construction.  One block step
+plus one padded row covers it.  Sized that way the same frame's guard is
+**1.27 MB** instead of 16.0 MB (largest single guard 78 KiB, C=512 at 7x7).
+
+Host measurement of the two patterns (64 calls each, on a faulted-in anonymous
+mapping, `memset` through libc - no compiler, no QPU):
+
+| zero fill | volume | ms | GB/s |
+|---|---:|---:|---:|
+| 64 x 256 KiB guard at its pad offsets | 16.0 MB | 9.24 | 1.73 |
+| 64 x bound guard | 1.27 MB | 0.74 | 1.72 |
+| plain `memset`, 17.3 MB | 17.3 MB | 10.35 | 1.75 |
+
+So the guard's 14.7 MB costs **8.5 ms per frame** at the memset rate the board
+delivers, and the firmware's `memset` is already at that rate for both the old
+and the new pattern - this is volume, not the store instruction.  8.50 ms of a
+404 ms frame is 2.1 %, i.e. 2.47 to 2.53 FPS at 160 if nothing else moves.  The
+smaller allocation also removes the same bytes from the scratch high-water
+mark, which is cleaned every request, so the dirty volume should fall with it
+(not measured yet).
+
+The copy is at the plain `memcpy` rate for its sizes and has no headroom:
+per-shape, 0.72-1.8 GB/s against a plain `memcpy` of 1.17 GB/s, with the
+small-row shapes (C=3, 160x160: 160 rows of 1920 B) losing to call overhead
+rather than to the copy itself.
+
 ## 3. What makes the bytes dirty
 
 Per frame at 160, by producer, from the tags added to the mark path:

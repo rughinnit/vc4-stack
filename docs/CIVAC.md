@@ -71,7 +71,7 @@ counters and from the node counts in the same run (`Conv` 64, `MaxPool` 3, so
 |---|---:|---:|---:|---:|---:|
 | original: whole padded image memset | 16.75 | 0.59 | 6.28 | **23.62** | 14.34 |
 | after border-only zeroing | 16.75 | 0.59 | 0 | **17.34** | 10.56 |
-| after sizing the guard (not built) | 1.39 | 0.59 | 0 | **1.98** | ~1.2 |
+| after sizing the guard | 1.39 | 0.59 | 0 | **1.98** | 0.89 |
 
 The guard is `67 x 256 KiB`.  What identifies the rest is an exact identity:
 `23.62 - 17.34 = 6.28 MB`, and `pad_copy_bytes` in the same runs is 6.280 MB.
@@ -92,9 +92,10 @@ a row starts 16 output pixels before the end of the 16-aligned row, so its
 source pixels reach `(Wg-1)*stride`; with `Wg <= wo+15` and `wo*stride <= wp`
 the read ends at most `15*stride+1` pixels past the row, and the taps of the
 last output row stay inside the padded image by construction.  One block step
-plus one padded row covers it.  Sized that way the same frame's guard is
-**1.39 MB** instead of 16.75 MB (1.27 MB over the 64 convs, 0.12 MB over the 3
-pools; largest single guard 78 KiB, C=512 at 7x7).
+plus one padded row covers it.  Sized that way the frame's guard is 1.39 MB
+instead of 16.75 MB (1.27 MB over the 64 convs, 0.12 MB over the 3 pools;
+largest single guard 78 KiB, C=512 at 7x7).  Measured, it is **1.5 MB / 0.89 ms**
+of zero fill at 160 against 17.3 MB / 10.58 ms - see §4.1.
 
 Host measurement of the two patterns (64 calls each, on a faulted-in anonymous
 mapping, `memset` through libc - no compiler, no QPU):
@@ -118,6 +119,16 @@ The copy is at the plain `memcpy` rate for its sizes and has no headroom:
 per-shape, 0.72-1.8 GB/s against a plain `memcpy` of 1.17 GB/s, with the
 small-row shapes (C=3, 160x160: 160 rows of 1920 B) losing to call overhead
 rather than to the copy itself.
+
+### 2.2 Which shapes the copy transposes: none
+
+The copy never transposes.  The input is NHWC with a row pitch and both sides
+are row-contiguous, so it is one `memcpy` of `W*C*4` per row; the only shapes
+that lose are the small rows, where the per-row call is the cost.  Measured per
+shape on the host against a plain `memcpy` of 1.17 GB/s: C=128 at 20x20 1.79,
+C=64 at 20x20 1.77, C=256 at 20x20 1.45, C=64 at 80x80 1.00, C=32 at 80x80
+0.93, C=16 at 80x80 0.92, C=3 at 160x160 0.72.  There is no packing, no
+channel shuffle and no element loop to widen.
 
 ## 3. What makes the bytes dirty
 
@@ -194,6 +205,36 @@ batch request with many entries used to collapse the list to the hull of the
 arena and clean up to 22 MB of it; a 64-entry batch marks 129 intervals, the
 collapse count in the suite is now 0, and no cleaned range is one nobody
 wrote.
+
+## 4.1 The gate: measured on the board
+
+One client, private daemon (protocol 4, 96 MiB, `--gpu-lock`), ARM 1.0 GHz,
+46-49 C, `throttled=0x0`, 20 frames after 3 warm-up; the base is the previous
+binary of the same tree (`6a21055`'s `vc4_nhwc.c`), rebuilt and measured in the
+same window.
+
+| | base (256 KiB guard) | sized guard | delta |
+|---|---:|---:|---:|
+| pad zero fill, 96 | 17.1 MB / 10.46 ms | 1.1 MB / 0.67 ms | -9.79 ms |
+| pad zero fill, 128 | 17.2 MB / 10.50 ms | 1.3 MB / 0.84 ms | -9.66 ms |
+| pad zero fill, 160 | 17.3 MB / 10.58 ms | 1.5 MB / 0.89 ms | -9.69 ms |
+| marks, 160 | 63.4 MB | 47.6 MB | -15.8 MB |
+| cleaned, 160 | 61.4 MB / 6.47 ms | 45.6 MB / 4.92 ms | -1.55 ms |
+| wall, 96 pipelined | 286.9 | 276.2 | -10.7 ms (3.48 -> 3.62 FPS) |
+| wall, 128 pipelined | 318.6 | 307.5 | -11.1 ms (3.14 -> 3.25 FPS) |
+| wall, 160 pipelined | 401.3 | 390.6 | -10.7 ms (2.49 -> 2.56 FPS) |
+| wall, 160 sync | 410.8 | 399.8 | -11.0 ms (2.43 -> 2.50 FPS) |
+| single frame, 160 | 410.6 | 399.9 | -10.7 ms |
+
+The saving is the same at every size because the guard is a fixed amount per
+pad call and a frame makes 67 pad calls at all three sizes.  It is larger than
+the 9.4 ms projected from the zero fill alone: the smaller allocation also
+removes 15.8 MB from the scratch high-water mark, so the cleaning falls by
+1.55 ms as well, as expected.
+
+**Digests: byte-identical.**  modelA, modelB, modelC and YOLOv8n at 96/128/160,
+synchronous and pipelined, 12 of 12 per-tensor digests equal to the base
+binary.  The bound holds.
 
 ## 5. What is left, with sizes
 

@@ -181,6 +181,28 @@ void      *vc4_host_ptr(vc4_ctx *ctx, const vc4_buf *b);   /* cacheable mapping 
 void       vc4_invalidate_buf(vc4_ctx *ctx, const vc4_buf *b);
 uint32_t   vc4_bus_addr(const vc4_ctx *ctx, const vc4_buf *b);
 
+/*
+ * Batch the launches issued by the next API calls into one daemon request.
+ *
+ * vc4_batch_begin() arms it; vc4_batch_end() submits what was queued, waits
+ * for every entry and returns the first failure (VC4_OK when all ran).  The
+ * daemon executes the list in order, each launch completing before the next is
+ * kicked, so ordering, timeouts and kernel-to-kernel memory ordering are the
+ * same
+ * as separate launches.  Arming is per context and only affects the daemon
+ * backend; the direct backend accepts the calls as no-ops.
+ *
+ * Correctness rule for callers: no entry may depend on CPU work between the
+ * begin and the end.  The backend enforces the memory side of this itself
+ * (uploads, downloads, dirty marks, scratch reuse and explicit invalidations
+ * drain the queue first), but a launch error is reported by the end, not by
+ * the call that issued it, so a caller that needs per-call error attribution
+ * should arm around exactly one API call.  That is what the Python binding
+ * does.
+ */
+void       vc4_batch_begin(vc4_ctx *ctx);
+vc4_status vc4_batch_end(vc4_ctx *ctx);
+
 /* --------------------------------------------------------------------- ops */
 /*
  * C = A * B, all f32 row-major, A is MxK, B is KxN, C is MxN, ld = K/N/N.

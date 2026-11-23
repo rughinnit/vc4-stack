@@ -96,6 +96,32 @@ int  vc4c_launch_wait_u(vc4c_conn *c, const vc4c_prog *p, unsigned nqpu,
                         unsigned timeout_ms, vc4c_result *out,
                         uint32_t uni_addr);
 
+/* Ordered batch (protocol 3).  Every entry is executed to completion before
+ * the next is kicked, exactly as one LAUNCH_WAIT per entry would be, but one
+ * request and one completion cover the list.  Uniforms live in `uniforms`
+ * (the client region), at uni_off, nqpu blocks of 64 B; a batch entry cannot
+ * carry the per-word uniform array.  `out`, when non-NULL, receives one
+ * struct vc4d_batch_item per entry in request order; `done` receives how many
+ * entries ran.  Returns 0 when every entry ran, otherwise the first failure
+ * (the entries after it are VC4D_E_NOTRUN).  Check vc4c_info()->flags for
+ * VC4D_F_LAUNCH_BATCH before calling this on a daemon that may be older. */
+typedef struct {
+    uint32_t kind;        /* VC4D_BENT_LAUNCH or VC4D_BENT_FENCE          */
+    uint32_t prog;        /* LAUNCH: program handle from vc4c_upload*     */
+    uint32_t timeout_ms;  /* LAUNCH: 0 = daemon default                   */
+    uint32_t nqpu;        /* LAUNCH                                       */
+    uint32_t nuni;        /* LAUNCH: the program's declared uniform count  */
+    uint32_t flags;       /* LAUNCH: VC4D_LAUNCH_UNI_MASK when exact      */
+    uint32_t uni_off;     /* LAUNCH: 64-byte aligned offset in uniforms   */
+    uint32_t uni_addr;    /* LAUNCH: bit u = word u is a bus address      */
+    uint32_t handle;      /* FENCE: client region handle                  */
+    uint32_t dir;         /* FENCE: VC4D_SYNC_W2G / VC4D_SYNC_G2R         */
+} vc4c_batch_ent;
+
+int  vc4c_launch_batch(vc4c_conn *c, const vc4c_buf *uniforms,
+                       const vc4c_batch_ent *ent, unsigned count,
+                       struct vc4d_batch_item *out, unsigned *done);
+
 /* Like vc4c_sync(), but only asks the daemon to flush the GPU L2: the
  * dma-buf mapping is write-combining, so there is no CPU cache to maintain
  * and walking a 60 MiB mapping per launch would dominate the launch. */

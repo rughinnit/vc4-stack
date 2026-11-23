@@ -54,7 +54,9 @@ class Prof(ctypes.Structure):
         ("civac_off_bytes", ctypes.c_uint64),
         ("n_launch", ctypes.c_uint64), ("n_upload", ctypes.c_uint64),
         ("n_download", ctypes.c_uint64), ("n_load", ctypes.c_uint64),
-        ("n_flush", ctypes.c_uint64), ("clean_bytes", ctypes.c_uint64),
+        ("n_flush", ctypes.c_uint64),
+        ("n_batch", ctypes.c_uint64), ("n_batch_launch", ctypes.c_uint64),
+        ("clean_bytes", ctypes.c_uint64),
         ("up_bytes", ctypes.c_uint64), ("down_bytes", ctypes.c_uint64),
     ]
 
@@ -221,6 +223,9 @@ def main():
             "pad_copy_bytes": pr.pad_copy_bytes / n,
             "civac_off_bytes": pr.civac_off_bytes / n,
             "launches_per_frame": pr.n_launch / n,
+            "batch_requests_per_frame": pr.n_batch / n,
+            "requests_per_frame": (pr.n_batch / n) if pr.n_batch
+                                  else (pr.n_launch / n),
             "uploads_per_frame": pr.n_upload / n,
             "downloads_per_frame": pr.n_download / n,
             "loads_per_frame": pr.n_load / n,

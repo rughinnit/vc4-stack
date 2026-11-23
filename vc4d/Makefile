@@ -16,8 +16,9 @@ LRU     = $(B)/test_prog_lru
 UNIMASK = $(B)/test_uni_mask
 CMAHOLD = $(B)/cmahold
 ARENASZ = $(B)/arena_size
+BATCH   = $(B)/test_batch
 
-all: $(DAEMON) $(LIB) $(SOLIB) $(DEMO) $(HOSTILE) $(LRU) $(UNIMASK) $(CMAHOLD) $(ARENASZ)
+all: $(DAEMON) $(LIB) $(SOLIB) $(DEMO) $(HOSTILE) $(LRU) $(UNIMASK) $(CMAHOLD) $(ARENASZ) $(BATCH)
 
 $(B):
 	mkdir -p $(B)
@@ -49,6 +50,9 @@ $(UNIMASK): test/test_uni_mask.c $(LIB) include/vc4client.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
 $(ARENASZ): test/arena_size.c $(LIB) include/vc4client.h | $(B)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
+
+$(BATCH): test/test_batch.c $(LIB) include/vc4client.h | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
 
 $(CMAHOLD): test/cmahold.c | $(B)

@@ -171,7 +171,25 @@ void vc4_invalidate_buf(vc4_ctx *ctx, const vc4_buf *b)
 {
     if (!ctx || !b || !ctx->arena)
         return;
+    (void)vc4__remote_batch_end(ctx);
     vc4__invalidate(ctx->arena + b->off, b->bytes);
+}
+
+/* Batching is explicit so the C API keeps its contract: a call that does not
+ * arm it completes every launch before returning, exactly as before.  The
+ * Python binding arms it around one call, which is the coarsest unit that is
+ * certainly free of client-side dependencies between launches. */
+void vc4_batch_begin(vc4_ctx *ctx)
+{
+    if (ctx && ctx->remote)
+        vc4__remote_batch_begin(ctx);
+}
+
+vc4_status vc4_batch_end(vc4_ctx *ctx)
+{
+    if (ctx && ctx->remote)
+        return vc4__remote_batch_end(ctx);
+    return VC4_OK;
 }
 
 const vc4_op_info *vc4_supported_ops(size_t *count)

@@ -443,3 +443,106 @@ A fallback is not a failure of the model, but it is a finding: if
 `plan_error` is set on a real frame, the Python node that allocated
 differently has to be identified before the plan can be claimed for that
 model.
+
+### 6.7 First silicon run
+
+The gate in 6.6 was run on 2026-11-23 with the packaged `vc4d` 1.2.9 (protocol
+2, 96 MiB) and then with the branch's protocol-3 daemon.  The plan path fails
+before producing a frame, at every size:
+
+```
+node '/model.22/dfl/Softmax' (Softmax): a non-finite input is refused: the
+composition multiplies activations and the elementwise MUL kernel returns NaN
+for an inf operand (measured), so +-inf would not be the ONNX answer
+```
+
+The same failure reproduces on unmodified `origin/main` (`628f94d`) with the
+packaged daemon, one client, batching absent, so it is not caused by the batch
+work.  With `VC4_NO_CPLAN=1` the same tree is **byte-identical** to the
+pre-change reference on modelA, modelB, modelC and YOLOv8n at 96/128/160.  The
+plan is therefore not usable for measurement until its replay of the frame is
+fixed; every number in section 7 was taken with `VC4_NO_CPLAN=1`.
+
+### 6.8 What the batch work changes for the plan
+
+The plan replay calls the same entry points the executor called, so a replay
+segment can be one batch scope: the engine's launcher queues the segment's
+launches and flushes at the next barrier.  On the protocol-level fake daemon
+(no QPU) that path builds 47 C nodes (105 records) and turns 332 launches into
+128 requests, so the two features compose structurally.  The composition does
+not lower the real request count yet, for two reasons: the plan's `c` steps
+are all single-node islands between Python steps in the current YOLOv8n plan
+(34 segments, every one of length 1, 91 Python nodes), and the plan itself
+cannot run on silicon yet (6.7).  The per-node group is therefore the measured
+granularity.
+
+## 7. Batch launch submission
+
+The launch path is now the largest removable host cost: one `sendmsg`/
+`recvmsg` pair per launch on the client, and one request dispatch, one reply
+and one wake-up per launch in `vc4d`.  A YOLOv8n-160 frame issues 332 of them.
+Protocol 3 adds `VC4D_OP_LAUNCH_BATCH`: one request carries an ordered list of
+launches (program slot, uniforms, uniform address mask, timeout, fence
+entries), the daemon executes them strictly in order with each launch
+completing before the next is kicked, and one reply carries a status per
+entry.  The first failure stops the list and the later entries are `E_NOTRUN`,
+so a client never has to infer what ran.  The single `LAUNCH` message and its
+validation are unchanged (`launch_one()` is shared), version-2 clients are
+still served, and the daemon advertises the op with `VC4D_F_LAUNCH_BATCH`.
+
+On the client, the remote backend snapshots each queued launch's uniform block
+into a private shadow slot (the 48 KiB area at `0x290000`, between the last
+kernel uniform slot and the data heap) so the next launch's uniform writes
+cannot corrupt a queued one.  The Python binding holds one scope per graph
+node; uploads, downloads, dirty marks, scratch reuse, explicit invalidations
+and L2 flushes drain the queue first.  `VC4INFER_NO_BATCH=1` selects the
+single-launch path on the same binary.
+
+### 7.1 Requests and cost at 1.0 GHz
+
+Same conditions as section 4: one client, ARM pinned to 1.0 GHz, every cell
+under `tools/thermal-guard.sh --max 75`, three interleaved rounds per size, a
+fresh private 96 MiB `vc4d` with `--gpu-lock` per cell, `VC4_NO_CPLAN=1` (6.7).
+"before" is `VC4INFER_NO_BATCH=1`; both rows are the same binary.
+
+| imgsz | requests before | requests after | launches | wall before | wall after | FPS before | FPS after |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 96 | 279 | **131** | 279 | 382.5 | **372.4** | 2.61 | **2.69** |
+| 128 | 276 | **127** | 276 | 412.6 | **402.8** | 2.42 | **2.48** |
+| 160 | 332 | **131** | 332 | 492.3 | **478.6** | 2.03 | **2.09** |
+
+| imgsz | client CPU-s before | after | daemon CPU-s before | after | total before | total after | change |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 96 | 0.201 | **0.194** | 0.048 | **0.043** | 0.249 | **0.238** | −4.4 % |
+| 128 | 0.204 | **0.197** | 0.053 | **0.048** | 0.257 | **0.245** | −4.7 % |
+| 160 | 0.222 | **0.214** | 0.066 | **0.059** | 0.288 | **0.272** | −5.6 % |
+
+Client CPU falls 3.4–3.6 %, `vc4d` 9.4–10.6 %, total 4.4–5.6 %, and the socket
+round trip per frame falls from 13.0/13.0/15.2 ms to 8.6/8.6/9.1 ms.  Wall
+falls 2.4–2.8 %: at these sizes the frame is GPU-bound, so removing host work
+does not move the wall by the same fraction.  The absolute CPU figures are
+`breakdown.py` cells, whose per-call instrumentation is present in both rows,
+and are therefore not directly comparable with the `measure.py` table in
+[COST-COMPARISON.md](COST-COMPARISON.md); the A/B difference is.
+
+### 7.2 Why the whole graph is not one request
+
+A 160 frame performs 8 uploads, 2 downloads and 17 explicit L2 flushes, and
+its node handlers read arena data (layout copies, `nchw` downloads).  Each of
+those points needs the queued launches complete before the CPU touches the
+memory, so it is a barrier in any correct batching scheme.  One request per
+frame would therefore have to defer host reads past the launches that produce
+their inputs, which is the one thing the executor does all over the graph.
+The measured granularity is the node: 131 requests for 332 launches at 160.
+Batching across nodes with no barrier would lower the count further but would
+move a launch timeout or error to the next flush instead of the node that
+issued it; that trade was not taken.
+
+### 7.3 Correctness
+
+Batching on and off produced **byte-identical** output for modelA, modelB,
+modelC and YOLOv8n at 96/128/160 against the pre-change reference outputs recorded before these merges.
+`op_matrix.py` is 152/152, 0 refused, 0 mismatch with batching on, and
+`vc4d/test/test_batch` covers the wire semantics (per-entry status, `E_NOTRUN`,
+fences, malformed requests).  The launch count is identical in both modes, so
+the protocol changes when the launches are submitted, not what is launched.

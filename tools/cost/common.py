@@ -36,7 +36,13 @@ def proc_rss_kb(pid=None):
 
 
 def vc4d_pid():
-    """The vc4d serving /run/vc4d.sock (the TV daemon has another socket)."""
+    """The vc4d serving $VC4D_SOCKET, default /run/vc4d.sock.
+
+    The TV daemon has another socket, and a measurement run may use a private
+    daemon to keep its arena and its restarts away from concurrent work; the
+    CPU reading has to come from whichever daemon actually served the cell.
+    """
+    want = os.environ.get("VC4D_SOCKET", "/run/vc4d.sock")
     for name in os.listdir("/proc"):
         if not name.isdigit():
             continue
@@ -47,7 +53,7 @@ def vc4d_pid():
         if not cmd or not cmd[0].endswith(b"vc4d"):
             continue
         args = [a.decode("utf-8", "replace") for a in cmd]
-        if "/run/vc4d.sock" in args:
+        if want in args:
             return int(name)
     return None
 

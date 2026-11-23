@@ -19,7 +19,8 @@ shared with concurrent work; every GPU run was serialised by
 - `infer/src/vc4_dev.c`: dispatch at `vc4_init`, `vc4__launch`,
   `vc4_upload`, `vc4_download`, `vc4__l2_flush`, `vc4__write`,
   `vc4__kernel_load_file`, `vc4__wait_idle`, `vc4__health`, `vc4_shutdown`.
-- `vc4d` protocol version 2: `ALLOC` replies with the region's GPU bus
+- `vc4d` protocol version 3 (see "Protocol 3" below; the version-2 `LAUNCH`
+  message is unchanged and still served): `ALLOC` replies with the region's GPU bus
   address; `LAUNCH` gains `UNI_IN_ARENA` (uniform words read from the client's
   arena) and `WAIT` (kick → idle → counters → L2 write-back in one reply).
   Since 1.2.7 it also gains `UNI_MASK` (a per-slot mask saying which uniform
@@ -209,10 +210,76 @@ calls, which is why a new engine works against an old daemon and vice versa.
   `vc4_convbwd`, `vc4_train` and the softmax/pool paths all run through
   `LAUNCH_WAIT`.
 
+## Protocol 3: batch launch submission
+
+Protocol 3 adds one op, `VC4D_OP_LAUNCH_BATCH` (13), and one HELLO flag,
+`VC4D_F_LAUNCH_BATCH` (bit 5).  The single `LAUNCH` message is unchanged and
+still what every other client uses.  HELLO accepts version 2 as well as 3 and
+replies with 3 and the flag, so a 1.2.10 client keeps working: it never sends
+the op and the daemon never sees it.  The client library mirrors this - it
+starts HELLO at 3, drops to 2 on `E_VERSION`, and then adopts whatever version
+the HELLO reply carries - so a new engine also works against an old daemon,
+with batching off.  The reply matters because 1.2.9 accepts a version-3 HELLO
+and still expects every later request to say 2; without honouring the reply a
+client gets `bad header` on its first `ALLOC`.  Both behaviours are exercised
+against a protocol-level fake and, separately, against the packaged daemon.
+
+The request is
+
+```
+struct vc4d_batch_req { uint32_t count, flags, reserved[2]; }
+count * struct vc4d_batch_ent { kind, prog, timeout_ms, nqpu, nuni, flags,
+                               uni_handle, uni_off, uni_addr, handle, dir; }
+```
+
+and the reply is the header plus `count * struct vc4d_batch_item { status,
+launch, errs, pad, wall_ns, cycles, pad2 }`, in request order.  `detail0` is
+how many entries ran and `detail1` the index of the first failure (0xffffffff
+when none).  A `LAUNCH` entry carries exactly what `struct vc4d_launch_req`
+carries; `VC4D_LAUNCH_UNI_ARENA` is required because the batch has no room for
+a per-word uniform array, `VC4D_LAUNCH_UNI_MASK` is optional and means the same
+thing, and `WAIT` is implied.  A `FENCE` entry is a `struct vc4d_sync_req`
+(region + direction) applied at that point in the order.
+
+Execution is the important part:
+
+* **Ordered and complete.**  Entry `i+1` is kicked only after entry `i` has
+  completed, with the same L2 write-back, the same timeout accounting and the
+  same GPU lock acquisition as a separate `LAUNCH_WAIT`.  The GPU sees the
+  same sequence it would have seen from one message per launch.
+* **Per-entry validation.**  `launch_one()` is literally the body that
+  `LAUNCH` used before; a batch entry and a single launch cannot drift apart in
+  what they accept.  `nuni` must match the count declared at `UPLOAD`, the
+  uniform block must lie in the client's region, and the address mask is
+  checked per word.
+* **Stop on the first failure.**  Entries before it have completed, it carries
+  its own `VC4D_*` status, and every later entry is `VC4D_E_NOTRUN` and never
+  touched.  A timeout therefore leaves the daemon in the same state (dead
+  context, recovery attempted) it reaches after a single timed-out launch, and
+  the client never has to infer which entries ran.
+* **What it is not.**  It is not a way to overlap host work with the GPU, and
+  it does not let a client put CPU work between entries.  A launch whose input
+  the client computes, or whose result the client reads, is a batch boundary.
+  The engine enforces the memory side of this in the remote backend: uploads,
+  downloads, dirty marks, scratch reuse, explicit invalidations and the L2
+  flush all drain the queue first.
+
+On the client side, `vc4c_launch_batch()` takes an array of
+`vc4c_batch_ent` and one uniform region.  The engine's remote backend snapshots
+each launch's 64 B x nqpu uniform block into a private shadow slot before
+queueing it (the 48 KiB area at 0x290000, between the last kernel uniform slot
+and the data heap), so a queued launch cannot be corrupted by the next launch's
+uniform writes.  `vc4_batch_begin()` / `vc4_batch_end()` are explicit: a caller
+that does not arm them gets the synchronous path byte for byte.  The Python
+binding arms around one C API call and reads the result in `_check`, which
+makes the C API call the unit of batching and keeps per-call error and timeout
+attribution.  `VC4INFER_NO_BATCH=1` turns it off for A/B runs on the same
+daemon.
+
 ## Reproduce
 
 ```sh
-cd /home/raspi/work/vc4d && make && sudo ./tools/install.sh   # protocol v2
+cd /home/raspi/work/vc4d && make && sudo ./tools/install.sh   # protocol v3
 cd /home/raspi/work/engine-daemon
 make
 REPS=5 VC4INFER_DAEMON=1 ./run_tests.sh                       # as raspi

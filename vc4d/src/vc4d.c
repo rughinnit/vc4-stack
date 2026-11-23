@@ -431,7 +431,7 @@ static int handle_hello(struct client *c, const struct vc4d_hdr *h,
         return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
     struct vc4d_hello_req q;
     memcpy(&q, pl, sizeof(q));
-    if (q.version != VC4D_VERSION) {
+    if (q.version < VC4D_VERSION_MIN || q.version > VC4D_VERSION) {
         log_denial(c, "HELLO", "version mismatch");
         return reply(c->fd, h, VC4D_E_VERSION, NULL, 0, -1, VC4D_VERSION, 0);
     }
@@ -451,7 +451,8 @@ static int handle_hello(struct client *c, const struct vc4d_hdr *h,
     r.max_prog = VC4D_MAX_PROG;
     r.flags = (opt.raw_srq ? VC4D_F_RAW_SRQ : 0) |
               (opt.allowlist ? VC4D_F_ALLOWLIST : 0) |
-              VC4D_F_NAMED_PROGS | VC4D_F_UNI_MASK | VC4D_F_ARENA_RESTORE;
+              VC4D_F_NAMED_PROGS | VC4D_F_UNI_MASK | VC4D_F_ARENA_RESTORE |
+              VC4D_F_LAUNCH_BATCH;
     r.ident0 = G.regs[R_IDENT0 / 4];
     r.ident1 = G.regs[R_IDENT1 / 4];
     return reply(c->fd, h, VC4D_OK, &r, sizeof(r), -1, 0, 0);
@@ -763,11 +764,17 @@ static int await_launch(struct client *c, uint32_t id, struct launch_result *lr,
     return status;
 }
 
-static int handle_launch(struct client *c, const struct vc4d_hdr *h,
-                         const uint8_t *pl, size_t plen)
+/* Validate and execute one launch.  LAUNCH and LAUNCH_BATCH share this: it
+ * never writes a reply (a batch needs the per-entry status instead), it
+ * returns the VC4D_* status, and on a wait-mode launch it fills *lrp.  `pl`
+ * is the launch payload: struct vc4d_launch_req followed, in the tagged
+ * uniform form only, by nqpu*nuni struct vc4d_uni.  *id_out receives the
+ * launch id whenever a kick happened. */
+static int launch_one(struct client *c, const uint8_t *pl, size_t plen,
+                      int wait, struct launch_result *lrp, uint32_t *id_out)
 {
     if (plen < sizeof(struct vc4d_launch_req))
-        return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
+        return VC4D_E_PROTO;
     struct vc4d_launch_req q;
     memcpy(&q, pl, sizeof(q));
     const struct vc4d_uni *uni = (const struct vc4d_uni *)(pl + sizeof(q));
@@ -776,46 +783,46 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
 
     if (q.flags & ~VC4D_LAUNCH_FLAGS_ALL) {
         log_denial(c, "LAUNCH", "unknown launch flags");
-        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+        return VC4D_E_INVAL;
     }
     if (have_mask && !in_arena) {
         log_denial(c, "LAUNCH", "UNI_MASK without UNI_IN_ARENA");
-        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+        return VC4D_E_INVAL;
     }
     if (q.nqpu < 1 || q.nqpu > VC4D_MAX_QPU || q.nuni < 1 ||
         q.nuni > VC4D_MAX_UNI) {
         log_denial(c, "LAUNCH", "nqpu/nuni out of range");
-        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+        return VC4D_E_INVAL;
     }
     if (have_mask && (q.uni_addr >> q.nuni) != 0) {
         log_denial(c, "LAUNCH", "UNI_MASK sets a bit past the last uniform word");
-        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+        return VC4D_E_INVAL;
     }
     if (in_arena) {
         if (plen != sizeof(q)) {
             log_denial(c, "LAUNCH", "UNI_IN_ARENA carries extra payload");
-            return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
+            return VC4D_E_PROTO;
         }
     } else if (plen != sizeof(q) + (size_t)q.nqpu * q.nuni * sizeof(*uni)) {
         log_denial(c, "LAUNCH", "uniform payload length mismatch");
-        return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
+        return VC4D_E_PROTO;
     }
     struct prog *p = find_prog(c, q.prog);
     if (!p) {
         log_denial(c, "LAUNCH", "unknown program handle");
-        return reply(c->fd, h, VC4D_E_NOENT, NULL, 0, -1, 0, 0);
+        return VC4D_E_NOENT;
     }
     if (q.nqpu > p->nqpu_max) {
         log_denial(c, "LAUNCH", "nqpu exceeds the program's declared maximum");
-        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+        return VC4D_E_INVAL;
     }
     if (q.nuni != p->nuni) {
         log_denial(c, "LAUNCH", "nuni differs from the count declared at UPLOAD");
-        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+        return VC4D_E_INVAL;
     }
     if (G.inflight || c->inflight) {
         log_denial(c, "LAUNCH", "a launch is already in flight");
-        return reply(c->fd, h, VC4D_E_BUSY, NULL, 0, -1, 0, 0);
+        return VC4D_E_BUSY;
     }
 
     uint32_t words[VC4D_MAX_QPU][VC4D_MAX_UNI];
@@ -825,12 +832,12 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
         struct region *r = find_region(c, q.uni_handle);
         if (!r) {
             log_denial(c, "LAUNCH", "uniform block in an unknown region");
-            return reply(c->fd, h, VC4D_E_NOENT, NULL, 0, -1, 0, 0);
+            return VC4D_E_NOENT;
         }
         if ((q.uni_off & 63u) ||
             (uint64_t)q.uni_off + 64ull * q.nqpu > r->len) {
             log_denial(c, "LAUNCH", "uniform block leaves its region");
-            return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+            return VC4D_E_INVAL;
         }
         for (uint32_t qpu = 0; qpu < q.nqpu; ++qpu) {
             const uint32_t *w = (const uint32_t *)(A.map + r->off +
@@ -848,12 +855,12 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
                     if (((q.uni_addr >> u) & 1u) && !arena_addr_ok(w[u])) {
                         log_denial(c, "LAUNCH",
                                    "declared address uniform is outside the arena");
-                        return reply(c->fd, h, VC4D_E_DENIED, NULL, 0, -1, 0, 0);
+                        return VC4D_E_DENIED;
                     }
                 } else if (!arena_word_ok(w[u])) {
                     log_denial(c, "LAUNCH",
                                "arena uniform word is outside the arena");
-                    return reply(c->fd, h, VC4D_E_DENIED, NULL, 0, -1, 0, 0);
+                    return VC4D_E_DENIED;
                 }
                 words[qpu][u] = w[u];
             }
@@ -866,29 +873,29 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
                 if (e->kind == VC4D_UNI_LIT) {
                     if (e->handle != 0 || e->len != 0) {
                         log_denial(c, "LAUNCH", "literal uniform with handle/len");
-                        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+                        return VC4D_E_INVAL;
                     }
                     if (literal_forbidden(e->off)) {
                         log_denial(c, "LAUNCH",
                                    "literal uniform is a bus/arena/MMIO address");
-                        return reply(c->fd, h, VC4D_E_DENIED, NULL, 0, -1, 0, 0);
+                        return VC4D_E_DENIED;
                     }
                     words[qpu][u] = e->off;
                 } else if (e->kind == VC4D_UNI_PTR) {
                     struct region *r = find_region(c, e->handle);
                     if (!r) {
                         log_denial(c, "LAUNCH", "uniform points at an unknown buffer");
-                        return reply(c->fd, h, VC4D_E_NOENT, NULL, 0, -1, 0, 0);
+                        return VC4D_E_NOENT;
                     }
                     if ((e->off & 3u) || (e->len & 3u) || !e->len ||
                         (uint64_t)e->off + e->len > r->len) {
                         log_denial(c, "LAUNCH", "uniform [off,len) leaves its buffer");
-                        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+                        return VC4D_E_INVAL;
                     }
                     words[qpu][u] = arena_bus(&A, r->off + e->off);
                 } else {
                     log_denial(c, "LAUNCH", "unknown uniform kind");
-                    return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+                    return VC4D_E_INVAL;
                 }
             }
         }
@@ -914,8 +921,7 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
         if (lr != 0) {
             log_denial(c, "LAUNCH", lr == -2 ? "GPU lock wait timed out"
                                              : "GPU lock failed");
-            return reply(c->fd, h, lr == -2 ? VC4D_E_BUSY : VC4D_E_IO,
-                         NULL, 0, -1, 0, 0);
+            return lr == -2 ? VC4D_E_BUSY : VC4D_E_IO;
         }
     }
 
@@ -926,7 +932,7 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
         gpu_lock_drop();
         logmsg("launch failed: %s", err);
         st_failed++;
-        return reply(c->fd, h, rc, NULL, 0, -1, 0, 0);
+        return rc;
     }
     /* This program must not be evicted while it is executing (G3). */
     p->busy = 1;
@@ -937,18 +943,158 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
         next_launch = 1;
     st_launches++;
     uint32_t id = c->launch_id;
-    if (q.flags & VC4D_LAUNCH_WAIT) {
-        struct launch_result lr;
-        char werr[256] = "";
-        int wst = await_launch(c, id, &lr, werr, sizeof(werr));
-        if (wst == VC4D_E_TIMEOUT)
-            return reply(c->fd, h, wst, NULL, 0, -1, id, 0);
+    if (id_out)
+        *id_out = id;
+    if (!wait)
+        return VC4D_OK;
+    char werr[256] = "";
+    return await_launch(c, id, lrp, werr, sizeof(werr));
+}
+
+static int handle_launch(struct client *c, const struct vc4d_hdr *h,
+                         const uint8_t *pl, size_t plen)
+{
+    if (plen < sizeof(struct vc4d_launch_req))
+        return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
+    struct vc4d_launch_req q;
+    memcpy(&q, pl, sizeof(q));
+    const int wait = (q.flags & VC4D_LAUNCH_WAIT) != 0;
+    struct launch_result lr;
+    uint32_t id = 0;
+    memset(&lr, 0, sizeof(lr));
+    int st = launch_one(c, pl, plen, wait, &lr, &id);
+    if (st != VC4D_OK) {
+        if (wait && st == VC4D_E_TIMEOUT)
+            return reply(c->fd, h, st, NULL, 0, -1, id, 0);
+        return reply(c->fd, h, st, NULL, 0, -1, 0, 0);
+    }
+    if (wait) {
         struct vc4d_wait_rsp wr = { .launch = id, .errs = lr.errs,
                                     .wall_ns = lr.wall_ns, .cycles = lr.cycles };
-        return reply(c->fd, h, wst, &wr, sizeof(wr), -1, 0, 0);
+        return reply(c->fd, h, VC4D_OK, &wr, sizeof(wr), -1, 0, 0);
     }
     struct vc4d_launch_rsp r = { .launch = id, .nqpu = q.nqpu };
     return reply(c->fd, h, VC4D_OK, &r, sizeof(r), -1, 0, 0);
+}
+
+/* One request, an ordered list of launches, one completion.
+ *
+ * The entries are executed exactly as separate LAUNCH messages would be: in
+ * order, each kicked only after the previous one completed, with the same
+ * validation, the same per-launch timeout and the same L2 write-back.  The
+ * difference is the host cost: one sendmsg/recvmsg pair and one daemon
+ * dispatch for the whole list instead of one each.
+ *
+ * An entry that fails validation or execution stops the batch: entries before
+ * it have run and completed, entries after it are reported VC4D_E_NOTRUN and
+ * never touched.  That is what makes the reply usable for a client that has
+ * queued dependent kernels: it never has to guess which ones ran. */
+static int handle_batch(struct client *c, const struct vc4d_hdr *h,
+                        const uint8_t *pl, size_t plen)
+{
+    if (plen < sizeof(struct vc4d_batch_req))
+        return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
+    struct vc4d_batch_req q;
+    memcpy(&q, pl, sizeof(q));
+    if (q.flags != 0) {
+        log_denial(c, "BATCH", "reserved flags set");
+        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+    }
+    if (q.count < 1 || q.count > VC4D_BATCH_MAX) {
+        log_denial(c, "BATCH", "entry count out of range");
+        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+    }
+    if (plen != sizeof(q) + (size_t)q.count * sizeof(struct vc4d_batch_ent)) {
+        log_denial(c, "BATCH", "payload length does not match the count");
+        return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
+    }
+    if (G.inflight || c->inflight) {
+        log_denial(c, "BATCH", "a launch is already in flight");
+        return reply(c->fd, h, VC4D_E_BUSY, NULL, 0, -1, 0, 0);
+    }
+
+    const struct vc4d_batch_ent *ent =
+        (const struct vc4d_batch_ent *)(pl + sizeof(q));
+
+    struct vc4d_batch_item item[VC4D_BATCH_MAX];
+    memset(item, 0, sizeof(item));
+    for (uint32_t i = 0; i < q.count; ++i)
+        item[i].status = VC4D_E_NOTRUN;
+
+    int first = VC4D_OK;
+    uint32_t fail_idx = 0xffffffffu;
+
+    for (uint32_t i = 0; i < q.count; ++i) {
+        const struct vc4d_batch_ent *e = &ent[i];
+        if (e->kind == VC4D_BENT_FENCE) {
+            if (e->dir > VC4D_SYNC_G2R || !find_region(c, e->handle)) {
+                log_denial(c, "BATCH", "fence with a bad handle or direction");
+                item[i].status = VC4D_E_INVAL;
+                first = VC4D_E_INVAL;
+                fail_idx = i;
+                break;
+            }
+            G.regs[R_L2CACTL / 4] = 1u << 2;    /* write back + invalidate */
+#if defined(__aarch64__)
+            __asm__ volatile("dsb sy" ::: "memory");
+#else
+            __sync_synchronize();
+#endif
+            item[i].status = VC4D_OK;
+            continue;
+        }
+        if (e->kind != VC4D_BENT_LAUNCH) {
+            log_denial(c, "BATCH", "unknown entry kind");
+            item[i].status = VC4D_E_INVAL;
+            first = VC4D_E_INVAL;
+            fail_idx = i;
+            break;
+        }
+        /* A batch carries no per-word uniform array: the words are in the
+         * client's arena, which is also what bounds the message size.  WAIT
+         * is implied and must not be requested explicitly. */
+        if (!(e->flags & VC4D_LAUNCH_UNI_ARENA) ||
+            (e->flags & VC4D_LAUNCH_WAIT) || e->handle || e->dir) {
+            log_denial(c, "BATCH",
+                       "launch entry is not a UNI_IN_ARENA launch");
+            item[i].status = VC4D_E_INVAL;
+            first = VC4D_E_INVAL;
+            fail_idx = i;
+            break;
+        }
+        struct vc4d_launch_req lq = {
+            .prog = e->prog,
+            .timeout_ms = e->timeout_ms,
+            .nqpu = e->nqpu,
+            .nuni = e->nuni,
+            .flags = e->flags,
+            .uni_handle = e->uni_handle,
+            .uni_off = e->uni_off,
+            .uni_addr = e->uni_addr,
+        };
+        struct launch_result lr;
+        uint32_t id = 0;
+        memset(&lr, 0, sizeof(lr));
+        int st = launch_one(c, (const uint8_t *)&lq, sizeof(lq), 1, &lr, &id);
+        item[i].status = (uint32_t)st;
+        item[i].launch = id;
+        item[i].errs = lr.errs;
+        item[i].wall_ns = lr.wall_ns;
+        item[i].cycles = lr.cycles;
+        if (st != VC4D_OK) {
+            first = st;
+            fail_idx = i;
+            break;
+        }
+    }
+
+    uint32_t done = 0;
+    for (uint32_t i = 0; i < q.count; ++i)
+        if (item[i].status != VC4D_E_NOTRUN)
+            done = i + 1;
+
+    size_t plen_out = (size_t)q.count * sizeof(struct vc4d_batch_item);
+    return reply(c->fd, h, first, item, plen_out, -1, done, fail_idx);
 }
 
 static int handle_wait(struct client *c, const struct vc4d_hdr *h,
@@ -1095,6 +1241,7 @@ static int dispatch(struct client *c, const struct vc4d_hdr *h,
     case VC4D_OP_FREE:      return handle_free(c, h, pl, plen);
     case VC4D_OP_UPLOAD:    return handle_upload(c, h, pl, plen);
     case VC4D_OP_LAUNCH:    return handle_launch(c, h, pl, plen);
+    case VC4D_OP_LAUNCH_BATCH: return handle_batch(c, h, pl, plen);
     case VC4D_OP_WAIT:      return handle_wait(c, h, pl, plen);
     case VC4D_OP_READ_REGS: return handle_read_regs(c, h, pl, plen);
     case VC4D_OP_WRITEREG:  return handle_writereg(c, h, pl, plen);
@@ -1707,7 +1854,8 @@ int main(int argc, char **argv)
             struct vc4d_hdr h;
             memcpy(&h, rbuf, sizeof(h));
             if (h.magic != VC4D_MAGIC || h.len != (uint32_t)got ||
-                h.version != VC4D_VERSION || h.status != 0) {
+                h.version < VC4D_VERSION_MIN || h.version > VC4D_VERSION ||
+                h.status != 0) {
                 st_rejects++;
                 char why[128];
                 snprintf(why, sizeof(why),

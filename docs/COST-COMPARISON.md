@@ -179,6 +179,40 @@ leaves a large block of each *second* idle because its frame takes 0.32–0.43 s
 ncnn leaves small gaps between 0.05–0.09 s frames.  Co-work sees the gaps, not
 the average.
 
+### Batch launch submission
+
+A later change makes the per-launch request itself optional: protocol 3 sends
+an ordered list of launches in one request and `vc4d` executes it in order,
+each launch completing before the next is kicked.  This is a same-build A/B
+(`VC4INFER_NO_BATCH=1` against the batch path), not a new comparison with
+ncnn.  The cells use `tools/cost/breakdown.py`, which instruments each binding
+call and node dispatch; the absolute CPU figures are therefore higher than the
+`measure.py` rows above and the table is an A/B, not a replacement for them.
+Conditions are §3's: ARM pinned at 1.0 GHz, `thermal-guard.sh --max 75`, three
+interleaved rounds per size, a fresh 96 MiB `vc4d` per cell, and
+`VC4_NO_CPLAN=1` because the C execution plan's first silicon run fails on
+`main` (see [CPU-BREAKDOWN.md](CPU-BREAKDOWN.md) §6.7).
+
+| imgsz | requests before → after | wall ms before → after | FPS before → after | total CPU-s before → after |
+|---:|---|---|---|---|
+| 96 | 279 → **131** (−53 %) | 382.5 → **372.4** | 2.61 → **2.69** | 0.249 → **0.238** (−4.4 %) |
+| 128 | 276 → **127** (−54 %) | 412.6 → **402.8** | 2.42 → **2.48** | 0.257 → **0.245** (−4.7 %) |
+| 160 | 332 → **131** (−61 %) | 492.3 → **478.6** | 2.03 → **2.09** | 0.288 → **0.272** (−5.6 %) |
+
+Client CPU falls 3.4–3.6 % and the daemon's 9.4–10.6 %; the socket round trip
+falls from 13.0/13.0/15.2 ms per frame to 8.6/8.6/9.1 ms.  Wall moves less
+(2.4–2.8 %) because the frame is GPU-bound at these sizes.  The equal-FPS
+comparison in §3 was not re-run at the new frame rates: ncnn would need fresh
+cells at 2.69, 2.48 and 2.09 FPS to restate the breakeven, and no claim is made
+from the scaled numbers.
+
+A whole-graph request is not attempted.  A 160 frame performs 8 uploads, 2
+downloads and 17 explicit L2 flushes, and its handlers read arena data between
+nodes; each is a point where the queue must complete before the CPU proceeds.
+The measured granularity is therefore the node (131 requests for 332 launches),
+and outputs are byte-identical to the single-launch path for the three shipped
+models and YOLOv8n at 96/128/160.
+
 ## 4. Co-run: the same CPU work under continuous inference
 
 **The co-run tables in this section were measured on the earlier build and were

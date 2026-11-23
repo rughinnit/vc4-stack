@@ -314,6 +314,10 @@ gpu test_onnx_breadth env PYTHONPATH="$PYTHONPATH:." timeout -k 5 600 \
 board
 cool
 
+echo "=== test_cplan_gpu (a real model, plan on vs off, byte-identical)"
+gpu test_cplan_gpu env PYTHONPATH="$PYTHONPATH:." timeout -k 5 900 \
+    python3 tests/test_cplan_gpu.py
+
 echo "=== test_copyops (layout copy kernels, byte-exact)"
 gpu test_copyops timeout -k 5 300 $RUN ./build/test_copyops
 board

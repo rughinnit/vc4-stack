@@ -8,11 +8,15 @@ offsets, and ``vc4_plan_run`` walks it in C.  This module builds the record;
 ``src/vc4_plan.c`` runs it.
 
 How it is built
-    The first strict, non-profile frame after the pool exists runs exactly as
-    before, with two additions: the engine is wrapped in a ``Trace`` that
-    copies each call's decoded arguments into a list, and the pool labels
-    every allocation so the offsets can be named.  After the frame the trace
-    is split per node.  A node becomes a C record when every call it made is
+    The first strict, non-profile frame that allocates no buffer outliving it
+    runs exactly as before, with two additions: the engine is wrapped in a
+    ``Trace`` that copies each call's decoded arguments into a list, and the
+    pool labels every allocation so the offsets can be named.  A frame that
+    does allocate such a buffer (a conv's packed weight panel, a broadcast
+    expansion) is not recorded: the buffer took a range an earlier node had
+    released, and replaying that node would overwrite it.  The next frame has
+    it live from the start and is safe.  After the frame the trace is split
+    per node.  A node becomes a C record when every call it made is
     one of the representable byte-moving or elementwise entry points and each
     of its outputs is an arena buffer; then its buffers are the ones the frame
     used, and replay needs no allocator.  A node with no calls whose outputs
@@ -265,8 +269,14 @@ class Plan:
     or skipped node; its output names alias the recorded buffers).
     """
 
-    def __init__(self, steps, desc, feed_sig, c_ops, c_nodes, py_nodes):
+    def __init__(self, steps, nodes, desc, feed_sig, c_ops, c_nodes,
+                 py_nodes):
         self.steps = steps
+        # nodes[i] is the node index, or the tuple of node indices, that
+        # steps[i] covers.  A C node with no records (an alias) inside a run
+        # of records stays in its tuple; a run that produced no records at
+        # all makes no step, so nothing has to be replayed for it.
+        self.nodes = nodes
         self.desc = desc
         self.feed_sig = feed_sig
         self.c_ops = c_ops
@@ -309,8 +319,10 @@ class Build:
     def __init__(self, feeds):
         self.tracer = None
         self.steps = []
+        self.nodes = []
         self.desc = {}
         self._pending = []
+        self._group = []
         self.c_ops = 0
         self.c_nodes = 0
         self.py_nodes = []
@@ -325,6 +337,7 @@ class Build:
         if skipped:
             self._flush()
             self.steps.append(("s", idx))
+            self.nodes.append((idx,))
             self._capture(node, values)
             return
         convs = []
@@ -344,8 +357,10 @@ class Build:
         if convs is None:
             self._flush()
             self.steps.append(("p", idx))
+            self.nodes.append((idx,))
             self.py_nodes.append(idx)
             return
+        self._group.append(idx)
         for v in convs:
             self._pending.append(_record(v))
         self.c_ops += len(convs)
@@ -369,7 +384,9 @@ class Build:
         if self._pending:
             self.steps.append(("c", (vc4infer.PlanOp * len(self._pending))
                                (*self._pending)))
-            self._pending = []
+            self.nodes.append(tuple(self._group))
+        self._pending = []
+        self._group = []
 
     # -- finish -------------------------------------------------------------
     def finish(self, records):
@@ -379,8 +396,8 @@ class Build:
             return None
         pin = {e["key"]: (int(e["seg"]), int(e["offset"]), int(e["bytes"]))
                for e in records}
-        plan = Plan(self.steps, self.desc, self.feed_sig, self.c_ops,
-                    self.c_nodes, self.py_nodes)
+        plan = Plan(self.steps, self.nodes, self.desc, self.feed_sig,
+                    self.c_ops, self.c_nodes, self.py_nodes)
         plan.pin = pin
         return plan
 

@@ -1052,14 +1052,19 @@ class Runner:
         # and the docs read its summary) but nothing else depends on it.
         self.cplan = None
         self.plan_error = None
+        self.cplan_deferrals = 0      # frames that built a panel, not a plan
         self._plan_build = None
         self._plan_saved = None
-        # Opt-in until the replay is correct on silicon: with it on, a
-        # YOLOv8n-160 frame stops at dfl/Softmax with a non-finite input, and
-        # the same frame is 332 launches and 0 over tolerance with it off.
+        # Default on: a non-profile frame is byte-identical to the Python
+        # path on modelB/modelC and YOLOv8n at 96/128/160 (tests/
+        # test_cplan_gpu.py).  The defect that made it opt-in was a weight
+        # panel allocated mid-frame into a range an earlier node had used,
+        # which the replay then handed back to that node; a frame that creates
+        # a persistent buffer is no longer recorded.  VC4_NO_CPLAN=1 or
+        # VC4_CPLAN=0 turns it off.
         self._cplan_enabled = (
-            os.environ.get("VC4_CPLAN", "") not in ("", "0")
-            and os.environ.get("VC4_NO_CPLAN", "") in ("", "0"))
+            os.environ.get("VC4_NO_CPLAN", "") in ("", "0")
+            and os.environ.get("VC4_CPLAN", "1") not in ("0", "false", "no"))
 
     def _apply_exec_state(self, st):
         """Restore the rewrite tables a build recorded, instead of rescanning.
@@ -3931,6 +3936,21 @@ class Runner:
         offset this key had".
         """
         records = self.pool.record or []
+        # A frame that created a persistent buffer cannot be the recording:
+        # the buffer took a range that an earlier node had used and released,
+        # so replaying that node would write over it.  The next frame has it
+        # live from the start and is safe to record.
+        if any(str(e.get("key", "")).startswith("panel:")
+               for e in records):
+            self.cplan_deferrals += 1
+            self._abort_plan_build()
+            return
+        why = self._replay_safe(records)
+        if why is not None:
+            self.plan_error = why
+            self._cplan_enabled = False
+            self._abort_plan_build()
+            return
         plan = build.finish(records)
         if plan is None:
             self._abort_plan_build()
@@ -3941,6 +3961,40 @@ class Runner:
         self.cplan = plan
         self._plan_build = None
         self._plan_saved = None
+
+    def _replay_safe(self, records):
+        """Why this recording cannot be replayed, or None.
+
+        Every per-frame allocation must be disjoint from every buffer that
+        outlives a frame (a packed panel, a constant).  A pinned replay hands
+        the recorded offsets out again, so an overlap is not a slow path: it
+        is one node writing another node's live data.  The allocator already
+        guarantees this for a frame that allocates no persistent buffer; this
+        check is the invariant stated, not a re-derivation.
+        """
+        persistent = []
+        for t in list(self._panels.values()) + list(self._art_panels.values()):
+            b = getattr(t, "buf", t)
+            if hasattr(b, "off") and hasattr(b, "bytes"):
+                persistent.append((int(b.off), int(b.off) + int(b.bytes)))
+        for name in self._consts:
+            v = self.values.get(name)
+            if isinstance(v, Tensor):
+                persistent.append((v.buf.off, v.buf.off + v.buf.bytes))
+        for e in records:
+            key = str(e.get("key", ""))
+            if key.startswith("panel:"):
+                continue
+            base = self.pool.segs[int(e["seg"])][0]
+            lo = base + int(e["offset"])
+            hi = lo + int(e["bytes"])
+            for plo, phi in persistent:
+                if lo < phi and plo < hi:
+                    return ("recorded allocation %r (%d..%d) overlaps a "
+                            "buffer that outlives the frame (%d..%d); a "
+                            "replay would write over it"
+                            % (key, lo, hi, plo, phi))
+        return None
 
     def _abort_plan_build(self):
         if self._plan_saved is not None:

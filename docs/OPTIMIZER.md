@@ -727,9 +727,18 @@ plain ONNX run builds the plan on its first frame, which is why the build cost
 (+107 ms on the 160 graph, measured with the device calls stubbed) is paid
 once per `Runner` and not once per process start.
 
-Correctness and the measured host delta are in CPU-BREAKDOWN.md 6.4-6.6.  The
-byte-for-byte gate on the real models is `tools/cost/check_plan_equiv.py` on
-the board; the CPU-side gates are `infer/tests/test_cplan.py` (build, fallback
-boundary, equivalence on synthetic graphs, and the structure of the real 160
-graph) and `infer/build/test_plan` (the C walker's decoding and stop-on-error
-rule, with a hook instead of the device).
+A plan is only recorded from a frame that allocates no buffer outliving it.
+A panel packed in the middle of a frame can take a range an earlier node has
+released; replaying that node then writes over the panel.  This is the
+`dfl/Softmax` failure of the first silicon run, and it is why the recording
+frame for a conv model is the second one (`runner.cplan_deferrals` counts the
+deferred frames) and why `Runner._replay_safe` refuses a recording in which a
+per-frame allocation overlaps a persistent buffer (`runner.plan_error`).
+
+Correctness and the measured delta are in CPU-BREAKDOWN.md 6.5-6.7.  The
+byte-for-byte gate on the real models is `tools/cost/check_plan_equiv.py` and
+`infer/tests/test_cplan_gpu.py`, both on the board; the CPU-side gates are
+`infer/tests/test_cplan.py` (build, the panel-deferral and overlap rule,
+fallback boundary, equivalence on synthetic graphs, and the structure of the
+real 160 graph) and `infer/build/test_plan` (the C walker's decoding and
+stop-on-error rule, with a hook instead of the device).

@@ -295,8 +295,8 @@ writers cannot drift silently.
 
 ### 6.2 How it is built
 
-The first strict, non-profile frame after the runner exists runs exactly as
-before, with two additions:
+The first strict, non-profile frame that creates no persistent buffer runs
+exactly as before, with two additions:
 
 * the engine is wrapped in `_plan.Trace`, which copies each call's decoded
   arguments into a list (a call it does not recognise is recorded as
@@ -311,6 +311,15 @@ alias existing buffers becomes an `ALIAS`.  Everything else becomes a
 `Runner._dispatch`, exactly as the loop did before, and continues after it.
 Skipped and folded nodes (the optimiser's fused activations, the SiLU pairs)
 become `("s", index)` steps and cost nothing.
+
+A frame is only recorded when it allocated no buffer that outlives it (a
+packed weight panel, a broadcast expansion).  Such a buffer takes a range an
+earlier node had already used and released, which is correct for that frame
+but not for a replay: the replay hands the earlier node its recorded offset
+back and that node writes over the panel.  Section 6.7 is the frame where
+that happened.  For a conv model the recording frame is therefore the
+second one, and `runner.cplan_deferrals` counts the frames that built a panel
+instead.
 
 The pool is then switched, in place, from bump/free allocation to the
 recording: every non-persistent allocation the replay still asks for (a
@@ -369,180 +378,99 @@ initialiser is a graph pass, not a plan feature.  `Sub` is a runtime tensor
 minus a broadcast constant: `_scaled` uploads a full-size constant buffer per
 frame, which is exactly the host traffic that keeps its node in Python.
 
-### 6.5 What is measured, and what is not
+### 6.5 Measured on silicon
 
-**Not measured on silicon.**  No client frame was measured for this change:
-the board was not available for GPU work, and the plan changes no kernel, so a
-new client figure would have to come from a dedicated run.  The client and
-daemon rows of sections 2 and 4 are therefore unchanged here, not updated -
-there is no frame of evidence for a new number yet.  The gate is
-a three-round, interleaved A/B on one client with `VC4_NO_CPLAN=1` against the
-default, both at 96/128/160, with `tools/cost/breakdown.py` and
-`/proc/<pid>/stat`; commands are in 6.6.  Until that runs, no claim is made
-about client CPU per frame.
+The plan is default again.  Three interleaved rounds per size, plan off
+(`VC4_NO_CPLAN=1`) then on, median of the three; eight timed frames after
+three warm-ups per cell, one client, packaged `vc4d` at `/run/vc4d.sock`,
+ARM pinned at 1.0 GHz, `tools/thermal-guard.sh --max 75`, peak 49.4 C,
+`throttled=0x0`.  `tools/cost/breakdown.py` reads client and daemon CPU from
+`/proc/<pid>/stat` and the phases from the launch-path profiler.
 
-**Measured on the ARM, host only.**  `infer/tests/bench_cplan.py` runs the real
-160 graph with the engine's calls stubbed to a counter, so the engine's own
-time is removed identically from both sides and the difference is the work
-this change moves: the per-node executor loop and the node host code.  On the
-board, ARM pinned at 1.0 GHz, no GPU client and no `vc4d` traffic,
-`time.thread_time()` around the frame, nine frames after the build frame,
-three runs.  The table is one run; the bracketed figures are the spread of the
-median across the three.
+| imgsz | plan | wall ms | client CPU-s | daemon CPU-s | total CPU-s | launches |
+|---:|---|---:|---:|---:|---:|---:|
+| 96 | off | 383.8 | 0.2025 | 0.0475 | 0.2500 | 279 |
+| 96 | on | 302.3 | 0.1225 | 0.0450 | **0.1675** | 279 |
+| 128 | off | 413.8 | 0.2050 | 0.0525 | 0.2575 | 276 |
+| 128 | on | 332.7 | 0.1263 | 0.0488 | **0.1750** | 276 |
+| 160 | off | 490.9 | 0.2225 | 0.0650 | 0.2875 | 332 |
+| 160 | on | 407.8 | 0.1400 | 0.0613 | **0.2013** | 332 |
 
-| frame | host ms | min | max |
-|---|---:|---:|---:|
-| Python path (`VC4_NO_CPLAN=1`) | 124.5 (123.8-124.9) | 123.1 | 127.2 |
-| frozen plan | 74.0 (74.0-74.3) | 73.6 | 74.9 |
+CPU per frame falls **33.0 %, 32.0 % and 30.0 %**, wall time falls 81-83 ms.
+The Python side is where it comes from: the same breakdown splits 160 into
+0.1421 s of node Python work on the Python path and 0.0694 s through the
+plan, and the executor skeleton (everything outside the per-node dispatch)
+from 0.0830 s to 0.0402 s.  C time falls by 0.009 s as well, because one
+`plan_run` call replaces a ctypes call and a dictionary lookup per C node.
+The daemon changes by only -0.002 to -0.004 s: the same 332 launches reach it.
 
-The plan path issues the same calls per frame (189 in this stub run, identical
-lists) and is **40 % cheaper in host time**: 50.2 ms per frame of executor and
-node-host work removed.  The delta is the stable quantity - 49.7, 50.3 and
-50.5 ms in the three runs.
+Two caveats about the absolute column.  The 160 baseline here is 0.2875 s, not
+the 0.241 s of section 4.  The measurement ran against the daemon that was
+already serving the board rather than a fresh one per cell, with four idle
+fake-daemon processes from an unrelated pipeline experiment on the same ARM
+(load average 1.3 of 4 cores), so the client figure is inflated.  The on/off
+delta is measured inside the same environment, cell by cell, which is the
+comparable number; the absolute baseline should be re-taken on an idle board
+before it replaces section 4.
 
-Two caveats, both about what the stub can and cannot say.  The absolute
-figure is not the client CPU of section 2, because the stub replaces the
-engine's own work (C op setup, the launch path) with a counter.  And the
-stub's bytes are not a correctness oracle: the synthetic equivalence tests
-(`infer/tests/test_cplan.py`) compare calls and bytes for elementwise, unary,
-concat, split, reshape, alias and a Python boundary, but the byte-for-byte
-claim for the real models is the silicon gate.
+### 6.6 The first run on silicon, and what it found
 
-The build frame costs **+107 ms** (257 ms to 364 ms with the same stub) because
-it runs the tracer and the labeler alongside the normal frame.  It is paid
-once per `Runner`, so a frame rate that matters has to amortise it; at the
-160 frame rate of section 4 it is about a quarter of one frame's CPU.
-
-### 6.6 The first run on silicon
+The gate that mattered, in order:
 
 ```
-make -C infer
-tools/thermal-guard.sh --max 75           # one client, nothing else on the GPU
-
-# correctness first: byte equality, every model, both paths
-python3 tools/cost/check_plan_equiv.py
-./build/test_plan                          # the walker, no device
-TMPDIR=$HOME/scratch/tmp python3 infer/tests/test_cplan.py
-
-# then the account, three interleaved rounds per size
-VC4INFER_PROF=1 python3 tools/cost/breakdown.py --size 160 --runs 8
-VC4_NO_CPLAN=1 VC4INFER_PROF=1 \
-    python3 tools/cost/breakdown.py --size 160 --runs 8
+PYTHONPATH=infer/python python3 infer/tools/op_matrix.py     # 152/152
+PYTHONPATH=infer/python python3 tools/cost/check_plan_equiv.py
+python3 infer/tests/test_cplan_gpu.py                        # real models
+VC4INFER_PROF=1 python3 tools/cost/breakdown.py --size N --runs 8
 ```
 
-The per-size matrix is 96/128/160 with and without the plan, median of ten
-after three warm-ups, one fresh `vc4d` per cell (`docs/COST-COMPARISON.md`
-protocol); the host-only benchmark above is not a substitute for it.  The op
-gate is `tools/op_matrix.py` 152/152 as before; the plan adds no op and
-changes no kernel.  What to look at on the first frame after the build: the
-call count in the profile must equal the launch count the daemon logs,
-`runner.plan_error` must stay `None`, and the daemon log must show no
-`GPU lock` or timeout line.
+`op_matrix` must be given `PYTHONPATH=infer/python`: it imports `vc4infer`
+without adding the tree to `sys.path`, so a run from a checkout silently
+tests the *installed* package.  The first gate run did exactly that and
+reported 147/152 with a wide-matmul mismatch from the installed, older
+engine; against the tree it is 152/152 with no mismatch.
 
-A fallback is not a failure of the model, but it is a finding: if
-`plan_error` is set on a real frame, the Python node that allocated
-differently has to be identified before the plan can be claimed for that
-model.
+`check_plan_equiv.py` reports all seven models byte-identical (modelA/B/C,
+`yolov8n_160`, and the 96/128/160 exports).  `test_cplan_gpu.py` runs
+modelB/modelC and YOLOv8n at 96/128/160 with the plan on and off, four and
+three frames respectively, and compares every output byte; all identical,
+same launch counts.
 
-### 6.7 First silicon run
+### 6.7 The defect the first silicon run found
 
-The gate in 6.6 was run on 2026-11-23 with the packaged `vc4d` 1.2.9 (protocol
-2, 96 MiB) and then with the branch's protocol-3 daemon.  The plan path fails
-before producing a frame, at every size:
+The first version recorded the plan from the model's first frame.  For
+YOLOv8n that frame packs each conv's weight panel on first use.  The panel is
+persistent, but it was allocated in the middle of the frame, and the
+allocator gave it a range an earlier node had used and released - valid for
+that frame, because the earlier node was finished.  The recording then maps
+that earlier node's allocation to the same range.  On replay the node runs
+again at its recorded offset, which is now the panel, and writes over it
+before the conv reads it.  The first conv after the stem read a corrupted
+panel; the values grew through the backbone and the head's `dfl/Softmax`
+received `±inf`, which the executor refuses by design.
 
-```
-node '/model.22/dfl/Softmax' (Softmax): a non-finite input is refused: the
-composition multiplies activations and the elementwise MUL kernel returns NaN
-for an inf operand (measured), so +-inf would not be the ONNX answer
-```
+What the host proof could not see: it compared the recorded call list with
+the replayed call list and the final bytes, with a stub engine.  The call
+lists were identical, because a corrupted panel does not change which calls
+are made; and the stub's conv ignored the panel and its allocator never
+returned a freed range to one, so neither half could fail.  The equivalence
+was real but not sufficient: it never asserted that a *recording* is
+replayable.
 
-The same failure reproduces on unmodified `origin/main` (`628f94d`) with the
-packaged daemon, one client, batching absent, so it is not caused by the batch
-work.  With `VC4_NO_CPLAN=1` the same tree is **byte-identical** to the
-pre-change reference on modelA, modelB, modelC and YOLOv8n at 96/128/160.  The
-plan is therefore not usable for measurement until its replay of the frame is
-fixed; every number in section 7 was taken with `VC4_NO_CPLAN=1`.
+Two rules close it.  A frame that allocates a persistent buffer is not
+recorded; the next frame has the panel live from its start and the allocator
+keeps clear of it.  And `Runner._replay_safe` refuses a recording in which
+any per-frame allocation overlaps a buffer that outlives the frame, naming
+the key and both ranges; `runner.plan_error` carries the refusal and the
+Runner stays on the Python path.  `_replay_safe` is stated rather than
+re-derived, so a future persistent buffer cannot reintroduce the class
+quietly.
 
-### 6.8 What the batch work changes for the plan
-
-The plan replay calls the same entry points the executor called, so a replay
-segment can be one batch scope: the engine's launcher queues the segment's
-launches and flushes at the next barrier.  On the protocol-level fake daemon
-(no QPU) that path builds 47 C nodes (105 records) and turns 332 launches into
-128 requests, so the two features compose structurally.  The composition does
-not lower the real request count yet, for two reasons: the plan's `c` steps
-are all single-node islands between Python steps in the current YOLOv8n plan
-(34 segments, every one of length 1, 91 Python nodes), and the plan itself
-cannot run on silicon yet (6.7).  The per-node group is therefore the measured
-granularity.
-
-## 7. Batch launch submission
-
-The launch path is now the largest removable host cost: one `sendmsg`/
-`recvmsg` pair per launch on the client, and one request dispatch, one reply
-and one wake-up per launch in `vc4d`.  A YOLOv8n-160 frame issues 332 of them.
-Protocol 3 adds `VC4D_OP_LAUNCH_BATCH`: one request carries an ordered list of
-launches (program slot, uniforms, uniform address mask, timeout, fence
-entries), the daemon executes them strictly in order with each launch
-completing before the next is kicked, and one reply carries a status per
-entry.  The first failure stops the list and the later entries are `E_NOTRUN`,
-so a client never has to infer what ran.  The single `LAUNCH` message and its
-validation are unchanged (`launch_one()` is shared), version-2 clients are
-still served, and the daemon advertises the op with `VC4D_F_LAUNCH_BATCH`.
-
-On the client, the remote backend snapshots each queued launch's uniform block
-into a private shadow slot (the 48 KiB area at `0x290000`, between the last
-kernel uniform slot and the data heap) so the next launch's uniform writes
-cannot corrupt a queued one.  The Python binding holds one scope per graph
-node; uploads, downloads, dirty marks, scratch reuse, explicit invalidations
-and L2 flushes drain the queue first.  `VC4INFER_NO_BATCH=1` selects the
-single-launch path on the same binary.
-
-### 7.1 Requests and cost at 1.0 GHz
-
-Same conditions as section 4: one client, ARM pinned to 1.0 GHz, every cell
-under `tools/thermal-guard.sh --max 75`, three interleaved rounds per size, a
-fresh private 96 MiB `vc4d` with `--gpu-lock` per cell, `VC4_NO_CPLAN=1` (6.7).
-"before" is `VC4INFER_NO_BATCH=1`; both rows are the same binary.
-
-| imgsz | requests before | requests after | launches | wall before | wall after | FPS before | FPS after |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 96 | 279 | **131** | 279 | 382.5 | **372.4** | 2.61 | **2.69** |
-| 128 | 276 | **127** | 276 | 412.6 | **402.8** | 2.42 | **2.48** |
-| 160 | 332 | **131** | 332 | 492.3 | **478.6** | 2.03 | **2.09** |
-
-| imgsz | client CPU-s before | after | daemon CPU-s before | after | total before | total after | change |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 96 | 0.201 | **0.194** | 0.048 | **0.043** | 0.249 | **0.238** | −4.4 % |
-| 128 | 0.204 | **0.197** | 0.053 | **0.048** | 0.257 | **0.245** | −4.7 % |
-| 160 | 0.222 | **0.214** | 0.066 | **0.059** | 0.288 | **0.272** | −5.6 % |
-
-Client CPU falls 3.4–3.6 %, `vc4d` 9.4–10.6 %, total 4.4–5.6 %, and the socket
-round trip per frame falls from 13.0/13.0/15.2 ms to 8.6/8.6/9.1 ms.  Wall
-falls 2.4–2.8 %: at these sizes the frame is GPU-bound, so removing host work
-does not move the wall by the same fraction.  The absolute CPU figures are
-`breakdown.py` cells, whose per-call instrumentation is present in both rows,
-and are therefore not directly comparable with the `measure.py` table in
-[COST-COMPARISON.md](COST-COMPARISON.md); the A/B difference is.
-
-### 7.2 Why the whole graph is not one request
-
-A 160 frame performs 8 uploads, 2 downloads and 17 explicit L2 flushes, and
-its node handlers read arena data (layout copies, `nchw` downloads).  Each of
-those points needs the queued launches complete before the CPU touches the
-memory, so it is a barrier in any correct batching scheme.  One request per
-frame would therefore have to defer host reads past the launches that produce
-their inputs, which is the one thing the executor does all over the graph.
-The measured granularity is the node: 131 requests for 332 launches at 160.
-Batching across nodes with no barrier would lower the count further but would
-move a launch timeout or error to the next flush instead of the node that
-issued it; that trade was not taken.
-
-### 7.3 Correctness
-
-Batching on and off produced **byte-identical** output for modelA, modelB,
-modelC and YOLOv8n at 96/128/160 against the pre-change reference outputs recorded before these merges.
-`op_matrix.py` is 152/152, 0 refused, 0 mismatch with batching on, and
-`vc4d/test/test_batch` covers the wire semantics (per-entry status, `E_NOTRUN`,
-fences, malformed requests).  The launch count is identical in both modes, so
-the protocol changes when the launches are submitted, not what is launched.
+The host check is `test_panel_deferral` in `test_cplan.py`: a graph whose
+conv output is larger than its input, so the panel lands in the input's freed
+range; the stub conv reports the panel's first word, so a corrupted panel
+changes the answer.  It asserts that the panel frame was deferred, that the
+replay matches the Python path, and that no pinned allocation overlaps a
+panel.  The silicon check is `test_cplan_gpu.py`, which runs a real model's
+plan-enabled frame, not a `profile=True` one: a profiling run never replays
+the plan, which is how the defect escaped the first selftest.

@@ -34,6 +34,12 @@ from vc4infer._onnxrun import Runner, Tensor               # noqa: E402
 
 FAILS = []
 
+# The plan's host gates force it on rather than inheriting the default: this
+# file is what proves the replay, and test_disable() switches it off
+# explicitly.
+os.environ.setdefault("VC4_CPLAN", "1")
+os.environ.pop("VC4_NO_CPLAN", None)
+
 
 def check(cond, what, detail=""):
     print("%-4s %s%s" % ("PASS" if cond else "FAIL", what,
@@ -235,6 +241,10 @@ class FakeEngine:
         return 4096
 
     def conv_nhwc_pack_w(self, wt, Cin, Cout, KH, KW, bias, wpanel):
+        # One deterministic word, so a conv output depends on the panel being
+        # the one that was packed.  A panel overwritten between packing and
+        # use changes the output, which is the failure this file must see.
+        self._floats(wpanel.off, 1)[:] = np.float32(7.0)
         self._call("pack_w", int(Cin), int(Cout))
 
     def conv_nhwc_pads(self, x, nimg, Cin, H, W, in_pitch, wpanel, Cout, KH,
@@ -242,6 +252,7 @@ class FakeEngine:
         ho = (H + pt + pb - dil * (KH - 1) - 1) // stride + 1
         wo = (W + pl + pr - dil * (KW - 1) - 1) // stride + 1
         self._zero(out)
+        self._floats(out.off, 1)[:] = self._floats(wpanel.off, 1)
         self._call("conv_nhwc_pads", int(Cin), int(Cout))
         return ho, wo, (wo + 15) // 16 * 16
 
@@ -403,6 +414,23 @@ def mk_copies():
                   [w, sp])
 
 
+def mk_panel_chain():
+    """Relu -> Conv -> Relu, sized so the panel reuses the input's range.
+
+    The conv output (9x16x16 floats) is larger than the input (1x16x9x9), so
+    the allocator bumps for it and the much smaller weight panel takes the
+    input's freed range.  That is the YOLOv8n pattern in miniature.
+    """
+    w = numpy_helper.from_array(np.zeros((16, 16, 3, 3), np.float32), "W")
+    b = numpy_helper.from_array(np.zeros((16,), np.float32), "B")
+    n = [helper.make_node("Relu", ["X"], ["r"]),
+         helper.make_node("Conv", ["r", "W", "B"], ["c"], pads=[1, 1, 1, 1],
+                          strides=[1, 1], kernel_shape=[3, 3]),
+         helper.make_node("Relu", ["c"], ["Y"])]
+    return _model(n, [_vi("X", [1, 16, 9, 9])], [_vi("Y", [1, 16, 9, 9])],
+                  [w, b])
+
+
 def mk_host_transfer():
     """Transpose goes through host numpy, so it cannot be a C step."""
     n = [helper.make_node("Transpose", ["X"], ["t"], perm=[0, 1, 3, 2]),
@@ -411,6 +439,18 @@ def mk_host_transfer():
 
 
 # ------------------------------------------------------------------- tests
+def warm_plan(r, feeds, frames=5):
+    """Run until the plan exists, and return the recording frame's calls."""
+    calls = []
+    for _ in range(frames):
+        pre = len(r.eng.calls)
+        r.run(feeds)
+        calls = list(r.eng.calls[pre:])
+        if r.cplan is not None:
+            return calls
+    return []
+
+
 def run_pair(model, feeds, passes="none"):
     """Steady-state Python frames vs the plan's replay frame.
 
@@ -436,10 +476,10 @@ def run_pair(model, feeds, passes="none"):
             os.environ["VC4_NO_CPLAN"] = old
     eng2 = FakeEngine()
     r2 = Runner(path, eng2, passes=passes)
-    out_build = r2.run(feeds)                 # the build frame
-    calls_build = list(eng2.calls)
+    calls_build = warm_plan(r2, feeds)
+    mark = len(eng2.calls)
     out_plan = r2.run(feeds)                  # the replay frame
-    calls_plan = list(eng2.calls[len(calls_build):])
+    calls_plan = list(eng2.calls[mark:])
     return (calls_py, out_py, calls_build, calls_plan, out_plan, r2)
 
 
@@ -508,6 +548,46 @@ def test_copies():
           "both outputs match")
 
 
+def test_panel_deferral():
+    """A frame that builds a panel is not a recording; the next frame is.
+
+    Two separate defects are covered.  The recording rule: a plan is not
+    frozen from a frame that allocated a persistent buffer, because that
+    buffer took a range an earlier node had used and released, and the replay
+    would hand the node its recorded offset back and overwrite the buffer.
+    The invariant: after the plan exists, no pinned allocation overlaps a
+    buffer that outlives a frame.  The conv's output reports the panel's
+    first word, so a corrupted panel is visible in the answer too.
+    """
+    print("panel allocated mid-frame")
+    x = np.random.default_rng(12).standard_normal((1, 16, 9, 9))
+    calls_py, out_py, _b, calls_plan, out_plan, r = run_pair(
+        mk_panel_chain(), {"X": x.astype(np.float32)})
+    check(r.cplan is not None, "a plan was built after the panel frame")
+    check(r.cplan_deferrals >= 1,
+          "the panel frame was not recorded (%d deferral)" % r.cplan_deferrals)
+    check(np.array_equal(out_py[0], out_plan[0]),
+          "the replay frame matches the Python path")
+    check(calls_plan == calls_py, "calls match")
+    # the invariant: no pinned allocation overlaps a persistent buffer
+    persistent = []
+    for t in r._panels.values():
+        b = getattr(t, "buf", t)
+        if hasattr(b, "off"):
+            persistent.append((int(b.off), int(b.off + b.bytes)))
+    seg = r.pool.segs[0][0]
+    overlap = []
+    for key, (s, off, n) in r.pool.pin.items():
+        lo = r.pool.segs[s][0] + off
+        hi = lo + n
+        for plo, phi in persistent:
+            if lo < phi and plo < hi:
+                overlap.append((key, lo, hi, plo, phi))
+    check(not overlap, "no pinned allocation overlaps a panel: %s"
+          % (overlap[:2],))
+    check(r.plan_error is None, "the plan was not refused: %s" % r.plan_error)
+
+
 def test_host_transfer():
     print("host-transfer node stays in Python")
     x = np.random.default_rng(5).standard_normal((1, 2, 4, 4))
@@ -525,7 +605,7 @@ def test_profile_after_build():
     path = save(mk_elementwise(), "m.onnx")
     eng = FakeEngine()
     r = Runner(path, eng, passes="none")
-    r.run({"X": x})
+    warm_plan(r, {"X": x})
     check(r.cplan is not None, "built")
     before = len(eng.calls)
     out = r.run({"X": x}, profile=True)
@@ -544,7 +624,7 @@ def test_feed_guard():
     path = save(mk_elementwise(), "m.onnx")
     eng = FakeEngine()
     r = Runner(path, eng, passes="none")
-    r.run({"X": x})
+    warm_plan(r, {"X": x})
     ok, msg = raises(lambda: r.run({"X": np.zeros((1, 4, 4, 8), np.float32)}),
                      UnsupportedNode, "frozen plan")
     check(ok, "a different feed shape is refused with a plan message")
@@ -596,7 +676,7 @@ def test_launch_count():
     path = save(mk_elementwise(), "m.onnx")
     eng = FakeEngine()
     r = Runner(path, eng, passes="ew")
-    r.run({"X": x})
+    warm_plan(r, {"X": x})
     n0 = eng.stats.launches
     r.run({"X": x})
     n1 = eng.stats.launches - n0
@@ -678,7 +758,11 @@ def test_yolo_structure():
             os.environ["VC4_NO_CPLAN"] = old
     eng2 = FakeEngine(arena=96 << 20)
     r2 = Runner(path, eng2, passes="all")
-    r2.run(feed)
+    r2.run(feed)                              # panels
+    for _ in range(4):
+        if r2.cplan is not None:
+            break
+        r2.run(feed)
     mark = len(eng2.calls)
     r2.run(feed)
     calls_plan = list(eng2.calls[mark:])
@@ -719,6 +803,7 @@ def main():
     test_fallback()
     test_alias()
     test_copies()
+    test_panel_deferral()
     test_host_transfer()
     test_profile_after_build()
     test_feed_guard()
@@ -731,7 +816,7 @@ def main():
     if FAILS:
         print("FAILED: %d check(s): %s" % (len(FAILS), ", ".join(FAILS)))
         return 1
-    print("OK: 13 groups passed")
+    print("OK: 14 groups passed")
     return 0
 
 

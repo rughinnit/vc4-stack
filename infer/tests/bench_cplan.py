@@ -71,17 +71,23 @@ def frame_times(model_path, runs, plan):
         eng = NullEngine(arena=96 << 20)
         r = Runner(model_path, eng, passes="all")
         feed = feed_for(r.model)
-        t0 = time.thread_time()
-        r.run(feed)                        # build frame (also warm-up)
-        build = time.thread_time() - t0
+        # Frame 0 packs the panels; a plan is not recorded from it.  Frame 1
+        # is the recording frame, and that is the build cost.
+        r.run(feed)
+        build = 0.0
         times = []
-        for _ in range(runs):
+        for i in range(runs + 1):
             t0 = time.thread_time()
+            n0 = len(eng.calls)
             r.run(feed)
-            times.append(time.thread_time() - t0)
+            dt = time.thread_time() - t0
+            if i == 0:
+                build = dt
+            else:
+                times.append(dt)
         return {"build": build, "median": statistics.median(times),
                 "min": min(times), "max": max(times),
-                "launches": eng.stats.launches,
+                "per_frame": len(eng.calls) - n0,
                 "plan": r.cplan.summary() if r.cplan else None}
     finally:
         if old is None:
@@ -113,7 +119,7 @@ def main(argv):
         print("plan: %d steps, %d C nodes with %d ops, %d Python nodes"
               % (s["steps"], s["c_nodes"], s["c_ops"], s["py_nodes"]))
     print("calls/frame: python %d, plan %d"
-          % (py["launches"], pl["launches"]))
+          % (py["per_frame"], pl["per_frame"]))
     delta = py["median"] - pl["median"]
     print("host delta: %.2f ms/frame (%.1f %%)"
           % (delta * 1e3, 100.0 * delta / py["median"]))

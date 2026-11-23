@@ -7,11 +7,17 @@ python3 "$(dirname "$0")/../tools/check_kgen_sync.py" || exit 1
 # followed by a board state check.  A stuck QPU cannot be reset from the ARM:
 # if STATE is not LIVE, stop and power-cycle the board.
 #
-#   REPS=5 ./run_tests.sh
+#   REPS=5 VC4_REQUIRE_GPU=1 ./run_tests.sh
 #
 # Unprivileged through the vc4d daemon:
 #
-#   REPS=5 VC4INFER_DAEMON=1 ./run_tests.sh
+#   REPS=5 VC4_REQUIRE_GPU=1 VC4INFER_DAEMON=1 ./run_tests.sh
+#
+# Without VC4_REQUIRE_GPU=1 the suite runs everything that needs no QPUs and
+# reports every GPU test as SKIPPED, by name, at the end.  That is deliberate:
+# a GPU client is exclusive, and a suite that takes the board because it was
+# invoked is a trap for whoever else is using it.  The gate lives in
+# tests/gpu_gate.py and tests/gpu_gate.h; each test exits 77 ("skipped").
 #
 # With the flag the GPU tests run as the invoking user (no sudo): vc4d owns
 # /dev/mem and the V3D registers, so only the daemon needs privilege.  The
@@ -22,6 +28,14 @@ cd "$(dirname "$0")"
 REPS=${REPS:-5}
 STATUS=${STATUS:-/home/raspi/vc4cl/tools/read_v3d_status}
 
+# A GPU client is exclusive: the QPUs have no preemption, and a run that
+# starts while the board belongs to something else can hang it.  Every test
+# that opens an engine refuses to run unless this is 1, and exits 77
+# ("skipped"): that is a deliberate opt-in, not a default.  A CPU-only run is
+# therefore complete and honest about the coverage it did not take.
+REQUIRE_GPU=${VC4_REQUIRE_GPU:-0}
+export VC4_REQUIRE_GPU
+
 DAEMON=${VC4INFER_DAEMON:-0}
 case "$DAEMON" in
     0|"")
@@ -29,13 +43,38 @@ case "$DAEMON" in
     *)
         SUDO=""; DMENV="VC4INFER_DAEMON=$DAEMON"; BACKEND="vc4d (unprivileged)";;
 esac
-RUN="$SUDO env $DMENV VC4INFER_TMO_MS=20000"
+RUN="$SUDO env $DMENV VC4_REQUIRE_GPU=$VC4_REQUIRE_GPU VC4INFER_TMO_MS=20000"
+
+TMPD=${TMPDIR:-$HOME/scratch/tmp}
+mkdir -p "$TMPD"
+
+GPU_SKIPS=""
+skip() {
+    echo "  SKIP: $1 (set VC4_REQUIRE_GPU=1 to run it)"
+    GPU_SKIPS="$GPU_SKIPS|$1"
+}
+
+gpu() {
+    # gpu <label> <command...>; 77 is the suite's "not opted in" status.
+    # The command is tested with `||` so `set -e` does not treat a skip as a
+    # fatal error before the status can be read.
+    label=$1; shift
+    st=0
+    "$@" || st=$?
+    if [ "$st" = 77 ]; then
+        skip "$label"
+        return 0
+    fi
+    return $st
+}
 
 clocks() {
+    [ "$REQUIRE_GPU" = 1 ] || return 0
     echo "--- clocks: $(vcgencmd measure_clock core) $(vcgencmd measure_clock v3d) $(vcgencmd get_throttled) $(vcgencmd measure_temp)"
 }
 
 board() {
+    [ "$REQUIRE_GPU" = 1 ] || return 0
     echo "--- board: $(vcgencmd measure_temp)"
     sudo -n "$STATUS" | grep -E "STATE|SRQCS|V3D_ERRORS"
     sudo -n "$STATUS" | grep -q "STATE: LIVE" || {
@@ -57,6 +96,7 @@ temp_c() { vcgencmd measure_temp 2>/dev/null | sed "s/^temp=//; s/.C$//"; }
 
 cool() {
     _t=$(temp_c); _n=0
+    [ "$REQUIRE_GPU" = 1 ] || return 0
     while [ -n "$_t" ] && [ "${_t%%.*}" -ge "$TEMP_START_LIMIT" ] && \
           [ "$_n" -lt "$COOL_MAX_S" ]; do
         sleep 2; _n=$((_n + 2)); _t=$(temp_c)
@@ -107,6 +147,8 @@ echo "=== test_autotune_space (no GPU: the space the generator can build)"
 TMPDIR="$AUTOTUNE_TMP" python3 tests/test_autotune_space.py
 
 # --- daemon regressions -----------------------------------------------------
+# Whole block: it starts a private vc4d, which is GPU work before any test.
+if [ "$REQUIRE_GPU" = 1 ]; then
 # G1/G9/G11 need a daemon they can provoke (timeout, departed client, lock
 # contention) without disturbing the one everything else talks to, so they run
 # against a private vc4d on its own socket.  --gpu-lock makes the two daemons
@@ -159,19 +201,31 @@ sudo -n kill $TPID 2>/dev/null
 trap - EXIT
 sudo -n rm -f "$TSOCK"
 
+else
+    for t in test_daemon_recover test_daemon_arena test_daemon_reap \
+             test_direct_lock test_prog_lru test_uni_mask test_daemon_kernels \
+             test_daemon_uni test_daemon_values; do
+        skip "$t"
+    done
+fi
+
 # G2: needs its own private daemons (it restarts one on purpose) and CMA that
 # it can hold and release, so it runs on its own sockets.  On a shared board it
 # reports SKIP when another process is holding CMA - that is not a failure.
-echo "=== test_daemon_g2 (G2: retry, loud degrade, restore without a reboot)"
-./tests/test_daemon_g2.sh "${G2_MB:-16}"
+if [ "$REQUIRE_GPU" = 1 ]; then
+    echo "=== test_daemon_g2 (G2: retry, loud degrade, restore without a reboot)"
+    ./tests/test_daemon_g2.sh "${G2_MB:-16}"
+else
+    skip test_daemon_g2
+fi
 
 echo "=== test_pool_sizing (G10: pool sized from the model, no 8 MiB floor)"
-timeout -k 5 300 $RUN PYTHONPATH=python TMPDIR="$TMPD" \
+gpu test_pool_sizing timeout -k 5 300 $RUN PYTHONPATH=python TMPDIR="$TMPD" \
     python3 tests/test_pool_sizing.py
 
 # Evidence for the security claim: a real suite client, with a live socket and
 # an arena mapping, has no /dev/mem and no capabilities.
-if [ "$DAEMON" != 0 ]; then
+if [ "$DAEMON" != 0 ] && [ "$REQUIRE_GPU" = 1 ]; then
     echo "=== unprivileged client evidence"
     # Long enough to still be running when inspected: one 256^3 matmul is
     # ~4 ms, so a short run exits before the evidence can be read (that made
@@ -212,73 +266,78 @@ if [ "$DAEMON" != 0 ]; then
 fi
 
 echo "=== test_gate (formerly gated entry points are open; argument checks fire)"
-$RUN ./build/test_gate
+gpu test_gate $RUN ./build/test_gate
 
 echo "=== test_autotune_api (Engine.autotune: cold, then the record)"
 AUTOTUNE_CACHE=${TMPDIR:-$HOME/scratch/tmp}/kcache-autotune-api
-VC4INFER_CACHE="$AUTOTUNE_CACHE" \
-    PYTHONPATH=$PYTHONPATH:. timeout -k 5 900 python3 tests/test_autotune_api.py
+gpu test_autotune_api env VC4INFER_CACHE="$AUTOTUNE_CACHE" \
+    PYTHONPATH="$PYTHONPATH:." timeout -k 5 900 \
+    python3 tests/test_autotune_api.py
 
 for t in test_ew test_matmul test_conv; do
     echo "=== $t  (reps=$REPS)"
-    timeout -k 5 900 $RUN ./build/$t "$REPS"
+    gpu "$t" timeout -k 5 900 $RUN ./build/$t "$REPS"
     board
 done
 
 echo "=== test_nhwc (NHWC data plane: conv/depthwise/pool/concat/upsample)"
-timeout -k 5 900 $RUN ./build/test_nhwc "$REPS"
+gpu test_nhwc timeout -k 5 900 $RUN ./build/test_nhwc "$REPS"
 board
 cool
 
 echo "=== test_onnxops (generic maxpool, forward softmax)"
-timeout -k 5 300 $RUN ./build/test_onnxops
+gpu test_onnxops timeout -k 5 300 $RUN ./build/test_onnxops
 
 # Pooling / normalisation / softmax variants / losses through the ONNX runner.
 # Python, so it uses the interpreter that has vc4infer importable (the tree).
 echo "=== test_onnx_norm (17 ops through the runner)"
-PYTHONPATH=$PYTHONPATH:. timeout -k 5 600 python3 tests/test_onnx_norm.py
+gpu test_onnx_norm env PYTHONPATH="$PYTHONPATH:." timeout -k 5 600 \
+    python3 tests/test_onnx_norm.py
 board
 cool
 
 echo "=== test_onnx_gaps (variadic/conversion/gather family through the runner)"
-PYTHONPATH=$PYTHONPATH:. timeout -k 5 900 python3 tests/test_onnx_gaps.py
+gpu test_onnx_gaps env PYTHONPATH="$PYTHONPATH:." timeout -k 5 900 \
+    python3 tests/test_onnx_gaps.py
 board
 cool
 
 echo "=== test_onnx_geom (geometry/detection family through the runner)"
-PYTHONPATH=$PYTHONPATH:. timeout -k 5 1200 python3 tests/test_onnx_geom.py
+gpu test_onnx_geom env PYTHONPATH="$PYTHONPATH:." timeout -k 5 1200 \
+    python3 tests/test_onnx_geom.py
 board
 cool
 
 echo "=== test_onnx_breadth (Split/Slice/MatMul/6x6 conv forms)"
-PYTHONPATH=$PYTHONPATH:. timeout -k 5 600 python3 tests/test_onnx_breadth.py
+gpu test_onnx_breadth env PYTHONPATH="$PYTHONPATH:." timeout -k 5 600 \
+    python3 tests/test_onnx_breadth.py
 board
 cool
 
 echo "=== test_copyops (layout copy kernels, byte-exact)"
-timeout -k 5 300 $RUN ./build/test_copyops
+gpu test_copyops timeout -k 5 300 $RUN ./build/test_copyops
 board
 cool
 
 echo "=== test_gated (gather/blit/reduce/cumsum/select3, element-wise)"
 for t in gather blit reduce cumsum sel3; do
-    timeout -k 5 300 $RUN ./build/test_gated "$t"
+    gpu "test_gated:$t" timeout -k 5 300 $RUN ./build/test_gated "$t"
 done
 board
 cool
 
 echo "=== test_coherency (cacheable arena mapping maintenance)"
-timeout -k 5 300 $RUN ./build/test_coherency
+gpu test_coherency timeout -k 5 300 $RUN ./build/test_coherency
 board
 cool
 
 echo "=== test_train_ops (training primitives)"
-timeout -k 5 300 $RUN ./build/test_train_ops
+gpu test_train_ops timeout -k 5 300 $RUN ./build/test_train_ops
 board
 cool
 
 echo "=== test_grad (finite differences)"
-timeout -k 5 600 $RUN ./build/test_grad 1
+gpu test_grad timeout -k 5 600 $RUN ./build/test_grad 1
 board
 cool
 
@@ -288,7 +347,7 @@ for op in softmax_bwd softmax_ce_bwd batchnorm_bwd layernorm_bwd \
           binop_bwd cat_bwd split_bwd pad_bwd transpose_bwd reduce_bwd \
           resize_nearest_bwd resize_bilinear_bwd gather_bwd scatter_bwd \
           bwop_run gate; do
-    timeout -k 2 120 $RUN ./build/test_bwd_one $op || {
+    gpu "test_bwd_one:$op" timeout -k 2 120 $RUN ./build/test_bwd_one $op || {
         echo "FAIL: test_bwd_one $op"; exit 1; }
 done
 board
@@ -296,21 +355,33 @@ cool
 
 cool
 echo "=== test_convgrad (conv dX/dW, pool; finite differences)"
-timeout -k 5 900 $RUN ./build/test_convgrad 1
+gpu test_convgrad timeout -k 5 900 $RUN ./build/test_convgrad 1
 board
 cool
 
 for o in sgd adam; do
     echo "=== test_train --opt $o (300 steps)"
-    timeout -k 5 600 $RUN ./build/test_train --opt $o --steps 300
+    gpu "test_train:$o" timeout -k 5 600 $RUN ./build/test_train --opt $o --steps 300
     board
 done
 
 for o in sgd adam; do
     echo "=== test_convnet --opt $o (150 steps)"
-    timeout -k 5 900 $RUN ./build/test_convnet --opt $o --steps 150
+    gpu "test_convnet:$o" timeout -k 5 900 $RUN \
+        ./build/test_convnet --opt $o --steps 150
     board
 done
 
 clocks
-echo "ALL TESTS PASSED"
+echo
+if [ -n "$GPU_SKIPS" ]; then
+    echo "ALL RUN TESTS PASSED"
+    echo "GPU tests skipped (VC4_REQUIRE_GPU is not 1):"
+    echo "$GPU_SKIPS" | tr '|' '\n' | while read -r t; do
+        [ -n "$t" ] && echo "  $t"
+    done
+    echo "They are not part of this run's coverage.  Re-run with"
+    echo "VC4_REQUIRE_GPU=1 on a board nobody else is using."
+else
+    echo "ALL TESTS PASSED"
+fi

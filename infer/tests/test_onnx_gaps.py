@@ -31,6 +31,13 @@ Exit status is 0 only when every case behaved as declared: a ``refused`` case
 must raise and every other case must run on the VC4 kernels within the
 tolerance ``test_onnx_ops`` uses.
 """
+
+# A GPU client: refuse unless VC4_REQUIRE_GPU=1 (tests/gpu_gate.py).
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from gpu_gate import require_gpu as _require_gpu
+_require_gpu(__file__)
 import argparse
 import os
 import sys

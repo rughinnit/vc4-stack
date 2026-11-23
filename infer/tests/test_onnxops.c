@@ -9,6 +9,7 @@
  * in the test only; libvc4infer has no CPU compute path.
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 static int pool_case(vc4_ctx *ctx, int C, int H, int W, int N, int S, int P)
@@ -125,6 +126,9 @@ static int softmax_case(vc4_ctx *ctx, uint32_t rows, uint32_t cols)
 
 int main(void)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int lock = gpu_lock();
     if (lock < 0) return 2;
     vc4_ctx *ctx = NULL;

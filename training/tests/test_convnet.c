@@ -23,6 +23,7 @@
  * usage: test_convnet [--opt sgd|adam] [--steps N] [--seed S] [--batch B]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 #include <math.h>
 
@@ -180,6 +181,9 @@ static uint64_t fnv(const void *p, size_t n)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     const char *opt = "sgd";
     int steps = 300;
     uint32_t seed = 12345;

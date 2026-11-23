@@ -18,6 +18,7 @@
  * usage: test_daemon_uni            (needs VC4INFER_DAEMON=1)
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -92,6 +93,9 @@ static void one(vc4_ctx *ctx, vc4_uop op, const char *label,
 
 int main(void)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     vc4_ctx *ctx = NULL;
     vc4_status st = vc4_init(&ctx, NULL, 0);
     if (st != VC4_OK) {

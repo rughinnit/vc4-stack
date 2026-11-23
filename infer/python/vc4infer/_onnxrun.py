@@ -3927,8 +3927,12 @@ class Runner:
         pool.pin = None
         pool.check = True
         pool.labeler = None
-        pool.live = {}
-        pool.free = []
+        # `live` and `free` still describe the allocator as the recording
+        # frame left it: the pinned replay never populated them, and the
+        # buffers it handed out are exactly the ranges the recording calls
+        # free.  Keeping the free list is what lets the re-run - and every
+        # frame after it - reuse the same arena instead of bumping past the
+        # build frame's high-water mark.
         self._labels = False
         self._garbage = []
         self._plan_saved = None

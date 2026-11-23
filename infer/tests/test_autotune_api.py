@@ -10,6 +10,13 @@ the record, and then runs modelA to show that the executor's path is unchanged.
     VC4INFER_CACHE=$HOME/scratch/kcache-autotune-api PYTHONPATH=python \
         python3 infer/tests/test_autotune_api.py
 """
+
+# A GPU client: refuse unless VC4_REQUIRE_GPU=1 (tests/gpu_gate.py).
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from gpu_gate import require_gpu as _require_gpu
+_require_gpu(__file__)
 import os
 import sys
 

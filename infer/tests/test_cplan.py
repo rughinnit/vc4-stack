@@ -603,6 +603,49 @@ def test_launch_count():
     check(n0 == n1, "build and replay launch the same kernels (%d)" % n0)
 
 
+def test_fallback_midprocess():
+    """A pin mismatch on a later frame: drop once, continue in Python.
+
+    The failure a handler with a data-dependent allocation would cause is
+    simulated by handing the pinned pool a recorded size that no longer
+    matches.  What is checked is the contract: the frame is re-run from the
+    feeds and is correct, the plan is not rebuilt, and later frames keep
+    working from the same arena.
+    """
+    print("fallback after the plan is in use")
+    x = np.random.default_rng(11).standard_normal((4, 8)).astype(np.float32)
+    path = save(mk_fallback(), "m.onnx")
+    eng = FakeEngine()
+    r = Runner(path, eng, passes="none")
+    first = r.run({"X": x})                   # build
+    replay = r.run({"X": x})                  # replay
+    check(r.cplan is not None, "the plan is in use")
+    check(np.array_equal(first[0], replay[0]), "the replay frame is correct")
+    key = sorted(k for k in r.pool.pin if k.startswith("n0:"))[0]
+    seg, off, nbytes = r.pool.pin[key]
+    r.pool.pin[key] = (seg, off, nbytes + 64)  # the tripwire
+    free_before = list(r.pool.free)
+    segs_before = len(r.pool.segs)
+    out = r.run({"X": x})                     # trips, drops, re-runs
+    check(r.plan_error is not None and "n0:" in r.plan_error,
+          "the mismatch is recorded: %s" % r.plan_error)
+    check(r.cplan is None, "the plan is gone")
+    check(r._cplan_enabled is False, "no rebuild is attempted")
+    check(np.array_equal(first[0], out[0]),
+          "the tripping frame returns the Python answer")
+    check(r.pool.free and
+          sum(sz for _o, sz in r.pool.free) ==
+          sum(sz for _o, sz in free_before),
+          "the allocator keeps its free bytes (%d of %d)"
+          % (sum(sz for _o, sz in r.pool.free),
+             sum(sz for _o, sz in free_before)))
+    for _ in range(20):
+        out = r.run({"X": x})
+    check(np.array_equal(first[0], out[0]), "later frames stay correct")
+    check(len(r.pool.segs) == segs_before,
+          "no extra pool segment over 20 frames (%d)" % len(r.pool.segs))
+
+
 def test_yolo_structure():
     """The real 160 graph: the plan builds, replays and issues the same calls.
 
@@ -681,13 +724,14 @@ def main():
     test_feed_guard()
     test_disable()
     test_launch_count()
+    test_fallback_midprocess()
     test_yolo_structure()
     test_abi()
     print()
     if FAILS:
         print("FAILED: %d check(s): %s" % (len(FAILS), ", ".join(FAILS)))
         return 1
-    print("OK: 12 groups passed")
+    print("OK: 13 groups passed")
     return 0
 
 

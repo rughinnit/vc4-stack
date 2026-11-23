@@ -38,6 +38,13 @@ The models are built by ``infer/tools/onnx/make_hybrid_models.py``; their
 references come from a full ``onnx.reference.ReferenceEvaluator`` run, i.e. an
 implementation independent of both the VC4 executor and this test.
 """
+
+# A GPU client: refuse unless VC4_REQUIRE_GPU=1 (tests/gpu_gate.py).
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from gpu_gate import require_gpu as _require_gpu
+_require_gpu(__file__)
 import ctypes
 import os
 import sys

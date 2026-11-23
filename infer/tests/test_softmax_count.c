@@ -1,8 +1,12 @@
 /* controlled correct-count test */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 #include <math.h>
 int main(void){
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int lock=gpu_lock(); if(lock<0) return 2;
     vc4_ctx *ctx=NULL; if(vc4_init(&ctx,NULL,0)!=VC4_OK) return 2;
     enum { R=8, C=16 };

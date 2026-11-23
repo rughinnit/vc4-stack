@@ -18,6 +18,13 @@ report named it and because it must stay correct through the new launch path.
 
     TMPDIR=$HOME/scratch/tmp VC4INFER_DAEMON=1 python3 tests/test_daemon_values.py
 """
+
+# A GPU client: refuse unless VC4_REQUIRE_GPU=1 (tests/gpu_gate.py).
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from gpu_gate import require_gpu as _require_gpu
+_require_gpu(__file__)
 import os
 import sys
 

@@ -12,6 +12,7 @@
  * usage: test_convgrad [reps]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 #include <math.h>
 
@@ -292,6 +293,9 @@ static int t_pool(vc4_ctx *ctx, int C, int H, int W)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int reps = argc > 1 ? atoi(argv[1]) : 1;
     int lock = gpu_lock();
     if (lock < 0) return 2;

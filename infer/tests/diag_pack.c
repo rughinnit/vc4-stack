@@ -1,5 +1,6 @@
 /* A/B: launch asm3's verified pack blob and mine through the same launcher. */
 #include "../src/vc4_int.h"
+#include "gpu_gate.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,9 @@ static uint8_t *slurp(const char *p, size_t *n)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int lock = open("/tmp/vc4-gpu.lock", O_RDWR | O_CREAT, 0666);
     if (lock < 0) lock = open("/tmp/vc4-gpu.lock", O_RDONLY);
     if (lock >= 0 && flock(lock, LOCK_EX) != 0) perror("flock");

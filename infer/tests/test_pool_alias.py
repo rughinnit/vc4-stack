@@ -25,6 +25,13 @@ choice of offset happens to miss the live bytes.
 
 usage: test_pool_alias.py     (needs vc4d running, like the other GPU tests)
 """
+
+# A GPU client: refuse unless VC4_REQUIRE_GPU=1 (tests/gpu_gate.py).
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from gpu_gate import require_gpu as _require_gpu
+_require_gpu(__file__)
 import os
 import sys
 import tempfile

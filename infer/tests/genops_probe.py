@@ -12,6 +12,13 @@ involved: the reference is verification only.
 Two shapes are always used (a 4096-element random vector and a hand-picked
 edge vector), plus a third for the periodic ops.
 """
+
+# A GPU client: refuse unless VC4_REQUIRE_GPU=1 (tests/gpu_gate.py).
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from gpu_gate import require_gpu as _require_gpu
+_require_gpu(__file__)
 import os
 import sys
 

@@ -2,6 +2,7 @@
  * usage: diag_probe M N K [r0]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 #include "../src/vc4_int.h"
 
@@ -35,6 +36,9 @@ static int run(void)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     M = argc > 1 ? atoi(argv[1]) : 8;
     N = argc > 2 ? atoi(argv[2]) : 64;
     K = argc > 3 ? atoi(argv[3]) : 16;

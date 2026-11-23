@@ -22,6 +22,7 @@
  * usage: test_train [--opt sgd|adam] [--steps N] [--seed S]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 #include <math.h>
@@ -157,6 +158,9 @@ static void init_weights(rng_t *r, float *w1, float *w2)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     const char *opt = "sgd";
     int steps = 300;
     uint32_t seed = 12345;

@@ -16,6 +16,7 @@
  * usage: test_daemon_kernels [N]        (needs VC4INFER_DAEMON=1)
  */
 #include "vc4_int.h"
+#include "gpu_gate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +52,9 @@ static size_t make_code(uint32_t *out, size_t cap, int i)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int nprog = argc > 1 ? atoi(argv[1]) : NPROG;
     if (nprog < 1 || nprog > 400)
         nprog = NPROG;

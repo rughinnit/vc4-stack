@@ -7,6 +7,7 @@
  * usage: test_train_ops [reps]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 #include <math.h>
@@ -221,6 +222,9 @@ static int t_softmax(vc4_ctx *ctx, uint32_t rows, int pad)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     (void)argc; (void)argv;
     int lock = gpu_lock();
     if (lock < 0) return 2;

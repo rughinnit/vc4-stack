@@ -19,6 +19,7 @@
  */
 #define _GNU_SOURCE
 #include "vc4infer.h"
+#include "gpu_gate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -276,6 +277,9 @@ fail:
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int reps = argc > 1 ? atoi(argv[1]) : 5;
     const char *cache = getenv("VC4INFER_CACHE");
 

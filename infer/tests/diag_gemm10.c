@@ -3,11 +3,15 @@
  *   mode 0 = A all ones (panel ones), 1 = A = delta at k=0, 2 = A = delta at k=1
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 #include "../src/vc4_int.h"
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int M = argc > 1 ? atoi(argv[1]) : 16;
     int N = argc > 2 ? atoi(argv[2]) : 64;
     int K = argc > 3 ? atoi(argv[3]) : 16;

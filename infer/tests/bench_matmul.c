@@ -16,10 +16,14 @@
  * usage: bench_matmul [size] [reps]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int M = argc > 1 ? atoi(argv[1]) : 256;
     int reps = argc > 2 ? atoi(argv[2]) : 5;
     int N = M, K = M;

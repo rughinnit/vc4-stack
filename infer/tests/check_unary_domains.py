@@ -9,6 +9,13 @@ inside of the domain, this one proves the boundary is a wall.
 
     VC4INFER_DAEMON=1 ... python3 infer/tests/check_unary_domains.py
 """
+
+# A GPU client: refuse unless VC4_REQUIRE_GPU=1 (tests/gpu_gate.py).
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from gpu_gate import require_gpu as _require_gpu
+_require_gpu(__file__)
 import os
 import sys
 

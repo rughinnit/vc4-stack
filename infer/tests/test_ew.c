@@ -12,6 +12,7 @@
  * usage: test_ew [reps]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 static int run(vc4_ctx *ctx, vc4_op op, const char *name, size_t n, int reps,
@@ -104,6 +105,9 @@ static int run(vc4_ctx *ctx, vc4_op op, const char *name, size_t n, int reps,
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int reps = argc > 1 ? atoi(argv[1]) : 5;
     int lock = gpu_lock();
     if (lock < 0)

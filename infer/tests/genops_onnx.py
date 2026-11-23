@@ -8,6 +8,13 @@ tree uses).  Tolerance 1e-4 + 1e-4*max(|ref|,1); every element is checked.
 
     VC4INFER_DAEMON=1 VC4INFER_CACHE=/tmp/kc python3 infer/tests/genops_onnx.py
 """
+
+# A GPU client: refuse unless VC4_REQUIRE_GPU=1 (tests/gpu_gate.py).
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from gpu_gate import require_gpu as _require_gpu
+_require_gpu(__file__)
 import os
 import sys
 

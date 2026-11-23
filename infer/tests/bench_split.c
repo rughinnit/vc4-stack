@@ -17,6 +17,7 @@
  * vc4__pack_run_q / vc4__gemm_run_q directly, like the diag_* programs.
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "../src/vc4_int.h"
 
 #include <stdio.h>
@@ -124,6 +125,9 @@ static int one(vc4_ctx *ctx, int M, int N, int K, int reps)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     vc4_ctx *ctx = NULL;
     int reps = 5;
 

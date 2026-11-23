@@ -1,6 +1,7 @@
 /* diag_kernel.c - launch one pool/col2im task directly, with explicit nqpu,
  * to isolate kernel hangs from the task-enumeration loop. */
 #include "vc4_int.h"
+#include "gpu_gate.h"
 #include "util.h"
 #include <math.h>
 
@@ -53,6 +54,9 @@ static void run_fwd(vc4_ctx *ctx, int nq, int tasks)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     setvbuf(stdout, NULL, _IONBF, 0);
     int nq = argc > 1 ? atoi(argv[1]) : 1;
     int tasks = argc > 2 ? atoi(argv[2]) : 1;

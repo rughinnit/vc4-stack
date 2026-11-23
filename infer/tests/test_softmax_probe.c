@@ -2,11 +2,15 @@
  * Runs the kernel in probe mode (max / exp / sum / p) and compares each
  * intermediate against a CPU oracle. */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 #include <math.h>
 
 int main(void)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int lock = gpu_lock();
     if (lock < 0) return 2;
     vc4_ctx *ctx = NULL;

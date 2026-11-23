@@ -18,6 +18,7 @@
  * cc with -Isrc: vc4__write/vc4__invalidate_off are internal (vc4_int.h).
  */
 #include "vc4_int.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 static void civac(void *p, size_t n)
@@ -105,6 +106,9 @@ static void download_after_qpu_write(vc4_ctx *ctx, vc4_buf *A, size_t n)
 
 int main(void)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int lock = gpu_lock();
     if (lock < 0)
         return 2;

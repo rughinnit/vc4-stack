@@ -3,6 +3,7 @@
  * Debug tool only; builds against the internal header.
  */
 #include "../src/vc4_int.h"
+#include "gpu_gate.h"
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,9 @@ static float fr(void)
 
 int main(void)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int lock = open("/tmp/vc4-gpu.lock", O_RDWR | O_CREAT, 0666);
     if (lock < 0) lock = open("/tmp/vc4-gpu.lock", O_RDONLY);
     if (lock >= 0 && flock(lock, LOCK_EX) != 0) perror("flock");

@@ -15,6 +15,7 @@
  * The input is fixed and deterministic so a rerun is comparable.
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 #include <math.h>
@@ -82,6 +83,9 @@ static void fill(float *x, size_t n, float lo, float span)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     if (argc < 2) {
         printf("usage: test_bwd_one <op>\n");
         return 2;

@@ -1,9 +1,13 @@
 /* diag_blob.c - load an arbitrary QPU blob and launch it (bisect harness). */
 #include "vc4_int.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) { printf("usage: diag_blob <file.bin> [nqpu] [u0] [u1]\n"); return 2; }
     int lock = gpu_lock();

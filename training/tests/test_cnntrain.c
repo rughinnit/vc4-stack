@@ -25,6 +25,7 @@
  *                      [--reps R] [--save FILE]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "vc4_int.h"
 #include "util.h"
 #include <math.h>
@@ -274,6 +275,9 @@ static uint64_t fnv(const void *p, size_t n)
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     const char *opt = "sgd";
     const char *savepath = "vc4_cnntrain.weights";
     int steps = 120, reps = 1;

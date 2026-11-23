@@ -2,12 +2,16 @@
  * usage: diag_mm3 M N K [reps]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 #define TOL 1e-4
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     if (argc < 4) { printf("usage: %s M N K [reps]\n", argv[0]); return 2; }
     int M = atoi(argv[1]), N = atoi(argv[2]), K = atoi(argv[3]);
     int reps = argc > 4 ? atoi(argv[4]) : 1;

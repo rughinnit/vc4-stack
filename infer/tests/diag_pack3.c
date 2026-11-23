@@ -1,5 +1,6 @@
 /* diag_pack3 - verify vc4__pack_run's panel against the CPU oracle. */
 #include "vc4_int.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 static int one(vc4_ctx *ctx, uint32_t TR, uint32_t K)
@@ -72,6 +73,9 @@ static int one(vc4_ctx *ctx, uint32_t TR, uint32_t K)
 
 int main(void)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int lock = gpu_lock(); if (lock < 0) return 2;
     vc4_ctx *ctx = NULL;
     if (vc4_init(&ctx, NULL, 0) != VC4_OK) { printf("init fail\n"); return 2; }

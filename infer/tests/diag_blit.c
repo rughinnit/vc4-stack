@@ -1,9 +1,13 @@
 /* diag_blit.c - what does vc4_blit actually write for n groups? */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     size_t bytes = argc > 1 ? (size_t)atoi(argv[1]) : 256;
     int reps = argc > 2 ? atoi(argv[2]) : 1;
     int chain = argc > 3 ? atoi(argv[3]) : 0;

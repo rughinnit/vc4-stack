@@ -2,11 +2,15 @@
  * usage: diag_pack10 [K] [M]
  */
 #include "vc4infer.h"
+#include "gpu_gate.h"
 #include "util.h"
 #include "../src/vc4_int.h"
 
 int main(int argc, char **argv)
 {
+    if (gpu_gate_skip(__FILE__))
+        return GPU_SKIP_STATUS;
+
     int K = argc > 1 ? atoi(argv[1]) : 16;
     int M = argc > 2 ? atoi(argv[2]) : 16;
     int lock = gpu_lock();

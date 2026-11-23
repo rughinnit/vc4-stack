@@ -13,6 +13,13 @@ prints the launch count per timestep (the cost of the unrolled method).
 Exit status 0 only when every output is inside the matrix tolerance
 ``1e-4 + 1e-4*max(|ref|,1)``.
 """
+
+# A GPU client: refuse unless VC4_REQUIRE_GPU=1 (tests/gpu_gate.py).
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from gpu_gate import require_gpu as _require_gpu
+_require_gpu(__file__)
 import argparse
 import os
 import sys

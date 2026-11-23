@@ -410,12 +410,75 @@ def test_exec_state(tmp):
           "exec: an artifact with no rewrite tables says so")
 
 
+def test_frozen_plan(tmp=None):
+    """The plan records survive the container and refuse what they cannot use.
+
+    A build records the plan in the build process's pool segments; a load
+    receives different ones and every offset is rebased.  The refusals are the
+    ABI, the record count, the segment geometry and the kernel table - each
+    names what disagrees instead of replaying into another buffer.
+    """
+    from vc4infer import _binding, _plan
+    import ctypes
+
+    op = _binding.PlanOp()
+    op.kind = _binding.PLAN_EW
+    op.a_off, op.a_bytes = 1050, 40
+    op.c_off, op.c_bytes = 2040, 40
+    op.n = 16
+    op.p[0] = 3
+    plan = _plan.Plan([("c", (_binding.PlanOp * 1)(op)), ("p", 7), ("s", 8)],
+                      [(3,), (7,), (8,)],
+                      {"a": (1050, 40, (1, 4), "nchw", 0),
+                       "y": (2040, 40, (1, 4), "nchw", 0)},
+                      {"X": ((1, 4), 4)}, 1, 1, [7])
+    block, blob = _plan.frozen_plan(plan, [(1000, 100), (2000, 50)], 152,
+                                    "kernels", 9)
+    loaded = _plan.plan_from_frozen(block, blob, 152,
+                                    [(3000, 100), (5000, 50)], "kernels")
+    rec = loaded.steps[0][1][0]
+    check(rec.a_off == 3050 and rec.c_off == 5040,
+          "the operation offsets are rebased (%d, %d)"
+          % (rec.a_off, rec.c_off))
+    check(loaded.desc["a"][0] == 3050 and loaded.desc["y"][0] == 5040,
+          "the output descriptors are rebased")
+    check(loaded.from_artifact and
+          [k for k, _ in loaded.steps] == ["c", "p", "s"] and
+          loaded.nodes == [(3,), (7,), (8,)],
+          "the step and node tables survive")
+
+    def refused(label, new_block, new_blob, new_segs, new_abi, new_kernels):
+        try:
+            _plan.plan_from_frozen(new_block, new_blob, new_abi, new_segs,
+                                   new_kernels)
+        except _plan.FrozenPlanError as e:
+            check(True, "%s refused: %s" % (label, str(e)[:60]))
+            return
+        check(False, "%s was not refused" % label)
+
+    b = dict(block)
+    b["version"] = _plan.FROZEN_VERSION + 1
+    refused("version", b, blob, [(3000, 100), (5000, 50)], 152, "kernels")
+    b = dict(block)
+    b["abi_bytes"] = 160
+    refused("record size", b, blob, [(3000, 100), (5000, 50)], 152,
+            "kernels")
+    refused("section length", block, blob[:-8],
+            [(3000, 100), (5000, 50)], 152, "kernels")
+    refused("segment count", block, blob, [(3000, 150)], 152, "kernels")
+    refused("segment sizes", block, blob, [(3000, 100), (5000, 60)], 152,
+            "kernels")
+    refused("kernel table", block, blob, [(3000, 100), (5000, 50)], 152,
+            "other")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="vc4x-test-", dir=os.environ.get("TMPDIR"))
     try:
         for fn in (test_roundtrip, test_container_damage, test_section_hash,
                    test_keys, test_referenced_graph, test_pinned_pool,
-                   test_dropped, test_seed_cache, test_exec_state):
+                   test_dropped, test_seed_cache, test_exec_state,
+                   test_frozen_plan):
             print("-- %s" % fn.__name__)
             fn(tmp)
     finally:

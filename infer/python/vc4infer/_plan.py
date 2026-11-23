@@ -51,6 +51,8 @@ Limits, stated rather than hidden
     why a node with a host output is never a C step in the first place.
 """
 import ctypes
+import hashlib
+import json
 import os
 import struct
 
@@ -283,6 +285,11 @@ class Plan:
         self.c_nodes = c_nodes
         self.py_nodes = py_nodes
         self.pin = {}
+        # True when the plan came out of an .vc4x artifact: the pool is
+        # already pinned by the artifact's arena plan, so a fallback must not
+        # unpin it, and a feed the recording cannot serve falls back rather
+        # than raising.
+        self.from_artifact = False
 
     def tensor(self, name):
         """The Tensor an output name names, built from its recorded buffer."""
@@ -413,3 +420,183 @@ def supports(eng):
         return False
     fn.restype = ctypes.c_size_t
     return int(fn()) == ctypes.sizeof(vc4infer.PlanOp)
+
+
+# ---------------------------------------------------------------- artifact
+FROZEN_VERSION = 1
+
+
+class FrozenPlanError(ValueError):
+    """A frozen plan in an artifact cannot be used by this engine."""
+
+
+def op_abi(eng):
+    """sizeof(vc4_plan_op) in the engine's library, or None."""
+    fn = getattr(getattr(eng, "lib", None), "vc4_plan_op_size", None)
+    if fn is None:
+        return None
+    fn.restype = ctypes.c_size_t
+    return int(fn())
+
+
+def kernel_digest(entries):
+    """sha256 over the kernel table's (name, blob, stamp) triples.
+
+    The plan's records name no kernel: the C entry points choose one from the
+    operation and its shape.  What they choose from is the artifact's kernel
+    table, so that table is what identifies the blobs a frozen plan will run.
+    """
+    rows = [[str(e.get("name")), e.get("sha256"), e.get("stamp")]
+            for e in entries]
+    rows.sort()
+    return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+
+
+def frozen_plan(plan, segs, abi_bytes, kernels_sha256, launches):
+    """(manifest block, op bytes) for ``plan``.
+
+    ``segs`` is the recording pool's [(base, size), ...]; the loader rebases
+    every offset by the difference between these and the pool it gets.
+    """
+    steps, nodes, ops = [], [], bytearray()
+    for (kind, item), group in zip(plan.steps, plan.nodes):
+        if kind == "c":
+            steps.append(["c", len(item)])
+            nodes.append([int(i) for i in group])
+            ops += bytes(memoryview(item).cast("B"))
+        else:
+            steps.append([kind, int(item)])
+            nodes.append([int(i) for i in group])
+    desc = {name: [int(off), int(nbytes), [int(d) for d in shape], layout,
+                   int(pitch)]
+            for name, (off, nbytes, shape, layout, pitch) in plan.desc.items()}
+    feeds = {name: [[int(d) for d in shape], int(n)]
+             for name, (shape, n) in plan.feed_sig.items()}
+    block = {
+        "version": FROZEN_VERSION,
+        "abi_bytes": int(abi_bytes),
+        "section": "plan_ops",
+        "bytes": len(ops),
+        "c_ops": int(plan.c_ops),
+        "c_nodes": int(plan.c_nodes),
+        "py_nodes": [int(i) for i in plan.py_nodes],
+        "launches": int(launches),
+        "segment_bases": [int(seg[0]) for seg in segs],
+        "segment_bytes": [int(seg[1]) for seg in segs],
+        "kernels_sha256": kernels_sha256,
+        "steps": steps,
+        "nodes": nodes,
+        "desc": desc,
+        "feed_sig": feeds,
+    }
+    return block, bytes(ops)
+
+
+def plan_from_frozen(block, ops, abi_bytes, segs, kernels_sha256):
+    """Rebuild a Plan on the segments a load received.
+
+    Raises FrozenPlanError naming what disagrees; the caller sets plan_error
+    and leaves the artifact on the Python path.
+    """
+    version = int(block.get("version", 0))
+    if version != FROZEN_VERSION:
+        raise FrozenPlanError(
+            "the artifact's frozen plan is version %d and this engine reads "
+            "version %d; rebuild the artifact"
+            % (version, FROZEN_VERSION))
+    want = int(block.get("abi_bytes", -1))
+    if want != int(abi_bytes):
+        raise FrozenPlanError(
+            "the artifact's frozen plan records %d B per operation and this "
+            "libvc4infer's vc4_plan_op is %d B; rebuild the artifact or run "
+            "the library it was built with" % (want, int(abi_bytes)))
+    got_k = block.get("kernels_sha256")
+    if got_k != kernels_sha256:
+        raise FrozenPlanError(
+            "the artifact's frozen plan refers to kernel table %s, but the "
+            "artifact carries %s; the plan and the blobs do not belong "
+            "together" % (str(got_k)[:16], str(kernels_sha256)[:16]))
+    from_bases = [int(v) for v in block.get("segment_bases", [])]
+    from_sizes = [int(v) for v in block.get("segment_bytes", [])]
+    to_bases = [int(seg[0]) for seg in segs]
+    if len(from_bases) != len(to_bases):
+        raise FrozenPlanError(
+            "the artifact's frozen plan was recorded over %d pool segment(s) "
+            "and this load created %d; rebuild the artifact"
+            % (len(from_bases), len(to_bases)))
+    if [int(seg[1]) for seg in segs] != from_sizes:
+        raise FrozenPlanError(
+            "the artifact's frozen plan was recorded over segment sizes %s "
+            "and this load created %s; rebuild the artifact"
+            % (from_sizes, [int(seg[1]) for seg in segs]))
+    ops = bytes(ops)
+    if len(ops) != int(block.get("bytes", -1)):
+        raise FrozenPlanError(
+            "the artifact's plan_ops section is %d B and the manifest says "
+            "%d B; the artifact is corrupt"
+            % (len(ops), int(block.get("bytes", -1))))
+
+    def rebase(off):
+        off = int(off)
+        for i, base in enumerate(from_bases):
+            if base <= off < base + from_sizes[i]:
+                return off - base + to_bases[i]
+        raise FrozenPlanError(
+            "the artifact's frozen plan refers to %d, which is outside the "
+            "%d recorded pool segment(s); the artifact is corrupt"
+            % (off, len(from_bases)))
+
+    def rebase_op(op):
+        for field in ("a_off", "b_off", "c_off"):
+            off = int(getattr(op, field))
+            if off:
+                setattr(op, field, rebase(off))
+
+    record = ctypes.sizeof(vc4infer.PlanOp)
+    steps, nodes = [], []
+    pos = 0
+    nops = 0
+    for ent, group in zip(block.get("steps", []), block.get("nodes", [])):
+        kind = ent[0]
+        n = int(ent[1])
+        if kind == "c":
+            size = n * record
+            if pos + size > len(ops):
+                raise FrozenPlanError(
+                    "the artifact's plan_ops section is shorter than its "
+                    "step table says; the artifact is corrupt")
+            arr = (vc4infer.PlanOp * n)()
+            ctypes.memmove(arr, ops[pos:pos + size], size)
+            pos += size
+            nops += n
+            for op in arr:
+                rebase_op(op)
+            steps.append(("c", arr))
+            nodes.append(tuple(int(i) for i in group))
+        elif kind in ("p", "s"):
+            steps.append((kind, n))
+            nodes.append(tuple(int(i) for i in group))
+        else:
+            raise FrozenPlanError(
+                "the artifact's frozen plan has step kind %r; this engine "
+                "reads c/p/s" % (kind,))
+    if pos != len(ops):
+        raise FrozenPlanError(
+            "the artifact's plan_ops section has %d B left after its %d "
+            "step(s); the artifact is corrupt" % (len(ops) - pos, len(steps)))
+    if nops != int(block.get("c_ops", nops)):
+        raise FrozenPlanError(
+            "the artifact's frozen plan has %d operations and its manifest "
+            "says %d; the artifact is corrupt"
+            % (nops, int(block.get("c_ops", nops))))
+    desc = {}
+    for name, v in (block.get("desc") or {}).items():
+        desc[name] = (rebase(int(v[0])), int(v[1]),
+                      tuple(int(d) for d in v[2]), v[3], int(v[4]))
+    feeds = {name: (tuple(int(d) for d in v[0]), int(v[1]))
+             for name, v in (block.get("feed_sig") or {}).items()}
+    plan = Plan(steps, nodes, desc, feeds, nops,
+                int(block.get("c_nodes", 0)),
+                [int(i) for i in block.get("py_nodes", [])])
+    plan.from_artifact = True
+    return plan

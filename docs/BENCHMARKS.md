@@ -391,6 +391,55 @@ The need is the engine's own floor (weights, packed conv panels,
 largest tensor) plus its scratch reserve and 8 MiB; `fits` means the
 static plan accepted the graph at the 64 MiB client arena.
 
+### The 150 MiB arena: the cells that needed 89-126 MiB
+
+Measured 2026-11-23 on the same board, with the packaged `vc4d.service` stopped
+for the window only: one private `vc4d` built from this tree ran on
+`/run/vc4d-mem-150.sock` at `--arena-mb 150` with `--gpu-lock`, the client asked
+for 145 MiB, ARM was pinned at 1.0 GHz, every cell ran under
+`tools/thermal-guard.sh --max 75`, and no timeout, context reset or reboot
+occurred.  The packaged unit was restored and verified afterwards
+(`vc4d 1.2.9, protocol 2, 96 MiB`).
+
+"Plan" is the liveness plan's pool plus the engine's conv/elementwise scratch
+(`docs/OPTIMIZER.md`); "high-water" is `Engine.memory()["peak_mb"]` against the
+pool the run allocated (segments in parentheses).  Accuracy is
+against the saved ONNX Runtime CPU reference on the fixed `bus.jpg` input, as
+in the rest of this section.
+
+| cell | plan MiB | runs | median ms | FPS | launches | high-water / pool MiB | max scaled | detections | status |
+|---|---:|---|---:|---:|---:|---|---:|---|---|
+| v5 s 160 | 83.0 | yes (raw graph) | 943.1 | 1.06 | 1488 | 7.32 of 84.45 (7) | 2.52 | 5/5, box 2.78 px | runs, accuracy off |
+| v8 s 160 | 98.2 | no | — | — | — | — | — | — | refusal: `up2_512` is 21440 B, over the 16384 B code slot |
+| v9 s 160 | 65.4 | yes (raw graph) | 2430.4 | 0.41 | 6512 | 4.57 of 64.37 (5) | 4.09 | 5/5, box 0.98 px | runs, accuracy off |
+| v8 n 320 | 52.2 | yes (raw graph) | 985.2 | 1.02 | 2060 | 8.98 of 41.30 (2) | 16.1 | 7 vs 5 | runs, accuracy off |
+| v8 n 640 | 131.6 | no | — | — | — | — | — | — | refusal: `copy2d` lane stride 1638400 x 15 overflows the 24-bit address multiply |
+
+The plan accepts all five under 145 MiB; v5 s and v9 s also fit the old
+96 MiB figure and v8 n 320 had been refused there.  Fitting is not running:
+v8 s stops on a kernel whose blob is larger than the client code slot, and
+v8 n 640 stops in the first conv because the row copy's lane stride exceeds
+the 24-bit multiply, before any memory question is reached.
+
+**v8 n 320 is the cell that moved, but on the optimised path.**  The raw graph
+returns the right detections and the wrong values (16.1 scaled).  The same
+graph with `VC4_OPT=all`, built as an artifact, measures **8.6e-4** scaled
+(0.0374 max abs), above the 5e-4 gate used for YOLOv8n-160 but two orders of
+magnitude below the raw graph, and fits the *default* 64 MiB arena:
+
+| cell | client arena | median ms | FPS | launches | pool + scratch MiB | max scaled |
+|---|---:|---:|---:|---:|---|---:|
+| v8 n 320, `--opt all` artifact | 60.0 | 836.7 | 1.20 | 512 | 22.96 + 22.20 | 8.6e-4 |
+
+That is the better result for the matrix: no private arena is needed, and the
+artifact is the shipping path.  The raw-graph row above is kept because the
+rest of this section uses the raw graph, and the two must not be conflated.
+
+These are capacity results, not speed results.  1.02-1.20 FPS for v8 n 320,
+1.06 for v5 s and 0.41 for v9 s are the frame rates of larger graphs doing
+more work; they are not comparable with YOLOv8n-160's 1.9-2.3 FPS and no table
+here should be read as a speedup or slowdown against it.
+
 ### Performance
 
 #### 160 × 160
@@ -543,16 +592,22 @@ with the QPU busy 50 % of the wall.  The same graph on four A53 cores takes
 3.1e-4 (the 1.5e-2 max absolute is the logit range, which is why the scaled
 number is the meaningful one).
 
-**The arena is the main hardware limit, and the gap is large.**  35 exported
-cells hit the 64 MiB client arena: 33 were refused at plan time, and 2
-(v8n320, v9s160) passed the plan and then died inside a kernel with `out of
-arena memory`, so the planner's clamp is optimistic at 64 MiB.  The measured
-needs range from 89 MiB to 348 MiB.  The worst are v5s640 **348 MiB (5.4× the
-arena)**, v12m320 326 MiB (5.1×), v10s640 301 MiB, and v12m160 298 MiB.
-Even the cheapest refusals are close to double the arena:
-v8s160 needs 100 MiB, v8n640 126 MiB, v9n640 119 MiB.  A 150 MiB arena would
-cover the n column at 640 and most of the s column at 160, but it cannot be
-mapped on this boot because CMA is occupied by the resident daemons.
+**The arena was the main hardware limit; the liveness plan moved part of it.**
+35 exported cells hit the 64 MiB client arena under the old estimate: 33 were
+refused at plan time, and 2 (v8n320, v9s160) passed the plan and then died
+inside a kernel with `out of arena memory`.  The old needs ranged from 89 MiB
+to 348 MiB.  The worst are v5s640 **348 MiB (5.4× the arena)**, v12m320
+326 MiB (5.1×), v10s640 301 MiB, and v12m160 298 MiB; v8s160 needed 100 MiB,
+v8n640 126 MiB, v9n640 119 MiB.
+
+Re-planned with the liveness pass (`docs/OPTIMIZER.md`), the same cells'
+pool-plus-scratch totals are 52.2 MiB (v8n320), 65.4 (v9s160), 83.0 (v5s160),
+98.2 (v8s160) and 131.6 (v8n640).  A 150 MiB arena was measured by stopping
+the packaged daemon for one window (see "The 150 MiB arena" above): all five
+plan under 145 MiB.  v8n320 now runs correctly as an `--opt all` artifact in
+60 MiB, the default arena, so it leaves this set.  v5s160 and v9s160 run at
+150 MiB but fail the accuracy gate; v8s160 and v8n640 still refuse, but for
+kernel limits (code slot, 24-bit address multiply), not for memory.
 
 **Nine cells are op-limited, not size-limited.**  v5's 6×6 stride-2 stem
 conv is unsupported; v9's Slice form needs a compact NCHW source; v10, v11 and

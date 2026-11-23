@@ -470,8 +470,14 @@ def cmd_build(args):
     print("kernels: %d blobs, %.2f MiB%s"
           % (s["kernels"], s["kernel_bytes"] / 2 ** 20,
              "" if s["kernels"] else " (names only)"))
-    print("plan:    pool %.2f MiB, scratch %.2f MiB, arena %.2f MiB"
-          % (s["pool_bytes"] / 2 ** 20, s["scratch_bytes"] / 2 ** 20,
+    print("plan:    peak %.2f MiB (permanent %.2f + temp %.2f + live %.2f, "
+          "reused %.2f), pool %.2f MiB, scratch %.2f MiB, arena %.2f MiB"
+          % (s.get("plan_bytes", s["pool_bytes"]) / 2 ** 20,
+             s.get("permanent_bytes", 0) / 2 ** 20,
+             s.get("temp_bytes", 0) / 2 ** 20,
+             s.get("activation_bytes", 0) / 2 ** 20,
+             s.get("reused_bytes", 0) / 2 ** 20,
+             s["pool_bytes"] / 2 ** 20, s["scratch_bytes"] / 2 ** 20,
              (s.get("arena_bytes") or 0) / 2 ** 20))
     t = s["timings"]
     print("build:   %.1f s (optimise %.1f s, panels %.1f s, plan %.1f s)"
@@ -505,8 +511,9 @@ def cmd_verify(args):
           % (s["weights"], s["weight_bytes"] / 2 ** 20))
     print("  kernels    %d blobs, %.2f MiB" % (s["kernels"],
                                                s["kernel_bytes"] / 2 ** 20))
-    print("  plan       pool %.2f MiB, scratch %.2f MiB"
-          % (s["pool_bytes"] / 2 ** 20, s["scratch_bytes"] / 2 ** 20))
+    print("  plan       peak %.2f MiB, pool %.2f MiB, scratch %.2f MiB"
+          % (s.get("plan_bytes", s["pool_bytes"]) / 2 ** 20,
+             s["pool_bytes"] / 2 ** 20, s["scratch_bytes"] / 2 ** 20))
     print("  generator  %s" % s["generator_digest"])
     print("  engine     %s" % s["engine_digest"])
     print("  board      %s" % s["board"])

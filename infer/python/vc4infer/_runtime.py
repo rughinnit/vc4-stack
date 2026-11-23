@@ -138,7 +138,7 @@ def prepare_env():
     return {
         "backend": backend(),
         "daemon": os.environ.get("VC4INFER_DAEMON", "0") not in ("", "0"),
-        "socket": SOCKET,
+        "socket": socket_path(),
         "kgen": kg,
         "cache": default_cache_dir(),
     }
@@ -171,7 +171,8 @@ def open_engine(cache_dir=None, arena_mb=None, retry_s=3.0):
     if daemon and not daemon_reachable():
         raise Error(
             "vc4d is not running (no %s). Start it with `sudo systemctl start "
-            "vc4d`, or run as root with VC4INFER_DAEMON=0." % socket_path())
+            "vc4d`, set VC4D_SOCKET to a private daemon's socket, or run "
+            "as root with VC4INFER_DAEMON=0." % socket_path())
     deadline = time.monotonic() + max(0.0, float(retry_s))
     while True:
         try:

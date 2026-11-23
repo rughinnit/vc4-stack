@@ -22,7 +22,10 @@ runs on the ARM (or on a machine with no VideoCore at all):
      pass on the synthetic graphs;
   8. the plan-time ConstantOfShape fold: the node becomes an initialiser whose
      bytes match benchmodels/materialise.py, IR-3 shape inputs are pruned, and
-     a fill over the fold budget refuses with its own arithmetic.
+     a fill over the fold budget refuses with its own arithmetic;
+  9. memory planning: real live ranges (view aliases and fused nodes included)
+     assign non-overlapping offsets with reuse, and the peak is a property of
+     the graph rather than the sum of every tensor.
 
 No GPU work, no kernel cache, no ctypes call into libvc4infer.  The real gate
 (152/152 operators, YOLOv8n parity) still needs silicon; commands are in
@@ -517,6 +520,130 @@ def test_plan_model():
               "%s keeps the elementwise launch count (%d)" % (spec, p.total))
 
 
+def mk_memory_chain():
+    """x -> Relu -> Relu -> Relu -> Reshape -> Add, 8x16x16 fp32 tensors."""
+    shape = (1, 8, 16, 16)
+    x = _vi("X", shape)
+    n = [helper.make_node("Relu", ["X"], ["A"]),
+         helper.make_node("Relu", ["A"], ["B"]),
+         helper.make_node("Relu", ["B"], ["C"]),
+         helper.make_node("Reshape", ["C", "s"], ["D"]),
+         helper.make_node("Add", ["D", "D"], ["Y"])]
+    s = numpy_helper.from_array(np.asarray([1, 2048], np.int64), "s")
+    return _model(n, [x], [_vi("Y", (1, 2048))], [s])
+
+
+def _overlaps(plan):
+    """Return the pairs of ranges whose live intervals and offsets collide."""
+    bad = []
+    rs = [r for r in plan.ranges if r.offset >= 0]
+    for i in range(len(rs)):
+        for j in range(i + 1, len(rs)):
+            a, b = rs[i], rs[j]
+            if a.permanent or b.permanent:
+                continue
+            if a.first <= b.last and b.first <= a.last:
+                if a.offset < b.end and b.offset < a.end:
+                    bad.append((a.name, b.name))
+    return bad
+
+
+def test_memory_plan():
+    print("plan-time liveness and static offsets")
+    m = mk_memory_chain()
+    shapes = {"X": [1, 8, 16, 16], "A": [1, 8, 16, 16],
+              "B": [1, 8, 16, 16], "C": [1, 8, 16, 16],
+              "D": [1, 2048], "Y": [1, 2048]}
+    plan = O.plan_memory(m, shapes)
+    check(plan.peak_bytes > 0, "the plan has a peak (%.1f KiB)"
+          % (plan.peak_bytes / 1024.0))
+    check(plan.peak_bytes == max(r.end for r in plan.ranges),
+          "the peak is the furthest planned byte")
+    check(not _overlaps(plan), "no two live ranges share an offset")
+    # a dies at node 0, c is born at node 2: their buffers are reused
+    a, c = plan.range("A"), plan.range("C")
+    check(a is not None and c is not None and a.offset == c.offset,
+          "a dead buffer is reused by the next one (A %s, C %s)"
+          % (a and a.offset, c and c.offset))
+    # D is a Reshape of C: no buffer of its own
+    check(plan.range("D") is None and plan.aliases.get("D") == "C",
+          "a view is an alias, not a buffer (%s)" % (plan.aliases,))
+    # a chain of elementwise ops allocates only its outputs: no copy block
+    check(plan.temp_bytes == 0,
+          "no copy op, no scratch block (%.1f KiB)"
+          % (plan.temp_bytes / 1024.0))
+    total = sum(r.bytes for r in plan.ranges)
+    check(plan.peak_bytes < total,
+          "reuse makes the peak smaller than the sum (%d < %d)"
+          % (plan.peak_bytes, total))
+    d = plan.as_dict()
+    check(d["planner"] == "liveness" and d["peak_bytes"] == plan.peak_bytes,
+          "the manifest form carries the peak and the ranges")
+    check(len(d["ranges"]) == len([r for r in plan.ranges if r.offset >= 0]),
+          "every placed range is in the manifest form")
+    check("peak" in plan.format(), "the printer names the peak")
+
+    # a fused node allocates nothing: one SiLU output, not two
+    m = mk_silu((1, 4, 4, 4))
+    res = O.optimise(m, passes="ew")
+    plan = O.plan_memory(res.model, {"X": [1, 4, 4, 4], "S": [1, 4, 4, 4],
+                                     "Y": [1, 4, 4, 4]})
+    check(plan.range("S") is None, "the fused Sigmoid has no buffer")
+    check(plan.range("Y") is not None, "the Mul's output is planned")
+
+    # a conv activation aliases the conv buffer
+    m = mk_conv_relu()
+    res = O.optimise(m, passes="epilogue")
+    plan = O.plan_memory(res.model, {"X": [1, 16, 8, 8], "C": [1, 16, 8, 8],
+                                     "Y": [1, 16, 8, 8]})
+    check(plan.range("Y") is None and plan.aliases.get("Y") == "C",
+          "a fused activation aliases the conv buffer (%s)" % (plan.aliases,))
+
+    # the shipped YOLOv8n graph: the plan is a peak, not a sum
+    if os.path.isfile(MODEL):
+        from vc4infer import coverage as _cov
+        m = onnx.load(MODEL)
+        res = O.optimise(m, passes="all")
+        shapes = _cov.refine_shapes(res.model)
+        plan = O.plan_memory(res.model, shapes)
+        check(plan.peak_bytes < (40 << 20),
+              "YOLOv8n-160 plans under 40 MiB (%.2f MiB)"
+              % plan.peak_mb)
+        check(plan.peak_bytes >= (24 << 20),
+              "and above its 24.4 MiB of weights and panels (%.2f MiB)"
+              % plan.peak_mb)
+        check(not _overlaps(plan), "YOLOv8n-160: no live ranges overlap")
+        old = O.legacy_pool_bytes(res.model, shapes)
+        check(old > plan.peak_bytes,
+              "the old walk over-reserves (%.2f -> %.2f MiB)"
+              % (old / 2 ** 20, plan.peak_mb))
+
+    # the runner sizes its first segment from the plan, and the A/B switch
+    # falls back to the old walk without touching the graph
+    path = save(mk_memory_chain(), "memchain.onnx")
+    eng = FakeEngine(arena=4 << 20)
+    r = Runner(path, eng, passes="none")
+    check(r.memory_plan is not None and r.memory_plan.peak_bytes > 0,
+          "the runner keeps the plan it was sized from")
+    check(r.pool_plan["memory"]["planner"] == "liveness",
+          "the pool plan carries the liveness table")
+    check(r.pool_plan["pool_bytes"] >= r.memory_plan.peak_bytes,
+          "the pool covers the plan's peak")
+    saved = os.environ.get("VC4_NO_MEM_PLAN")
+    try:
+        os.environ["VC4_NO_MEM_PLAN"] = "1"
+        eng = FakeEngine(arena=4 << 20)
+        r = Runner(path, eng, passes="none")
+        check(r.memory_plan is None and
+              r.pool_plan["memory"]["planner"] == "legacy",
+              "VC4_NO_MEM_PLAN selects the old walk")
+    finally:
+        if saved is None:
+            os.environ.pop("VC4_NO_MEM_PLAN", None)
+        else:
+            os.environ["VC4_NO_MEM_PLAN"] = saved
+
+
 def test_dispatch_fake_engine():
     print("fused dispatch (fake engine)")
     saved = os.environ.get("VC4_NO_SILU_FUSE")
@@ -921,6 +1048,7 @@ def main():
     test_epilogue()
     test_layout()
     test_plan_model()
+    test_memory_plan()
     test_dispatch_fake_engine()
     test_dispatch_matmul_fold()
     test_runner_markers()

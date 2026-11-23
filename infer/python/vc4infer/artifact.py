@@ -506,13 +506,31 @@ class Artifact:
             "pool_bytes": int(p.get("pool_bytes", 0)),
             "estimate_bytes": int(p.get("estimate_bytes",
                                         p.get("pool_bytes", 0))),
+            "plan_bytes": int(p.get("plan_bytes",
+                                    p.get("pool_bytes", 0))),
+            "headroom_bytes": int(p.get("headroom_bytes", 0)),
             "floor_bytes": int(p.get("floor_bytes", 0)),
             "scratch_bytes": int(p.get("scratch_bytes", 0)),
             "arena_bytes": int(p.get("arena_bytes", 0)),
             "clamped": bool(p.get("clamped", False)),
+            "permanent_bytes": int(p.get("permanent_bytes", 0)),
+            "temp_bytes": int(p.get("temp_bytes", 0)),
+            "activation_bytes": int(p.get("activation_bytes", 0)),
+            "reused_bytes": int(p.get("reused_bytes", 0)),
+            "margin_bytes": int(p.get("margin_bytes", 0)),
+            "memory": p.get("memory") or {},
             "artifact": True,
         }
         return out
+
+    @property
+    def memory_plan(self):
+        """The plan-time liveness table recorded at build, as a dict.
+
+        Empty for an artifact built before the liveness pass; the loader then
+        uses the recorded allocation table and the recorded pool size.
+        """
+        return dict(self.manifest.get("plan", {}).get("memory") or {})
 
     @property
     def shapes(self):
@@ -648,6 +666,14 @@ class Artifact:
                 "bytes": plan["frozen"].get("bytes"),
             }),
             "pool_bytes": int(plan.get("pool_bytes", 0)),
+            "plan_bytes": int(plan.get("plan_bytes",
+                                       plan.get("pool_bytes", 0))),
+            "headroom_bytes": int(plan.get("headroom_bytes", 0)),
+            "permanent_bytes": int(plan.get("permanent_bytes", 0)),
+            "temp_bytes": int(plan.get("temp_bytes", 0)),
+            "activation_bytes": int(plan.get("activation_bytes", 0)),
+            "reused_bytes": int(plan.get("reused_bytes", 0)),
+            "margin_bytes": int(plan.get("margin_bytes", 0)),
             "scratch_bytes": int(plan.get("scratch_bytes", 0)),
             "file_bytes": (os.path.getsize(self.path)
                            if self.path and os.path.exists(self.path) else None),
@@ -1096,8 +1122,27 @@ def build(model_path, out_path, *, opt="all", imgsz=None, opset=17,
 
     plan = _plan_from(entries)
     missing = run1_keys - {e["key"] for e in plan}
+    recorded_end = int(max((e["offset"] + e["bytes"] for e in plan),
+                           default=0))
+    # The artifact does not upload the raw weights a packed panel replaces, so
+    # its recorded plan is computed over the graph without them.  The build's
+    # own run was sized with them (a safe first segment); with one segment the
+    # pool can now shrink to the furthest byte the run actually used.
+    from .optimizer.memory import plan_memory
+    mem_report = plan_memory(model, shapes,
+                             dropped=[e["name"] for e in dropped])
+    plan_peak = int(mem_report.peak_bytes)
+    if len(segment_bytes) == 1:
+        pooled = max((recorded_end + 63) // 64 * 64, plan_peak)
+        if pooled != pool_bytes:
+            pool_bytes = pooled
+            segment_bytes = [pool_bytes]
     say("pass B: %.1f s, %d allocations, pool %.1f MiB"
         % (t_b, len(plan), pool_bytes / 2 ** 20))
+    say("memory plan: peak %.2f MiB, recorded %.2f MiB, %+.2f MiB margin%s"
+        % (plan_peak / 2 ** 20, recorded_end / 2 ** 20,
+           (recorded_end - plan_peak) / 2 ** 20,
+           "" if len(segment_bytes) == 1 else " (the pool grew a segment)"))
 
     # --- assemble the artifact ---------------------------------------------
     entries = []
@@ -1170,10 +1215,20 @@ def build(model_path, out_path, *, opt="all", imgsz=None, opset=17,
             "pool_bytes": pool_bytes,
             "segment_bytes": segment_bytes,
             "estimate_bytes": int(pool_plan.get("estimate_bytes", pool_bytes)),
+            "plan_bytes": plan_peak,
+            "headroom_bytes": int(mem_report.headroom_bytes),
             "floor_bytes": int(pool_plan.get("floor_bytes", 0)),
             "scratch_bytes": int(pool_plan.get("scratch_bytes", 0)),
             "clamped": bool(pool_plan.get("clamped", False)),
+            "permanent_bytes": int(mem_report.permanent_bytes),
+            "temp_bytes": int(mem_report.temp_bytes),
+            "activation_bytes": int(mem_report.activation_bytes),
+            "reused_bytes": int(mem_report.reused_bytes),
+            # the recorded run's furthest byte, against the plan's peak: a
+            # positive margin is the per-node scratch the graph could not name
+            "margin_bytes": int(recorded_end - plan_peak),
             "high_water_bytes": high,
+            "memory": mem_report.as_dict(),
             "allocations": plan,
             # The frozen execution plan, recorded from the same frame: the
             # device calls, their buffers, the Python steps and the output

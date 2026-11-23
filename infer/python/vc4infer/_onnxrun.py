@@ -1054,7 +1054,12 @@ class Runner:
         self.plan_error = None
         self._plan_build = None
         self._plan_saved = None
-        self._cplan_enabled = (os.environ.get("VC4_NO_CPLAN", "") in ("", "0"))
+        # Opt-in until the replay is correct on silicon: with it on, a
+        # YOLOv8n-160 frame stops at dfl/Softmax with a non-finite input, and
+        # the same frame is 332 launches and 0 over tolerance with it off.
+        self._cplan_enabled = (
+            os.environ.get("VC4_CPLAN", "") not in ("", "0")
+            and os.environ.get("VC4_NO_CPLAN", "") in ("", "0"))
 
     def _apply_exec_state(self, st):
         """Restore the rewrite tables a build recorded, instead of rescanning.

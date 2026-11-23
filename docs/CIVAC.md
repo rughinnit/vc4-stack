@@ -244,10 +244,20 @@ binary.  The bound holds.
   has to handle the edge rows itself) and it is the largest single client item
   after the execution plan.  This branch does not attempt it.
 * **The scratch over-mark: ~3 ms/frame at 160.**  30 MB of scratch is marked
-  and cleaned although the CPU never wrote it.  The safe form is to let each op
-  mark what it writes and drop the high-water mark, which turns a conservative
-  invariant into a per-op obligation; the byte-identity gate over six models
-  would catch a missed one, and it is the next step rather than this one.
+  and cleaned although the CPU never wrote it (the counts: marks 47.6 MB,
+  cleaned 45.6 MB, unique pages 6.6 MB after the guard change).  The safe form
+  is to let each op mark what it writes and drop the launch path's high-water
+  mark.  Assessed and left: the allocation sites that would take on the
+  obligation are 30+ across `vc4_conv.c`, `vc4_ew.c`, `vc4_gemm.c`,
+  `vc4_gen.c` and `vc4_nhwc.c`, and only some of them are CPU-written (the
+  rest are GPU scratch).  Enforcing it needs a check that fails on an unmarked
+  write, not just the digest gate: the workable one is a poison on
+  `vc4__scratch_alloc` (0xA5 fill) plus a scan of the request's scratch extent
+  at launch for bytes that differ from the poison and are not covered by a
+  dirty range, behind an environment flag and run over the op suite.  That is
+  buildable; it was not built here, and until it is, the high-water mark stays.
+  3 ms of a 390 ms frame does not justify an invariant that only the six-model
+  digest gate checks.
 * **Nothing else.**  Marked ≈ cleaned, the list is precise at YOLO shapes, and
   the unique footprint is small only because the pad buffer is rewritten - which
   the cleaning cannot avoid while the writing happens.

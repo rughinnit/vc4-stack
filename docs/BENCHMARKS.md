@@ -420,10 +420,10 @@ in the rest of this section.
 | cell | plan MiB | runs | median ms | FPS | launches | high-water / pool MiB | max scaled | detections | status |
 |---|---:|---|---:|---:|---:|---|---:|---|---|
 | v5 s 160 | 83.0 | yes (raw graph) | 943.1 | 1.06 | 1488 | 7.32 of 84.45 (7) | 2.52 | 5/5, box 2.78 px | runs, accuracy off |
-| v8 s 160 | 97.2 | yes (raw graph) | 972.6 | 1.03 | 1249 | 88.56 of 93.48 (2) | 3.87 | — | runs, accuracy far off |
+| v8 s 160 | 97.2 | yes (raw graph) | 966.4 | 1.03 | 1250 | 88.56 of 93.48 (2) | 4.2e-4 | — | runs, accuracy in gate |
 | v9 s 160 | 65.4 | yes (raw graph) | 2430.4 | 0.41 | 6512 | 4.57 of 64.37 (5) | 4.09 | 5/5, box 0.98 px | runs, accuracy off |
 | v8 n 320 | 52.2 | yes (raw graph) | 985.2 | 1.02 | 2060 | 8.98 of 41.30 (2) | 16.1 | 7 vs 5 | runs, accuracy off |
-| v8 n 640 | 150.9 | yes (raw graph) | 2835.6 | 0.35 | 6604 | 71.74 of 89.02 (2) | 34.0 | — | runs at 181.0 MiB client, accuracy far off |
+| v8 n 640 | 150.9 | yes (raw graph) | 2885.0 | 0.35 | 6679 | 71.74 of 89.02 (2) | 2.5e-4 | — | runs at 181.0 MiB client, accuracy in gate |
 
 The plan accepts v5 s, v9 s, v8 n 320 and v8 s under 145 MiB; v5 s and v9 s
 also fit the old 96 MiB figure and v8 n 320 had been refused there.  v8 n 640
@@ -441,14 +441,20 @@ is exact even at lane 15 (24576000).  The guard now refuses only a stride that
 does not fit the operand, names it, and also covers `nlane == 16`, which it
 skipped before.
 
-Running is still not agreement.  On the fixed `rng(1234)` input, against an
-ONNX Runtime CPU reference for the same input, v8 s 160 measures 3.87 scaled
-raw and 1.50 on the optimiser's graph; v8 n 640 measures 34.0 raw and 16.5
-optimised, and its 324 anchors over 0.25 against the reference's zero are
-confident answers to noise.  The same harness on this tree measures 3.7e-4
-scaled for YOLOv8n-160 and 2.6e-4 for YOLOv8n-320, so the difference is in
-these graphs at these widths, not in the measurement.  No row here claims a
-correct answer for the two cells.
+Both cells are now in the accuracy gate, and two silent defects had to be
+fixed first (A21, A22 in `docs/BUGS.md`).  (1) The first launch of every
+batched request after the first was dropped: an op longer than one 64-launch
+request lost one launch per request.  That was the first divergence of
+v8 n 320 and v8 n 640, both at `/model.0/act/Sigmoid` (node 1), and a single
+640-shaped Sigmoid reproduced it with no conv.  (2) `pack3`'s source-row pitch
+`K*4` is a 13-bit field; at K=4608 (512 channels x 3x3) it wrapped and built
+the weight panel from the wrong rows.  That was v8 s 160's next divergence, at
+`/model.22/cv2.2/cv2.2.0/conv` (512->64, 3x3, 5x5).
+
+On the fixed `rng(1234)` input against ONNX Runtime, v8 s 160 measures 4.15e-4
+scaled (max abs 0.0449), raw and optimised; v8 n 640 measures 2.54e-4 (0.0986),
+raw and optimised.  The same harness measures 3.7e-4 for YOLOv8n-160 and
+2.6e-4 for YOLOv8n-320.
 
 **v8 n 320 is the cell that moved, but on the optimised path.**  The raw graph
 returns the right detections and the wrong values (16.1 scaled).  The same
@@ -459,8 +465,8 @@ magnitude below the raw graph, and fits the *default* 64 MiB arena:
 | cell | client arena | median ms | FPS | launches | pool + scratch MiB | max scaled |
 |---|---:|---:|---:|---:|---|---:|
 | v8 n 320, `--opt all` artifact | 60.0 | 836.7 | 1.20 | 512 | 22.96 + 22.20 | 8.6e-4 |
-| v8 s 160, `--opt all` | 181.0 | 877.6 | 1.14 | 368 | 91.87 + 5.76 | 1.50 |
-| v8 n 640, `--opt all` | 181.0 | 2420.8 | 0.41 | 1217 | 63.02 + 87.91 | 16.5 |
+| v8 s 160, `--opt all` | 149.0 | 873.2 | 1.15 | 368 | 91.87 + 5.76 | 4.2e-4 |
+| v8 n 640, `--opt all` | 181.0 | 2455.1 | 0.41 | 1229 | 63.02 + 87.91 | 2.5e-4 |
 
 That is the better result for the matrix: no private arena is needed, and the
 artifact is the shipping path.  The raw-graph row above is kept because the
@@ -483,7 +489,7 @@ here should be read as a speedup or slowdown against it.
 | v5 | l | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v5 | x | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v8 | n | 108.2 | 9.24 | 521.0 | 1.92 | 4.8× | 802 | 1.5e-02 / 3.1e-04; 4/4 det; box 0.00 px | ok (64 MiB arena) |
-| v8 | s | 272.2 | 3.67 | 972.6 | 1.03 | 3.6× | 1249 | 3.87 scaled (rng); 0 vs 0 anchors | runs (181 MiB client), accuracy far off |
+| v8 | s | 272.2 | 3.67 | 966.4 | 1.03 | 3.5× | 1250 | 4.2e-4 scaled (rng) | runs (149 MiB client), accuracy in gate |
 | v8 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v8 | l | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v8 | x | — | — | — | — | — | — | — | not exportable (memory limit) |
@@ -552,7 +558,7 @@ here should be read as a speedup or slowdown against it.
 | v5 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v5 | l | — | — | — | — | — | — | — | not attempted (optional) |
 | v5 | x | — | — | — | — | — | — | — | not attempted (optional) |
-| v8 | n | 1330.3 | 0.75 | 2835.6 | 0.35 | 2.1× | 6604 | 34.0 scaled (rng); 324 vs 0 anchors | runs (181 MiB client), accuracy far off |
+| v8 | n | 1330.3 | 0.75 | 2885.0 | 0.35 | 2.2× | 6679 | 2.5e-4 scaled (rng) | runs (181 MiB client), accuracy in gate |
 | v8 | s | 3224.5 | 0.31 | — | — | — | — | — | does not fit (needs 194 MiB) |
 | v8 | m | — | — | — | — | — | — | — | not exportable (memory limit) |
 | v8 | l | — | — | — | — | — | — | — | not attempted (optional) |

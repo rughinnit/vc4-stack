@@ -705,22 +705,26 @@ accounting used here.  Capacity is not correctness:
 - **v5s160** and **v9s160** run on the raw graph at 150 MiB (943 ms and
   2430 ms, 1.06 and 0.41 FPS) but fail the accuracy gate at 2.52 and 4.09
   scaled.  The plan made them fit; it did not make them right.
-- **v8s160** runs on the raw graph at 147 MiB (972.6 ms, 1.03 FPS, 1249
-  launches) and on the optimiser's graph (877.6 ms, 1.14 FPS, 368 launches).
-  Both are wrong against ONNX Runtime on the fixed input: 3.87 and 1.50
-  scaled.  The 512-channel upsample kernel is now 1240 B, not 21440 B: the
-  channel-block loop runs at run time, so the code slot no longer refuses it.
+- **v8s160** runs on the raw graph at 149 MiB (966.4 ms, 1.03 FPS, 1250
+  launches) and on the optimiser's graph (873.2 ms, 1.15 FPS, 368 launches),
+  at 4.15e-4 scaled against ONNX Runtime on the fixed input for both.  Two
+  defects had to be fixed first: the dropped first launch of every batched
+  request after the first (A21), and `pack3`'s 13-bit source pitch, which
+  corrupted the 512-channel 3x3 weight panel at K=4608 (A22).  The
+  512-channel upsample kernel is 1240 B, not 21440 B: the channel-block loop
+  runs at run time, so the code slot does not refuse it.
 - **v8n640** runs on the raw graph in a 184 MiB daemon (181.0 MiB of client
-  arena; 2835.6 ms, 0.35 FPS, 6604 launches) and on the optimiser's graph
-  (2420.8 ms, 0.41 FPS, 1217 launches).  Both are wrong: 34.0 and 16.5
-  scaled, and 324 anchors over 0.25 against the reference's zero.  The
-  lane-stride guard that refused it was testing the product; `mul24` truncates
-  the operand, and 1638400 is inside the 24-bit operand, so the copy is
-  exact.  The cell does not fit 150 MiB: its plan is 150.9 MiB of pool and
-  scratch and the pool grows one segment at the first conv.
+  arena; 2885.0 ms, 0.35 FPS, 6679 launches) and on the optimiser's graph
+  (2455.1 ms, 0.41 FPS, 1229 launches), at 2.54e-4 scaled for both.  The
+  first divergence here was the same batched-launch drop at
+  `/model.0/act/Sigmoid`; the lane-stride guard that once refused the cell was
+  testing the product, and `mul24` truncates the operand, so 1638400 is
+  inside the field.  The cell does not fit 150 MiB: its plan is 150.9 MiB of
+  pool and scratch and the pool grows one segment at the first conv.
 
 The accuracy harness is sound on the same tree: YOLOv8n-160 and YOLOv8n-320
-measure 3.7e-4 and 2.6e-4 scaled, raw and optimised.
+measure 3.7e-4 and 2.6e-4 scaled, raw and optimised; under the batch daemon
+YOLOv8n-320 measures 2.6e-4 after A21, 24.2 before it.
 
 The measured table is in `docs/BENCHMARKS.md` sec. 14.  The reduction is a
 capacity result: the FPS of these larger graphs is not comparable with

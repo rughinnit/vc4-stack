@@ -18,6 +18,9 @@
 
 static const float TOL_CONV = 3e-4f;   /* fp32 k=576 truncating-add floor */
 
+/* TOL_CONV is the k=576 floor; a K=4608 accumulation needs its own. */
+static float g_tol_conv = TOL_CONV;
+
 /* reference NHWC conv: in [H][W][Cin] (pitch), out [ho][Wg][Cout] */
 static void ref_conv_nhwc(const float *in, int Cin, int H, int W, int pitch,
                           const float *wt, int Cout, int KH, int KW,
@@ -199,7 +202,7 @@ static int one_conv(vc4_ctx *ctx, int Cin, int H, int W, int Cout, int KH,
         vc4_get_stats(ctx, &s1);
         vc4_download(ctx, &bout, out, nout * 4);
         check_t ck = { 0, 0, 0, 1 };
-        check_plane(&ck, out, ref, nimg, ho, Wg, Cout, wo, TOL_CONV);
+        check_plane(&ck, out, ref, nimg, ho, Wg, Cout, wo, g_tol_conv);
         double gpu_ms = (double)((s1.pack_ns - s0.pack_ns) +
                                  (s1.kernel_ns - s0.kernel_ns)) / 1e6;
         double wall_ms = (double)(t1 - t0) / 1e6;
@@ -316,7 +319,7 @@ static int one_conv_dil(vc4_ctx *ctx, int Cin, int H, int W, int Cout, int KH,
         vc4_get_stats(ctx, &s1);
         vc4_download(ctx, &bout, out, nout * 4);
         check_t ck = { 0, 0, 0, 1 };
-        check_plane(&ck, out, ref, nimg, ho, Wg, Cout, wo, TOL_CONV);
+        check_plane(&ck, out, ref, nimg, ho, Wg, Cout, wo, g_tol_conv);
         double gpu_ms = (double)((s1.pack_ns - s0.pack_ns) +
                                  (s1.kernel_ns - s0.kernel_ns)) / 1e6;
         double wall_ms = (double)(t1 - t0) / 1e6;
@@ -440,7 +443,7 @@ static int one_group(vc4_ctx *ctx, int Cin, int Cout, int groups, int H, int W,
         vc4_get_stats(ctx, &s1);
         vc4_download(ctx, &bout, out, nout * 4);
         check_t ck = { 0, 0, 0, 1 };
-        check_plane(&ck, out, ref, nimg, ho, Wg, Cout, wo, TOL_CONV);
+        check_plane(&ck, out, ref, nimg, ho, Wg, Cout, wo, g_tol_conv);
         double gpu_ms = (double)((s1.pack_ns - s0.pack_ns) +
                                  (s1.kernel_ns - s0.kernel_ns)) / 1e6;
         double wall_ms = (double)(t1 - t0) / 1e6;
@@ -591,7 +594,7 @@ static int one_group_nchw(vc4_ctx *ctx, int Cin, int Cout, int groups, int H,
         }
         vc4_download(ctx, &bout, out, nout * 4);
         check_t ck = { 0, 0, 0, 1 };
-        check_plane(&ck, out, ref, nimg, ho, Wg, Cout, wo, TOL_CONV);
+        check_plane(&ck, out, ref, nimg, ho, Wg, Cout, wo, g_tol_conv);
         double gpu_ms = (double)((s1.pack_ns - s0.pack_ns) +
                                  (s1.kernel_ns - s0.kernel_ns)) / 1e6;
         double wall_ms = (double)(t1 - t0) / 1e6;
@@ -1005,6 +1008,12 @@ int main(int argc, char **argv)
     bad |= one_conv(ctx, 32, 32, 32, 16, 3, 3, 2, 1, 0, 1, reps);
     bad |= one_conv(ctx, 32, 24, 40, 16, 1, 1, 1, 0, 1, 1, reps);
     bad |= one_conv(ctx, 16, 16, 16, 16, 3, 3, 1, 0, 1, 1, reps);
+    /* K=Cin*3*3=4608: pack3's source-row pitch is K*4 = 18432 B, above the
+     * 13-bit VDR pitch field (8191); before the CPU pack fallback the weight
+     * panel was silently wrong and this conv was off by ~8.7. */
+    g_tol_conv = 2e-3f;      /* K=4608 fp32 truncating-add floor */
+    bad |= one_conv(ctx, 512, 5, 5, 64, 3, 3, 1, 1, 1, 1, reps);
+    g_tol_conv = TOL_CONV;
     /* dilation: 3x3 d2 (effective 5x5), 3x3 d2 stride 2, 5x5 d1 */
     bad |= one_conv_dil(ctx, 32, 32, 32, 32, 3, 3, 1, 2, 2, 1, reps);
     bad |= one_conv_dil(ctx, 32, 32, 32, 16, 3, 3, 2, 2, 2, 1, reps);

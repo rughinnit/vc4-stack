@@ -206,10 +206,26 @@ vc4_status vc4_conv_nhwc_pack_w(vc4_ctx *ctx, const vc4_buf *wt, int Cin,
      * the QPUs read it; the launch path tracks only the per-op scratch, so
      * every CPU write into a persistent buffer has to mark itself. */
     vc4__mark_dirty(ctx, wpanel->off, (size_t)Cout * nk * 4);
-    vc4_status st = vc4__pack3_run(ctx, ctx->gpu_bus + (uint32_t)
-                                  ((uint8_t *)wr - ctx->arena), K, 64u * K,
-                                  vc4_bus_addr(ctx, wpanel), 64u * nk,
-                                  (uint32_t)Cout / 16u);
+    vc4_status st;
+    if ((uint64_t)K * 4u > 8191u) {
+        /* pack3 reads a source row of K floats with the VDR pitch K*4, a
+         * 13-bit field.  Above 8191 B it wraps and the panel is silently
+         * wrong (K=4608 -> 18432 B).  The panel is a permutation of Cout*K
+         * floats, so do it once on the CPU instead. */
+        float *wp = (float *)(ctx->arena + wpanel->off);
+        for (uint32_t cb = 0; cb < (uint32_t)Cout / 16u; ++cb)
+            for (uint32_t k = 0; k < K; ++k)
+                for (uint32_t r = 0; r < 16u; ++r)
+                    wp[((size_t)cb * nk + k) * 16u + r] =
+                        wr[((size_t)cb * 16u + r) * K + k];
+        vc4__mark_dirty(ctx, wpanel->off, (size_t)Cout * nk * 4);
+        st = VC4_OK;
+    } else {
+        st = vc4__pack3_run(ctx, ctx->gpu_bus + (uint32_t)
+                            ((uint8_t *)wr - ctx->arena), K, 64u * K,
+                            vc4_bus_addr(ctx, wpanel), 64u * nk,
+                            (uint32_t)Cout / 16u);
+    }
     if (st == VC4_OK && bias) {
         vc4__invalidate_off(ctx, bias->off, (size_t)Cout * 4);
         const float *bsrc = (const float *)(ctx->arena + bias->off);

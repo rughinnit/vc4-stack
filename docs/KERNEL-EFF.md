@@ -268,7 +268,18 @@ tools/thermal-guard.sh --max 75 -- python3 infer/tools/onnx/profile_classes.py \
     infer/packaging/vc4infer/data/models/yolov8n_160.onnx --conv
 ```
 
-## 7. The flat-panel im2col: second form, CPU-verified, silicon gate pending
+## 7. The flat-panel im2col: closed by its silicon gate
+
+**Closed.**  The second form of the flat panel -- a 16-pixel block whose 16
+VPM rows are filled from four 4-row VDRs and stored with the row kernel's own
+16 x 16 transposing store -- is **exact on one QPU and corrupt on two or
+more**.  The store shape is not what failed: the QPU accepts this one where it
+rejected the first form's 4-word store, with no `V3D_ERR_STAT`.  What has not
+been shown to work is four loads filling the window ahead of one store.
+`VC4_CONV_FLAT` refuses, the blob is named `im2col_nhwc_flat2_*`, and any
+future attempt has to meet the constraint in "Constraint for any future
+attempt" below.  Everything above the gate on this page is what that attempt
+can reuse.
 
 `kgen.build_im2col_nhwc_flat2(Cin, KH, KW, stride, dilation)` keeps the
 16-pixel block and takes its pixels from the flat output plane:
@@ -276,10 +287,10 @@ tools/thermal-guard.sh --max 75 -- python3 infer/tools/onnx/profile_classes.py \
 group of four pixels can never straddle a padded row, because the flat plane
 is `ho` rows of exactly `align4(wo)` pixels.
 
-The first form of this pass stored each group with a 16 k row by 4 pixel word
-transposing VDW and was rejected on silicon (section below).  The second form
-uses no new store shape at all: it fills the 16 VPM rows the row kernel's own
-16 x 16 transposing store reads, from four 4-row VDRs at the pixel pitch.
+The first form stored each group with a 16 k row by 4 pixel word transposing
+VDW and was rejected on silicon (section below).  The second form uses no new
+store shape at all: it fills the 16 VPM rows the row kernel's own 16 x 16
+transposing store reads, from four 4-row VDRs at the pixel pitch.
 
 | piece | shape | change from the row kernel |
 |---|---|---|
@@ -317,34 +328,42 @@ tap, channel block) and for two QPU splits plus one QPU:
   control words are generator constants, not model ones, so this is the part
   the model cannot see.
 
-The group addresses are accumulated as the kernel accumulates them, and four
-mutations of the generator each fail the check: the 4-word store, the 48-byte
-store gap, a 16-row load and the missing channel-block back-step.
+The group addresses are accumulated as the kernel accumulates them, and the
+destination is a register accumulated per (tap, channel block), so a missing
+advance shifts the tile instead of comparing equal.  Five mutations of the
+generator each fail the check: the 4-word store, the 48-byte store gap, a
+16-row load, the missing channel-block back-step, and the destination advance
+placed only inside the channel loop.
+
+This proof, and its destination model in particular, is what a future form
+reuses: it is cheap, it is host-only, and it caught one of the two defects the
+gate then confirmed.  It cannot see VPM request ordering, which is why it did
+not catch the other.
 
 15 shapes, 0 failures, the 13 of the first form plus 20x20 and 60x60:
 
 | shape | M flat | M row | ratio | words flat2 | words row | delta |
 |---|---:|---:|---:|---:|---:|---:|
-| 160x160x16 k3 | 25,600 | 25,600 | 1.000 | 336 | 365 | -29 |
+| 160x160x16 k3 | 25,600 | 25,600 | 1.000 | 345 | 365 | -20 |
 | 20x20x64 k3 | 400 | 640 | 0.625 | 412 | 365 | +47 |
 | 10x10x32 k3 | 128 | 160 | 0.800 | 412 | 365 | +47 |
-| 5x5x16 k3 | 48 | 80 | 0.600 | 336 | 365 | -29 |
-| 13x7x16 k3 | 112 | 112 | 1.000 | 336 | 365 | -29 |
-| 7x13x16 k3 | 112 | 208 | 0.538 | 336 | 365 | -29 |
-| 3x1x16 k3 | 16 | 16 | 1.000 | 336 | 365 | -29 |
-| 4x3x16 k3 | 16 | 48 | 0.333 | 336 | 365 | -29 |
-| 20x20x16 k3 s2 | 128 | 160 | 0.800 | 336 | 365 | -29 |
-| 20x20x16 k3 p0 | 368 | 576 | 0.639 | 336 | 365 | -29 |
-| 20x20x16 k5 p2 | 400 | 640 | 0.625 | 726 | 995 | -269 |
-| 20x20x16 k3 p2 d2 | 400 | 640 | 0.625 | 336 | 365 | -29 |
+| 5x5x16 k3 | 48 | 80 | 0.600 | 345 | 365 | -20 |
+| 13x7x16 k3 | 112 | 112 | 1.000 | 345 | 365 | -20 |
+| 7x13x16 k3 | 112 | 208 | 0.538 | 345 | 365 | -20 |
+| 3x1x16 k3 | 16 | 16 | 1.000 | 345 | 365 | -20 |
+| 4x3x16 k3 | 16 | 48 | 0.333 | 345 | 365 | -20 |
+| 20x20x16 k3 s2 | 128 | 160 | 0.800 | 345 | 365 | -20 |
+| 20x20x16 k3 p0 | 368 | 576 | 0.639 | 345 | 365 | -20 |
+| 20x20x16 k5 p2 | 400 | 640 | 0.625 | 751 | 995 | -244 |
+| 20x20x16 k3 p2 d2 | 400 | 640 | 0.625 | 345 | 365 | -20 |
 | 40x40x32 k1 | 1,600 | 1,920 | 0.833 | 150 | 119 | +31 |
-| 20x20x16 k3 (op 20) | 400 | 640 | 0.625 | 336 | 365 | -29 |
-| 60x60x16 k3 | 3,600 | 3,840 | 0.938 | 336 | 365 | -29 |
+| 20x20x16 k3 (op 20) | 400 | 640 | 0.625 | 345 | 365 | -20 |
+| 60x60x16 k3 | 3,600 | 3,840 | 0.938 | 345 | 365 | -20 |
 
 Rows per 16-pixel block: **16 panel rows, one 16x16 store**, over the same 16
 VPM rows (four loads of 4) the row kernel fills with one load of 16.  Against
 the refused first form (454 words for 3x3, 1,048 for 5x5, 180 for 1x1) the
-blob shrinks by 118, 322 and 30 words.  The largest is 930 of the 2,048
+blob shrinks by 109, 297 and 30 words.  The largest is 930 of the 2,048
 instruction slot (5x5 with two channel blocks or more); beyond that the size
 does not depend on `Cin`, because the channel loop is a branch: 512 channels
 cost the same blob as 32.
@@ -352,44 +371,27 @@ cost the same blob as 32.
 Blob size is not what the panel costs, because the channel loop runs.  Per
 channel-block iteration the flat2 body is 27 words against the row kernel's
 15: 20 VPM command words (four load setups, four strides, four addresses, four
-waits, one store setup, stride, address and wait) against 8, plus the address
-update, counter, branch and its three delay slots.  Per tap the row kernel
-spends 12 words rebuilding its tap base (the padding the QPU's missing
-register forwarding forces) against the flat2 kernel's one 4-word group
-advance, so the two cross over near two channel blocks:
+waits, one store setup, stride, address and wait) against 8, plus the
+destination advance, the address update, counter, branch and its three delay
+slots.  Per tap the row kernel spends 12 words rebuilding its tap base (the
+padding the QPU's missing register forwarding forces) against the flat2
+kernel's one 4-word group advance, so the two cross over between one and two
+channel blocks:
 
 | channel blocks per tap | flat2 words per tap | row words per tap | ratio |
 |---:|---:|---:|---:|
-| 1 | 24 | 27 | 0.89 |
+| 1 | 25 | 27 | 0.93 |
 | 2 | 59 | 42 | 1.40 |
 | 4 | 113 | 72 | 1.57 |
 | 32 | 869 | 492 | 1.77 |
 
 (Per-tap counts are for every tap after the first; the first costs one
 4-word advance less.)  The flat path runs 0.795 of the blocks, so at one
-channel block the panel's instructions fall to 0.71 and at four or more they
+channel block the panel's instructions fall to 0.74 and at four or more they
 rise to about 1.3-1.4, while its bytes and the GEMM's M fall to 0.795 in
 every case.
 
-### Modelled effect
-
-Modelled over the model's 64 conv layers, the panel and GEMM row counts go
-33,952 -> 26,992, a ratio of **0.795** (20.5% fewer rows).  What that does to
-conv depends on what the panel pass is bound by -- it is 24% of conv QPU, so
-the panel's 49 ms against the GEMM's 157 ms at 206 ms of conv:
-
-| panel bound by | panel | GEMM | conv |
-|---|---|---|---|
-| bytes (0.795x) | 49 -> 39 ms | 157 -> 125 ms | 206 -> 164 ms |
-| instructions, 1 channel block (0.71x) | 49 -> 35 ms | 157 -> 125 ms | 206 -> 160 ms |
-| instructions, 4+ channel blocks (1.35x) | 49 -> 66 ms | 157 -> 125 ms | 206 -> 191 ms |
-
-The four loads also serialise four VPM waits per (tap, channel block) where
-the row kernel waits once for four times the data, so a latency bound would
-land below the instruction rows.  Which bound applies is what the gate
-measures.
-
-### Silicon gate: the first form's store was not legal
+### The first form's store was not legal
 
 Recorded from the first form, run on the rebased tree (origin/main 54ddbd0)
 with the packaged vc4d, one client, 45-48 C, `throttled=0x0`.  The blob
@@ -410,100 +412,134 @@ panel's own store is 16/16 with a zero stride, the C store is 4/16 with
 rejected.  That is why the second form keeps the 16x16 store and moves the
 flat schedule into the load side only.
 
-### Silicon gate, second form: exact on one QPU, corrupt across QPUs
+### The gate: exact at one QPU, corrupt at two or more
 
 Run on 5a2782d with the packaged vc4d, one client, ARM capped at 1.0 GHz,
 `core` 400 MHz, `v3d` 300 MHz, 43-49 C, `throttled=0x0` in every run, under
 `tools/thermal-guard.sh --max 75`.
 
-The store shape is accepted.  The first form's 4-word transposing store raised
-`V3D_ERR_STAT=0x10`; this form's 16x16 store raises nothing: the 5x5 probe
-returns `ok` in 0.15 ms, no queue error, no timeout, no context reset, and the
-blob names are `im2col_nhwc_flat2_16_5_5_s1_d1` (751 words) with
-`gemm_48_16_416_b1_q3` against the row path's `im2col_nhwc2_16_5_5_s1_d1`
-(995) and `gemm_80_16_416_b1_q5` -- 48 panel rows where the row path uses 80,
-read off the launched GEMM's name, not modelled.
+**The store shape is accepted.**  The 5x5 probe returns `ok` in 0.15 ms with
+no queue error, no timeout and no context reset, and loads
+`im2col_nhwc_flat2_16_5_5_s1_d1` (751 words) with `gemm_48_16_416_b1_q3`
+against the row path's 995-word blob and `gemm_80_16_416_b1_q5` -- **48 panel
+rows where the row path uses 80**, read from the launched GEMM's name rather
+than modelled.
 
-Two defects were found, and only the first is fixed.
+**The one-QPU checkpoint.**  With the im2col restricted to one QPU (a test
+build with `NHWC_IM2COL_QPU 1`) the same 5x5 probe through the engine matches
+the CPU convolution to **9.8e-05, 0/400 over 5e-4** -- the same figure the row
+path gets -- and panel dumps match the schedule word for word:
+**13,600/13,600** words for the 16-channel 5x5 and **9,216/9,216** for an
+8x8x16 3x3, with the VPM row content, the transposing store, the group walk
+and the destination all as modelled.  That checkpoint is what says the block
+schedule itself is sound; what it cannot see is more than one QPU.
 
-**1. The store destination did not advance per tap** when a layer has one
-channel block.  The advance lived in the channel loop, which `Cin == 16` does
-not have, so every tap of a block overwrote the block's first 1,024 bytes and
-the rest of the panel stayed unwritten.  The 5x5 probe measured max abs 16.6
-against the direct convolution, and a panel dump showed the last tap's tile
-repeated at the start of the block.  The advance now sits after every store,
-so it runs once per (tap, channel block) whether or not there is a loop; the
-blobs are 345 (3x3, 16 ch), 412 (3x3, 32+), 751 (5x5, 16 ch), 930 (5x5, 32+)
-and 150 (1x1) words.  `check_im2col_flat.py` now models the destination as a
-register accumulated per (tap, channel block) and checks the emitted blob for
-exactly one 1,024-byte advance per tap, which fails on the old placement.
+**Two or more QPUs, the panel is corrupt.**  The same 5x5 probe reads max abs
+14.8 at the committed four-QPU split, and the dumps show whole tiles
+belonging to a later tap and, in a 1x1 case, a tile holding another QPU's
+source address.  Each candidate was tested with a probe built for it:
 
-**2. The panel is corrupt when more than one QPU runs the kernel.**  With the
-im2col restricted to one QPU (`NHWC_IM2COL_QPU 1`, a test build) the same
-5x5 probe matches the CPU convolution to **9.8e-05**, 0/400 over 5e-4; panel
-dumps match the schedule word for word -- **13,600/13,600** for the 5x5 case
-and **9,216/9,216** for an 8x8x16 3x3 -- with the VPM row content, the
-transposing store and the destination all as modelled.  With the shipped four-QPU split the probe reads max abs 14.8
-and a panel dump shows whole tiles belonging to a later tap and, in the 1x1
-case, to another QPU's source address.  What the split is not:
+* **not uniform staging.**  A kernel that stores the 16 uniform words it
+  received back to memory shows every QPU getting its own block: source
+  offset, panel offset, QPU index and counters all correct.
+* **not a shared VPM window.**  Four QPUs given identical source and
+  destination but distinct windows produce a correct tile, so a QPU's window
+  is its own.
+* **not the load or store drain.**  One extra VPM-load drain before the store
+  and a second VPM-store wait after it change nothing.
+* **not the uniform count.**  The proven row kernel with a 14th uniform read
+  is exact across four QPUs.
 
-* not uniform staging: a probe kernel that stores the 16 uniform words it
-  received back to memory shows every QPU getting its own block (address,
-  source offset, QPU index and counters all correct);
-* not the VPM row window being shared: four QPUs given identical source and
-  destination but distinct windows produce a correct tile;
-* not the load or store drain: one extra VPM-load drain before the store and
-  a second VPM-store wait after it change nothing;
-* not the uniform count: the proven row kernel with a 14th uniform read is
-  still exact across four QPUs.
+**The surviving hypothesis** is that the store reads its window after later
+loads have refilled it.  What this kernel does that no proven kernel in the
+tree does is issue **four VPM loads ahead of one store** (the row im2col
+issues one, the elementwise kernel none).  The overrun follows no fixed
+per-QPU rule -- two taps per QPU at 16 channels, none then four then seven at
+32, and another QPU's source address outright in the 1x1 case -- which is what
+a store overtaken by a refill looks like, not a miscomputed address.  No
+further window was spent on it: see "Why it is closed".
 
-What the kernel does that no proven kernel in the tree does is issue **four
-VPM loads before one store** (the row im2col issues one, the elementwise
-kernel none).  The overrun does not follow a fixed per-QPU rule -- two taps per
-QPU at 16 channels, none then four then seven at 32, and another QPU's source
-address outright in the 1x1 case -- which is what a store reading its window
-after later loads have refilled it would look like, not a miscomputed
-address.  That is the first thing the next attempt should change: either a
-single 16-row load where the block lies inside one output row (every layer
-whose `align4(wo)` is a multiple of 16, which includes all of the 160- and
-80-wide layers) or a load sequence that keeps only one request in flight, as
-the row kernel does.
+### Why it is closed
 
-The gate therefore stopped at its first step: `test_conv`, `test_nhwc` with
-the flag, and the flat parity and profile were not run, because they would
-measure a panel no QPU has written correctly.  The flag is unchanged.
+Even with the hazard fixed, the arithmetic is scoped to the wrong layers.  The
+flat block only removes padding where `align4(wo) < align16(wo)`: nothing at
+160 or 80 wide, 0.833 at 40, 0.625 at 20, 0.750 at 10.  The layers with
+padding to remove are the head's 3x3s and `model.7`, and those are exactly the
+layers with four to sixteen channel blocks, where the flat body costs 1.57 to
+1.77 times the row kernel's words per tap (the table above) and the panel's
+instructions do not fall.  The model's own numbers put the ceiling on the
+gain at 210 ms of conv to 191 ms under an instruction bound (the modelled
+table below), against the **20.1 ms per frame** at 160 that the conv pad
+itself costs (`docs/CIVAC.md`, `docs/DAEMON-PIPE.md`).  Chasing a VPM
+ordering hazard for a share of 19 ms on a subset of layers is the wrong
+trade.
 
-**State of this pass:** the flag still refuses.  `VC4_CONV_FLAT=1` prints
-`refused: the flat panel's 4-row VDR fills have only a host-side proof` and
+For reference, the model that motivated the form: over the model's 64 conv
+layers the panel and GEMM row counts go 33,952 -> 26,992, a ratio of **0.795**
+(20.5% fewer rows).  What that does to conv depends on what the panel pass is
+bound by -- it is 24% of conv QPU, so the panel's 49 ms against the GEMM's
+157 ms at 206 ms of conv:
+
+| panel bound by | panel | GEMM | conv |
+|---|---|---|---|
+| bytes (0.795x) | 49 -> 39 ms | 157 -> 125 ms | 206 -> 164 ms |
+| instructions, 1 channel block (0.74x) | 49 -> 36 ms | 157 -> 125 ms | 206 -> 161 ms |
+| instructions, 4+ channel blocks (1.35x) | 49 -> 66 ms | 157 -> 125 ms | 206 -> 191 ms |
+
+No row of that table was measured: the flat path never ran correctly on more
+than one QPU, so its timings do not exist.
+
+### Constraint for any future attempt
+
+A block schedule that fills the block's 16 VPM rows from several loads may
+not issue the store with more than one load in flight.  It must meet one of:
+
+1. **one load in flight before the store** -- the loads are issued and
+   retired one at a time, so the store's window cannot be refilled behind it;
+   or
+2. **a single 16-row load** where the block lies inside one output row --
+   every layer whose `align4(wo)` is a multiple of 16, which is the whole
+   160- and 80-wide part of this model -- which is the row kernel's own shape
+   and needs no group walk at all.
+
+The four-load form recorded here violates that constraint: it is exact at one
+QPU and corrupt at two or more, which is why it is refused.  A form that meets
+the constraint still has to pass its own gate on two QPUs before anything else
+is measured; this page is the evidence that the store shape, the row fields
+and the group walk are not what needs re-proving, and that a host model
+without VPM ordering cannot close this class of defect.
+
+### State of this pass
+
+The flag still refuses.  `VC4_CONV_FLAT=1` prints
+`refused: the flat panel is exact on one QPU and corrupt on two or more` and
 serves the row-padded panel; the 5x5 probe with the flag set loads
 `im2col_nhwc2_16_5_5_s1_d1` and `gemm_80_16_416_b1_q5` and matches the CPU to
-9.8e-05, which is the row path doing the work.
+9.8e-05, which is the row path doing the work.  The blob stays
+`im2col_nhwc_flat2_*`, so a cache filled by the first form cannot be mistaken
+for it.
 
-Baseline on this boot, same client and daemon, flag unset: `selftest`
-**PASS 4/4**, YOLOv8n-160 **0/44,100 over 5e-4** (max abs 2.04e-02, max rel
-2.24e-04) in **832 launches, 597.0 ms wall**; `profile_classes.py --conv`
-gives **wall 593.1 ms, QPU 267.4 ms, 831 launches, QPU duty 45 %**, conv
-**205.9 ms** of which the panel is **46.0 ms (22.8 %)** and the GEMM
-**156.0 ms**.  The layers the flat block would help are the head's 3x3s at
-40x40 and 20x20 (`model.22` 80/64/256 channels: panel 1.2-2.4 ms, GEMM
-5.2-8.2 ms each) and `model.7` (128->256: 0.59 + 10.32 ms); the 160- and
-80-wide layers have no row padding to remove.  Those are also the layers with
-four or more channel blocks, where the flat body is 1.7x the row kernel's
-instructions per block.
+Baseline on the same boot (5a2782d), same client and daemon, flag unset:
+`selftest` **PASS 4/4**, YOLOv8n-160 **0/44,100 over 5e-4** (max abs 2.04e-02,
+max rel 2.24e-04) in **832 launches, 597.0 ms wall**; `profile_classes.py
+--conv` gives **wall 593.1 ms, QPU 267.4 ms, 831 launches, QPU duty 45 %**,
+conv **205.9 ms** of which the panel is **46.0 ms (22.8 %)** and the GEMM
+**156.0 ms**.  The largest convs are `model.7` (128->256 k3, 0.59 + 10.32 ms)
+and the head's `cv3.0.1` (80->80 k3, 2.45 + 8.18 ms), `cv3.0.0` (64->80 k3,
+1.94 + 6.61 ms) and `cv3.2.0` (256->80 k3, 1.20 + 6.43 ms).
 
-**M and launches.** The flat block reduces the GEMM's M (the first form's
-probe: 80 rows to 48; the model's 64 conv layers: 33,952 to 26,992) and does
-not add a launch per conv: the im2col is still one launch per conv and the
-GEMM one, with the im2col's QPU count the largest divisor of the block count
-up to four.  Both forms measured 3 launches on the probe (weight pack, im2col,
-GEMM).
+**M and launches.**  The flat block reduces the GEMM's M (the probe: 80 rows
+to 48; the model's 64 conv layers: 33,952 to 26,992, modelled) and does not
+add a launch per conv: the im2col is still one launch per conv and the GEMM
+one, with the im2col's QPU count the largest divisor of the block count up to
+four.  The probe measured 3 launches either way (weight pack, im2col, GEMM).
 
 ## 8. What is not in this pass
 
 | candidate | measured reason it is not here |
 |---|---|
 | direct 3x3 conv | at most 50 ms (18%); the coalesced form repeats the panel transpose per column block, the naive form is 16x the A transactions |
-| flat conv blocks | second form is exact on one QPU and corrupt on the committed four-QPU split (section 7); the default path is unchanged |
+| flat conv blocks | closed by its gate: exact at one QPU, corrupt at two or more, and the arithmetic only helps the layers it cannot fix (section 7) |
 | 16x32 GEMM tile | 1.33x fewer bytes per FLOP, but the C rows would have to take the A-file registers the addressing uses: a new schedule |
 | batching several ew groups per QPU | the long sigmoid/silu body reliably hangs a QPU on its second group at 12 QPUs; the launches it would save are host time |
 | L2 enable on the launch path | no change to 256^3 (0.0%) and none to a 64-column B tile that fits L2 |

@@ -281,6 +281,11 @@ account of the 0.241 s window; the plan removes most of the last two.
   kernels, so the average cost per remaining launch is higher (0.065 s / 365 =
   178 us).  The layout pass takes 33 of them (sec. 3.3).  A coarser poll
   interval would cut this and add latency; it is a trade, not a free win.
+  Measured since ([DAEMON-PIPE.md](DAEMON-PIPE.md) §6.2): polling every 1 us
+  instead of 10 saves 7 ms of a 407 ms frame at 160 and leaves the daemon's
+  CPU unchanged; yielding instead of sleeping saves 21 ms and takes the
+  daemon from 0.08 to 0.27 CPU-seconds per frame.  So the poll interval is
+  worth 2-5 % of wall at one extreme and 6.75 % of a core at the other.
 * **C op setup, 0.055 s.**  The padded image is 0.021 s of it (24.8 MB zeroed,
   6.6 MB copied) and the GEMM alignment copies are most of the rest.  Zeroing
   only the border is the obvious next change and was not made here.

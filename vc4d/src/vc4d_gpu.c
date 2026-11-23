@@ -202,6 +202,7 @@ int gpu_finish(struct gpu *g, struct launch_result *r, char *err, size_t errn)
     r->cycles = g->regs[R_PCTR_VAL / 4];
     r->errs = errs;
     g->gpu_ns += r->wall_ns;
+    g->last_finish_ns = t;
     g->inflight = 0;
     if (errs) {
         snprintf(err, errn, "V3D_ERR_STAT=0x%08x (SRQCS=0x%08x)", errs, s);
@@ -344,6 +345,7 @@ int gpu_recover(struct gpu *g, char *err, size_t errn)
     if (rc == 0) {
         g->dead = 0;
         g->inflight = 0;
+        g->last_finish_ns = 0;      /* the probe is not part of a launch stream */
     }
     return rc;
 }

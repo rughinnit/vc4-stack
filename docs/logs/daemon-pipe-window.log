@@ -1,0 +1,61 @@
+=== window 10:32:40 frequency(48)=1000000000 temp=45.1'C
+=== async [--prefetch] 10:32:42 temp=45.1'C
+--- test_prefetch
+  PASS  a new client gets a region and a program: ok
+  PASS  and runs a launch: rc=ok item=0
+PASSED (0 failure(s))
+--- hashes
+0
+--- measurement
+client pid 95942, vc4d pid 95927, arm 1000 MHz, temp 48.3 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+96     sync         292.5    3.42    170.3   0.58   187.0    483.0    110.0     50.0      0.0      0.0   297.0  (pool 31.7/3.2 MiB of 64, 47-48 C)
+96     pipelined    288.1    3.47    170.3   0.59   187.0    483.0    120.0     50.0    175.5      0.3   288.9  (pool 31.7/3.2 MiB of 64, 47-48 C)
+       blocked at: depth 0.4 ms, invalidate 0.0, l2 flush 0.0, scratch 167.4, host 0.3, other 7.1
+128    sync         329.9    3.03    202.4   0.61   183.0    583.0    120.0     50.0      0.0      0.0   330.0  (pool 35.5/4.4 MiB of 64, 47-49 C)
+128    pipelined    322.0    3.11    202.2   0.63   183.0    583.0    120.0     50.0    207.8      0.3   322.1  (pool 35.5/4.4 MiB of 64, 48-48 C)
+       blocked at: depth 0.4 ms, invalidate 0.0, l2 flush 0.0, scratch 201.4, host 0.1, other 5.6
+160    sync         415.7    2.41    269.4   0.65   187.0    832.0    130.0     70.0      0.0      0.0   415.0  (pool 41.6/7.4 MiB of 64, 48-49 C)
+160    pipelined    405.3    2.47    269.6   0.67   187.0    832.0    135.0     70.0    276.2      0.5   405.8  (pool 41.6/7.4 MiB of 64, 48-49 C)
+       blocked at: depth 1.7 ms, invalidate 0.0, l2 flush 0.0, scratch 260.5, host 0.1, other 13.5
+vc4d: prefetch: 3 datagram(s) read early, 3 prepared under a launch
+vc4d: launch timing: 107652 launch(es), kernel 338200 ns, gap 344027 ns, period 682227 ns (389 gap(s) over 20 ms not counted)
+vc4d: gap split: completion notice 676945 ns, register kick 1465 ns, turnaround -334383 ns
+=== sync [prefetch] 10:34:28 temp=47.8'C
+--- test_prefetch
+  PASS  a new client gets a region and a program: ok
+  PASS  and runs a launch: rc=ok item=0
+PASSED (0 failure(s))
+--- hashes
+0
+--- measurement
+client pid 96001, vc4d pid 95986, arm 1000 MHz, temp 48.3 C
+size   path       wall ms     FPS   QPU ms   duty   req/f launch/f  cli CPU  dmn CPU  wait ms   pad ms  lat ms
+96     sync         291.9    3.43    169.6   0.58   187.0    483.0    110.0     40.0      0.0      0.0   295.9  (pool 31.7/3.2 MiB of 64, 48-49 C)
+96     pipelined    288.0    3.47    169.4   0.59   187.0    483.0    120.0     40.0    175.0      0.3   289.1  (pool 31.7/3.2 MiB of 64, 48-49 C)
+       blocked at: depth 0.4 ms, invalidate 0.0, l2 flush 0.0, scratch 167.0, host 0.3, other 7.0
+128    sync         330.1    3.03    200.9   0.61   183.0    583.0    120.0     50.0      0.0      0.0   329.0  (pool 35.5/4.4 MiB of 64, 48-49 C)
+128    pipelined    321.4    3.11    201.0   0.63   183.0    583.0    120.0     50.0    206.8      0.3   321.1  (pool 35.5/4.4 MiB of 64, 48-49 C)
+       blocked at: depth 0.3 ms, invalidate 0.0, l2 flush 0.0, scratch 200.4, host 0.1, other 5.8
+160    sync         414.0    2.42    267.6   0.65   187.0    832.0    130.0     60.0      0.0      0.0   413.6  (pool 41.6/7.4 MiB of 64, 49-49 C)
+160    pipelined    404.4    2.47    268.0   0.66   187.0    832.0    140.0     60.0    274.2      0.5   403.4  (pool 41.6/7.4 MiB of 64, 49-49 C)
+       blocked at: depth 1.6 ms, invalidate 0.0, l2 flush 0.0, scratch 258.8, host 0.1, other 13.2
+vc4d: prefetch: 0 datagram(s) read early, 0 prepared under a launch
+vc4d: launch timing: 107652 launch(es), kernel 336158 ns, gap 344657 ns, period 680816 ns (389 gap(s) over 20 ms not counted)
+vc4d: gap split: completion notice 675931 ns, register kick 1484 ns, turnaround -332758 ns
+--- hashes: async vs sync
+modelA.onnx          pipelined 32046642e33f066b identical
+modelA.onnx          sync      32046642e33f066b identical
+modelB.onnx          pipelined 07e9f0d62bd005c0 identical
+modelB.onnx          sync      07e9f0d62bd005c0 identical
+modelC.onnx          pipelined 078c3b53eb87e5a0 identical
+modelC.onnx          sync      078c3b53eb87e5a0 identical
+yolov8n_128.onnx     pipelined 0e9b5fb6a1d60787 identical
+yolov8n_128.onnx     sync      0e9b5fb6a1d60787 identical
+yolov8n_160.onnx     pipelined 1c4fc302bce0d401 identical
+yolov8n_160.onnx     sync      1c4fc302bce0d401 identical
+yolov8n_96.onnx      pipelined c7bf0eed9ced2358 identical
+yolov8n_96.onnx      sync      c7bf0eed9ced2358 identical
+all identical
+=== end 10:36:12 temp=48.3'C throttled=0x0
+unit restored

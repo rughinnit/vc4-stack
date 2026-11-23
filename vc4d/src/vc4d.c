@@ -32,6 +32,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <pwd.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -54,6 +55,10 @@
 #define MAX_PROGS_SLOTS  128
 #define DEFAULT_GPU_LOCK "/tmp/vc4-gpu.lock"
 #define MAX_DENIALS_LOG  20
+/* How many prepared requests run back to back before the main loop returns to
+ * poll() for the liveness sweep and the arena restore.  8 launches is about
+ * 11 ms at YOLOv8n-160's kernel time. */
+#define PLAN_CHAIN_MAX   8
 
 struct region { int used; uint32_t off, len; };
 struct prog {
@@ -70,6 +75,13 @@ struct prog {
     char     name[VC4D_NAME_MAX];
     uint64_t lru;
     int      busy;
+    /* Number of prepared launches (see "prepared launches" below) that name
+     * this slot.  A pinned slot is never handed out again and never evicted,
+     * so a plan cannot be built on a program that a later request re-uses.  In
+     * this design no UPLOAD can run between preparing a plan and running it,
+     * so the pin never actually arbitrates; it exists so that a future change
+     * which lets one in cannot corrupt a slot instead. */
+    int      pins;
 };
 
 struct client {
@@ -97,6 +109,8 @@ struct opts {
     int      drop;
     int      gpu_lock;
     int      verbose;
+    int      prefetch;       /* prepare the next request during a launch */
+    int      poll_us;        /* sleep between completion polls (0 = yield) */
 };
 
 static struct opts opt;
@@ -117,8 +131,86 @@ static const char *restart_reason = "GPU context could not be reset";
 static uint64_t lru_clock;       /* monotonic use counter for the program LRU */
 static int busy_slot = -1;       /* the program slot that is executing */
 
+/* ----------------------------------------------------- prepared launches --
+ *
+ * A request is validated in two halves.  launch_prepare() is the half that
+ * reads the message, the client's arena and the program table and decides
+ * whether the launch is legal; launch_kick() is the half that touches the GPU.
+ * The synchronous path calls them back to back, exactly as launch_one() did.
+ * The pipelined path calls the first half while the previous launch is still
+ * executing, so that when that launch completes the only work between the two
+ * kernels is the GPU lock and the register sequence.
+ *
+ * Nothing is *accepted* early.  A prepared request owns no reply, no launch id
+ * and no client-visible status until the previous request has completed and it
+ * is its turn; if the daemon cannot run it (it decided to exit after a
+ * timeout, or it was signalled) the client sees what it sees today - EOF.
+ * See docs/DAEMON-PIPE.md for the design and for what must never overlap.
+ */
+struct prep_err {
+    int32_t     status;     /* VC4D_* refusal, 0 if none */
+    const char *deny;       /* denial text; the caller logs it where the
+                             * synchronous path would have logged it */
+};
+
+struct planned_ent {
+    uint32_t    kind;       /* VC4D_BENT_LAUNCH or VC4D_BENT_FENCE */
+    int32_t     status;     /* VC4D_OK, this entry's refusal, or NOTRUN */
+    const char *deny;       /* this entry's refusal text, or NULL */
+    uint32_t    prog;       /* program slot index, or 0xffffffff */
+    uint32_t    gen;        /* that slot's generation at prepare time */
+    uint32_t    code_bus;
+    uint32_t    nqpu, nuni, timeout_ms;
+    int         in_arena;   /* the QPU reads the uniforms from the arena */
+    int         tagged;     /* staged uniforms must be written at the kick */
+    uint32_t    uni_handle, region_off;   /* identity of the arena block */
+    uint32_t    uni_off;    /* tagged form: the program's uniform slot */
+    const uint32_t (*words)[VC4D_MAX_UNI];
+    uint32_t    uni_bus[VC4D_MAX_QPU];
+    uint32_t    fence_dir;
+};
+
+struct plan {
+    struct vc4d_hdr  h;     /* the request header, for the reply */
+    int              ready;
+    int              client;
+    uint32_t         count;
+    struct planned_ent ent[VC4D_BATCH_MAX];
+};
+
+/* One datagram read before the daemon is ready to act on it.  It is always the
+ * next message on that connection, so holding it here preserves the order the
+ * client sent; inbox_process() is the same code that handles a datagram read at
+ * the top of the loop, so the two cannot drift apart. */
+static struct {
+    int          ready;
+    int          client;
+    size_t       got;       /* datagram length; 0 means the peer closed */
+    int          err;       /* errno from recvmsg, 0 if none */
+    int          extra;     /* SCM_RIGHTS descriptors seen (already closed) */
+    int          truncated;
+    uint8_t      buf[VC4D_MAX_MSG];
+} inbox;
+
+static struct plan plans[2];
+static int plan_run = -1;        /* plan index being executed, or -1 */
+static uint64_t st_prefetch_read, st_prefetch_hit;
+static uint64_t st_gap_ns, st_gap_n, st_gap_idle;
+/* Where a launch-to-launch gap goes: from the previous launch's completion to
+ * the point the completion loop noticed it, and the register sequence of the
+ * next launch.  The rest of the gap is the client's turnaround, which the
+ * prepared path is meant to remove. */
+static uint64_t st_notice_ns, st_kick_ns;
+
 static void client_destroy(int idx);
 static void reap_dead_clients(int keep, const char *why);
+static int  batch_prepare(struct client *c, const struct vc4d_hdr *h,
+                          const uint8_t *pl, size_t plen, struct plan *P,
+                          struct prep_err *pe);
+static void prefetch_try(struct client *c);
+static int  run_prepared(int slot);
+static int  inbox_fill(struct client *c, int nonblock);
+static int  inbox_process(int idx);
 
 static void logmsg(const char *fmt, ...)
 {
@@ -285,6 +377,56 @@ static int reply(int fd, const struct vc4d_hdr *req, int32_t status,
     }
 }
 
+/* -------------------------------------------------- plan bookkeeping ---- */
+
+/* Drop the pins a plan holds and forget which entries it named, so that a plan
+ * can be released exactly once however it ends. */
+static void unpin_ent(struct planned_ent *e)
+{
+    if (e->prog < MAX_PROGS_SLOTS && progs[e->prog].pins > 0 &&
+        progs[e->prog].gen == e->gen)
+        progs[e->prog].pins--;
+    e->prog = 0xffffffffu;
+}
+
+static void plan_unpin(struct plan *P)
+{
+    for (uint32_t i = 0; i < P->count; ++i)
+        unpin_ent(&P->ent[i]);
+}
+
+/* The plan buffer that is neither executing nor holding a prepared request.
+ * Two exist so that a prepared request can prepare the next one while it
+ * runs; -1 means both are taken, which this daemon's one-request-at-a-time
+ * rule makes unreachable. */
+static int plan_free_slot(void)
+{
+    for (int i = 0; i < 2; ++i)
+        if (i != plan_run && !plans[i].ready)
+            return i;
+    return -1;
+}
+
+static int plan_pending(void)
+{
+    for (int i = 0; i < 2; ++i)
+        if (plans[i].ready)
+            return i;
+    return -1;
+}
+
+/* Write the L2 back to DRAM and invalidate it, so an unprivileged reader sees
+ * the QPU's stores.  This is the daemon's only cache maintenance. */
+static void l2_writeback(void)
+{
+    G.regs[R_L2CACTL / 4] = 1u << 2;
+#if defined(__aarch64__)
+    __asm__ volatile("dsb sy" ::: "memory");
+#else
+    __sync_synchronize();
+#endif
+}
+
 /* ------------------------------------------------------------- region/prog */
 static struct region *find_region(struct client *c, uint32_t handle)
 {
@@ -332,6 +474,7 @@ static void prog_release(int slot)
     p->used = 0;
     p->owner = -1;
     p->name[0] = 0;
+    p->pins = 0;
     if (st_progs > 0)
         st_progs--;
 }
@@ -363,6 +506,8 @@ static int prog_slot_for(struct client *c, const char *name,
             continue;
         if (p->busy)
             return -1;              /* the copy that is executing; refuse */
+        if (p->pins)
+            return -1;              /* a prepared launch still names it */
         if (same)
             *same = 1;
         return i;
@@ -380,7 +525,7 @@ static int prog_slot_for(struct client *c, const char *name,
         int best = -1;
         for (int i = 0; i < PROBE_SLOT; ++i) {
             struct prog *p = &progs[i];
-            if (!p->used || p->busy)
+            if (!p->used || p->busy || p->pins)
                 continue;
             if (pass == 0 && p->owner != c->idx)
                 continue;
@@ -690,15 +835,32 @@ static int await_launch(struct client *c, uint32_t id, struct launch_result *lr,
                         char *err, size_t errn)
 {
     int rc;
+    int tries = 0;
     for (;;) {
+        /* Use the QPU's busy time to get the next request ready.  Nothing of
+         * it is executed here: see "prepared launches" above.  The socket is
+         * checked once every four completion polls (a few tens of us): a
+         * request arrives at most once per launch, and a recvmsg that finds
+         * nothing is not free. */
+        if ((tries++ & 3) == 0)
+            prefetch_try(c);
         rc = gpu_poll(&G);
-        if (rc != 0)
+        if (rc != 0) {
+            if (G.last_finish_ns) {
+                uint64_t now = now_ns();
+                if (now > G.last_finish_ns && now - G.last_finish_ns < 20000000ull)
+                    st_notice_ns += now - G.last_finish_ns;
+            }
             break;
+        }
         if (now_ns() > G.deadline) {
             rc = -2;
             break;
         }
-        usleep(10);
+        if (opt.poll_us > 0)
+            usleep((useconds_t)opt.poll_us);
+        else
+            sched_yield();
     }
     memset(lr, 0, sizeof(*lr));
     if (rc == -2) {
@@ -751,12 +913,7 @@ static int await_launch(struct client *c, uint32_t id, struct launch_result *lr,
     c->inflight = 0;
     prog_unbusy();
     gpu_lock_drop();
-    G.regs[R_L2CACTL / 4] = 1u << 2;             /* result to DRAM */
-#if defined(__aarch64__)
-    __asm__ volatile("dsb sy" ::: "memory");
-#else
-    __sync_synchronize();
-#endif
+    l2_writeback();                              /* result to DRAM */
     if (status != VC4D_OK) {
         st_failed++;
         logmsg("launch %u error: %s", id, err);
@@ -764,17 +921,36 @@ static int await_launch(struct client *c, uint32_t id, struct launch_result *lr,
     return status;
 }
 
-/* Validate and execute one launch.  LAUNCH and LAUNCH_BATCH share this: it
- * never writes a reply (a batch needs the per-entry status instead), it
- * returns the VC4D_* status, and on a wait-mode launch it fills *lrp.  `pl`
- * is the launch payload: struct vc4d_launch_req followed, in the tagged
- * uniform form only, by nqpu*nuni struct vc4d_uni.  *id_out receives the
- * launch id whenever a kick happened. */
-static int launch_one(struct client *c, const uint8_t *pl, size_t plen,
-                      int wait, struct launch_result *lrp, uint32_t *id_out)
+/* Validate one launch and stage everything the kick will need.  This is the
+ * validation half of what used to be launch_one(); it reads the message, the
+ * client's arena and the program table, and writes nothing but *L (and, for
+ * the tagged-uniform form, the caller's staging block).  It performs no MMIO,
+ * takes no lock and allocates nothing, which is what makes it safe to run
+ * while another launch is executing.
+ *
+ * On refusal it returns -1 with *pe filled and logs nothing: the caller logs
+ * the denial where the synchronous path always logged it, so a prepared
+ * request and a freshly received one produce the same log and the same reply.
+ * `busy_first` keeps the "a launch is already in flight" check before uniform
+ * validation for a single LAUNCH, exactly where it was; a batch checks it once
+ * at the top of the request instead (its per-entry copy was unreachable).
+ * `stage_words` hands over a block for the tagged form, which cannot be
+ * materialised in the program's uniform slot until the kick. */
+static int launch_prepare(struct client *c, const uint8_t *pl, size_t plen,
+                          int busy_first, int stage_words,
+                          uint32_t (*words)[VC4D_MAX_UNI],
+                          struct planned_ent *L, struct prep_err *pe)
 {
-    if (plen < sizeof(struct vc4d_launch_req))
-        return VC4D_E_PROTO;
+    memset(pe, 0, sizeof(*pe));
+    memset(L, 0, sizeof(*L));
+    L->kind = VC4D_BENT_LAUNCH;
+    L->status = VC4D_OK;
+    L->prog = 0xffffffffu;
+
+    if (plen < sizeof(struct vc4d_launch_req)) {
+        pe->status = VC4D_E_PROTO;
+        return -1;
+    }
     struct vc4d_launch_req q;
     memcpy(&q, pl, sizeof(q));
     const struct vc4d_uni *uni = (const struct vc4d_uni *)(pl + sizeof(q));
@@ -782,62 +958,71 @@ static int launch_one(struct client *c, const uint8_t *pl, size_t plen,
     const int have_mask = (q.flags & VC4D_LAUNCH_UNI_MASK) != 0;
 
     if (q.flags & ~VC4D_LAUNCH_FLAGS_ALL) {
-        log_denial(c, "LAUNCH", "unknown launch flags");
-        return VC4D_E_INVAL;
+        pe->status = VC4D_E_INVAL;
+        pe->deny = "unknown launch flags";
+        return -1;
     }
     if (have_mask && !in_arena) {
-        log_denial(c, "LAUNCH", "UNI_MASK without UNI_IN_ARENA");
-        return VC4D_E_INVAL;
+        pe->status = VC4D_E_INVAL;
+        pe->deny = "UNI_MASK without UNI_IN_ARENA";
+        return -1;
     }
     if (q.nqpu < 1 || q.nqpu > VC4D_MAX_QPU || q.nuni < 1 ||
         q.nuni > VC4D_MAX_UNI) {
-        log_denial(c, "LAUNCH", "nqpu/nuni out of range");
-        return VC4D_E_INVAL;
+        pe->status = VC4D_E_INVAL;
+        pe->deny = "nqpu/nuni out of range";
+        return -1;
     }
     if (have_mask && (q.uni_addr >> q.nuni) != 0) {
-        log_denial(c, "LAUNCH", "UNI_MASK sets a bit past the last uniform word");
-        return VC4D_E_INVAL;
+        pe->status = VC4D_E_INVAL;
+        pe->deny = "UNI_MASK sets a bit past the last uniform word";
+        return -1;
     }
     if (in_arena) {
         if (plen != sizeof(q)) {
-            log_denial(c, "LAUNCH", "UNI_IN_ARENA carries extra payload");
-            return VC4D_E_PROTO;
+            pe->status = VC4D_E_PROTO;
+            pe->deny = "UNI_IN_ARENA carries extra payload";
+            return -1;
         }
     } else if (plen != sizeof(q) + (size_t)q.nqpu * q.nuni * sizeof(*uni)) {
-        log_denial(c, "LAUNCH", "uniform payload length mismatch");
-        return VC4D_E_PROTO;
+        pe->status = VC4D_E_PROTO;
+        pe->deny = "uniform payload length mismatch";
+        return -1;
     }
     struct prog *p = find_prog(c, q.prog);
     if (!p) {
-        log_denial(c, "LAUNCH", "unknown program handle");
-        return VC4D_E_NOENT;
+        pe->status = VC4D_E_NOENT;
+        pe->deny = "unknown program handle";
+        return -1;
     }
     if (q.nqpu > p->nqpu_max) {
-        log_denial(c, "LAUNCH", "nqpu exceeds the program's declared maximum");
-        return VC4D_E_INVAL;
+        pe->status = VC4D_E_INVAL;
+        pe->deny = "nqpu exceeds the program's declared maximum";
+        return -1;
     }
     if (q.nuni != p->nuni) {
-        log_denial(c, "LAUNCH", "nuni differs from the count declared at UPLOAD");
-        return VC4D_E_INVAL;
+        pe->status = VC4D_E_INVAL;
+        pe->deny = "nuni differs from the count declared at UPLOAD";
+        return -1;
     }
-    if (G.inflight || c->inflight) {
-        log_denial(c, "LAUNCH", "a launch is already in flight");
-        return VC4D_E_BUSY;
+    if (busy_first && (G.inflight || c->inflight)) {
+        pe->status = VC4D_E_BUSY;
+        pe->deny = "a launch is already in flight";
+        return -1;
     }
-
-    uint32_t words[VC4D_MAX_QPU][VC4D_MAX_UNI];
-    uint32_t uni_bus[VC4D_MAX_QPU];
 
     if (in_arena) {
         struct region *r = find_region(c, q.uni_handle);
         if (!r) {
-            log_denial(c, "LAUNCH", "uniform block in an unknown region");
-            return VC4D_E_NOENT;
+            pe->status = VC4D_E_NOENT;
+            pe->deny = "uniform block in an unknown region";
+            return -1;
         }
         if ((q.uni_off & 63u) ||
             (uint64_t)q.uni_off + 64ull * q.nqpu > r->len) {
-            log_denial(c, "LAUNCH", "uniform block leaves its region");
-            return VC4D_E_INVAL;
+            pe->status = VC4D_E_INVAL;
+            pe->deny = "uniform block leaves its region";
+            return -1;
         }
         for (uint32_t qpu = 0; qpu < q.nqpu; ++qpu) {
             const uint32_t *w = (const uint32_t *)(A.map + r->off +
@@ -853,71 +1038,124 @@ static int launch_one(struct client *c, const uint8_t *pl, size_t plen,
                      * exactly those; a word with the bit clear is a value, so
                      * a float whose bits look like a bus address is legal. */
                     if (((q.uni_addr >> u) & 1u) && !arena_addr_ok(w[u])) {
-                        log_denial(c, "LAUNCH",
-                                   "declared address uniform is outside the arena");
-                        return VC4D_E_DENIED;
+                        pe->status = VC4D_E_DENIED;
+                        pe->deny =
+                            "declared address uniform is outside the arena";
+                        return -1;
                     }
                 } else if (!arena_word_ok(w[u])) {
-                    log_denial(c, "LAUNCH",
-                               "arena uniform word is outside the arena");
-                    return VC4D_E_DENIED;
+                    pe->status = VC4D_E_DENIED;
+                    pe->deny = "arena uniform word is outside the arena";
+                    return -1;
                 }
-                words[qpu][u] = w[u];
             }
-            uni_bus[qpu] = arena_bus(&A, r->off + q.uni_off + 64u * qpu);
+            L->uni_bus[qpu] = arena_bus(&A, r->off + q.uni_off + 64u * qpu);
         }
+        L->uni_handle = q.uni_handle;
+        L->region_off = r->off;
+        L->in_arena = 1;
     } else {
+        if (!stage_words || !words) {
+            /* The tagged form is materialised in the program's own uniform
+             * slot, so a caller that cannot hand over a staging block cannot
+             * prepare one.  No such caller exists: a batch forces the arena
+             * form. */
+            pe->status = VC4D_E_INVAL;
+            pe->deny = "tagged uniforms without a staging block";
+            return -1;
+        }
         for (uint32_t qpu = 0; qpu < q.nqpu; ++qpu) {
             for (uint32_t u = 0; u < q.nuni; ++u) {
                 const struct vc4d_uni *e = &uni[(size_t)qpu * q.nuni + u];
                 if (e->kind == VC4D_UNI_LIT) {
                     if (e->handle != 0 || e->len != 0) {
-                        log_denial(c, "LAUNCH", "literal uniform with handle/len");
-                        return VC4D_E_INVAL;
+                        pe->status = VC4D_E_INVAL;
+                        pe->deny = "literal uniform with handle/len";
+                        return -1;
                     }
                     if (literal_forbidden(e->off)) {
-                        log_denial(c, "LAUNCH",
-                                   "literal uniform is a bus/arena/MMIO address");
-                        return VC4D_E_DENIED;
+                        pe->status = VC4D_E_DENIED;
+                        pe->deny = "literal uniform is a bus/arena/MMIO address";
+                        return -1;
                     }
                     words[qpu][u] = e->off;
                 } else if (e->kind == VC4D_UNI_PTR) {
                     struct region *r = find_region(c, e->handle);
                     if (!r) {
-                        log_denial(c, "LAUNCH", "uniform points at an unknown buffer");
-                        return VC4D_E_NOENT;
+                        pe->status = VC4D_E_NOENT;
+                        pe->deny = "uniform points at an unknown buffer";
+                        return -1;
                     }
                     if ((e->off & 3u) || (e->len & 3u) || !e->len ||
                         (uint64_t)e->off + e->len > r->len) {
-                        log_denial(c, "LAUNCH", "uniform [off,len) leaves its buffer");
-                        return VC4D_E_INVAL;
+                        pe->status = VC4D_E_INVAL;
+                        pe->deny = "uniform [off,len) leaves its buffer";
+                        return -1;
                     }
                     words[qpu][u] = arena_bus(&A, r->off + e->off);
                 } else {
-                    log_denial(c, "LAUNCH", "unknown uniform kind");
-                    return VC4D_E_INVAL;
+                    pe->status = VC4D_E_INVAL;
+                    pe->deny = "unknown uniform kind";
+                    return -1;
                 }
             }
         }
-
-        /* materialise uniforms in the program's own 64 B x 12 area */
-        for (uint32_t qpu = 0; qpu < q.nqpu; ++qpu) {
-            uint8_t *dst = A.map + p->uni_off + (size_t)qpu * 64;
-            memset(dst, 0, 64);             /* each launch is self-contained */
-            memcpy(dst, words[qpu], (size_t)q.nuni * 4);
-            uni_bus[qpu] = arena_bus(&A, p->uni_off + (uint32_t)qpu * 64);
-        }
+        for (uint32_t qpu = 0; qpu < q.nqpu; ++qpu)
+            L->uni_bus[qpu] = arena_bus(&A, p->uni_off + (uint32_t)qpu * 64u);
+        L->uni_off = p->uni_off;
+        L->tagged = 1;
+        L->words = words;
     }
-    __sync_synchronize();
+
+    L->prog = (uint32_t)(p - progs);
+    L->gen = p->gen;
+    L->code_bus = arena_bus(&A, p->code_off);
+    L->nqpu = q.nqpu;
+    L->nuni = q.nuni;
 
     uint32_t tmo = q.timeout_ms ? q.timeout_ms : DEFAULT_TIMEOUT;
     if (tmo > opt.max_timeout_ms)
         tmo = opt.max_timeout_ms;
+    L->timeout_ms = tmo;
+
+    p->pins++;              /* the slot cannot be freed or re-used */
+    return 0;
+}
+
+/* The execution half: everything from the program's LRU touch to the
+ * completion, i.e. exactly what launch_one() did after validation.  The
+ * identity checks below cannot fail between a prepare and its kick - nothing
+ * else runs in between - and exist so that a future change which lets another
+ * message in cannot start a kernel on a slot that was freed or re-used under a
+ * prepared entry; the refusal is the one the synchronous path gives for a
+ * handle that is no longer valid. */
+static int launch_kick(struct client *c, struct planned_ent *L, int wait,
+                       struct launch_result *lrp, uint32_t *id_out)
+{
+    if (L->prog >= MAX_PROGS_SLOTS)
+        return VC4D_E_NOENT;
+    struct prog *p = &progs[L->prog];
+    if (!p->used || p->gen != L->gen || p->owner != c->idx)
+        return VC4D_E_NOENT;
+    if (L->in_arena &&
+        (!c->reg[L->uni_handle].used ||
+         c->reg[L->uni_handle].off != L->region_off))
+        return VC4D_E_NOENT;
+
+    if (L->tagged) {
+        /* materialise uniforms in the program's own 64 B x 12 area */
+        for (uint32_t qpu = 0; qpu < L->nqpu; ++qpu) {
+            uint8_t *dst = A.map + L->uni_off + (size_t)qpu * 64;
+            memset(dst, 0, 64);             /* each launch is self-contained */
+            memcpy(dst, L->words[qpu], (size_t)L->nuni * 4);
+        }
+    }
+    __sync_synchronize();
 
     prog_touch(p);          /* LRU: a launch is the strongest use */
 
     if (opt.gpu_lock && gpu_lock_fd >= 0) {
-        int lr = gpu_lock_take(tmo < 30000u ? tmo : 30000u);
+        int lr = gpu_lock_take(L->timeout_ms < 30000u ? L->timeout_ms : 30000u);
         if (lr != 0) {
             log_denial(c, "LAUNCH", lr == -2 ? "GPU lock wait timed out"
                                              : "GPU lock failed");
@@ -925,9 +1163,26 @@ static int launch_one(struct client *c, const uint8_t *pl, size_t plen,
         }
     }
 
+    /* The gap between the previous launch's completion and this kick is what
+     * the prepared-request work is meant to remove; it is measured here, from
+     * timestamps the daemon already takes, and printed on exit.  A gap over
+     * 20 ms is not a launch gap (it is the client's host work between frames,
+     * or a recovery) and is counted separately. */
+    if (G.last_finish_ns) {
+        uint64_t gap = now_ns() - G.last_finish_ns;
+        if (gap < 20000000ull) {
+            st_gap_ns += gap;
+            st_gap_n++;
+        } else {
+            st_gap_idle++;
+        }
+    }
+
     char err[256];
-    int rc = gpu_kick(&G, arena_bus(&A, p->code_off), uni_bus,
-                      (int)q.nqpu, tmo, err, sizeof(err));
+    uint64_t kick_t0 = now_ns();
+    int rc = gpu_kick(&G, L->code_bus, L->uni_bus, (int)L->nqpu,
+                      L->timeout_ms, err, sizeof(err));
+    st_kick_ns += now_ns() - kick_t0;
     if (rc != 0) {
         gpu_lock_drop();
         logmsg("launch failed: %s", err);
@@ -959,10 +1214,19 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
     struct vc4d_launch_req q;
     memcpy(&q, pl, sizeof(q));
     const int wait = (q.flags & VC4D_LAUNCH_WAIT) != 0;
+    struct planned_ent L;
+    struct prep_err pe;
+    uint32_t words[VC4D_MAX_QPU][VC4D_MAX_UNI];
+    if (launch_prepare(c, pl, plen, 1, 1, words, &L, &pe) != 0) {
+        if (pe.deny)
+            log_denial(c, "LAUNCH", pe.deny);
+        return reply(c->fd, h, pe.status, NULL, 0, -1, 0, 0);
+    }
     struct launch_result lr;
     uint32_t id = 0;
     memset(&lr, 0, sizeof(lr));
-    int st = launch_one(c, pl, plen, wait, &lr, &id);
+    int st = launch_kick(c, &L, wait, &lr, &id);
+    unpin_ent(&L);
     if (st != VC4D_OK) {
         if (wait && st == VC4D_E_TIMEOUT)
             return reply(c->fd, h, st, NULL, 0, -1, id, 0);
@@ -988,94 +1252,148 @@ static int handle_launch(struct client *c, const struct vc4d_hdr *h,
  * An entry that fails validation or execution stops the batch: entries before
  * it have run and completed, entries after it are reported VC4D_E_NOTRUN and
  * never touched.  That is what makes the reply usable for a client that has
- * queued dependent kernels: it never has to guess which ones ran. */
-static int handle_batch(struct client *c, const struct vc4d_hdr *h,
-                        const uint8_t *pl, size_t plen)
+ * queued dependent kernels: it never has to guess which ones ran.
+ *
+ * The request is handled in two halves.  batch_prepare() validates every entry
+ * and stages what the kick will need; batch_run() executes the entries and
+ * sends the one reply.  handle_batch() calls them back to back.  When the
+ * previous launch is still executing, the wait loop calls batch_prepare() for
+ * this request and the run happens immediately after that launch's reply, so
+ * nothing but the GPU lock and the register sequence sits between two kernels.
+ * See docs/DAEMON-PIPE.md.
+ */
+static int batch_prepare(struct client *c, const struct vc4d_hdr *h,
+                         const uint8_t *pl, size_t plen, struct plan *P,
+                         struct prep_err *pe)
 {
-    if (plen < sizeof(struct vc4d_batch_req))
-        return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
+    memset(pe, 0, sizeof(*pe));
+    P->ready = 0;
+    P->client = -1;
+    P->count = 0;
+    P->h = *h;
+
+    if (plen < sizeof(struct vc4d_batch_req)) {
+        pe->status = VC4D_E_PROTO;
+        return -1;
+    }
     struct vc4d_batch_req q;
     memcpy(&q, pl, sizeof(q));
     if (q.flags != 0) {
-        log_denial(c, "BATCH", "reserved flags set");
-        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+        pe->status = VC4D_E_INVAL;
+        pe->deny = "reserved flags set";
+        return -1;
     }
     if (q.count < 1 || q.count > VC4D_BATCH_MAX) {
-        log_denial(c, "BATCH", "entry count out of range");
-        return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
+        pe->status = VC4D_E_INVAL;
+        pe->deny = "entry count out of range";
+        return -1;
     }
     if (plen != sizeof(q) + (size_t)q.count * sizeof(struct vc4d_batch_ent)) {
-        log_denial(c, "BATCH", "payload length does not match the count");
-        return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
+        pe->status = VC4D_E_PROTO;
+        pe->deny = "payload length does not match the count";
+        return -1;
     }
-    if (G.inflight || c->inflight) {
-        log_denial(c, "BATCH", "a launch is already in flight");
-        return reply(c->fd, h, VC4D_E_BUSY, NULL, 0, -1, 0, 0);
-    }
+    P->count = q.count;
 
     const struct vc4d_batch_ent *ent =
         (const struct vc4d_batch_ent *)(pl + sizeof(q));
 
-    struct vc4d_batch_item item[VC4D_BATCH_MAX];
-    memset(item, 0, sizeof(item));
-    for (uint32_t i = 0; i < q.count; ++i)
-        item[i].status = VC4D_E_NOTRUN;
-
-    int first = VC4D_OK;
-    uint32_t fail_idx = 0xffffffffu;
+    for (uint32_t i = 0; i < q.count; ++i) {
+        struct planned_ent *e = &P->ent[i];
+        memset(e, 0, sizeof(*e));
+        e->status = VC4D_E_NOTRUN;
+        e->prog = 0xffffffffu;
+    }
 
     for (uint32_t i = 0; i < q.count; ++i) {
-        const struct vc4d_batch_ent *e = &ent[i];
-        if (e->kind == VC4D_BENT_FENCE) {
-            if (e->dir > VC4D_SYNC_G2R || !find_region(c, e->handle)) {
-                log_denial(c, "BATCH", "fence with a bad handle or direction");
-                item[i].status = VC4D_E_INVAL;
-                first = VC4D_E_INVAL;
-                fail_idx = i;
+        const struct vc4d_batch_ent *in = &ent[i];
+        struct planned_ent *e = &P->ent[i];
+        if (in->kind == VC4D_BENT_FENCE) {
+            if (in->dir > VC4D_SYNC_G2R || !find_region(c, in->handle)) {
+                e->kind = VC4D_BENT_FENCE;
+                e->status = VC4D_E_INVAL;
+                e->deny = "fence with a bad handle or direction";
                 break;
             }
-            G.regs[R_L2CACTL / 4] = 1u << 2;    /* write back + invalidate */
-#if defined(__aarch64__)
-            __asm__ volatile("dsb sy" ::: "memory");
-#else
-            __sync_synchronize();
-#endif
-            item[i].status = VC4D_OK;
+            e->kind = VC4D_BENT_FENCE;
+            e->status = VC4D_OK;
+            e->fence_dir = in->dir;
             continue;
         }
-        if (e->kind != VC4D_BENT_LAUNCH) {
-            log_denial(c, "BATCH", "unknown entry kind");
-            item[i].status = VC4D_E_INVAL;
-            first = VC4D_E_INVAL;
-            fail_idx = i;
+        if (in->kind != VC4D_BENT_LAUNCH) {
+            e->status = VC4D_E_INVAL;
+            e->deny = "unknown entry kind";
             break;
         }
         /* A batch carries no per-word uniform array: the words are in the
          * client's arena, which is also what bounds the message size.  WAIT
          * is implied and must not be requested explicitly. */
-        if (!(e->flags & VC4D_LAUNCH_UNI_ARENA) ||
-            (e->flags & VC4D_LAUNCH_WAIT) || e->handle || e->dir) {
-            log_denial(c, "BATCH",
-                       "launch entry is not a UNI_IN_ARENA launch");
-            item[i].status = VC4D_E_INVAL;
-            first = VC4D_E_INVAL;
-            fail_idx = i;
+        if (!(in->flags & VC4D_LAUNCH_UNI_ARENA) ||
+            (in->flags & VC4D_LAUNCH_WAIT) || in->handle || in->dir) {
+            e->status = VC4D_E_INVAL;
+            e->deny = "launch entry is not a UNI_IN_ARENA launch";
             break;
         }
         struct vc4d_launch_req lq = {
-            .prog = e->prog,
-            .timeout_ms = e->timeout_ms,
-            .nqpu = e->nqpu,
-            .nuni = e->nuni,
-            .flags = e->flags,
-            .uni_handle = e->uni_handle,
-            .uni_off = e->uni_off,
-            .uni_addr = e->uni_addr,
+            .prog = in->prog,
+            .timeout_ms = in->timeout_ms,
+            .nqpu = in->nqpu,
+            .nuni = in->nuni,
+            .flags = in->flags,
+            .uni_handle = in->uni_handle,
+            .uni_off = in->uni_off,
+            .uni_addr = in->uni_addr,
         };
+        struct prep_err ep;
+        if (launch_prepare(c, (const uint8_t *)&lq, sizeof(lq), 0, 0, NULL,
+                           e, &ep) != 0) {
+            memset(e, 0, sizeof(*e));
+            e->kind = VC4D_BENT_LAUNCH;
+            e->status = ep.status;
+            e->deny = ep.deny;
+            e->prog = 0xffffffffu;
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Execute a prepared batch and send its reply. */
+static int batch_run(struct client *c, struct plan *P)
+{
+    struct vc4d_batch_item item[VC4D_BATCH_MAX];
+    memset(item, 0, sizeof(item));
+    for (uint32_t i = 0; i < P->count; ++i)
+        item[i].status = VC4D_E_NOTRUN;
+
+    if (G.inflight || c->inflight) {
+        log_denial(c, "BATCH", "a launch is already in flight");
+        plan_unpin(P);
+        return reply(c->fd, &P->h, VC4D_E_BUSY, NULL, 0, -1, 0, 0);
+    }
+
+    int first = VC4D_OK;
+    uint32_t fail_idx = 0xffffffffu;
+
+    for (uint32_t i = 0; i < P->count; ++i) {
+        struct planned_ent *e = &P->ent[i];
+        if (e->status != VC4D_OK) {
+            if (e->deny)
+                log_denial(c, "BATCH", e->deny);
+            item[i].status = (uint32_t)e->status;
+            first = e->status;
+            fail_idx = i;
+            break;
+        }
+        if (e->kind == VC4D_BENT_FENCE) {
+            l2_writeback();                 /* write back + invalidate */
+            item[i].status = VC4D_OK;
+            continue;
+        }
         struct launch_result lr;
         uint32_t id = 0;
         memset(&lr, 0, sizeof(lr));
-        int st = launch_one(c, (const uint8_t *)&lq, sizeof(lq), 1, &lr, &id);
+        int st = launch_kick(c, e, 1, &lr, &id);
         item[i].status = (uint32_t)st;
         item[i].launch = id;
         item[i].errs = lr.errs;
@@ -1088,24 +1406,110 @@ static int handle_batch(struct client *c, const struct vc4d_hdr *h,
         }
     }
 
+    plan_unpin(P);
+
     uint32_t done = 0;
-    for (uint32_t i = 0; i < q.count; ++i)
+    for (uint32_t i = 0; i < P->count; ++i)
         if (item[i].status != VC4D_E_NOTRUN)
             done = i + 1;
 
-    size_t plen_out = (size_t)q.count * sizeof(struct vc4d_batch_item);
-    return reply(c->fd, h, first, item, plen_out, -1, done, fail_idx);
+    size_t plen_out = (size_t)P->count * sizeof(struct vc4d_batch_item);
+    return reply(c->fd, &P->h, first, item, plen_out, -1, done, fail_idx);
 }
 
+/* Run a plan that has been prepared, whether by this dispatch or during the
+ * previous launch.  The plan owns the datagram it came from, so the inbox is
+ * released here: after this point the request has been executed or refused. */
+static int run_prepared(int slot)
+{
+    struct plan *P = &plans[slot];
+    struct client *c = clients[P->client];
+    plan_run = slot;
+    P->ready = 0;
+    inbox.ready = 0;
+    if (!c) {
+        plan_unpin(P);
+        plan_run = -1;
+        return 0;
+    }
+    int rc = batch_run(c, P);
+    plan_run = -1;
+    return rc;
+}
+
+/* Read the next datagram and prepare it while the QPU is busy.  Only a batch
+ * is prepared; anything else is left in the inbox and handled in order when
+ * its turn comes, which is the same point the main loop would have handled it.
+ * Nothing here touches the GPU, the program table's LRU or the client's
+ * accounting. */
+static void prefetch_try(struct client *c)
+{
+    if (!opt.prefetch || plan_run < 0 || inbox.ready)
+        return;
+    int slot = plan_free_slot();
+    if (slot < 0)
+        return;
+    if (!inbox_fill(c, 1))
+        return;
+    st_prefetch_read++;
+    if (inbox.err || inbox.extra || inbox.got == 0 || inbox.truncated ||
+        inbox.got > sizeof(inbox.buf) ||
+        inbox.got < sizeof(struct vc4d_hdr))
+        return;
+    struct vc4d_hdr h;
+    memcpy(&h, inbox.buf, sizeof(h));
+    if (h.magic != VC4D_MAGIC || h.len != (uint32_t)inbox.got ||
+        h.version < VC4D_VERSION_MIN || h.version > VC4D_VERSION ||
+        h.status != 0)
+        return;
+    if (h.op != VC4D_OP_SUBMIT && h.op != VC4D_OP_LAUNCH_BATCH)
+        return;
+    struct prep_err pe;
+    if (batch_prepare(c, &h, inbox.buf + sizeof(h),
+                      inbox.got - sizeof(h), &plans[slot], &pe) != 0)
+        return;                 /* the normal path logs and replies, in order */
+    plans[slot].client = c->idx;
+    plans[slot].ready = 1;
+    st_prefetch_hit++;
+}
+
+static int handle_batch(struct client *c, const struct vc4d_hdr *h,
+                        const uint8_t *pl, size_t plen)
+{
+    struct prep_err pe;
+    /* A synchronous batch refuses a request while a launch is in flight before
+     * it validates anything, as it always did.  The prepared path cannot check
+     * here (a launch *is* in flight while it prepares) and checks at the run
+     * instead, where nothing is in flight by construction. */
+    if (G.inflight || c->inflight) {
+        log_denial(c, "BATCH", "a launch is already in flight");
+        return reply(c->fd, h, VC4D_E_BUSY, NULL, 0, -1, 0, 0);
+    }
+    int slot = plan_free_slot();
+    if (slot < 0) {
+        /* Unreachable: a prepared request is run before the loop reads again,
+         * so both buffers cannot be busy here.  Refusing is what keeps the
+         * reply order if that ever changes. */
+        log_denial(c, "BATCH", "a request is already prepared");
+        return reply(c->fd, h, VC4D_E_BUSY, NULL, 0, -1, 0, 0);
+    }
+    if (batch_prepare(c, h, pl, plen, &plans[slot], &pe) != 0) {
+        if (pe.deny)
+            log_denial(c, "BATCH", pe.deny);
+        return reply(c->fd, h, pe.status, NULL, 0, -1, 0, 0);
+    }
+    plans[slot].client = c->idx;
+    return run_prepared(slot);
+}
 /* SUBMIT (protocol 4) is LAUNCH_BATCH with a looser connection contract: the
  * client may have VC4D_SUBMIT_MAX of them outstanding and the daemon serves
  * them in arrival order.  The execution is identical - the same handler, the
  * same validation, the same completion - because the overlap happens on the
- * client's side of the socket, not the daemon's.  Anything else here (an id
- * table, an accepted-but-unrun queue) would add state that the arena and
- * program-slot lifetimes would then have to cover, and would buy nothing: a
- * single-threaded daemon cannot start a second request while the first is
- * executing anyway. */
+ * client's side of the socket.  What the daemon does with the queue it now has
+ * in front of it is prepare the next request while the current one runs
+ * (docs/DAEMON-PIPE.md); it still starts one kernel at a time, has no id table
+ * and no accepted-but-unrun request, because a prepared request is thrown away
+ * rather than replied to if it is not its turn. */
 static int handle_submit(struct client *c, const struct vc4d_hdr *h,
                          const uint8_t *pl, size_t plen)
 {
@@ -1238,12 +1642,7 @@ static int handle_sync(struct client *c, const struct vc4d_hdr *h,
         log_denial(c, "SYNC", "bad handle or direction");
         return reply(c->fd, h, VC4D_E_INVAL, NULL, 0, -1, 0, 0);
     }
-    G.regs[R_L2CACTL / 4] = 1u << 2;    /* write back + invalidate */
-#if defined(__aarch64__)
-    __asm__ volatile("dsb sy" ::: "memory");
-#else
-    __sync_synchronize();
-#endif
+    l2_writeback();
     return reply(c->fd, h, VC4D_OK, NULL, 0, -1, 0, 0);
 }
 
@@ -1279,6 +1678,21 @@ static void client_destroy(int idx)
     struct client *c = clients[idx];
     if (!c)
         return;
+    /* A prepared request that names this client dies with it: it owns no
+     * reply, so there is nothing to send and nothing to report.  The plan that
+     * is executing belongs to this client only if it is being called from its
+     * own dispatch, which cannot happen while a plan runs. */
+    for (int i = 0; i < 2; ++i) {
+        if (i == plan_run)
+            continue;
+        if (plans[i].ready || plans[i].client == idx) {
+            plan_unpin(&plans[i]);
+            plans[i].ready = 0;
+            plans[i].client = -1;
+        }
+    }
+    if (inbox.ready && inbox.client == idx)
+        inbox.ready = 0;
     if (c->inflight) {
         logmsg("client pid=%d disconnected with launch %u in flight",
                (int)c->pid, c->launch_id);
@@ -1604,6 +2018,165 @@ static void drop_privileges(void)
            (unsigned)uid, (unsigned)dgid);
 }
 
+/* ---------------------------------------------------------------- inbox --
+ *
+ * The loop reads one datagram into the inbox and then interprets it, either at
+ * the top of the loop or from the wait loop while a launch is executing.  Both
+ * go through inbox_process(), which is the block that used to follow recvmsg()
+ * in main(): same header checks, same denial replies, same dispatch.  Holding
+ * a datagram here therefore cannot reorder anything - it is always the next
+ * message on that connection - and it cannot change what a request is answered
+ * with.
+ */
+
+/* Returns 1 when the inbox holds something to process, 0 when there was
+ * nothing to read.  The descriptors of an SCM_RIGHTS message are closed here,
+ * as the loop always did; the count is kept so the denial is still issued in
+ * order. */
+static int inbox_fill(struct client *c, int nonblock)
+{
+    static uint8_t cbuf[CMSG_SPACE(4 * sizeof(int))];
+    struct iovec iov = { .iov_base = inbox.buf, .iov_len = sizeof(inbox.buf) };
+    struct msghdr m;
+    memset(&m, 0, sizeof(m));
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = cbuf;
+    m.msg_controllen = sizeof(cbuf);
+
+    ssize_t got = recvmsg(c->fd, &m, MSG_TRUNC | MSG_CMSG_CLOEXEC |
+                                          (nonblock ? MSG_DONTWAIT : 0));
+    if (got < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+            return 0;
+        inbox.err = errno;
+        inbox.got = 0;
+        inbox.extra = 0;
+        inbox.truncated = 0;
+        inbox.client = c->idx;
+        inbox.ready = 1;
+        return 1;
+    }
+    int extra = 0;
+    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&m); cm; cm = CMSG_NXTHDR(&m, cm)) {
+        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+            int nfd = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+            for (int k = 0; k < nfd; ++k) {
+                int f;
+                memcpy(&f, CMSG_DATA(cm) + k * sizeof(int), sizeof(int));
+                close(f);
+                extra++;
+            }
+        }
+    }
+    inbox.err = 0;
+    inbox.got = (size_t)got;
+    inbox.extra = extra;
+    inbox.truncated = (m.msg_flags & MSG_CTRUNC) != 0;
+    inbox.client = c->idx;
+    inbox.ready = 1;
+    return 1;
+}
+
+/* Interpret the datagram in the inbox.  Returns like dispatch(): 0 keeps the
+ * client, non-zero destroys it. */
+static int inbox_process(int idx)
+{
+    struct client *c = clients[idx];
+    size_t got = inbox.got;
+    int extra = inbox.extra;
+    int truncated = inbox.truncated;
+    int err = inbox.err;
+    inbox.ready = 0;
+    inbox.err = 0;
+    if (!c)
+        return 0;
+    if (err) {
+        client_destroy(idx);
+        return 0;
+    }
+    if (got == 0) {
+        client_destroy(idx);
+        return 0;
+    }
+    if (extra) {
+        st_rejects++;
+        log_denial(c, "?", "client sent an unexpected file descriptor");
+        struct vc4d_hdr hh;
+        memset(&hh, 0, sizeof(hh));
+        reply(c->fd, &hh, VC4D_E_DENIED, NULL, 0, -1, 0, 0);
+        return 0;
+    }
+    if (got > sizeof(inbox.buf) || got < sizeof(struct vc4d_hdr) || truncated) {
+        st_rejects++;
+        int too_big = got > sizeof(inbox.buf);
+        log_denial(c, "?", too_big ? "oversized datagram" : "truncated datagram");
+        struct vc4d_hdr hh;
+        memset(&hh, 0, sizeof(hh));
+        reply(c->fd, &hh, too_big ? VC4D_E_TOOLARGE : VC4D_E_PROTO,
+              NULL, 0, -1, (uint32_t)got, 0);
+        if (c->denials > 1000)
+            client_destroy(idx);
+        return 0;
+    }
+    struct vc4d_hdr h;
+    memcpy(&h, inbox.buf, sizeof(h));
+    if (h.magic != VC4D_MAGIC || h.len != (uint32_t)got ||
+        h.version < VC4D_VERSION_MIN || h.version > VC4D_VERSION ||
+        h.status != 0) {
+        st_rejects++;
+        char why[128];
+        snprintf(why, sizeof(why),
+                 "bad header (magic=0x%08x len=%u got=%zu ver=%u status=%d)",
+                 h.magic, h.len, got, h.version, h.status);
+        log_denial(c, "?", why);
+        struct vc4d_hdr hh = h;
+        hh.op = 0;
+        hh.seq = 0;
+        int st = (h.magic == VC4D_MAGIC && h.version != VC4D_VERSION)
+                 ? VC4D_E_VERSION : VC4D_E_PROTO;
+        reply(c->fd, &hh, st, NULL, 0, -1, 0, 0);
+        if (c->denials > 1000)
+            client_destroy(idx);
+        return 0;
+    }
+    return dispatch(c, &h, inbox.buf + sizeof(h), got - sizeof(h));
+}
+
+/* Serve one client: the datagram in the inbox (reading one if there is none),
+ * then every request the wait loop prepared behind it.  The chain reads
+ * nothing new, so a client at depth 2 is served one request at a time exactly
+ * as before, with the preparation moved under the previous launch; the
+ * liveness sweep still runs every PLAN_CHAIN_MAX launches. */
+static void serve_client(int idx)
+{
+    struct client *c = clients[idx];
+    if (!c)
+        return;
+    if (!inbox.ready && !inbox_fill(c, 1))
+        return;
+    if (inbox.client != idx)
+        return;                 /* another connection's; not ours to run */
+    int rc = inbox_process(idx);
+    int chain = 0;
+    while (rc == 0 && !stop_flag && !restart_needed) {
+        if (chain && chain % PLAN_CHAIN_MAX == 0)
+            reap_dead_clients(-1, "during a prepared chain");
+        int s = plan_pending();
+        if (s >= 0) {
+            rc = run_prepared(s);
+        } else if (inbox.ready && inbox.client == idx) {
+            rc = inbox_process(idx);
+        } else {
+            break;
+        }
+        chain++;
+    }
+    if (rc != 0)
+        client_destroy(idx);
+}
+
+
 int main(int argc, char **argv)
 {
     /* Journald and a redirected log must see each line as it happens: the
@@ -1618,6 +2191,8 @@ int main(int argc, char **argv)
     opt.max_timeout_ms = MAX_TIMEOUT;
     opt.raw_srq = 1;
     opt.drop = 1;
+    opt.prefetch = 0;
+    opt.poll_us = 10;
 
     const char *e;
     if ((e = getenv("VC4D_SOCKET"))) opt.socket_path = e;
@@ -1627,6 +2202,8 @@ int main(int argc, char **argv)
     if ((e = getenv("VC4D_GPU_LOCK"))) opt.gpu_lock = atoi(e) != 0;
     if ((e = getenv("VC4D_NO_DROP"))) opt.drop = atoi(e) == 0;
     if ((e = getenv("VC4D_VERBOSE"))) opt.verbose = atoi(e) != 0;
+    if ((e = getenv("VC4D_PREFETCH"))) opt.prefetch = atoi(e) != 0;
+    if ((e = getenv("VC4D_POLL_US"))) opt.poll_us = atoi(e);
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--socket") && i + 1 < argc) opt.socket_path = argv[++i];
@@ -1640,11 +2217,15 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--no-drop")) opt.drop = 0;
         else if (!strcmp(argv[i], "--gpu-lock")) opt.gpu_lock = 1;
         else if (!strcmp(argv[i], "--verbose")) opt.verbose = 1;
+        else if (!strcmp(argv[i], "--prefetch")) opt.prefetch = 1;
+        else if (!strcmp(argv[i], "--no-prefetch")) opt.prefetch = 0;
+        else if (!strcmp(argv[i], "--poll-us") && i + 1 < argc) opt.poll_us = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: vc4d [--socket PATH] [--arena-mb N] [--group NAME]\n"
                    "            [--drop-user NAME] [--allowlist FILE] [--strict]\n"
                    "            [--max-timeout-ms N] [--no-raw-srq] [--no-drop]\n"
-                   "            [--gpu-lock] [--verbose]\n");
+                   "            [--gpu-lock] [--verbose] [--prefetch]"
+                   " [--poll-us N]\n");
             return 0;
         } else {
             fprintf(stderr, "vc4d: unknown argument %s\n", argv[i]);
@@ -1741,6 +2322,9 @@ int main(int argc, char **argv)
     }
     logmsg("listening on %s (mode 0660 group %s gid %u)",
            opt.socket_path, opt.group, (unsigned)gid);
+    logmsg("prepared launches %s", opt.prefetch
+           ? "enabled (a request is validated while the previous one runs)"
+           : "disabled (synchronous)");
 
     if (opt.gpu_lock) {
         gpu_lock_fd = open(DEFAULT_GPU_LOCK, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
@@ -1780,6 +2364,11 @@ int main(int argc, char **argv)
         arena_maybe_restore();
         if (stop_flag || restart_needed)
             break;
+        /* A chain that stopped early can leave one datagram, already read, in
+         * the inbox.  Run it before waiting for anything, or the daemon would
+         * poll for a message it has already consumed. */
+        if (inbox.ready)
+            serve_client(inbox.client);
         int n = 0;
         pfds[n].fd = listen_fd;
         pfds[n].events = POLLIN;
@@ -1810,87 +2399,11 @@ int main(int argc, char **argv)
                     accept_client();
                 continue;
             }
-            struct client *c = clients[who[pi]];
+            /* Poll about this connection; serve_client() reads one datagram
+             * and runs it plus anything prepared behind it. */
             if (!(pfds[pi].revents & (POLLIN | POLLHUP | POLLERR)))
                 continue;
-
-            static uint8_t rbuf[VC4D_MAX_MSG];
-            static uint8_t cbuf[CMSG_SPACE(4 * sizeof(int))];
-            struct iovec iov = { .iov_base = rbuf, .iov_len = sizeof(rbuf) };
-            struct msghdr m;
-            memset(&m, 0, sizeof(m));
-            m.msg_iov = &iov;
-            m.msg_iovlen = 1;
-            m.msg_control = cbuf;
-            m.msg_controllen = sizeof(cbuf);
-            ssize_t got = recvmsg(c->fd, &m, MSG_TRUNC | MSG_CMSG_CLOEXEC);
-            if (got < 0) {
-                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
-                    continue;
-                client_destroy(c->idx);
-                continue;
-            }
-            int extra = 0;
-            for (struct cmsghdr *cm = CMSG_FIRSTHDR(&m); cm; cm = CMSG_NXTHDR(&m, cm)) {
-                if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
-                    int nfd = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-                    for (int k = 0; k < nfd; ++k) {
-                        int f;
-                        memcpy(&f, CMSG_DATA(cm) + k * sizeof(int), sizeof(int));
-                        close(f);
-                        extra++;
-                    }
-                }
-            }
-            if (got == 0) {
-                client_destroy(c->idx);
-                continue;
-            }
-            if (extra) {
-                st_rejects++;
-                log_denial(c, "?", "client sent an unexpected file descriptor");
-                struct vc4d_hdr hh;
-                memset(&hh, 0, sizeof(hh));
-                reply(c->fd, &hh, VC4D_E_DENIED, NULL, 0, -1, 0, 0);
-                continue;
-            }
-            if ((size_t)got > sizeof(rbuf) || (size_t)got < sizeof(struct vc4d_hdr) ||
-                (m.msg_flags & MSG_CTRUNC)) {
-                st_rejects++;
-                int too_big = (size_t)got > sizeof(rbuf);
-                log_denial(c, "?", too_big ? "oversized datagram" : "truncated datagram");
-                struct vc4d_hdr hh;
-                memset(&hh, 0, sizeof(hh));
-                reply(c->fd, &hh, too_big ? VC4D_E_TOOLARGE : VC4D_E_PROTO,
-                      NULL, 0, -1, (uint32_t)got, 0);
-                if (c->denials > 1000)
-                    client_destroy(c->idx);
-                continue;
-            }
-            struct vc4d_hdr h;
-            memcpy(&h, rbuf, sizeof(h));
-            if (h.magic != VC4D_MAGIC || h.len != (uint32_t)got ||
-                h.version < VC4D_VERSION_MIN || h.version > VC4D_VERSION ||
-                h.status != 0) {
-                st_rejects++;
-                char why[128];
-                snprintf(why, sizeof(why),
-                         "bad header (magic=0x%08x len=%u got=%zd ver=%u status=%d)",
-                         h.magic, h.len, got, h.version, h.status);
-                log_denial(c, "?", why);
-                struct vc4d_hdr hh = h;
-                hh.op = 0;
-                hh.seq = 0;
-                int st = (h.magic == VC4D_MAGIC && h.version != VC4D_VERSION)
-                         ? VC4D_E_VERSION : VC4D_E_PROTO;
-                reply(c->fd, &hh, st, NULL, 0, -1, 0, 0);
-                if (c->denials > 1000)
-                    client_destroy(c->idx);
-                continue;
-            }
-            int rc = dispatch(c, &h, rbuf + sizeof(h), got - sizeof(h));
-            if (rc != 0)
-                client_destroy(c->idx);
+            serve_client(who[pi]);
         }
     }
 
@@ -1900,6 +2413,23 @@ int main(int argc, char **argv)
     unlink(opt.socket_path);
     gpu_close(&G);
     arena_close(&A);
+    {
+        double kern = st_launches ? (double)G.gpu_ns / (double)st_launches : 0.0;
+        double gap = st_gap_n ? (double)st_gap_ns / (double)st_gap_n : 0.0;
+        logmsg("prefetch: %llu datagram(s) read early, %llu prepared under a launch",
+               (unsigned long long)st_prefetch_read,
+               (unsigned long long)st_prefetch_hit);
+        logmsg("launch timing: %llu launch(es), kernel %.0f ns, gap %.0f ns,"
+               " period %.0f ns (%llu gap(s) over 20 ms not counted)",
+               (unsigned long long)st_launches, kern, gap, kern + gap,
+               (unsigned long long)st_gap_idle);
+        logmsg("gap split: completion notice %.0f ns, register kick %.0f ns,"
+               " turnaround %.0f ns",
+               st_gap_n ? (double)st_notice_ns / (double)st_gap_n : 0.0,
+               st_launches ? (double)st_kick_ns / (double)st_launches : 0.0,
+               gap - ((st_gap_n ? (double)st_notice_ns / (double)st_gap_n : 0.0)
+                      + (st_launches ? (double)st_kick_ns / (double)st_launches : 0.0)));
+    }
     logmsg("exit%s (reclaimed %llu client(s), %llu GPU reset(s), %llu slot eviction(s))",
            restart_needed ? ": restarting" : "",
            (unsigned long long)st_reclaimed, (unsigned long long)st_recoveries,

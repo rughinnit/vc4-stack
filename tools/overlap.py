@@ -160,6 +160,8 @@ def main():
     ap.add_argument("--frames", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--sync-only", action="store_true")
+    ap.add_argument("--pipe-only", action="store_true",
+                    help="only the pipelined path (for a daemon-side counter)")
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
     os.environ["VC4INFER_PROF"] = "1"
@@ -175,7 +177,9 @@ def main():
         if not os.path.exists(model):
             print("%-6d %s missing" % (size, model))
             continue
-        for pipeline in ([False] if args.sync_only else [False, True]):
+        paths = ([False] if args.sync_only
+                 else [True] if args.pipe_only else [False, True])
+        for pipeline in paths:
             try:
                 c = cell(model, args.frames, args.warmup, pipeline, args.check)
             except Exception as e:                  # noqa: BLE001

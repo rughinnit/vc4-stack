@@ -111,6 +111,9 @@ struct gpu {
     uint64_t t0;
     uint64_t deadline;
     uint64_t gpu_ns;
+    /* When the last launch completed, for the finish -> next kick gap the
+     * prepared-request work is meant to remove (docs/DAEMON-PIPE.md). */
+    uint64_t last_finish_ns;
     /* context-reset support: the daemon's own known-good program */
     int      recovering;      /* set while gpu_recover() runs a probe     */
     int      probe_ready;

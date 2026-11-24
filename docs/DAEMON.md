@@ -303,10 +303,11 @@ Why 256: a code slot cannot exceed 16 KiB (`kgen` refuses a larger blob), a
 model that exposed the limit needs 133 kernels (bccd YOLO11n-160, 3 classes).
 Against 128 entries the LRU freed 5 slots per frame; the UPLOAD that restores
 them is a serialised round trip, and the frame went to 1631 ms / 0.61 FPS
-with the QPU at 17 % duty.  With 256 the set stays resident: 428 ms / 2.3 FPS
-for the same class of model, zero evictions in the journal.  256 also leaves
-room for a second input size in one session without turning the cache back
-into the bottleneck.
+with the QPU at 17 % duty.  With 256 the 133-kernel set stays resident:
+520 ms / 1.92 FPS, QPU duty 54 %, and zero evictions in the journal.
+YOLOv8n-160, whose 96 kernels already fit, is unchanged at 412 ms.  256 also
+leaves room for a second input size in one session without turning the cache
+back into the bottleneck.
 
 **HELLO.**  The reply now carries the map's name in a 12-byte field that used
 to be reserved: `"slots256"` from this daemon, empty from a daemon older than

@@ -13,7 +13,7 @@ OpenGL driver.
 | measured on the board | |
 |---|---|
 | ONNX operators, expressible set | **152/152**, 0 refused, 0 mismatched |
-| YOLOv8n 160x160, every op on the QPUs | **481.7 ms / 2.08 FPS** (ncnn on the four A53 cores: 74.8 ms) |
+| YOLOv8n 160x160, every op on the QPUs | **427 ms / 2.34 FPS** from a `.vc4x` artifact, 468 ms from ONNX (ncnn on the four A53 cores: 74.8 ms) |
 | GEMM, hand-written QPU kernel | **13.7 GFLOP/s** at 256 cubed |
 | adapters | PyTorch 244 checks, JAX 25 VHLO ops, LiteRT 44 checks, and TensorFlow, ONNX Runtime, ggml, TVM — one engine behind all of them |
 
@@ -40,6 +40,74 @@ membership and a verification pass.  `--fast` builds for speed on the board,
 list are in [`docs/INSTALL.md`](docs/INSTALL.md).  At run time choose the
 **managed** backend (unprivileged, ~0.1 ms/launch, the default) or **direct**
 (root, no launch overhead: 410 vs 481.7 ms) — [`docs/BACKENDS.md`](docs/BACKENDS.md).
+
+## Run inference
+
+Three jobs, each a copy-paste block.  Every command below was run on the
+reference board with the packaged engine, ARM capped at 1.0 GHz, one client
+against `vc4d` (no root).
+
+### 1. YOLO with real COCO weights
+
+```sh
+vc4infer selftest                                   # 4 shipped models, ~10 s
+VC4_OPT=all vc4infer run \
+    /usr/share/vc4infer/models/yolov8n_160.onnx \
+    --imgsz 160 --input photo.jpg                   # writes photo_vc4infer.jpg
+VC4_OPT=all vc4infer bench \
+    /usr/share/vc4infer/models/yolov8n_160.onnx --imgsz 160 --reps 5
+```
+
+`VC4_OPT=all` is the fast path, and it matters: the optimiser passes are
+opt-in, so an unset variable runs the unfolded graph at **576.8 ms / 1.73 FPS**
+while `all` runs it at **468.2 ms / 2.13 FPS**, same model, same engine.  Any
+YOLOv8 or YOLO11 export at a fixed fp32 shape runs if its operators are in the
+table; `vc4infer nodes model.onnx` lists what is refused, by name, before you
+start.  `docs/ACCURACY-FPS.md` has the resolution curve and the detections that
+survive 96, 128 and 160.
+
+### 2. Your own ONNX model
+
+```sh
+vc4infer nodes model.onnx                          # per-node backend, refusals by name
+VC4_OPT=all vc4infer build model.onnx -o model.vc4x
+vc4infer verify model.vc4x
+vc4infer run model.vc4x --imgsz 160 --input photo.jpg
+```
+
+`build` is the path to deploy: it runs the optimiser, packs the weights and
+freezes the allocation and execution plans once (14.9 s for YOLOv8n), then
+loads in 0.5 s instead of 3-4 s and runs a frame in **427.3 ms / 2.34 FPS**
+against 468.2 from ONNX.  Requirements are fp32, static shapes and an arena the
+graph fits; the planner prints the need before it allocates.  There is no CPU
+fallback, so an operator outside the table raises and names itself rather than
+running slowly.
+
+At 96x96 a frame costs `2.5 + 3.13 * convs` ms, so a 30 FPS detector is about
+nine convolutions and 0.05 GFLOP -- [`docs/ACCURACY-FPS.md`](docs/ACCURACY-FPS.md)
+has the budget and the training recipe.
+
+### 3. A language model
+
+TinyStories-1M (3.7 M parameters) runs end to end: 378 static nodes, none
+refused, **1.06 tokens/s** over a 16-token window and 0.42 over 32, with output
+that matches ONNX Runtime to 5.5e-4 mean logit difference and 8 of 8 greedy
+steps.  It is a demonstration, not an assistant: there is no KV cache, so every
+token recomputes the window.
+
+```sh
+python3 infer/tools/onnx/make_tinystories.py \
+    --src model.onnx --ctx 16 --out ts1m_c16.onnx
+python3 infer/tools/onnx/tinystories_decode.py \
+    --model ts1m_c16.onnx --ctx 16 --tokenizer <tokenizer dir> --tokens 8
+```
+
+Both scripts live in the checkout, need the 23.6 MB fp32 export and a tokenizer
+directory, and compare against ONNX Runtime CPU as they decode.
+[`docs/TINY-LLM.md`](docs/TINY-LLM.md) records the rewrite, the licence (neither
+the base model nor the export declares one) and the cost table.  No larger
+language model fits: a real llama.cpp graph needs more than the 64 MiB client
+arena -- [`docs/GGML.md`](docs/GGML.md).
 
 ## Hardware
 
@@ -96,11 +164,13 @@ the operator; it does not run on the ARM instead.
 - [`docs/STATUS.md`](docs/STATUS.md) — one row per workstream, its state, and
   the file or test behind that state.
 - [`docs/ACCURACY-FPS.md`](docs/ACCURACY-FPS.md) — YOLOv8n at 96/128/160 with
-  COCO weights: 2.83 / 2.60 / 2.14 FPS, the detections that survive each size,
-  and the launch and FLOP budget behind the curve.
+  COCO weights: the detections that survive each size, and the launch and FLOP
+  budget behind the curve.  The curve predates the host work; the current points
+  and the CPU per frame are in [`docs/CPU-BREAKDOWN.md`](docs/CPU-BREAKDOWN.md)
+  section 4.
 - [`docs/TINY-LLM.md`](docs/TINY-LLM.md) — TinyStories-1M end to end: 378 static
-  nodes, none refused, 1.06 tokens/s at 16 tokens, and the two engine defects
-  that keep its output from matching ONNX Runtime.
+  nodes, none refused, 1.06 tokens/s at 16 tokens, output matching ONNX Runtime
+  step for step, and the two engine defects that stood in the way.
 
 Accuracy is in [`docs/ACCURACY.md`](docs/ACCURACY.md) (identical detections to
 0.00 px against the CPU); the ncnn head-to-head (6.4×, same detections) in

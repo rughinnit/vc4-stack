@@ -249,9 +249,10 @@ at IoU 0.6, conf 0.001, pycocotools-style 101-point AP over IoU 0.50:0.05:0.95.
 Pseudo-labels are worth nothing measurable on this dataset. The identical
 schedule on ground truth alone scores 0.601 / 0.427 against 0.596 / 0.426 with
 them -- a 0.005 difference in mAP50 and 0.001 in mAP50-95 on 87 images, inside
-the run-to-run spread, and slightly in favour of the ground truth. The 1,488 extra boxes are 96 % RBC
-and RBC AP50 is already 0.81, so the teacher had nothing to add to the class it
-knows best, and the cells the labels miss are not cells the teacher finds. The
+the run-to-run spread, and slightly in favour of the ground truth. The 1,488
+extra boxes are 96 % RBC and RBC AP50 is already 0.81, so the teacher had
+nothing to add to the class it knows best, and the cells the labels miss are not
+cells the teacher finds. The
 mechanism works -- the student trains on the teacher's probabilities rather than
 one-hot targets, and its class loss sits at 0.073 instead of collapsing to
 0.003 -- but it buys no accuracy here. What the pseudo-labels would have fixed
@@ -270,11 +271,13 @@ teacher at 320 (0.878 here, 0.904 under ultralytics' validator) it is 0.28
 mAP50 behind, and that gap buys 16x the frame rate on the same silicon.
 
 Platelets are the failure: AP50 0.000 against 83 val instances, and 0 predicted
-on either test image. At 96 px a platelet is about 8 px across, which is one
-stride-8 cell, so the grid cannot separate it from the RBC it sits on. The
-teacher at 96 has the same problem (0.019); at 320 it reaches 0.829. If platelet
-counts matter, the operating point has to be 128 or the head needs a second,
-finer level, and both cost launches (VC4-MODEL.md sec. 7).
+on either test image. At 96 px the class medians are 17 px wide for RBC, 32 for
+WBC and **7** for platelets (10th-90th percentile 4.9-9.2), so a platelet is
+smaller than one stride-8 cell and the 12x12 grid cannot separate it from the
+RBC it sits on. The teacher at 96 has the same problem (0.019); at 320 it
+reaches 0.829. If platelet counts matter, the operating point has to be 128 or
+the head needs a second, finer level, and both cost launches (VC4-MODEL.md
+sec. 7).
 
 ### Speed on the board
 

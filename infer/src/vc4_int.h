@@ -44,6 +44,19 @@
 #define VC4_P4_UNI_BASE   0x210000u
 #define VC4_P4_DATA_BASE  0x300000u
 
+/* The zones are one map: a change to a count without the bases (or the other
+ * way round) is exactly the layout defect this header is here to prevent. */
+_Static_assert(VC4_CODE_BASE + VC4_MAX_KERNELS * VC4_CODE_SLOT <= VC4_UNI_BASE,
+               "code slots must end below the uniform areas");
+_Static_assert(VC4_UNI_BASE + VC4_MAX_KERNELS * VC4_UNI_SLOT <= VC4_DATA_BASE,
+               "uniform areas must end below the data heap");
+_Static_assert(VC4_CODE_BASE + VC4_P4_MAX_KERNELS * VC4_CODE_SLOT <=
+               VC4_P4_UNI_BASE,
+               "protocol-4 code slots must end below its uniform areas");
+_Static_assert(VC4_P4_UNI_BASE + VC4_P4_MAX_KERNELS * VC4_UNI_SLOT <=
+               VC4_P4_DATA_BASE,
+               "protocol-4 uniform areas must end below its data heap");
+
 #define VC4_UNI_WORDS     16
 
 typedef struct {

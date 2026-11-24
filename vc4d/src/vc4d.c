@@ -56,6 +56,12 @@
  * slot in 9 bits now (see find_prog()), so slot 255 is addressable: with the
  * old 8-bit field the probe slot could never match a handle. */
 #define MAX_PROGS_SLOTS  256
+_Static_assert(MAX_PROGS_SLOTS == A_CODE_SLOTS,
+               "the slot table and the arena code area must agree");
+_Static_assert(A_CODE_BASE + A_CODE_SLOTS * A_CODE_SLOT <= A_UNI_BASE,
+               "code slots must end below the uniform areas");
+_Static_assert(A_UNI_BASE + A_CODE_SLOTS * A_UNI_SLOT <= A_DATA_BASE,
+               "uniform areas must end below the data heap");
 #define DEFAULT_GPU_LOCK "/tmp/vc4-gpu.lock"
 #define MAX_DENIALS_LOG  20
 /* How many prepared requests run back to back before the main loop returns to

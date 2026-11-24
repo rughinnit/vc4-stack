@@ -132,6 +132,116 @@ commands, the licence and the cost table).  No larger
 language model fits: a real llama.cpp graph needs more than the 64 MiB client
 arena -- [`docs/GGML.md`](docs/GGML.md).
 
+## Command reference
+
+`vc4infer [--backend managed|direct] COMMAND [OPTIONS]`.  The same reference is
+in the man page, `man vc4infer`.
+
+| command | what it does |
+|---|---|
+| `run MODEL` | one inference; a detector's outputs are decoded to boxes, anything else is printed as tensors |
+| `bench MODEL` | timed runs: wall, FPS, launches, QPU duty and the split between QPU, host and launch path |
+| `nodes MODEL` | static report: what each node is, which backend runs it, what is refused, by name |
+| `util MODEL` | device-invariant accounting: QPU share, bytes over the wire, launches per node class |
+| `selftest` | the four shipped reference models against their recorded outputs |
+| `build MODEL -o OUT` | freeze a `.vc4x`: optimiser passes, packed weights, kernel blobs, allocation and execution plans |
+| `verify ARTIFACT` | check every section and key of a `.vc4x` against this engine, without running it |
+
+### Flags
+
+**`run`** `--input PATH` (image, `.npy` or `.csv`; random without it),
+`--imgsz N` (letterbox, must match the model), `--conf 0.25`, `--iou 0.45`,
+`--max-det 300`, `--classes PATH` (one name per line, default COCO-80),
+`--out PATH` (default `<input>_vc4infer.jpg`), `--no-save`, `--json`,
+`--save-json PATH`, `--mode strict|hybrid`, `--host-policy device|structural|any`,
+`--cache DIR`, `--no-artifact`.
+
+**`bench`, `util`** `--imgsz N`, `--reps 3`, `--input PATH`, `--json`.
+
+**`nodes`** `-v` (every node with status, backend and reason), `--json`,
+`--mode`, `--host-policy`.
+
+**`selftest`** `--models DIR` (default `/usr/share/vc4infer/models`).
+
+**`build`** `-o/--out PATH`, `--opt all|none|spec` (default `all`),
+`--imgsz N` and `--opset N` for a `.pt` input (defaults 640 and 17),
+`--no-embed-graph`, `--no-embed-kernels`, `--arena-mb N`, `--cache DIR`.
+
+**`verify`** `--json`.
+
+**global** `--backend managed|direct`, `--version` (package, engine API and live
+backend), `-h`.
+
+### Environment
+
+| variable | effect |
+|---|---|
+| `VC4_OPT` | optimiser passes for the ONNX path: `none`, `all`, or a list. **Unset measures the slow path** (832 launches against 332 at 160) |
+| `VC4_CPLAN`, `VC4_NO_CPLAN` | enable or disable the frozen execution plan (default on) |
+| `VC4_NO_MEM_PLAN=1` | size the pool with the old walk, for comparison |
+| `VC4INFER_BACKEND` | `managed` or `direct`, same as `--backend` |
+| `VC4INFER_DAEMON` | `1` selects the daemon; `0` is the direct-root path for the low-level suite |
+| `VC4INFER_LIB` | path to `libvc4infer.so`; a checkout's build wins over the installed one |
+| `VC4INFER_CACHE` | kernel blob cache (default `~/.cache/vc4infer/kcache`) |
+| `VC4INFER_KGEN` | kernel generator path, for a tree that is not installed |
+| `VC4INFER_ARENA_MB` | arena to request from the daemon |
+| `VC4_POOL_RESERVE_MB` | extra pool slack for graphs the estimate understates |
+| `VC4D_SOCKET` | daemon socket (default `/run/vc4d.sock`) |
+| `VC4INFER_MODELS` | reference models for `selftest` |
+| `VC4INFER_NO_BATCH=1` | disable batched launch submission, for the A/B |
+| `VC4INFER_PROF=1` | launch-path profiler and per-node statistics |
+
+### Exit status
+
+`0` success; `1` a reference model over tolerance or a failed run; `2` usage,
+missing file, model and input disagreeing; `3` unsupported operator or exhausted
+arena; `4` host debt under the device policy; `6` control flow the executor
+cannot run; `8` the shipped model files are not the packaged ones.
+
+### Examples
+
+Verify the installation and time the shipped detector:
+
+```sh
+vc4infer selftest
+vc4infer bench /usr/share/vc4infer/models/yolov8n_160.onnx --imgsz 160 --reps 5
+# 411.9 ms/image (mean), 2.43 FPS - 332 launches, qpu_duty 60.7 %
+```
+
+Check an unfamiliar graph before running it, then freeze it and measure it:
+
+```sh
+vc4infer nodes best.onnx
+# 355 nodes: 355 supported, 0 unsupported, 0 unverified
+VC4_OPT=all vc4infer build best.onnx -o best.vc4x
+# artifact 545986eefd971442 (25.50 MiB)
+# weights: 91 prepacked buffers, 14.57 MiB
+# kernels: 133 blobs, 0.64 MiB
+# plan:    peak 17.96 MiB, pool 17.96 MiB, scratch 5.76 MiB, arena 64.00 MiB
+# build:   16.4 s (optimise 2.8 s, panels 4.2 s, plan 3.1 s)
+vc4infer verify best.vc4x
+# all sections verified; every key matches this engine
+vc4infer run best.vc4x --imgsz 160 --input BloodImage_00007.jpg --classes names.txt
+# decode: 525 anchors, 3 classes, channels_first; 87 above conf 0.25 -> 14 after NMS (IoU 0.45)
+#   1   WBC   0.840   193.9   85.2   404.1   289.1
+#   2   RBC   0.779    16.6  292.4   137.0   396.8
+```
+
+Machine-readable detections, no annotated file:
+
+```sh
+vc4infer run best.vc4x --imgsz 160 --input photo.jpg --json --no-save
+```
+
+The whole sequence at once, from a source checkout:
+
+```sh
+tools/demo.sh best.onnx BloodImage_00007.jpg 160 names.txt
+```
+
+A custom model that was trained elsewhere, end to end, is worked through in
+[`docs/CASE-BCCD.md`](docs/CASE-BCCD.md).
+
 ## Hardware
 
 Verified on **Raspberry Pi 3 Model B** (BCM2837, VideoCore IV, 12 QPUs, 6 TMUs),

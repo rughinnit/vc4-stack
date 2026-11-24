@@ -1,186 +1,327 @@
-.TH VC4INFER 1 "2026-11-20" "vc4infer 1.1.2" "User Commands"
+.TH VC4INFER 1 "25 November 2026" "vc4infer 1.2.12" "User Commands"
 .SH NAME
-vc4infer \- run fixed-shape fp32 ONNX graphs on the VideoCore IV QPUs
+vc4infer \- run fixed-shape fp32 ONNX models on the VideoCore IV QPUs
 .SH SYNOPSIS
 .B vc4infer
-.I command
-.RI [ options ]
+[\fB\-\-backend\fR \fImanaged\fR|\fIdirect\fR] \fICOMMAND\fR [\fIOPTIONS\fR]
+.br
+.B vc4infer \-\-version
 .SH DESCRIPTION
 .B vc4infer
-executes a fixed-shape, batch-1, fp32 ONNX graph on the VideoCore IV (V3D)
-QPUs of a Raspberry Pi 1/2/3, Zero or CM1/CM3.
-Every float operation (convolutions, GEMMs, elementwise, pooling, softmax) is
-dispatched to
-.BR libvc4infer ;
-the ARM cores only move bytes, pad, gather, concatenate and perform integer
-shape bookkeeping.
-An operator, attribute or shape the engine cannot dispatch raises
-.B UnsupportedNode
-naming the node and its ONNX op type.
-There is no CPU arithmetic fallback.
+executes an ONNX graph on the twelve QPUs of a Raspberry Pi VideoCore IV and
+returns its outputs.  Every floating-point operator runs on the QPUs; there is
+no CPU arithmetic fallback, so an operator, shape or attribute outside the
+supported set raises and names itself instead of running slowly.
 .PP
-Unprivileged runs go through the
-.B vc4d
-helper daemon on
-.IR /run/vc4d.sock ,
-which owns
-.I /dev/mem
-and the V3D register window.
-The client opens neither.
+The default backend is
+.BR managed :
+an unprivileged client that talks to
+.BR vc4d (8)
+over a socket.  The
+.B direct
+backend maps the arena itself, needs root and exists for measurement and the
+low-level test suite.
+.PP
+A model can be run straight from ONNX, or built once into a
+.I .vc4x
+engine artifact that freezes the optimiser passes, the packed weight panels,
+the kernel blobs and both the allocation and execution plans.
 .SH COMMANDS
+.SS run \fIMODEL\fR
+Run one inference.  For a detector the outputs are decoded to boxes; for other
+graphs they are printed as tensors.
 .TP
-.B run \fImodel.onnx\fR \-\-input \fIimage|csv|npy\fR [\-\-imgsz N] [\-\-conf 0.25] [\-\-iou 0.45] [\-\-json]
-Run one inference.
-Images (JPEG/PNG/BMP/WebP) are letterboxed to the model input size, converted
-to RGB/fp32 and normalised to [0,1].
-A YOLOv8/YOLO11 detection head is decoded on the host (boxes from the
-cx,cy,w,h rows, best class, confidence threshold, class-aware NMS) and the
-boxes are mapped back to the original image pixels.
-An annotated image is written next to the input unless
-.B \-\-no\-save
-is given.
-With
-.B \-\-json
-the command prints a single JSON document: model, input, timings, decoded
-detections and the annotated image path.
+.B \-\-input \fIPATH\fR
+An image (jpg, png), a
+.I .npy
+tensor or a
+.I .csv
+file.  Without it the input is random, which is only useful for timing.
 .TP
-.B bench \fImodel.onnx\fR [\-\-imgsz N] [\-\-reps N]
-Time the graph end to end.
-One warm-up run performs the kernel JIT and is reported separately, then
-.B \-\-reps
-(default 3) timed runs.
-Prints milliseconds per image (mean, median, best), FPS, launches per image,
-GPU (pack + kernel) time as a fraction of wall time, and arena / graph-pool /
-peak memory.
+.B \-\-imgsz \fIN\fR
+Letterbox size for an image input.  It must match the model's input.
 .TP
-.B nodes \fImodel.onnx\fR [\-v]
-Static coverage report: node counts per ONNX op, a supported/unsupported
-verdict for every node, the names and reasons for the unsupported ones, and the
-number of
-.B Mul(x, Sigmoid(x))
-pairs that fuse into a single SiLU launch.
-The executor stays authoritative:
-.B nodes
-reads the graph, attributes and initialiser shapes; it does not run it.
+.B \-\-conf \fIF\fR
+Confidence threshold (default 0.25).
 .TP
-.B selftest
-Run the shipped reference models (modelA, modelB, modelC and the real YOLOv8n
-COCO export at 160x160) against their stored CPU references with
-atol = rtol = 5e-4.
-Exits 0 when every element of every output is inside tolerance, 1 otherwise.
-.SH OPTIONS
-.TP
-.B \-\-version
-Print the version, the resolved engine library, the onnx/numpy versions, the
-backend and the kernel-cache path.
-.TP
-.BI \-\-conf " x"
-Confidence threshold for detections (default 0.25).
-.TP
-.BI \-\-iou " x"
+.B \-\-iou \fIF\fR
 NMS IoU threshold (default 0.45).
 .TP
-.BI \-\-imgsz " N"
-Letterbox size.
-It must match the model's static input size; the model cannot be resized at
-run time.
+.B \-\-max-det \fIN\fR
+Maximum detections kept (default 300).
 .TP
-.BI \-\-cache " dir"
-Kernel blob cache.
-Default
-.IR $XDG_CACHE_HOME/vc4infer/kcache
-(or
-.IR ~/.cache/vc4infer/kcache ).
-The first run JIT-compiles the kernels for the graph (about a second) and
-stores them there.
+.B \-\-classes \fIPATH\fR
+One class name per line; defaults to COCO-80.
+.TP
+.B \-\-out \fIPATH\fR
+Annotated image path (default
+.IR input_vc4infer.jpg ).
+.TP
+.B \-\-no-save
+Do not write an annotated image.
+.TP
+.B \-\-json
+Print one JSON document instead of a table.
+.TP
+.B \-\-save-json \fIPATH\fR
+Also write the JSON document to this path.
+.SS bench \fIMODEL\fR
+Time a model end to end and report wall time, FPS, launches, QPU duty and the
+partition of time between the QPU, the host and the launch path.
+.TP
+.B \-\-imgsz \fIN\fR
+Input size, validated against the model.
+.TP
+.B \-\-reps \fIN\fR
+Timed runs (default 3).
+.TP
+.B \-\-input \fIPATH\fR
+A real input instead of random data.
+.TP
+.B \-\-json
+Machine-readable output.
+.SS nodes \fIMODEL\fR
+Static report: what each node is, which backend would run it, and what is
+refused, by name.  The authoritative answer comes from
+.BR run ;
+this command is the one to try first on an unfamiliar graph.
+.TP
+.B \-\-verbose
+List every node with its status, backend and reason.
+.TP
+.B \-\-mode {strict,hybrid}
+Which policy the report describes (default hybrid for a report, strict for
+execution).
+.TP
+.B \-\-host-policy {device,structural,any}
+Under hybrid: what the host may do.  \fIdevice\fR forbids runtime host compute,
+\fIstructural\fR allows metadata and control, \fIany\fR also runs unwritten
+numeric operators.
+.SS util \fIMODEL\fR
+Device-invariant utilisation accounting: what share of the frame is QPU
+arithmetic, what moved over the wire, and how many launches each class needs.
+.TP
+.B \-\-imgsz \fIN\fR
+Input size.
+.TP
+.B \-\-reps \fIN\fR
+Timed runs (default 3).
+.TP
+.B \-\-input \fIPATH\fR
+A real input instead of random data.
+.TP
+.B \-\-json
+Machine-readable output.
+.SS selftest
+Run the four reference models shipped in
+.IR /usr/share/vc4infer/models ,
+compare every output against its recorded reference and print the maximum
+absolute and relative difference.  Exit status 1 when any element is over
+tolerance, 8 when the model files are not the packaged ones.
+.TP
+.B \-\-models \fIDIR\fR
+Model directory (default
+.IR /usr/share/vc4infer/models ).
+.SS build \fIMODEL\fR
+Convert a model into a
+.I .vc4x
+engine artifact.  This is the deployable form: the optimiser runs once, the
+weight panels are packed, the kernel blobs are generated and hashed, and the
+allocation and execution plans are frozen.  The result loads in about half a
+second instead of three to four, and refuses by name when it is paired with a
+different engine, board or kernel ABI.
+.TP
+.B \-o, \-\-out \fIPATH\fR
+Output artifact (default
+.IR model.vc4x ).
+.TP
+.B \-\-opt \fISPEC\fR
+Optimiser passes baked in: \fIall\fR (default), \fInone\fR, or a comma-separated
+list such as \fIepilogue,layout\fR.
+.TP
+.B \-\-imgsz \fIN\fR
+Export size for a
+.I .pt
+input (default 640), recorded in the artifact.
+.TP
+.B \-\-opset \fIN\fR
+Export opset for a
+.I .pt
+input (default 17), recorded.
+.TP
+.B \-\-no-embed-graph
+Reference an adjacent
+.I .onnx
+instead of embedding the graph in the artifact.
+.TP
+.B \-\-no-embed-kernels
+Record kernel blob names and hashes only; the loader then needs the cache to
+hold them.
+.TP
+.B \-\-arena-mb \fIN\fR
+Client arena to plan against (default: what the daemon serves).
+.SS verify \fIARTIFACT\fR
+Check every section and every key of a
+.I .vc4x
+against this engine, board and kernel ABI, without running it.
+.SH GLOBAL OPTIONS
+.TP
+.B \-\-backend {managed,direct}
+Execution backend (default managed).  The same choice can be made with
+.BR VC4INFER_BACKEND .
+.TP
+.B \-\-version
+Print the package version, the engine API version and the backend and socket in
+use, then exit.
+.TP
+.B \-h, \-\-help
+Usage, for the command as a whole or after a command name.
 .SH ENVIRONMENT
 .TP
+.B VC4_OPT
+Optimiser passes for the ONNX path, used when
+.B \-\-opt
+is not given: empty or \fInone\fR runs the graph unfolded, \fIall\fR runs every
+pass, or a comma-separated list.  Folded graphs need fewer launches, so an
+unset variable measures the slow path.
+.TP
+.B VC4_CPLAN, VC4_NO_CPLAN
+Enable or disable the frozen execution plan (default enabled).
+.B VC4_NO_CPLAN=1
+is the A/B control.
+.TP
+.B VC4_NO_MEM_PLAN
+Set to 1 to size the pool with the old walk instead of the plan-time
+allocator, for comparison.
+.TP
+.B VC4INFER_BACKEND
+\fImanaged\fR or \fIdirect\fR, same as
+.BR \-\-backend .
+.TP
 .B VC4INFER_DAEMON
-1 (the default set by the CLI) uses vc4d; 0 uses the direct
-.I /dev/mem
-backend and needs root.
+1 selects the daemon backend; 0 is the direct-root path used by the low-level
+test suite.
 .TP
-.B VC4INFER_ARENA_MB
-Arena size to request from vc4d (default 64, daemon-capped).
-.TP
-.B VC4_POOL_RESERVE_MB
-Bytes kept free for per-convolution scratch (default 24; use 40 for 320x320).
+.B VC4INFER_LIB
+Path to
+.IR libvc4infer.so ;
+a checkout's build wins over the installed library.
 .TP
 .B VC4INFER_CACHE
-Kernel blob cache directory.
+Kernel blob cache directory (default
+.IR ~/.cache/vc4infer/kcache ).
 .TP
 .B VC4INFER_KGEN
-Alternative
-.I kgen.py
-kernel generator (default
-.IR /usr/lib/vc4infer/kgen/kgen.py ).
+Path to the kernel generator, for a tree that is not installed.
 .TP
-.B VC4_NO_SILU_FUSE
-1 disables the
-.B Mul(x, Sigmoid(x)) -> Silu
-graph rewrite (A/B measurement only; about 15% slower).
-.SH SUPPORTED NODES
-Conv (1x1/3x3, stride 1/2, group 1 or depthwise), Relu, Sigmoid, Silu, Add,
-Mul, Sub, Div (by a constant), MaxPool, Concat, Split, Slice, Resize (nearest),
-Transpose, Softmax (<= 16 classes), MatMul, Gemm, GlobalAveragePool, Reshape,
-Flatten, Squeeze, Unsqueeze, Cast, Identity, Constant, Shape, Gather.
-Batch 1 and fp32 only.
+.B VC4INFER_ARENA_MB
+Arena to request from the daemon, in MiB.
+.TP
+.B VC4_POOL_RESERVE_MB
+Extra pool slack for graphs whose temporary need the estimate understates.
+.TP
+.B VC4D_SOCKET
+Daemon socket (default
+.IR /run/vc4d.sock ).
+.TP
+.B VC4INFER_MODELS
+Reference model directory for
+.BR selftest .
+.TP
+.B VC4INFER_NO_BATCH
+1 disables batched launch submission, for the A/B comparison.
+.TP
+.B VC4INFER_PROF
+1 enables the launch-path profiler and per-node statistics.
 .SH FILES
 .TP
-.I /usr/lib/aarch64-linux-gnu/libvc4infer.so.1
-The engine.
+.I /run/vc4d.sock
+the default daemon socket
 .TP
-.I /usr/include/vc4infer.h
-The C API.
+.I /usr/share/vc4infer/models
+the reference models and their checksums
 .TP
-.I /usr/lib/python3/dist-packages/vc4infer.py
-The ctypes binding.
-.TP
-.I /usr/lib/vc4infer/kgen/
-The QPU kernel generator used to JIT blobs.
-.TP
-.I /usr/share/vc4infer/models/
-The selftest models and their stored inputs and references.
+.I ~/.cache/vc4infer/kcache
+generated kernel blobs, keyed by name and hashed
 .SH EXAMPLES
+Run a shipped detector on an image:
 .PP
 .nf
-vc4infer nodes yolov8n.onnx
-vc4infer run yolov8n.onnx --input bus.jpg --imgsz 160
-vc4infer run yolov8n.onnx --input bus.jpg --imgsz 160 --json
-vc4infer bench yolov8n.onnx --reps 5
-vc4infer selftest
-.fi
-.SH EXIT STATUS
-0 on success.
-1 when selftest reports a mismatch.
-2 on a usage error.
-3 when the model needs an unsupported node or shape.
-.SH PYTHON API
-The same engine is importable:
-.B import vc4infer
-provides
-.B Engine
-(raw numpy outputs, plan, profile, memory),
-.B Device
-and a thin
-.B yolo.Detector
-on top of
-.B postprocess.decode_yolo
-and
-.BR postprocess.nms .
-The wheel is pure Python and uses the engine library installed by this package:
 .RS
-.nf
-pip install https://rughinnit.github.io/vc4top/pip/vc4infer-1.1.2-py3-none-any.whl
-.fi
+vc4infer run /usr/share/vc4infer/models/yolov8n_160.onnx \\
+    --imgsz 160 --input photo.jpg
 .RE
-See
-.I /usr/share/doc/vc4infer/PYTHON-API.md
-and the examples in
-.IR /usr/share/doc/vc4infer/ .
-.SH SEE ALSO
-.BR vc4top (1)
+.fi
 .PP
-.I /usr/share/doc/vc4infer/README.md
-for measured performance, the supported-node table, the 320x320 arena recipe
-and the known limits.
+Build, verify and use an artifact of your own model:
+.PP
+.nf
+.RS
+VC4_OPT=all vc4infer build model.onnx \-o model.vc4x
+vc4infer verify model.vc4x
+vc4infer run model.vc4x --imgsz 160 --input photo.jpg \\
+    --classes names.txt
+.RE
+.fi
+.PP
+Check the four reference models:
+.PP
+.nf
+.RS
+vc4infer selftest
+.RE
+.fi
+.PP
+Time a shipped detector and see what a graph is made of:
+.PP
+.nf
+.RS
+vc4infer bench /usr/share/vc4infer/models/yolov8n_160.onnx \\
+    --imgsz 160 --reps 5
+vc4infer nodes model.onnx -v
+.RE
+.fi
+.PP
+In a source checkout,
+.I tools/demo.sh
+runs the five steps of the second example above in one command and prints the
+output of each.
+.SH EXIT STATUS
+.TP
+.B 0
+success
+.TP
+.B 1
+a reference model is over tolerance, or a run failed
+.TP
+.B 2
+usage error: bad arguments, a missing file, a model and input that disagree
+.TP
+.B 3
+an operator, shape or attribute is unsupported, or the arena is exhausted
+.TP
+.B 4
+host debt under the device policy
+.TP
+.B 6
+control flow that the host-scheduled executor cannot run
+.TP
+.B 8
+the shipped model files are not the packaged ones
+.SH NOTES
+The QPU is a single resource: run one client at a time.  The daemon serialises
+launches, so a second client does not corrupt the first, but two timed runs at
+once measure each other.
+.PP
+An artifact is tied to the engine that built it: a package upgrade invalidates
+it, and
+.B verify
+says so rather than running it.
+.SH SEE ALSO
+.BR vc4d (8),
+.BR vc4\-query (1),
+.BR vc4\-smi (1),
+.BR vc4top (1).
+.PP
+Documentation under
+.IR /usr/share/doc/vc4infer .

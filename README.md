@@ -102,18 +102,18 @@ TOK=~/scratch/refs/tinystories                     # tokenizer.json, vocab, merg
 python3 infer/tools/onnx/make_tinystories.py \
     --src "$SRC" --ctx 16 --out ~/ts1m_c16.onnx
 python3 infer/tools/onnx/tinystories_decode.py \
-    --model ~/ts1m_c16.onnx --ctx 16 --tokenizer "$TOK" --tokens 8
+    --model ~/ts1m_c16.onnx --ctx 16 --tokenizer "$TOK" --tokens 8 --no-ort
 ```
 
 Both scripts live in the checkout and are not part of the package, so the
 command has to run from the repository root.  `SRC` and `TOK` are where the
 fetch in [`docs/TINY-LLM.md`](docs/TINY-LLM.md) puts the two inputs; point them
 at your own copy of the export and its tokenizer directory if it lives
-elsewhere.  The wrapper needs `onnx` and `numpy`; the decode tool also compares
-against ONNX Runtime CPU unless `--no-ort` is given.
-[`docs/TINY-LLM.md`](docs/TINY-LLM.md) records the fetch commands, the rewrite,
-the licence (neither the base model nor the export declares one) and the cost
-table.  No larger
+elsewhere.  The wrapper needs `onnx` and `numpy`; `--no-ort` skips the ONNX
+Runtime comparison, because Debian's `python3-onnxruntime` build dies with an
+illegal instruction on this SoC.  The pip wheel in a venv works and gives the
+parity figure ([`docs/TINY-LLM.md`](docs/TINY-LLM.md), which also has the fetch
+commands, the licence and the cost table).  No larger
 language model fits: a real llama.cpp graph needs more than the 64 MiB client
 arena -- [`docs/GGML.md`](docs/GGML.md).
 

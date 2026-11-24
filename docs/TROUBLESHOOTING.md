@@ -811,3 +811,21 @@ never open `/dev/mem`; if it does, you are on the wrong backend
 (`VC4INFER_DAEMON=0` is the direct-root path used only by the low-level test
 suite).
 
+## 16. `import onnxruntime`: Illegal instruction
+
+Symptom: `python3 -c "import onnxruntime"` exits 132 with
+`Illegal instruction`, and any process that imports it is killed the same way.
+
+Cause: Debian's `python3-onnxruntime` 1.21.0 is built for a newer ARM baseline
+than the Cortex-A53 in the Pi 3B, so the first unsupported instruction traps.
+
+Fix: use the pip wheel, which is built for the baseline:
+
+```sh
+python3 -m venv ~/ortvenv && ~/ortvenv/bin/pip install onnxruntime
+~/ortvenv/bin/python -c "import onnxruntime; print(onnxruntime.__version__)"
+```
+
+The tools that need ONNX Runtime as a reference (`tinystories_decode.py`, the
+accuracy sweeps) run under that interpreter.  The engine, the daemon and the
+CLI do not need it at all.

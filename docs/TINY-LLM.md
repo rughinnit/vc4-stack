@@ -346,7 +346,20 @@ infer/build/test_matmul 5            # 4x16384, 4x16385, 8/16x16448 included
 python3 infer/tests/test_pool_alias.py
 ```
 
-The decode tool needs `onnxruntime` for the reference (`--no-ort` skips it);
-the wrapper needs only `onnx` and `numpy`. Run one client at a time through
+The decode tool needs `onnxruntime` for the reference (`--no-ort` skips it).
+Do not take it from Debian: `python3-onnxruntime` 1.21.0 dies with an illegal
+instruction on the Cortex-A53, which is an ARMv8.0 core and that build is not.
+The pip wheel works:
+
+```sh
+python3 -m venv ~/ortvenv && ~/ortvenv/bin/pip install onnxruntime
+~/ortvenv/bin/python infer/tools/onnx/tinystories_decode.py \
+    --model ~/scratch/refs/tinystories/wrap/ts1m_c16.onnx --ctx 16 \
+    --tokenizer ~/scratch/refs/tinystories --tokens 8
+```
+
+With 1.32.0 the run reports 1021.7 ms per token on the QPUs against 17.5 ms on
+the CPU, and all eight greedy steps equal.  The wrapper needs only `onnx` and
+`numpy`. Run one client at a time through
 `vc4d` and keep the ARM at 1.0 GHz: this graph is 1.4-3.5 s per token at 96 MiB
 and the thermal guard at 75 C was never approached (peak 53 C).

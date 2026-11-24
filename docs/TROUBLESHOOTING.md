@@ -406,6 +406,25 @@ overhead).  If the allocation fails, go to section 7; a 150 MiB contiguous CMA
 block is not always available.  Restore the unit's 72 MiB default when you are
 done (`sudo systemctl restart vc4d`).
 
+## 6a. `vc4d` serves 48 MiB right after an upgrade
+
+Symptom: after installing a new `vc4d` and starting it, `vc4-query` reports
+`arena 50331648 bytes (48.0 MiB)` and a YOLOv8n run then fails on the arena,
+although `/etc/default/vc4d` asks for 96 MiB. The journal has a line like:
+
+```
+vc4d: arena restore: 2 attempt(s) already failed; next try in 118 s
+      (a fragmented CMA can refuse the full block even when enough is free in pieces)
+```
+
+Cause: the new daemon started while the previous one's CMA block was still
+being released, so the 96 MiB allocation failed and it fell back to the 48 MiB
+it could get.
+
+Fix: `sudo systemctl restart vc4d`, then confirm `vc4-query` reports 96.0 MiB.
+The request in `/etc/default/vc4d` was already correct. If a restart still
+yields 48 MiB, something else holds CMA: section 7.
+
 ## 7. CMA exhaustion (VC4CL + the engine, or a too-large arena)
 
 **Symptom.** `vc4d` starts and immediately falls back or restarts; the kernel

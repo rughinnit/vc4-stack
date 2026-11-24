@@ -190,6 +190,7 @@ raw logs in [`docs/results/`](docs/results) and [`docs/logs/`](docs/logs).
 | [`docs/API.md`](docs/API.md) | `vc4infer` and `torch_vc4` reference: `Engine`/`Device`/`Detector`, error types, `host_policy`, op table |
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | every failure mode we hit, with symptom, cause and fix |
 | [`docs/ECOSYSTEM.md`](docs/ECOSYSTEM.md) | the repository family, what lives where, the old-path map, the two execution paths |
+| [`docs/UPSTREAM.md`](docs/UPSTREAM.md) | **upstream and our work**: the two-remote layout for the three forks, the read-only `upstream-master` mirror, the merge rules, and how far each fork is from the project it forks |
 | [`docs/OPTIMIZER.md`](docs/OPTIMIZER.md) | the inference optimiser: pass pipeline, correctness gates, per-shape autotuning, plan accounting |
 | [`docs/VC4-MODEL.md`](docs/VC4-MODEL.md) | a detector built to the measured launch and FLOP budget, and the 30/60 FPS gaps |
 | [`docs/KERNELS.md`](docs/KERNELS.md) | the QPU kernels, the store defects behind them, how each is verified |
@@ -212,6 +213,10 @@ are components or the package channel — [`docs/ECOSYSTEM.md`](docs/ECOSYSTEM.m
   fusion, layout propagation or allocation — [`docs/STATUS.md`](docs/STATUS.md).
 - Every reported number carries its conditions, a run log and a mismatch count —
   [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), [`docs/results/`](docs/results).
+- Three components are forks, not our code: `VC4CL`, `VC4C` and `VC4CLStdLib`
+  come from `doe300`, and each keeps its upstream commits and authors.
+  `tools/upstream-status.sh` reports how far each is from the project it forks
+  and exits non-zero when one is behind — [`docs/UPSTREAM.md`](docs/UPSTREAM.md).
 
 ## Licence
 

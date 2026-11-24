@@ -330,7 +330,7 @@ int main(int argc, char **argv)
 		return bad ? 1 : 0;
 	}
 
-	printf("vc4-smi 1.0.0  --  VideoCore IV (V3D)  %s\n", when);
+	printf("vc4-smi " VC4_SMI_VERSION "  --  VideoCore IV (V3D)  %s\n", when);
 	printf("GPU  %d QPUs / %d slices   backend %s\n",
 	       total_qpu, nsl, access(SOCK_PATH, F_OK) == 0 ? "vc4d" : "none");
 	printf("\n");

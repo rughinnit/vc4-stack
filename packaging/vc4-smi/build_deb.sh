@@ -16,7 +16,8 @@ stage=$root/build/vc4-smi-deb
 build=$root/build/vc4-smi
 
 mkdir -p "$build"
-gcc -O2 -g -Wall -Wextra -std=gnu11 -o "$build/vc4-smi" "$here/vc4-smi.c"
+gcc -O2 -g -Wall -Wextra -std=gnu11 -DVC4_SMI_VERSION=\"$ver\" \
+	-o "$build/vc4-smi" "$here/vc4-smi.c"
 
 rm -rf "$stage"
 install -d "$stage/usr/bin" "$stage/usr/share/man/man1" "$stage/usr/share/doc/vc4-smi"

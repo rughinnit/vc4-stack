@@ -75,6 +75,16 @@ vc4infer verify model.vc4x
 vc4infer run model.vc4x --imgsz 160 --input photo.jpg
 ```
 
+To watch all five steps with their output in one go, from a checkout:
+
+```sh
+tools/demo.sh model.onnx photo.jpg 160 names.txt
+```
+
+It prints the node report, the build (optimiser, prepacked weights, kernel
+blobs, plans), the verification, the detections with an annotated image, and a
+five-run benchmark.
+
 `build` is the path to deploy: it runs the optimiser, packs the weights and
 freezes the allocation and execution plans once (14.9 s for YOLOv8n), then
 loads in 0.5 s instead of 3-4 s and runs a frame in **427.3 ms / 2.34 FPS**

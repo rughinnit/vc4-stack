@@ -87,6 +87,11 @@ At 96x96 a frame costs `2.5 + 3.13 * convs` ms, so a 30 FPS detector is about
 nine convolutions and 0.05 GFLOP -- [`docs/ACCURACY-FPS.md`](docs/ACCURACY-FPS.md)
 has the budget and the training recipe.
 
+A worked example with a model trained elsewhere: [`docs/CASE-BCCD.md`](docs/CASE-BCCD.md)
+takes a YOLO11n blood-cell detector from a workstation through export, artifact
+and measurement - 1.93 FPS at 160 with detections identical to ultralytics, and
+the reproduction commands.
+
 ### 3. A language model
 
 TinyStories-1M (3.7 M parameters) runs end to end: 378 static nodes, none

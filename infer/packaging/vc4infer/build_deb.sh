@@ -62,13 +62,31 @@ install -m 0755 "$root/cli/vc4infer" "$stage/usr/bin/vc4infer"
 
 # ---- the Python package (same code as the wheel) ----------------------------
 install -m 0644 "$root/python/vc4infer"/*.py "$pkg/vc4infer/"
-install -m 0644 "$root/python/vc4infer/kgen"/*.py "$pkg/vc4infer/kgen/"
-install -m 0644 "$root/python/vc4infer/contrib"/*.py "$pkg/vc4infer/contrib/"
-install -m 0644 "$root/python/vc4infer/ort"/*.py "$pkg/vc4infer/ort/"
+# Every subpackage in the tree, not a hand list: the list that named kgen,
+# contrib and ort shipped 1.2.11 without vc4infer/optimizer, and every
+# $VC4_OPT run then died on the import while the build itself passed.
+for d in "$root"/python/vc4infer/*/; do
+	name=$(basename "$d")
+	[ -n "$(ls "$d"*.py 2>/dev/null)" ] || continue
+	install -d "$pkg/vc4infer/$name"
+	install -m 0644 "$d"*.py "$pkg/vc4infer/$name/"
+done
 
 # ---- engine library + header ------------------------------------------------
 install -m 0755 "$so" "$stage/usr/lib/$triplet/libvc4infer.so.1"
 # the header, the .so symlink and the build files live in vc4infer-dev
+
+# ---- every subpackage reached the stage -------------------------------------
+missing=
+for d in "$root"/python/vc4infer/*/; do
+	name=$(basename "$d")
+	[ -n "$(ls "$d"*.py 2>/dev/null)" ] || continue
+	[ -d "$pkg/vc4infer/$name" ] || missing="$missing $name"
+done
+[ -z "$missing" ] || {
+	echo "refusing to build: subpackages missing from the stage:$missing" >&2
+	exit 1
+}
 
 # ---- kernel generator for C clients (the Python package has its own copy) ---
 for f in kgen.py kops.py qenc.py gen.py vpmwords.py; do

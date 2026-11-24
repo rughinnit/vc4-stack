@@ -328,10 +328,18 @@ for f in config.json tokenizer.json tokenizer_config.json vocab.json merges.txt;
 resolve/b873615e9ceb8f2cdb6c14a90641c99052fa4a7f/$f
 done
 
-python infer/tools/onnx/make_tinystories.py --src onnx/model.onnx \
-  --ctx 16 --out wrap/ts1m_c16.onnx --report wrap/ts1m_c16.json
-python infer/tools/onnx/tinystories_decode.py --model wrap/ts1m_c16.onnx \
-  --ctx 16 --tokenizer . --tokens 8 --json dec16.json
+# from the checkout: the fetch above leaves the reader in the download
+# directory, and both scripts are relative to the repository root
+mkdir -p ~/scratch/refs/tinystories/wrap
+python infer/tools/onnx/make_tinystories.py \
+  --src ~/scratch/refs/tinystories/onnx/model.onnx \
+  --ctx 16 --out ~/scratch/refs/tinystories/wrap/ts1m_c16.onnx \
+  --report ~/scratch/refs/tinystories/wrap/ts1m_c16.json
+python infer/tools/onnx/tinystories_decode.py \
+  --model ~/scratch/refs/tinystories/wrap/ts1m_c16.onnx --ctx 16 \
+  --tokenizer ~/scratch/refs/tinystories --tokens 8 --json dec16.json
+# add --no-ort when onnxruntime is not installed, as on this board's system
+# python; the tokens and the timings are still measured, the parity is not
 
 # the two reproductions, as tests
 infer/build/test_matmul 5            # 4x16384, 4x16385, 8/16x16448 included

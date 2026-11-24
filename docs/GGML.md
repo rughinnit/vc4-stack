@@ -163,7 +163,7 @@ maps it once), so a second `init_backend` is refused with a clear message.
 
 ```
 vc4d arena 96 MiB ── client takes 64 MiB (VC4INFER_ARENA_MB, default 64)
-  │  0x000000 .. 0x300000   engine code/uniform slots (VC4_DATA_BASE)
+  │  0x000000 .. 0x600000   engine code/uniform slots (VC4_DATA_BASE)
   ├─ tensor pool      min(48 MiB, 60% of arena) = 38 MiB
   │    └─ op scratch   min(8 MiB, pool/4) = 8 MiB   → 30 MiB for ggml buffers
   └─ engine op scratch (GEMM panels, im2col, padding) grows above the pool:

@@ -38,9 +38,35 @@
  *
  * Version 2 is also where the G3/G4 additions live: they are opt-in, so a
  * client that sends neither a program name nor a uniform address mask sees
- * exactly the old behaviour. */
-#define VC4D_VERSION    4u
-#define VC4D_VERSION_MIN 2u           /* oldest HELLO version still served  */
+ * exactly the old behaviour.
+ *
+ * Version 5 changes the arena map and nothing else.  Protocol 2..4 is the
+ * 128-slot map ("slots128": code at 0x1000 + slot*16 KiB, uniforms at
+ * 0x210000 + slot*4 KiB, batch shadows at 0x290000, data heap at 0x300000);
+ * version 5 is "slots256" (256 code slots to 0x401000, uniforms at 0x410000,
+ * batch shadows at 0x510000, data heap at 0x600000).  A detector with 133
+ * distinct kernels evicts on every frame against a 128-entry table, so the
+ * table is not a capacity knob: the two sides must agree on the map before a
+ * single byte is laid out in the arena.
+ *
+ * The HELLO reply names the layout it serves (VC4D_LAYOUT_NAME).  A version-5
+ * client compares that name before it allocates, and a daemon older than
+ * version 5 is reached through the existing ladder, where the version number
+ * is the name of the map: protocol 4 means slots128.  The daemon's floor is
+ * VC4D_SERVE_MIN (5), so a version-4 client cannot talk a new daemon into
+ * serving requests against a 128-slot assumption; it gets E_VERSION and a
+ * denial naming both maps.  The wire messages did not change size or
+ * meaning, which is why the ladder still terminates on old daemons. */
+#define VC4D_VERSION    5u
+#define VC4D_VERSION_MIN 2u           /* oldest protocol the client can speak */
+#define VC4D_SERVE_MIN  5u            /* oldest HELLO this daemon serves      */
+
+/* The arena map a protocol version implies, by name.  The strings are what a
+ * refusal prints, so an operator can tell which side is stale without reading
+ * the offsets out of a header. */
+#define VC4D_LAYOUT_NAME    "slots256"
+#define VC4D_LAYOUT_P4_NAME "slots128"
+
 /* How many SUBMIT requests one connection may have outstanding.  Two is what
  * the engine's depth-2 pipeline needs: the request being executed and the one
  * being prepared.  The limit exists so a client cannot fill the daemon's
@@ -143,7 +169,10 @@ struct vc4d_hello_rsp {
     uint32_t max_msg, max_qpu, max_uni, max_prog;
     uint32_t flags;
     uint32_t ident0, ident1;      /* read-only V3D identification */
-    uint32_t reserved[4];
+    /* NUL-padded VC4D_LAYOUT_NAME; empty from a daemon older than 5.  It
+     * occupies what used to be reserved[0..2], so the reply keeps its size. */
+    char     layout[12];
+    uint32_t reserved[1];
 };
 
 struct vc4d_alloc_req  { uint32_t bytes; uint32_t flags; };
@@ -344,6 +373,7 @@ struct vc4d_stats_rsp {
     uint32_t arena_degraded;/* 1: CMA refused arena_want, using less      */
 };
 
+_Static_assert(sizeof(struct vc4d_hello_rsp) == 60, "hello_rsp");
 _Static_assert(sizeof(struct vc4d_hdr) == 28, "hdr");
 _Static_assert(sizeof(struct vc4d_uni) == 16, "uni");
 _Static_assert(sizeof(struct vc4d_launch_req) == 32, "launch_req");

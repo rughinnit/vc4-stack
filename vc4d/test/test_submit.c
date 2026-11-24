@@ -1,5 +1,5 @@
 /*
- * test_submit.c - protocol 4: SUBMIT without waiting, poll later.
+ * test_submit.c - protocol 4+: SUBMIT without waiting, poll later.
  *
  * No GPU and no daemon install: the test starts test/fake_daemon.py, which
  * speaks the wire protocol, hands out a memfd arena and delays each request so
@@ -87,7 +87,8 @@ int main(int argc, char **argv)
     CHECK(rc == 0 && (info.flags & VC4D_F_ASYNC_SUBMIT),
           "HELLO advertises VC4D_F_ASYNC_SUBMIT (v%u flags=0x%x)",
           info.version, info.flags);
-    CHECK(info.version == 4, "negotiated protocol 4 (got %u)", info.version);
+    CHECK(info.version == VC4D_VERSION,
+          "negotiated protocol %u (got %u)", VC4D_VERSION, info.version);
 
     vc4c_buf region;
     rc = vc4c_alloc(c, 1 << 20, 0, &region);

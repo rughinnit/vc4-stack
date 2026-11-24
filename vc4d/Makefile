@@ -19,8 +19,9 @@ ARENASZ = $(B)/arena_size
 BATCH   = $(B)/test_batch
 SUBMIT  = $(B)/test_submit
 PREFETCH = $(B)/test_prefetch
+HVER    = $(B)/test_hello_version
 
-all: $(DAEMON) $(LIB) $(SOLIB) $(DEMO) $(HOSTILE) $(LRU) $(UNIMASK) $(CMAHOLD) $(ARENASZ) $(BATCH) $(SUBMIT) $(PREFETCH)
+all: $(DAEMON) $(LIB) $(SOLIB) $(DEMO) $(HOSTILE) $(LRU) $(UNIMASK) $(CMAHOLD) $(ARENASZ) $(BATCH) $(SUBMIT) $(PREFETCH) $(HVER)
 
 $(B):
 	mkdir -p $(B)
@@ -62,6 +63,9 @@ $(PREFETCH): test/test_prefetch.c $(LIB) include/vc4client.h | $(B)
 
 $(SUBMIT): test/test_submit.c $(LIB) test/fake_daemon.py | $(B)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB) -o $@
+
+$(HVER): test/test_hello_version.c proto/vc4d_proto.h | $(B)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 $(CMAHOLD): test/cmahold.c | $(B)
 	$(CC) $(CFLAGS) $< -o $@

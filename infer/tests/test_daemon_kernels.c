@@ -1,17 +1,17 @@
 /*
  * test_daemon_kernels.c - G3 from the engine's side: a session may touch more
- * than VC4_MAX_KERNELS (128) distinct kernels.
+ * than the live kernel cache holds.
  *
- * Before 1.2.7 the cache was a fixed 128-entry array with no eviction, and the
- * daemon's program table had 127 usable slots, so the 129th kernel failed with
- * "kernel cache full (128 entries)" (or E_NOMEM from UPLOAD) and every shape
- * that was not already loaded failed afterwards.  A full YOLOv8 "util" run and
- * a long training session both reach that.
+ * Before 1.2.7 the cache was a fixed array with no eviction and the daemon's
+ * program table had 127 usable slots, so the 129th kernel failed with
+ * "kernel cache full" (or E_NOMEM from UPLOAD) and every shape that was not
+ * already loaded failed afterwards.  Protocol 5 holds 256 (the daemon reserves
+ * one for its probe), and a real detector reaches 133, so the transport no
+ * longer churns for it.
  *
- * Now both caches evict LRU-wise and the remote backend keeps each kernel's
- * code so a launch whose daemon slot was evicted is re-uploaded transparently.
- * This test loads NPROG=200 distinct kernels (the default is 128), launches
- * every one, then runs the first one again.
+ * The eviction path still has to work for a session that exceeds the table.
+ * This test loads NPROG=300 distinct kernels, launches every one, then runs
+ * the first one again.
  *
  * usage: test_daemon_kernels [N]        (needs VC4INFER_DAEMON=1)
  */
@@ -22,7 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define NPROG 200
+#define NPROG 300
 
 static int fails;
 #define CHECK(cond, ...) do {                                          \

@@ -21,7 +21,7 @@ the properties the pipelined path has to keep:
 usage: fake_daemon.py SOCKET [--log FILE] [--delay-ms N] [--arena-mb N]
 
 Environment (kept because the earlier CPU work used them):
-  FAKE_VERSION       protocol version to serve (default 4)
+  FAKE_VERSION       protocol version to serve (default 5)
   FAKE_HELLO_MAX     highest HELLO version accepted (default = FAKE_VERSION)
   FAKE_NO_BATCH      do not advertise LAUNCH_BATCH
   FAKE_NO_SUBMIT     do not advertise SUBMIT / protocol 4
@@ -38,7 +38,7 @@ import sys
 import time
 
 MAGIC = 0x44344356
-VERSION = int(os.environ.get("FAKE_VERSION", "4"))
+VERSION = int(os.environ.get("FAKE_VERSION", "5"))
 HELLO_MAX = int(os.environ.get("FAKE_HELLO_MAX", str(VERSION)))
 ADVERTISE_BATCH = VERSION >= 3 and not os.environ.get("FAKE_NO_BATCH")
 ADVERTISE_SUBMIT = (VERSION >= 4 and not os.environ.get("FAKE_NO_SUBMIT")
@@ -70,8 +70,13 @@ E_OK, E_PROTO, E_VERSION, E_TOOLARGE, E_INVAL = 0, 1, 2, 3, 4
 E_NOMEM, E_NOENT, E_BUSY, E_TIMEOUT, E_GPU = 5, 6, 7, 8, 9
 E_NOTRUN = 13
 
-DATA_BASE = 0x300000
+# The map is the protocol version: 5 is slots256 (heap at 6 MiB), 2..4 is
+# slots128 (heap at 3 MiB).  The client picks the same values from the version
+# it negotiated, so a FAKE_VERSION=4 run still models an old daemon exactly.
+DATA_BASE = 0x600000 if VERSION >= 5 else 0x300000
 ARENA = 128 << 20
+LAYOUT = ("slots256" if VERSION >= 5 else "slots128").encode()
+LAYOUT_WORDS = struct.unpack("<III", LAYOUT.ljust(12, b"\0")[:12])
 BUS0 = 0xE0000000
 
 # Address words are checked and probed as "bus + arena offset".  The probe
@@ -316,7 +321,8 @@ def main():
                         flags |= (1 << 6)
                     out = HELLO_RSP.pack(VERSION, ARENA, DATA_BASE, 4096,
                                         65536, 12, 16, 16384, flags,
-                                       0x02443356, 0xC1102431, 0, 0, 0, 0)
+                                       0x02443356, 0xC1102431,
+                                       *LAYOUT_WORDS, 0)
                 emit({"op": "hello", "version": reqver if pl else 0,
                       "status": st})
             elif op == OP_ALLOC:

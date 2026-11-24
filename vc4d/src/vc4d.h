@@ -20,22 +20,33 @@
 #define ARENA_DEFAULT   (64u << 20)
 #define ARENA_MIN       (8u << 20)
 
-/* arena layout (offsets inside the dma-buf) */
+/* arena layout (offsets inside the dma-buf), protocol 5 "slots256".
+ *
+ * A code slot is 16 KiB because kgen refuses a blob larger than 16384 B, so
+ * 256 slots are 4 MiB.  A real detector needs 133 distinct kernels (bccd
+ * YOLO11n-160); the old 128-entry table evicted five of them per frame, which
+ * cost 1.2 s of the 1.65 s frame.  256 leaves room for a second input size in
+ * the same session and still costs only 3 MiB of the 96 MiB arena (the data
+ * heap moves from 3 MiB to 6 MiB).
+ *
+ * Intervals: code 0x001000..0x401000, uniforms 0x410000..0x510000, the
+ * client's batch uniform shadows 0x510000..0x528000 (not daemon state, but
+ * reserved so both sides place them identically), data 0x600000..bytes. */
 #define A_HDR_BASE      0x000000u
 #define A_CODE_BASE     0x001000u
-#define A_CODE_SLOTS    128u
+#define A_CODE_SLOTS    256u
 #define A_CODE_SLOT     0x4000u          /* 16 KiB per program */
-#define A_UNI_BASE      0x210000u
+#define A_UNI_BASE      0x410000u
 #define A_UNI_SLOT      0x1000u          /* 12 QPUs x 64 B */
-#define A_DATA_BASE     0x300000u        /* client-allocatable heap */
+#define A_DATA_BASE     0x600000u        /* client-allocatable heap */
 
 #define MAX_CLIENTS     8
 #define MAX_REGIONS     64
 /* One client may cache up to all the daemon's program slots: the engine
- * uploads one program per kernel shape, and a test that runs several conv
- * shapes legitimately needs ~25.  The table is global (MAX_PROGS_SLOTS) and
- * evicted LRU-wise, so this is no longer a hard per-client cap (G3). */
-#define MAX_PROGS_CLI   128
+ * uploads one program per kernel shape, and a detector reaches 133.  The
+ * table is global (MAX_PROGS_SLOTS) and evicted LRU-wise, so this is no
+ * longer a hard per-client cap (G3). */
+#define MAX_PROGS_CLI   256
 /* The last code/uniform slot is the daemon's own: it holds the known-good
  * probe launch that verifies a GPU context reset (see gpu_recover()). */
 #define PROBE_SLOT      (MAX_PROGS_SLOTS - 1)

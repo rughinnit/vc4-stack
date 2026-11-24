@@ -1,7 +1,9 @@
 # vc4d — privileged helper for unprivileged VC4 compute
 
-Source tree: `/home/raspi/work/vc4d`. Installed as `vc4d.service` (active,
-protocol version 3; version-2 clients are still served).
+Source tree: `/home/raspi/work/vc4-stack/vc4d`. Installed as `vc4d.service`
+(active, protocol version 5; a client that descends the HELLO ladder still
+reaches a protocol-2..4 daemon, and a version-4 client is refused by this
+one).
 
 Goal: move `/dev/mem` and V3D dispatch out of client processes, so engines and
 tools run unprivileged without raw memory access.
@@ -20,8 +22,10 @@ LAUNCH, LAUNCH_BATCH, WAIT, READ_REGS, WRITEREG, SYNC, STATS, PING, CLOSE.
   the table is full the least recently used slot that is not executing is
   freed (the daemon's probe slot and the in-flight program are never
   evicted).  A client that sends no name is keyed by the code sha256, which
-  gives it the same behaviour for a repeated upload.  Slots are 128, 127
-  usable; `STATS.evictions` counts the frees.
+  gives it the same behaviour for a repeated upload.  Slots are 256, 255
+  usable; `STATS.evictions` counts the frees.  Protocol 5 raised the table
+  from 128 because a real detector needs 133 distinct kernels: the extra
+  five were evicted and re-uploaded on every frame.
 - **UNI_PTR** uniforms are resolved to `arena_bus + base + off` only after
   alignment, length and 64-bit bounds checks.  **UNI_LIT** is refused if it
   lands in the GPU bus, V3D MMIO or the arena's physical range.  UPLOAD
@@ -146,12 +150,14 @@ launch is better.
 - The unit needs `ReadWritePaths=/tmp` (with `ProtectSystem=strict`) or the
   daemon cannot create `/tmp/vc4-gpu.lock` at boot.
 - Per-client program slots must cover a whole process's kernel set (one per
-  shape): 128, not 64 - and the last one is reserved for the daemon's recovery
-  probe, so clients get 127.  Since 1.2.7 that is a cache, not a limit: slots
-  are evicted LRU-wise (keyed by the kernel name the client sends with
-  UPLOAD) and the engine re-uploads a kernel whose slot was evicted, so a
-  session can touch 250 distinct kernels (measured: 250/250 uploads and
-  launches, 374 evictions) where 127 was previously fatal.
+  shape): 256 with protocol 5 - and the last one is reserved for the daemon's
+  recovery probe, so clients get 255.  The measured bccd YOLO11n-160 detector
+  needs 133, which the 128-slot table could only serve by evicting five per
+  frame; 256 keeps them resident and costs 3 MiB of the 96 MiB arena.  The
+  table is still an LRU, not a limit: slots are evicted least-recently-used
+  (keyed by the kernel name the client sends with UPLOAD) and the engine
+  re-uploads a kernel whose slot was evicted, so a session can touch more
+  than 255 distinct kernels.
 - A launch timeout is no longer terminal (G1): the daemon resets the V3D
   context under the GPU lock, verifies it with the probe program and resumes;
   if the reset cannot be verified it exits 75 for `Restart=always`.  A departed

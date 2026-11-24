@@ -5,25 +5,57 @@
 #include "vc4infer.h"
 #include <sys/types.h>
 
-#define VC4_MAX_KERNELS   128
+#define VC4_MAX_KERNELS   256
 /* Names of every blob this context has loaded, in load order.  The kernel
- * table above is an LRU of 128 live slots (the code area holds no more); an
- * engine artifact needs the full set, which is larger for a detector. */
+ * table above is an LRU of the live slots the negotiated arena layout offers;
+ * an engine artifact needs the full set, which is larger for a detector. */
 #define VC4_MAX_SEEN      512
 #define VC4_MAX_QPU       12
 #define VC4_TUNE_MEMO     32
 
-/* arena layout (one dma-buf):
+/* arena layout of one dma-buf, protocol 5 ("slots256"):
  *   0x000000  arena signature (unique per process, used for the phys scan)
- *   0x001000  kernel code slots   32 x 16 KiB
- *   0x090000  per-kernel uniform areas, 32 x 4 KiB (12 QPUs x 64 B each)
- *   0x100000  data heap (persistent buffers + per-op scratch)
- */
+ *   0x001000  kernel code slots     256 x 16 KiB         -> 0x401000
+ *   0x410000  per-kernel uniforms   256 x 4 KiB (12 QPUs x 64 B each)
+ *   0x510000  batched-launch uniform shadows, 2 x 64 x 768 B
+ *   0x600000  data heap (persistent buffers + per-op scratch)
+ *
+ * These are offsets inside the client's region, which starts at the daemon's
+ * data base.  A 16 KiB code slot is the kgen ceiling, so 256 slots are 4 MiB;
+ * a detector with 133 distinct kernels needs the table and the client cache
+ * to hold them without evicting on every frame, and 256 leaves room for a
+ * second input size in the same session.
+ *
+ * Protocol 2..4 defines the same map with 128 slots: uniform areas at
+ * 0x210000, shadows at 0x290000 and the data heap at 0x300000.  A version-5
+ * client that has to descend to an older daemon uses those values; the
+ * negotiated protocol version selects one set at connect time and the rest of
+ * the engine reads ctx->uni_base / ctx->data_base / ctx->max_kernels. */
 #define VC4_CODE_BASE     0x001000u
 #define VC4_CODE_SLOT     0x4000u
-#define VC4_UNI_BASE      0x210000u
+#define VC4_UNI_BASE      0x410000u
 #define VC4_UNI_SLOT      0x1000u
-#define VC4_DATA_BASE     0x300000u
+#define VC4_DATA_BASE     0x600000u
+
+/* The 128-slot layout of protocol 2..4.  Kept because the HELLO ladder still
+ * serves those daemons (they have no way to describe a layout of their own,
+ * so the version is the name of the map). */
+#define VC4_P4_MAX_KERNELS 128
+#define VC4_P4_UNI_BASE   0x210000u
+#define VC4_P4_DATA_BASE  0x300000u
+
+/* The zones are one map: a change to a count without the bases (or the other
+ * way round) is exactly the layout defect this header is here to prevent. */
+_Static_assert(VC4_CODE_BASE + VC4_MAX_KERNELS * VC4_CODE_SLOT <= VC4_UNI_BASE,
+               "code slots must end below the uniform areas");
+_Static_assert(VC4_UNI_BASE + VC4_MAX_KERNELS * VC4_UNI_SLOT <= VC4_DATA_BASE,
+               "uniform areas must end below the data heap");
+_Static_assert(VC4_CODE_BASE + VC4_P4_MAX_KERNELS * VC4_CODE_SLOT <=
+               VC4_P4_UNI_BASE,
+               "protocol-4 code slots must end below its uniform areas");
+_Static_assert(VC4_P4_UNI_BASE + VC4_P4_MAX_KERNELS * VC4_UNI_SLOT <=
+               VC4_P4_DATA_BASE,
+               "protocol-4 uniform areas must end below its data heap");
 
 #define VC4_UNI_WORDS     16
 
@@ -62,6 +94,12 @@ struct vc4_ctx {
     uint32_t gpu_phys;
     uint32_t gpu_bus;
     size_t   arena_bytes;
+    /* The negotiated arena map.  Protocol 5 (and the direct path) use the
+     * constants above; a version-5 client talking to a protocol-2..4 daemon
+     * switches to the VC4_P4_* values at connect. */
+    uint32_t uni_base;       /* per-kernel uniform areas               */
+    uint32_t data_base;      /* first byte of the data heap            */
+    int      max_kernels;    /* live kernel-cache entries for the map  */
     size_t   arena_top;      /* persistent bump cursor                 */
     size_t   scratch;        /* scratch bump cursor, reset per op      */
     /* Remote depth-2 pipeline: the two scratch windows are carved from the
@@ -163,7 +201,7 @@ vc4_status vc4__kernel_load_file(vc4_ctx *ctx, const char *name,
                                  const uint8_t *words, size_t bytes,
                                  int nqpu, vc4_kernel **out);
 /* The cache entry a newly uploaded kernel goes in: a free one, or - when all
- * VC4_MAX_KERNELS are live - the least recently used one, whose code/uniform
+ * ctx->max_kernels are live - the least recently used one, whose code/uniform
  * area is then reused.  Shared with the remote backend so both paths have the
  * same behaviour when a session touches more kernels than the cache holds. */
 vc4_kernel *vc4__kern_slot(vc4_ctx *ctx);

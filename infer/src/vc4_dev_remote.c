@@ -269,12 +269,16 @@ void vc4_prof_report(void)
 enum { MK_OP = 0, MK_UNI, MK_SCRATCH };
 /* Shadow uniform slots for batched launches.
  *
- * The arena has 128 kernel slots: code at 0x1000 + slot*16 KiB, uniforms at
- * 0x210000 + slot*4 KiB, so the uniform areas end at 0x290000 and the data
- * heap starts at 0x300000.  The 448 KiB between them is unused in both
- * backends; the 96 KiB this needs sits at its start.  (The first attempt put
- * this at 0x230000, which is kernel slot 32's uniform block - it corrupted
- * uniforms of larger graphs and hung the QPU.)
+ * Protocol 5 has 256 kernel slots: code at 0x1000 + slot*16 KiB to 0x401000,
+ * uniforms at 0x410000 + slot*4 KiB to 0x510000, and the data heap at
+ * 0x600000.  The 96 KiB this needs sits at 0x510000, the start of the
+ * reserved gap.  (The first attempt at the 128-slot map put it at 0x230000,
+ * which is kernel slot 32's uniform block - it corrupted uniforms of larger
+ * graphs and hung the QPU.)
+ *
+ * Protocol 2..4 has the same structure with 128 slots: uniforms to 0x290000
+ * and the heap at 0x300000, so the shadows move to 0x290000.  The value is
+ * chosen once at connect (r->batch_uni_base) from the negotiated protocol.
  *
  * One 12-QPU block per queued launch means a launch's uniforms can never be
  * overwritten by the next launch while it waits in the queue.  With protocol
@@ -282,13 +286,18 @@ enum { MK_OP = 0, MK_UNI, MK_SCRATCH };
  * blocks: set 0 at slot 0, set 1 at slot VC4D_BATCH_MAX.  A request writes its
  * uniforms while the other set is being executed, which is why the sets cannot
  * share slots. */
-#define REMOTE_BATCH_UNI_BASE   0x290000u
-#define REMOTE_BATCH_UNI_STRIDE 768u
-#define REMOTE_BATCH_SETS       2
+#define REMOTE_BATCH_UNI_BASE    0x510000u
+#define REMOTE_BATCH_UNI_BASE_P4 0x290000u
+#define REMOTE_BATCH_UNI_STRIDE  768u
+#define REMOTE_BATCH_SETS        2
 _Static_assert(REMOTE_BATCH_UNI_BASE +
                REMOTE_BATCH_SETS * VC4D_BATCH_MAX * REMOTE_BATCH_UNI_STRIDE
                <= VC4_DATA_BASE,
-               "batch uniform shadows must stay below the data heap");
+               "protocol-5 batch shadows must stay below the data heap");
+_Static_assert(REMOTE_BATCH_UNI_BASE_P4 +
+               REMOTE_BATCH_SETS * VC4D_BATCH_MAX * REMOTE_BATCH_UNI_STRIDE
+               <= VC4_P4_DATA_BASE,
+               "protocol-4 batch shadows must stay below the data heap");
 
 /* One request's worth of launches, from the first queued launch to the reply
  * that reaps it.  Two exist because protocol 4 allows two requests to be
@@ -329,6 +338,7 @@ struct vc4_remote {
     int        have_uni_mask;         /* daemon takes the address mask     */
     int        have_batch;            /* daemon takes LAUNCH_BATCH         */
     int        have_submit;           /* daemon takes SUBMIT (protocol 4)  */
+    uint32_t   batch_uni_base;        /* shadow area for the negotiated map */
     int        batch_on;              /* between vc4_batch_begin/end       */
     int        pipe_on;               /* depth-2 request pipelining armed  */
     struct vc4_batch b[REMOTE_BATCH_SETS];
@@ -514,7 +524,7 @@ void vc4_prof_frame_begin(void)
 
 static void account_unique(vc4_ctx *ctx, uint32_t off, size_t len)
 {
-    size_t npages = (ctx->arena_bytes - VC4_DATA_BASE) / 4096u + 1;
+    size_t npages = (ctx->arena_bytes - ctx->data_base) / 4096u + 1;
     size_t words = (npages + 63u) / 64u;
     if (!uniq_bits || uniq_words < words) {
         free(uniq_bits);
@@ -526,11 +536,11 @@ static void account_unique(vc4_ctx *ctx, uint32_t off, size_t len)
         }
     }
     frame_bytes += len;
-    uint64_t first = ((uint64_t)off > VC4_DATA_BASE ? (uint64_t)off
-                                                     : VC4_DATA_BASE);
+    uint64_t first = ((uint64_t)off > ctx->data_base ? (uint64_t)off
+                                                      : ctx->data_base);
     uint64_t last = (uint64_t)off + len;
     for (uint64_t a = first & ~4095ull; a < last; a += 4096) {
-        size_t p = (size_t)((a - VC4_DATA_BASE) >> 12);
+        size_t p = (size_t)((a - ctx->data_base) >> 12);
         if (p >= npages)
             break;
         uint64_t bit = 1ull << (p & 63);
@@ -697,6 +707,41 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
         fprintf(stderr, "[vc4] HELLO flags=0x%x batch=%d submit=%d uni_mask=%d\n",
                 info.flags, r->have_batch, r->have_submit, r->have_uni_mask);
 
+    /* The arena map is the protocol version.  A version-5 daemon names it in
+     * HELLO; a name this client does not know is a pair built from different
+     * trees, and nothing may be laid out in the arena.  Protocols 2..4
+     * predate the field and are "slots128" by definition, which is what the
+     * ladder descends to: the client keeps its own region and uses the zone
+     * values that daemon's clients have always used. */
+    if (info.version >= 5) {
+        if (strncmp(info.layout, VC4D_LAYOUT_NAME, sizeof(info.layout)) != 0) {
+            char got[sizeof(info.layout) + 1];
+            memcpy(got, info.layout, sizeof(info.layout));
+            got[sizeof(info.layout)] = 0;
+            vc4__set_err(ctx,
+                         "vc4d serves layout '%s' but this client was built "
+                         "for '%s' (protocol %u): rebuild vc4d and "
+                         "libvc4infer from the same tree",
+                         got, VC4D_LAYOUT_NAME, VC4D_VERSION);
+            vc4c_close(r->conn);
+            free(r);
+            free(ctx);
+            return VC4_ERR_IO;
+        }
+        ctx->uni_base = VC4_UNI_BASE;
+        ctx->data_base = VC4_DATA_BASE;
+        ctx->max_kernels = VC4_MAX_KERNELS;
+        r->batch_uni_base = REMOTE_BATCH_UNI_BASE;
+    } else {
+        ctx->uni_base = VC4_P4_UNI_BASE;
+        ctx->data_base = VC4_P4_DATA_BASE;
+        ctx->max_kernels = VC4_P4_MAX_KERNELS;
+        r->batch_uni_base = REMOTE_BATCH_UNI_BASE_P4;
+        if (getenv("VC4INFER_DEBUG"))
+            fprintf(stderr, "[vc4] protocol %u daemon: 128-slot layout, "
+                    "data base 0x%x\n", info.version, ctx->data_base);
+    }
+
     /* The daemon hands out regions from its data heap only. */
     size_t max = info.arena_bytes > info.data_base
                      ? (size_t)(info.arena_bytes - info.data_base) : 0;
@@ -742,16 +787,17 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
 
     /* Never accept a grant that cannot hold data.
      *
-     * The engine keeps its code and uniform slots in the first VC4_DATA_BASE
-     * bytes of its region and allocates upwards from there, so a region of
-     * exactly VC4_DATA_BASE is an arena with zero usable bytes - the client
+     * The engine keeps its code and uniform slots in the first
+     * ctx->data_base bytes of its region and allocates upwards from there, so
+     * a region of exactly ctx->data_base is an arena with zero usable bytes -
+     * the client
      * would report "ok" and then fail every vc4_alloc() (measured: B12, a
      * struct-layout mismatch between two objects of the library, which made
      * the client read the daemon's `off` as its `len`).  The reply is checked
      * against what HELLO advertised, so a disagreement between client and
      * daemon about the alloc reply fails here, with the numbers, instead of
      * much later inside a graph. */
-    if (r->region.len <= VC4_DATA_BASE ||
+    if (r->region.len <= ctx->data_base ||
         r->region.off < info.data_base ||
         (uint64_t)r->region.off + r->region.len > info.arena_bytes ||
         r->region.len < got) {
@@ -766,7 +812,7 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
                      "every object of libvc4infer.a",
                      (size_t)r->region.len, r->region.off, info.arena_bytes,
                      info.data_base,
-                     r->region.len > VC4_DATA_BASE ? "some"
+                     r->region.len > ctx->data_base ? "some"
                                                    : "no",
                      want >> 20, (size_t)got >> 20);
         vc4c_free(r->conn, &r->region);
@@ -778,9 +824,9 @@ vc4_status vc4__remote_init(vc4_ctx **out, const char *cache_dir,
 
     ctx->arena = r->region.map;
     ctx->arena_bytes = r->region.len;
-    ctx->arena_top = VC4_DATA_BASE;
+    ctx->arena_top = ctx->data_base;
     ctx->scratch = ctx->arena_top;
-    ctx->dirty_top = VC4_DATA_BASE;    /* covers the uniform slots below it */
+    ctx->dirty_top = ctx->data_base;   /* covers the uniform slots below it */
     ctx->gpu_bus = r->region.bus;      /* bus address of region.map[0] */
     /* ctx->v3d stays NULL: every register path is replaced by the daemon. */
     if (getenv("VC4INFER_DEBUG"))
@@ -847,13 +893,13 @@ vc4_status vc4__remote_load(vc4_ctx *ctx, const char *name,
     vc4_kernel *k = vc4__kern_slot(ctx);
     if (!k) {
         vc4__set_err(ctx, "remote kernel cache: no slot (all %d in use)",
-                     VC4_MAX_KERNELS);
+                     ctx->max_kernels);
         return VC4_ERR_NOMEM;
     }
     int slot = (int)(k - ctx->k);
     k->code_off = VC4_CODE_BASE + (uint32_t)slot * VC4_CODE_SLOT;
-    k->uni_off = VC4_UNI_BASE + (uint32_t)slot * VC4_UNI_SLOT;
-    if (k->uni_off + VC4_UNI_SLOT > VC4_DATA_BASE ||
+    k->uni_off = ctx->uni_base + (uint32_t)slot * VC4_UNI_SLOT;
+    if (k->uni_off + VC4_UNI_SLOT > ctx->data_base ||
         (size_t)k->uni_off + 64u * VC4_MAX_QPU > ctx->arena_bytes) {
         vc4__set_err(ctx, "kernel cache: uniform area does not fit the arena");
         return VC4_ERR_NOMEM;
@@ -1033,10 +1079,10 @@ static vc4_status remote_queue_launch(vc4_ctx *ctx, const vc4_kernel *k,
         b = &r->b[r->cur];
     }
     int slot = b->set * (int)VC4D_BATCH_MAX + b->npend;
-    uint32_t off = REMOTE_BATCH_UNI_BASE +
+    uint32_t off = r->batch_uni_base +
                    (uint32_t)slot * REMOTE_BATCH_UNI_STRIDE;
     uint32_t mask = r->have_uni_mask ? remote_uni_mask(ctx, k, nqpu) : 0;
-    if ((uint64_t)off + 64ull * (unsigned)nqpu > VC4_DATA_BASE) {
+    if ((uint64_t)off + 64ull * (unsigned)nqpu > ctx->data_base) {
         vc4__set_err(ctx, "launch: batch uniform area is outside the arena");
         return VC4_ERR_INVAL;
     }

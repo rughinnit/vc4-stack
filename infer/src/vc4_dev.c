@@ -496,7 +496,7 @@ static vc4_status gpu_alloc(vc4_ctx *ctx, size_t want)
             return VC4_ERR_IO;
         }
         ctx->arena_bytes = len;
-        ctx->arena_top = VC4_DATA_BASE;
+        ctx->arena_top = ctx->data_base;
         ctx->scratch = ctx->arena_top;
         return VC4_OK;
     }
@@ -540,7 +540,7 @@ vc4_status vc4_init(vc4_ctx **out, const char *cache_dir, size_t arena_bytes)
            message can say what is wrong. */
         vc4_ctx *c = *out;
         if (!c || vc4_arena_bytes(c) < (8u << 20) ||
-            vc4_arena_used(c) != VC4_DATA_BASE || !c->gpu_bus) {
+            vc4_arena_used(c) != c->data_base || !c->gpu_bus) {
             /* Loud on purpose: this is a broken build, not a runtime
                condition, and `out` is NULL afterwards, so there is nowhere
                else for the detail to go. */
@@ -562,6 +562,11 @@ vc4_status vc4_init(vc4_ctx **out, const char *cache_dir, size_t arena_bytes)
         return VC4_ERR_NOMEM;
     ctx->mem_fd = -1;
     ctx->dmabuf_fd = -1;
+    /* The direct path owns the whole arena, so it always has the 256-slot
+     * map; only the daemon backend can have negotiated an older one. */
+    ctx->uni_base = VC4_UNI_BASE;
+    ctx->data_base = VC4_DATA_BASE;
+    ctx->max_kernels = VC4_MAX_KERNELS;
 
     if (arena_bytes == 0)
         arena_bytes = env_arena();

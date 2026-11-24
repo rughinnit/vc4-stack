@@ -52,7 +52,16 @@
 #define DEFAULT_SOCKET   "/run/vc4d.sock"
 #define DEFAULT_TIMEOUT  2000u
 #define MAX_TIMEOUT      10000u
-#define MAX_PROGS_SLOTS  128
+/* 256 slots, one reserved for the recovery probe.  The handle carries the
+ * slot in 9 bits now (see find_prog()), so slot 255 is addressable: with the
+ * old 8-bit field the probe slot could never match a handle. */
+#define MAX_PROGS_SLOTS  256
+_Static_assert(MAX_PROGS_SLOTS == A_CODE_SLOTS,
+               "the slot table and the arena code area must agree");
+_Static_assert(A_CODE_BASE + A_CODE_SLOTS * A_CODE_SLOT <= A_UNI_BASE,
+               "code slots must end below the uniform areas");
+_Static_assert(A_UNI_BASE + A_CODE_SLOTS * A_UNI_SLOT <= A_DATA_BASE,
+               "uniform areas must end below the data heap");
 #define DEFAULT_GPU_LOCK "/tmp/vc4-gpu.lock"
 #define MAX_DENIALS_LOG  20
 /* How many prepared requests run back to back before the main loop returns to
@@ -437,24 +446,28 @@ static struct region *find_region(struct client *c, uint32_t handle)
 
 static struct prog *find_prog(struct client *c, uint32_t handle)
 {
-    uint32_t idx = handle & 0xFFu;
+    /* idx is slot + 1 in the low 9 bits, the handle generation above it. */
+    uint32_t idx = handle & 0x1FFu;
     if (!idx || idx > MAX_PROGS_SLOTS)
         return NULL;
     struct prog *p = &progs[idx - 1];
     if (!p->used || p->owner != c->idx)
         return NULL;
-    if (((p->gen << 8) | idx) != handle)
+    if (((p->gen << 9) | idx) != handle)
         return NULL;
     return p;
 }
 
 /* ----------------------------------------------------- program slot LRU (G3)
  *
- * The old table had 128 slots (one reserved for the probe) and no way to
- * reclaim one: a session that touched more than 127 distinct kernels - the
- * full YOLOv8 graph plus a few shapes - got E_NOMEM from UPLOAD for the rest
- * of its life and every later launch failed until the daemon was restarted.
- * That is a transient condition (more shapes than slots) turned permanent.
+ * Before 1.2.7 the table had 128 slots (one reserved for the probe) and no
+ * way to reclaim one: a session that touched more than 127 distinct kernels
+ * got E_NOMEM from UPLOAD for the rest of its life.  The LRU fixed the
+ * permanent failure, but not the cost: a 133-kernel detector over a 128-entry
+ * table frees and re-uploads five programs per frame, and each UPLOAD is a
+ * serialised round trip that stalls the next launch.  Protocol 5 raises the
+ * table to 256 so the whole set stays resident; the LRU remains for a session
+ * that genuinely touches more than that.
  *
  * A slot is now freed by LRU.  The key is the program *name* the client sends
  * with UPLOAD (the code sha256 for a client that sends none), so re-uploading
@@ -576,8 +589,22 @@ static int handle_hello(struct client *c, const struct vc4d_hdr *h,
         return reply(c->fd, h, VC4D_E_PROTO, NULL, 0, -1, 0, 0);
     struct vc4d_hello_req q;
     memcpy(&q, pl, sizeof(q));
-    if (q.version < VC4D_VERSION_MIN || q.version > VC4D_VERSION) {
-        log_denial(c, "HELLO", "version mismatch");
+    if (q.version < VC4D_SERVE_MIN || q.version > VC4D_VERSION) {
+        /* The map is named, not just the number.  A client built against
+         * protocol 4 lays its heap out at data base 3 MiB and has no field in
+         * HELLO that could carry a layout, so there is nothing to negotiate:
+         * the version is the name of the map, and the only agreement that is
+         * safe is a refusal the operator can read. */
+        char why[256];
+        const char *want = q.version > VC4D_VERSION ? "newer than this daemon"
+                         : q.version >= 2 ? VC4D_LAYOUT_P4_NAME
+                         : "an unknown protocol";
+        snprintf(why, sizeof(why),
+                 "protocol %u (layout %s) refused: this daemon serves "
+                 "protocol %u, layout %s (%u slots, data base 0x%x)",
+                 q.version, want, VC4D_VERSION, VC4D_LAYOUT_NAME,
+                 A_CODE_SLOTS, A_DATA_BASE);
+        log_denial(c, "HELLO", why);
         return reply(c->fd, h, VC4D_E_VERSION, NULL, 0, -1, VC4D_VERSION, 0);
     }
     /* A client arriving is the natural moment to sweep: anything left over
@@ -594,6 +621,7 @@ static int handle_hello(struct client *c, const struct vc4d_hdr *h,
     r.max_qpu = VC4D_MAX_QPU;
     r.max_uni = VC4D_MAX_UNI;
     r.max_prog = VC4D_MAX_PROG;
+    snprintf(r.layout, sizeof(r.layout), "%s", VC4D_LAYOUT_NAME);
     r.flags = (opt.raw_srq ? VC4D_F_RAW_SRQ : 0) |
               (opt.allowlist ? VC4D_F_ALLOWLIST : 0) |
               VC4D_F_NAMED_PROGS | VC4D_F_UNI_MASK | VC4D_F_ARENA_RESTORE |
@@ -748,7 +776,7 @@ static int handle_upload(struct client *c, const struct vc4d_hdr *h,
     }
 
     struct prog *p = &progs[slot];
-    uint32_t gen = same ? p->gen : ((p->gen + 1u) & 0xFFFFFFu);
+    uint32_t gen = same ? p->gen : ((p->gen + 1u) & 0x7FFFFFu);
     if (!gen)
         gen = 1;
     int was_used = same;
@@ -773,7 +801,7 @@ static int handle_upload(struct client *c, const struct vc4d_hdr *h,
     __sync_synchronize();
     st_bytes_up += clen;
 
-    uint32_t hnd = (gen << 8) | (uint32_t)(slot + 1);
+    uint32_t hnd = (gen << 9) | (uint32_t)(slot + 1);
     struct vc4d_upload_rsp r = { .prog = hnd, .code_off = p->code_off,
                                  .words = p->words };
     if (opt.verbose)
@@ -1459,7 +1487,7 @@ static void prefetch_try(struct client *c)
     struct vc4d_hdr h;
     memcpy(&h, inbox.buf, sizeof(h));
     if (h.magic != VC4D_MAGIC || h.len != (uint32_t)inbox.got ||
-        h.version < VC4D_VERSION_MIN || h.version > VC4D_VERSION ||
+        h.version < VC4D_SERVE_MIN || h.version > VC4D_VERSION ||
         h.status != 0)
         return;
     if (h.op != VC4D_OP_SUBMIT && h.op != VC4D_OP_LAUNCH_BATCH)
@@ -2136,6 +2164,28 @@ static int inbox_process(int idx)
         int st = (h.magic == VC4D_MAGIC && h.version != VC4D_VERSION)
                  ? VC4D_E_VERSION : VC4D_E_PROTO;
         reply(c->fd, &hh, st, NULL, 0, -1, 0, 0);
+        if (c->denials > 1000)
+            client_destroy(idx);
+        return 0;
+    }
+    /* An old protocol's HELLO reaches handle_hello() so the refusal can name
+     * both maps; every other old request is refused here, before it can lay a
+     * byte out under the map that version assumed.  The wire range above is
+     * the ladder's range, not this daemon's floor. */
+    if (h.op != VC4D_OP_HELLO && h.version < VC4D_SERVE_MIN) {
+        st_rejects++;
+        char why[192];
+        snprintf(why, sizeof(why),
+                 "protocol %u (layout %s) refused: this daemon serves "
+                 "protocol %u, layout %s",
+                 h.version,
+                 h.version >= 2 ? VC4D_LAYOUT_P4_NAME : "an unknown protocol",
+                 VC4D_VERSION, VC4D_LAYOUT_NAME);
+        log_denial(c, "?", why);
+        struct vc4d_hdr hh = h;
+        hh.op = 0;
+        hh.seq = 0;
+        reply(c->fd, &hh, VC4D_E_VERSION, NULL, 0, -1, VC4D_VERSION, 0);
         if (c->denials > 1000)
             client_destroy(idx);
         return 0;

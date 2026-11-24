@@ -19,18 +19,18 @@ shared with concurrent work; every GPU run was serialised by
 - `infer/src/vc4_dev.c`: dispatch at `vc4_init`, `vc4__launch`,
   `vc4_upload`, `vc4_download`, `vc4__l2_flush`, `vc4__write`,
   `vc4__kernel_load_file`, `vc4__wait_idle`, `vc4__health`, `vc4_shutdown`.
-- `vc4d` protocol version 3 (see "Protocol 3" below; the version-2 `LAUNCH`
-  message is unchanged and still served): `ALLOC` replies with the region's GPU bus
-  address; `LAUNCH` gains `UNI_IN_ARENA` (uniform words read from the client's
-  arena) and `WAIT` (kick → idle → counters → L2 write-back in one reply).
-  Since 1.2.7 it also gains `UNI_MASK` (a per-slot mask saying which uniform
-  words are addresses, which is what makes parameters ≤ −2.0 possible), and
-  `UPLOAD` may carry the kernel name that keys the program-slot LRU.  Both are
-  opt-in: a client that sends neither gets the exact 1.2.6 behaviour.  The
-  daemon's program table is 128 slots (127 usable) and **evicts LRU-wise**, so
-  a session is no longer limited to 127 distinct kernels; the unit uses
-  `--arena-mb 72` (CMA is 256 MiB; 72 leaves the engine's full 64 MiB client
-  region).
+- `vc4d` protocol version 5 (see "Protocol 5" below; the version-2 `LAUNCH`
+  message is unchanged and still served by the client ladder): `ALLOC` replies
+  with the region's GPU bus address; `LAUNCH` gains `UNI_IN_ARENA` (uniform
+  words read from the client's arena) and `WAIT` (kick → idle → counters → L2
+  write-back in one reply).  Since 1.2.7 it also gains `UNI_MASK` (a per-slot
+  mask saying which uniform words are addresses, which is what makes
+  parameters ≤ −2.0 possible), and `UPLOAD` may carry the kernel name that
+  keys the program-slot LRU.  Both are opt-in.  Protocol 5 raises the program
+  table to 256 slots (255 usable) and moves the code/uniform zones: a real
+  detector needs 133 distinct kernels, and against 128 the LRU freed five of
+  them on every frame.  The unit uses `--arena-mb 96` (CMA is 256 MiB; 96
+  leaves the engine's full 64 MiB client region).
 - Op code (`vc4_gemm.c`, `vc4_ew.c`, `vc4_conv.c`, `vc4_convbwd.c`,
   `vc4_train.c`) is unchanged except for dirty-range marks where the CPU
   writes buffers that the GPU later reads.
@@ -214,15 +214,16 @@ calls, which is why a new engine works against an old daemon and vice versa.
 
 Protocol 3 adds one op, `VC4D_OP_LAUNCH_BATCH` (13), and one HELLO flag,
 `VC4D_F_LAUNCH_BATCH` (bit 5).  The single `LAUNCH` message is unchanged and
-still what every other client uses.  HELLO accepts version 2 as well as 3 and
-replies with 3 and the flag, so a 1.2.10 client keeps working: it never sends
-the op and the daemon never sees it.  The client library mirrors this - it
-starts HELLO at 3, drops to 2 on `E_VERSION`, and then adopts whatever version
-the HELLO reply carries - so a new engine also works against an old daemon,
-with batching off.  The reply matters because 1.2.9 accepts a version-3 HELLO
-and still expects every later request to say 2; without honouring the reply a
-client gets `bad header` on its first `ALLOC`.  Both behaviours are exercised
-against a protocol-level fake and, separately, against the packaged daemon.
+still what every other client uses.  A 1.2.10 daemon accepted version 2 as
+well as 3 and replied with 3 and the flag, so an old client kept working: it
+never sent the op and the daemon never saw it.  The client library mirrors this
+- it starts HELLO at its own version, drops one version at a time on
+`E_VERSION`, and then adopts whatever version the HELLO reply carries - so a
+new engine also works against an old daemon.  The reply matters because 1.2.9
+accepts a version-3 HELLO and still expects every later request to say 2;
+without honouring the reply a client gets `bad header` on its first `ALLOC`.
+Both behaviours are exercised against a protocol-level fake and, separately,
+against the packaged daemon.
 
 The request is
 
@@ -267,19 +268,85 @@ Execution is the important part:
 On the client side, `vc4c_launch_batch()` takes an array of
 `vc4c_batch_ent` and one uniform region.  The engine's remote backend snapshots
 each launch's 64 B x nqpu uniform block into a private shadow slot before
-queueing it (the 48 KiB area at 0x290000, between the last kernel uniform slot
-and the data heap), so a queued launch cannot be corrupted by the next launch's
-uniform writes.  `vc4_batch_begin()` / `vc4_batch_end()` are explicit: a caller
+queueing it (96 KiB at 0x510000 with protocol 5, between the last kernel
+uniform area and the data heap; 0x290000 with protocol 2..4), so a queued
+launch cannot be corrupted by the next launch's uniform writes.  `vc4_batch_begin()` / `vc4_batch_end()` are explicit: a caller
 that does not arm them gets the synchronous path byte for byte.  The Python
 binding arms around one C API call and reads the result in `_check`, which
 makes the C API call the unit of batching and keeps per-call error and timeout
 attribution.  `VC4INFER_NO_BATCH=1` turns it off for A/B runs on the same
 daemon.
 
+## Protocol 5: the 256-slot arena map
+
+Version 5 changes the arena map and nothing else: no message grew, no op
+changed meaning, and the single-launch, batch and SUBMIT paths are byte for
+byte the protocol-4 ones.  The client also only lays out its *own* region, so
+the daemon and the client must agree on where the fixed zones sit before the
+first `ALLOC`.
+
+| zone | protocol 2..4 ("slots128") | protocol 5 ("slots256") |
+|---|---|---|
+| code slots (16 KiB each) | `0x001000`, 128 -> `0x201000` | `0x001000`, 256 -> `0x401000` |
+| per-kernel uniforms (4 KiB each) | `0x210000`, 128 -> `0x290000` | `0x410000`, 256 -> `0x510000` |
+| batch uniform shadows (2 x 64 x 768 B) | `0x290000` -> `0x2a8000` | `0x510000` -> `0x528000` |
+| data heap | `0x300000` | `0x600000` |
+
+The extra 3 MiB of reserved prefix is the whole cost.  With the 96 MiB arena
+the client still asks for its 64 MiB region and keeps 58 MiB instead of 61
+MiB of data; the largest planned graphs on this board are YOLOv8n-320
+(22.96 MiB pool + 22.20 MiB scratch) and the bccd 320 detector (25.17 +
+22.20 MiB), so both still fit.
+
+Why 256: a code slot cannot exceed 16 KiB (`kgen` refuses a larger blob), a
+16 KiB slot is what makes the table size the only lever, and the measured
+model that exposed the limit needs 133 kernels (bccd YOLO11n-160, 3 classes).
+Against 128 entries the LRU freed 5 slots per frame; the UPLOAD that restores
+them is a serialised round trip, and the frame went to 1631 ms / 0.61 FPS
+with the QPU at 17 % duty.  With 256 the 133-kernel set stays resident:
+520 ms / 1.92 FPS, QPU duty 54 %, and zero evictions in the journal.
+YOLOv8n-160, whose 96 kernels already fit, is unchanged at 412 ms.  256 also
+leaves room for a second input size in one session without turning the cache
+back into the bottleneck.
+
+**HELLO.**  The reply now carries the map's name in a 12-byte field that used
+to be reserved: `"slots256"` from this daemon, empty from a daemon older than
+5.  A version-5 client compares the name before it allocates and refuses a
+mismatch by printing both names.  The request is unchanged, which is what
+keeps the fallback ladder working:
+
+- a version-5 client against a protocol-2..4 daemon starts at HELLO 5, gets
+  `E_VERSION`, descends one version at a time, and settles on the version the
+  old daemon serves.  The protocol version *is* the map's name there
+  (protocol 4 means slots128), so the client switches its uniform base, batch
+  shadows and heap start to the protocol-2..4 values and caps its kernel
+  cache at 128.  Everything else - batching, SUBMIT, the single-launch path -
+  keeps working.
+- an old client against this daemon is refused.  `VC4D_SERVE_MIN` is 5, so a
+  version-4 HELLO gets `E_VERSION` and the denial names both maps:
+  `protocol 4 (layout slots128) refused: this daemon serves protocol 5,
+  layout slots256 (256 slots, data base 0x600000)`.  The same refusal applies
+  to every non-HELLO request from an old protocol, so a client that ignores
+  the HELLO reply cannot send an `ALLOC` under a 3 MiB heap assumption
+  either.  This is deliberate:
+  an old client would place its heap at a data base the daemon did not
+  reserve, and no field in the old protocol could tell it otherwise.
+
+The tests that hardcode the map were updated rather than special-cased:
+`vc4d/test/fake_daemon.py` picks data base 6 MiB / 3 MiB from its
+`FAKE_VERSION`, so the protocol-3 fallback in `infer/tests/test_pipeline.py`
+still models a real old daemon; `vc4d/test/test_submit.c` asserts the
+negotiated protocol against `VC4D_VERSION`; `test_prog_lru` runs 320 programs
+so the 256-slot LRU is exercised; `test_daemon_kernels` runs 300; and
+`vc4d/test/test_hello_version` pins the negotiation itself (HELLO 5 names the
+map, HELLO 4 and a version-4 ALLOC are refused, the connection survives for
+the ladder).
+
 ## Reproduce
 
 ```sh
-cd /home/raspi/work/vc4d && make && sudo ./tools/install.sh   # protocol v3
+cd /home/raspi/work/vc4-stack && make -C vc4d && make -C infer
+packaging/vc4d/build_deb.sh 1.4.0 && infer/packaging/vc4infer/build_deb.sh 1.2.12
 cd /home/raspi/work/engine-daemon
 make
 REPS=5 VC4INFER_DAEMON=1 ./run_tests.sh                       # as raspi

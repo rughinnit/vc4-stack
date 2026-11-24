@@ -90,7 +90,7 @@ def check(cond, fmt, *args):
 class Fake:
     """A fake daemon process plus the records it wrote."""
 
-    def __init__(self, tag, version=4, delay_ms=0, arena_mb=128):
+    def __init__(self, tag, version=5, delay_ms=0, arena_mb=128):
         self.sock = os.path.join(TMP, "pipe-%s-%d.sock" % (tag, os.getpid()))
         self.log = os.path.join(TMP, "pipe-%s-%d.jsonl" % (tag, os.getpid()))
         for p in (self.sock, self.log, self.log + ".counts"):

@@ -56,9 +56,14 @@ skip() {
 
 gpu() {
     # gpu <label> <command...>; 77 is the suite's "not opted in" status.
-    # The command is tested with `||` so `set -e` does not treat a skip as a
-    # fatal error before the status can be read.
+    # The opt-in is checked here as well as inside each test binary: some C
+    # files in the suite are also shipped products (training/tests/test_train.c
+    # is the vc4train payload), and a product must not refuse to run.
     label=$1; shift
+    if [ "${VC4_REQUIRE_GPU:-}" != 1 ]; then
+        skip "$label"
+        return 0
+    fi
     st=0
     "$@" || st=$?
     if [ "$st" = 77 ]; then

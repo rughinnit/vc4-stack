@@ -565,7 +565,10 @@ like a model problem.
 **Cause (before 1.2.7).** Both caches were fixed arrays with no eviction: the
 daemon had 128 program slots (127 usable, one is the recovery probe) and the
 engine a 128-entry kernel table.  "More distinct kernels than slots" was
-therefore a permanent failure instead of a cache miss.
+therefore a permanent failure instead of a cache miss.  Protocol 5 raised the
+daemon table to 256 (255 usable) and the engine cache to 256, because a
+detector with 133 kernels was paying five evictions and re-uploads per frame
+even after the LRU made it survive.
 
 **Fix.** Upgrade to 1.2.7 or later.  Program slots are an LRU keyed by the
 kernel name, the engine's kernel table is an LRU that keeps each kernel's code,

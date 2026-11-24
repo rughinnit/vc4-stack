@@ -1,15 +1,18 @@
 /*
  * test_prog_lru.c - G3: more kernel programs than slots must not be fatal.
  *
- * Before 1.2.7 a daemon session had 127 usable program slots (one is the
- * probe), no way to free one, and a per-client cap of 128 handles.  A run that
- * touched more distinct kernels - the full YOLOv8 graph does - got E_NOMEM
- * from UPLOAD for every later shape and every following launch failed until
- * `systemctl restart vc4d`.
+ * Before 1.2.7 a daemon session had no way to free a program slot and a
+ * per-client cap of 128 handles.  A run that touched more distinct kernels -
+ * a real detector reaches 133 - got E_NOMEM from UPLOAD for every later shape
+ * and every following launch failed until `systemctl restart vc4d`.
+ *
+ * Protocol 5 raises the table to 256 slots (255 usable; one is the probe), so
+ * 320 distinct programs exercise the LRU again: 65 of them must be evicted and
+ * re-uploaded by name, and none may fail.
  *
  * What this checks:
  *
- *   1. 250 distinct programs upload successfully.  (Before: upload #128
+ *   1. 320 distinct programs upload successfully.  (Before 1.2.7: upload #128
  *      fails with E_NOMEM.)
  *   2. every one of them launches, including the ones whose slot was evicted
  *      in the meantime *if* the daemon advertises named programs: the test
@@ -20,7 +23,7 @@
  *   4. STATS reports evictions and the slot count stays bounded.
  *
  * It also runs against a daemon that does not know about named programs (no
- * VC4D_F_NAMED_PROGS): then it uploads unnamed and the failure at #128 is the
+ * VC4D_F_NAMED_PROGS): then it uploads unnamed and the shortfall is the
  * "before" behaviour, reported as such.
  *
  * The program is the daemon's own known-good probe (`thrend` + three branch
@@ -37,7 +40,7 @@
 #include "vc4d_proto.h"
 #include "vc4client.h"
 
-#define NPROG 250
+#define NPROG 320
 
 static const uint32_t head[4] = {
     0x9e70009eu, 0x30000000u,      /* thrend */
@@ -178,7 +181,7 @@ int main(int argc, char **argv)
     if (named)
         CHECK(1, "the LRU kept the slot table bounded and every launch worked");
     else
-        CHECK(0, "this daemon predates named slots: 127 is still the cap");
+        CHECK(0, "this daemon predates named slots: the table is still a cap");
 
     vc4c_free(c, &uni);
     vc4c_close(c);

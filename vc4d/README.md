@@ -75,11 +75,15 @@ struct vc4d_hdr {
 A reply always echoes magic/op/version/seq.  Up to version 3 one request is
 outstanding per connection (the client library is synchronous).  Version 4
 adds `SUBMIT`, of which a client may have two outstanding; see the op table
-and the note below it.
+and the note below it.  Version 5 changes the arena map only (256 code slots,
+uniforms at `0x410000`, data heap at `0x600000`) and adds the map's name to
+the `HELLO` reply; no framing changed.  This daemon serves version 5 and
+refuses older clients by name; the client library still descends its HELLO
+ladder to an older daemon.
 
 | op | name | request payload | reply payload |
 |---|---|---|---|
-| 1 | `HELLO` | `{version, flags}` | `{version, arena_bytes, data_base, page_size, max_msg, max_qpu, max_uni, max_prog, flags, ident0, ident1, ...}` |
+| 1 | `HELLO` | `{version, flags}` | `{version, arena_bytes, data_base, page_size, max_msg, max_qpu, max_uni, max_prog, flags, ident0, ident1, layout[12], ...}` |
 | 2 | `ALLOC` | `{bytes, flags}` | `{handle, off, len, bus}` **+ dma-buf fd via SCM_RIGHTS** (`bus` = GPU bus address of the region) |
 | 3 | `FREE` | `{handle}` | — |
 | 4 | `UPLOAD` | `{bytes, max_qpu, nuni, flags}` + program bytes [+ name bytes with `VC4D_UPLOAD_NAMED`] | `{prog, code_off, words}` |
@@ -148,9 +152,10 @@ removes is the daemon's inability to tell a *legitimate* float from an address.
 **Named programs** (`UPLOAD.flags & VC4D_UPLOAD_NAMED`, 1.2.7): the payload is
 `vc4d_upload_req + code + name`, name 1..63 printable bytes, no NUL.  The name
 keys the program-slot LRU: re-uploading a name reuses its slot, and when all
-127 client slots are in use the least recently used one that is not executing
+255 client slots are in use the least recently used one that is not executing
 is freed (the daemon's probe slot and the in-flight program are never
-evicted).  A client that sends no name is keyed by the code's SHA-256, which
+evicted).  Protocol 5 has 256 slots in total; the 128-slot table could not
+hold the 133 kernels of a measured detector without evicting five per frame.  A client that sends no name is keyed by the code's SHA-256, which
 behaves the same for repeated uploads.  `STATS.evictions` counts the frees;
 `--verbose` logs each one with the name.
 
@@ -443,7 +448,7 @@ context under the board GPU lock and *proves* it:
    `VPMBASE=16`, re-arm the counters, `SRQ` reset, and require an idle queue;
 3. launch the daemon's own probe program - four instructions,
    `thrend` + the three delay slots every kernel ends with - from the reserved
-   last code slot (`PROBE_SLOT = 127`), with a zeroed 64-byte uniform block,
+   last code slot (`PROBE_SLOT = 255`), with a zeroed 64-byte uniform block,
    and require completion with no new `ERRSTAT` bits.
 
 Measured on this board: 12 cycles, ~1 us per probe, sub-millisecond for the
@@ -532,18 +537,16 @@ other's queue; a wrapper must therefore not take the lock itself (the engine
 detects the resulting wait and fails with a message naming the lock after
 `VC4INFER_GPU_LOCK_MS`, default 30 s).
 
-**Sizing.**  The unit starts with `--arena-mb 72` (CMA is 256 MiB on this
-board).  The engine's default client arena is 64 MiB and the daemon's data
-heap starts at 2 MiB, so a 64 MiB daemon arena left a client 1 MiB short and
-`test_convgrad` failed late with `E_NOMEM`; 72 MiB gives the client its full
-64 MiB region.  A 128 MiB arena also works when it can be allocated, but a
-128 MiB contiguous CMA block is not reliable at boot: the daemon's own shrink
-ladder fell back to 64 MiB after the vc4 DRM driver and fragmentation had
-taken the rest, which reproduced the failure.  72 MiB has been reliable
-across restarts.  `MAX_PROGS_CLI` is 64 (from 16):
-the engine uploads one program per kernel *shape*, and a single conv-grad
-process legitimately needs ~25, so a 16-slot per-client cap made later
-gradient kernels fail to upload.
+**Sizing.**  The unit starts with `--arena-mb 96` (CMA is 256 MiB on this
+board).  The engine's default client arena is 64 MiB and the protocol-5 data
+heap starts at 6 MiB, so a 64 MiB region leaves 58 MiB of data.  A 128 MiB
+arena also works when it can be allocated, but a 128 MiB contiguous CMA block
+is not reliable at boot: the daemon's own shrink ladder fell back to 64 MiB
+after the vc4 DRM driver and fragmentation had taken the rest, which
+reproduced the `test_convgrad` failure.  96 MiB has been reliable across
+restarts.  `MAX_PROGS_CLI` is 256 (from 16):
+the engine uploads one program per kernel *shape*, a conv-grad process needs
+~25, and a detector reaches 133, so the table is sized for the whole set.
 
 **Acceptance**: `REPS=5 VC4INFER_DAEMON=1 ./run_tests.sh` as user `raspi`
 passes the whole suite with 0 mismatches (matmul all shapes, conv 3×3/1×1,

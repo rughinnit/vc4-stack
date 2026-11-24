@@ -33,7 +33,7 @@ fallback.  ``Engine(path, mode="hybrid")`` is the opt-in exception:
 ``host_policy="any"`` runs those too, for compatibility only.
 """
 
-__version__ = "1.2.11"
+__version__ = "1.2.12"
 
 from ._binding import (                                        # noqa: F401
     Engine as _LibraryEngine, Buf, Stats, OpInfo, Error, Unsupported, VC4_OK,

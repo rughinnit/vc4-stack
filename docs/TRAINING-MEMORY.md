@@ -13,8 +13,8 @@ allocates its whole state in the arena and reports `vc4_arena_used()`.
 | item | size | how |
 |---|---|---|
 | one dma-buf arena | 64 MiB default (direct), 8–96 MiB via `VC4INFER_ARENA_MB` / `vc4d --arena-mb` | `vc4_arena_bytes()` |
-| layout | `0x000000` signature, `0x001000` 32 × 16 KiB kernel code slots, `0x210000` uniform areas, `0x300000` data heap | `vc4_int.h` |
-| usable data heap | `arena_bytes − 0x300000` | measured: a 16 MiB arena reports 3.00 MiB used at init → 13.0 MiB of data |
+| layout | `0x000000` signature, `0x001000` 256 × 16 KiB kernel code slots, `0x410000` uniform areas, `0x510000` batch shadows, `0x600000` data heap | `vc4_int.h` |
+| usable data heap | `arena_bytes − 0x600000` | measured: a 16 MiB arena reports 6.00 MiB used at init → 10.0 MiB of data (protocol 5; a protocol-4 daemon keeps the 3 MiB map) |
 | persistent buffers | bump-allocated upward, never freed (`vc4_alloc`) | params, grads, optimiser state, saved activations, labels |
 | per-op scratch | bump from `arena_top`, reset before/after every op | GEMM panels, padded tails |
 | backward workspace | bump **downward** from the end of the arena (`vc4__ws_alloc`) | the temporaries of a composed backward |

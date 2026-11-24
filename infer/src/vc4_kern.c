@@ -394,18 +394,19 @@ static vc4_status blob_read(vc4_ctx *ctx, const char *path,
 
 /* ------------------------------------------------------- kernel cache slots
  *
- * VC4_MAX_KERNELS entries, each owning a code slot and a uniform area (direct
- * mode) or a daemon program slot (remote mode).  A session that touches more
- * distinct kernels than that used to fail with "kernel cache full (128
- * entries)" and every later shape was unusable until the process restarted
- * (G3).  The cache is an LRU now: the least recently loaded/launched entry is
- * replaced.  Callers use a vc4_kernel* only between returning it and launching
- * it - every op loads, fills uniforms and launches in one function - so
- * replacing the oldest entry cannot invalidate a live pointer. */
+ * ctx->max_kernels entries, each owning a code slot and a uniform area
+ * (direct mode) or a daemon program slot (remote mode).  A session that
+ * touches more distinct kernels than that used to fail with "kernel cache
+ * full (128 entries)" and every later shape was unusable until the process
+ * restarted (G3).  The cache is an LRU now: the least recently loaded or
+ * launched entry is replaced.  Callers use a vc4_kernel* only between
+ * returning it and launching it - every op loads, fills uniforms and launches
+ * in one function - so replacing the oldest entry cannot invalidate a live
+ * pointer. */
 vc4_kernel *vc4__kern_slot(vc4_ctx *ctx)
 {
     int slot = -1;
-    if (ctx->nkern < VC4_MAX_KERNELS) {
+    if (ctx->nkern < ctx->max_kernels) {
         slot = ctx->nkern++;
     } else {
         for (int i = 0; i < ctx->nkern; ++i) {
@@ -433,13 +434,13 @@ vc4_status vc4__kernel_load_file(vc4_ctx *ctx, const char *name,
     vc4_kernel *k = vc4__kern_slot(ctx);
     if (!k) {
         vc4__set_err(ctx, "kernel cache: no slot (all %d in use)",
-                     VC4_MAX_KERNELS);
+                     ctx->max_kernels);
         return VC4_ERR_NOMEM;
     }
     int slot = (int)(k - ctx->k);
     k->code_off = VC4_CODE_BASE + (uint32_t)slot * VC4_CODE_SLOT;
-    k->uni_off = VC4_UNI_BASE + (uint32_t)slot * VC4_UNI_SLOT;
-    if (k->uni_off + VC4_UNI_SLOT > VC4_DATA_BASE) {
+    k->uni_off = ctx->uni_base + (uint32_t)slot * VC4_UNI_SLOT;
+    if (k->uni_off + VC4_UNI_SLOT > ctx->data_base) {
         vc4__set_err(ctx, "kernel cache: uniform area overlaps the data heap");
         return VC4_ERR_NOMEM;
     }

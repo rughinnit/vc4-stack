@@ -52,12 +52,14 @@
 #define VC4_TF_MIN_ARENA_MB 8
 #define VC4_TF_MAX_ARENA_MB 96
 
-/* The first 3 MiB of the arena hold the QPU code slots and the uniform
+/* The first 6 MiB of the arena hold the QPU code slots and the uniform
  * blocks: vc4d reserves [0, A_DATA_BASE) and libvc4infer's vc4_init() checks
- * that the context starts at VC4_DATA_BASE (= 0x300000 in both vc4d.h and
- * infer/src/vc4_int.h).  Only the rest is a data heap, so that is what the
- * allocator may hand out. */
-#define VC4_TF_DATA_BASE (3u << 20u)
+ * that the context starts at VC4_DATA_BASE (= 0x600000 in both vc4d.h and
+ * infer/src/vc4_int.h with protocol 5).  Only the rest is a data heap, so
+ * that is what the allocator may hand out.  This is the first estimate, before
+ * the engine is up; engine_up_locked() replaces it with the context's real
+ * start, so a protocol-4 daemon (3 MiB) simply lowers the limit. */
+#define VC4_TF_DATA_BASE (6u << 20u)
 
 /* ------------------------------------------------------------------ state */
 

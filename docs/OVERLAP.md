@@ -86,7 +86,7 @@ while the first is reading:
 
 | resource | why it cannot be shared | cost |
 |---|---|---|
-| uniform shadow | the daemon reads a launch's 64 B/QPU block when it kicks it | 48 KiB per set, 96 KiB total (`0x290000`, below `VC4_DATA_BASE`) |
+| uniform shadow | the daemon reads a launch's 64 B/QPU block when it kicks it | 48 KiB per set, 96 KiB total (`0x510000` with protocol 5, `0x290000` with 2..4, below `VC4_DATA_BASE`) |
 | scratch windows | a conv zero-pads its whole input into scratch, then launches on it | 1/3 of the free arena per window |
 | pool blocks | a block freed by node N+1's liveness may still be read by node N's request | the quarantine's high-water; measured +0.06 to +0.17 MiB |
 

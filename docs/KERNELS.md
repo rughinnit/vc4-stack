@@ -299,7 +299,9 @@ two-launch path and not merely within tolerance.
 ### 7.1 The budget before writing any code
 
 The code slot is 2,048 instructions (16 KiB, `docs/TRAINING-MEMORY.md`); the
-JIT refuses a larger blob.  Both GEMMs have room to spare in their store
+JIT refuses a larger blob.  The daemon's protocol-5 program table holds 256
+such slots, so a detector's 133 distinct kernels stay resident; a slot cannot
+be widened to hold more than one kernel, which is why the table grew instead.  Both GEMMs have room to spare in their store
 path, and the two have very different register situations:
 
 | kernel | tile | C vectors live at the store | free B registers | free A registers |

@@ -79,7 +79,7 @@ def _replace_inputs(graph, repl):
 def _delete_nodes(graph, pred):
     keep = [n for n in graph.node if not pred(n)]
     dropped = len(graph.node) - len(keep)
-    graph.node.clear()
+    del graph.node[:]
     graph.node.extend(keep)
     return dropped
 
@@ -269,7 +269,7 @@ def fuse_layernorm(model):
         first = min(i for i, n in enumerate(g.node) if n.name in names)
         kept = [n for i, n in enumerate(g.node) if n.name not in names]
         kept.insert(first, node)
-        g.node.clear()
+        del g.node[:]
         g.node.extend(kept)
         made += 1
     return made
@@ -412,7 +412,7 @@ def fold_shape_metadata(model):
                     g.initializer.append(
                         numpy_helper.from_array(vals[name], name=name))
         kept = [n for i, n in enumerate(g.node) if i not in dead]
-        g.node.clear()
+        del g.node[:]
         g.node.extend(kept)
         total += len(folded)
     return total
@@ -482,7 +482,7 @@ def squeeze_matmul_batch(model):
         kept.append(helper.make_node("Reshape", [y2, out_shape], [orig],
                                      name=node.name + "_unsqueeze"))
         made += 1
-    g.node.clear()
+    del g.node[:]
     g.node.extend(kept)
     return made
 
@@ -498,7 +498,7 @@ def prune(model):
             kept.append(node)
             live.update(i for i in node.input if i)
     kept.reverse()
-    g.node.clear()
+    del g.node[:]
     g.node.extend(kept)
     inits = [i for i in g.initializer if i.name in live]
     del g.initializer[:]

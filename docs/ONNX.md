@@ -55,7 +55,9 @@ infer/python/vc4infer/_binding.py ctypes binding for both ops, vc4_get_stats, an
 
 ```sh
 cd vc4-stack
-source /home/raspi/work/torch-vc4/.venv/bin/activate   # torch CPU + numpy + onnx
+python3 -m venv ~/venvs/torch && . ~/venvs/torch/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install numpy onnx
 export VC4INFER_CACHE=$HOME/.cache/vc4infer/kcache      # writable JIT cache
 
 python infer/tools/onnx/export_models.py
@@ -225,7 +227,7 @@ with `infer/tools/onnx/export_yolo.py` at **1x3x160x160** (opset 13, 12.4 MiB, 2
 now runs to completion on the QPUs and matches a CPU reference.
 
 ```
-source /home/raspi/work/torch-vc4/.venv/bin/activate
+source ~/venvs/torch/bin/activate          # created in section 2 above
 cd vc4-stack/infer/tools/onnx
 export VC4INFER_CACHE=$HOME/.cache/vc4infer/kcache
 VC4INFER_DAEMON=1 python3 yolo_bench.py \

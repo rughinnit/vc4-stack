@@ -129,7 +129,7 @@ every run, which is stronger than "accurate" and is what a training loop needs.
 vc4infer selftest                      # 4 models against stored references
 vc4infer selftest --json               # per-case max abs / max rel / counts
 python3 infer/tools/op_matrix.py --only Conv,Softmax --stage all   # per-op vs onnx.reference
-cd ~/work/torch-vc4 && sh tests/run_all.sh   # forward and gradient checks vs CPU
+cd ~/work/vc4-stack/torch && sh tests/run_all.sh   # forward and gradient checks vs CPU
 ```
 
 `vc4infer selftest` prints `0 elements over tolerance` only when it is true; the

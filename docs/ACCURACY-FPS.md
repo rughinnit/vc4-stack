@@ -276,7 +276,7 @@ The exported file is the input to the same measurement used in sec. 2, on the
 board:
 
 ```sh
-cd ~/work/vc4-accfps
+cd ~/work/vc4-stack
 export TMPDIR=$HOME/scratch/tmp VC4_OPT=all
 export PYTHONPATH=$PWD/infer/python
 tools/thermal-guard.sh --max 71 -- \
@@ -295,7 +295,7 @@ no trained weights.  Build it the same way [VC4-MODEL.md](VC4-MODEL.md)
 does:
 
 ```sh
-~/work/torch-vc4/.venv/bin/python infer/tools/det/build.py vc4det-n --imgsz 96
+python3 infer/tools/det/build.py vc4det-n --imgsz 96
 # 8 convs, 22 compute nodes, 0.046 GFLOP, 96x96
 # measured at random init: 27.5 ms, 18 launches, 36.3 FPS
 ```
@@ -387,7 +387,7 @@ point at or above 30 FPS is the 0.046 GFLOP, 8-conv, 96×96 student at 27.5 ms
 ## 9. Reproduce
 
 ```sh
-cd ~/work/vc4-accfps
+cd ~/work/vc4-stack
 export TMPDIR=$HOME/scratch/tmp          # never /tmp on this board
 export VC4_OPT=all
 export PYTHONPATH=$PWD/infer/python
@@ -400,13 +400,13 @@ tools/build-fast.sh infer -j3
 cd infer/tools/onnx
 for s in 96 128 160; do
   YOLO_IMGSZ=$s YOLO_WEIGHTS=/path/to/yolov8n.pt \
-    ~/work/torch-vc4/.venv/bin/python export_yolo.py
+    ~/venvs/yolo/bin/python export_yolo.py      # ultralytics + torch
 done
 mkdir -p ~/scratch/accfps/models
 cp models/yolov8n_{96,128,160}.onnx ~/scratch/accfps/models/
 
 # 3. CPU references (no device)
-cd ~/work/vc4-accfps
+cd ~/work/vc4-stack
 ~/scratch/ortvenv/bin/python infer/tools/onnx/accfps_curve.py refs \
   --models ~/scratch/accfps/models --out ~/scratch/accfps/out \
   --image ~/scratch/refs/yolo/bus.jpg

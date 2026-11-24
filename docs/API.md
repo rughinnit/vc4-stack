@@ -322,7 +322,7 @@ statically linked against `libvc4infer.a` and `libvc4client.a`).  Build it on
 the Pi:
 
 ```sh
-cd ~/work/torch-vc4
+cd ~/work/vc4-stack/torch
 python3 -m venv .venv
 . .venv/bin/activate
 pip install --no-cache-dir --no-deps \
@@ -539,7 +539,7 @@ launch- and round-trip-bound; a whole-tensor Python dispatch adds 50-100 µs.
 At 256³ the QPU GEMM is still 1.7x slower than torch's four-core CPU GEMM.
 Eager PyTorch is not the speed path on this board; the graph engine is.  Full
 tables and the per-op harness are `RESULTS.md` and `tests/bench_ops.py` in the
-`torch-vc4` checkout.
+`torch/` directory.
 
 ## 2.7 Limits and operational notes
 
@@ -562,4 +562,4 @@ tables and the per-op harness are `RESULTS.md` and `tests/bench_ops.py` in the
 
 For the complete, measured per-op table with the exact raise reason for every
 entry, see `COMPLETENESS.md` (the $1 work's document) and the
-`torch-vc4` checkout's `RESULTS.md`.
+`torch/` directory's `RESULTS.md`.

@@ -103,7 +103,7 @@ by 3.2e-4 relative.
 ## 4. `torch_vc4` vs the CPU, per op
 
 Quiet board, `torch.set_num_threads(4)`, median of 5 after 2 warm-ups, vc4 wall
-includes the synchronous round trip (`torch-vc4/COMPLETENESS.md`).
+includes the synchronous round trip (`torch/COMPLETENESS.md`).
 
 | op | vc4 ms | CPU ms | ratio |
 |---|---:|---:|---:|

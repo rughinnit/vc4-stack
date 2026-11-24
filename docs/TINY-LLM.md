@@ -315,7 +315,7 @@ but it continues the prompt.
 
 ```sh
 cd ~/work/vc4-stack
-source ~/work/torch-vc4/.venv/bin/activate
+# the system python3 has onnx and numpy; onnxruntime is optional (--no-ort)
 export VC4INFER_CACHE=$HOME/.cache/vc4infer/kcache
 
 # fetch (revision pinned)

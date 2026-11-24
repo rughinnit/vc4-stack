@@ -268,8 +268,8 @@ export VC4_OPT=all
 make -C infer -j3 VC4D_DIR=$HOME/work/vc4-stack/vc4d build/libvc4infer.so.1
 
 # 2. YAML -> ONNX, with the channel/op audit (Ultralytics venv on the board)
-~/work/torch-vc4/.venv/bin/python infer/tools/det/build.py vc4det-n --imgsz 96
-~/work/torch-vc4/.venv/bin/python infer/tools/det/build.py vc4det-n --imgsz 128
+python3 infer/tools/det/build.py vc4det-n --imgsz 96
+python3 infer/tools/det/build.py vc4det-n --imgsz 128
 
 # 3. launch count with no device
 python3 infer/tools/plan_diff.py infer/tools/det/models/vc4det-n_96.onnx --passes all
@@ -281,7 +281,7 @@ tools/thermal-guard.sh --max 71 -- \
   python3 infer/tools/det/node_profile.py infer/tools/det/models/vc4det-n_96.onnx /dev/stdout
 
 # 5. what a training step costs here
-~/work/torch-vc4/.venv/bin/python infer/tools/det/train_probe.py vc4det-n --imgsz 96
+~/venvs/torch/bin/python infer/tools/det/train_probe.py vc4det-n --imgsz 96
 ```
 
 Raw rows behind the tables: [vc4-model.json](vc4-model.json).

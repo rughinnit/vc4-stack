@@ -317,22 +317,27 @@ Distillation recipe for the workstation:
   decay, weight decay 5e-4, batch 64, no mosaic after epoch 290.  The student
   is small enough that an epoch is minutes, not hours, on one GPU.
 
-The loop is the one piece not in this tree (sec. 6, point 2).  Its command
-line, once written, is:
+The loop is in the tree now, run on a real dataset, and
+[CASE-BCCD.md](CASE-BCCD.md) carries the result: 400 epochs on BCCD at 96,
+val mAP50 0.596 / mAP50-95 0.426, and 25.0 ms / 40.0 FPS on the board with 18
+launches.  The command line is:
 
 ```sh
-python infer/tools/det/distil.py \
-  --teacher runs/yolov8n-96/weights/best.pt \
-  --student infer/tools/det/vc4det-n.yaml --imgsz 96 \
-  --data /datasets/coco --epochs 300 --batch 64 --device cuda:0 \
-  --lambda-box 7.5 --lambda-cls 0.5 --lambda-obj 1.0
+python infer/tools/det/pseudo.py --teacher best.pt \
+    --images datasets/merged/images/train \
+    --labels datasets/merged/labels/train \
+    --out pseudo/train --imgsz 320
+
+python infer/tools/det/train_student.py --data datasets/merged \
+    --pseudo pseudo/train --imgsz 96 --epochs 400 --batch 64 --device cuda:0 \
+    --w-box 7.5 --w-cls 0.5 --w-obj 1.0 --out runs/student
 ```
 
-Then `build.py` exports the distilled checkpoint at 96, and the same
-`accfps_curve.py --model ... --tag 96` command as 6.1 measures parity and
-latency.  A trained student at 0.046 GFLOP is expected at ~27.5 ms / 36.3 FPS
-because weights do not change the conv cost; the open question the workstation
-run answers is accuracy, not speed.
+`train_student.py` exports the fused graph itself (fp32, static 1x3x96x96,
+opset 13) and `check_graph.py` proves it matches the graph `build.py` produces
+from the same YAML, layer for layer and to 1.5e-08 in value.  The predicted
+27.5 ms / 36.3 FPS was right within the board's run-to-run spread: weights do
+not change the conv cost, and the open question was accuracy, not speed.
 
 ## 7. The fine-tune that did run: coco8, three epochs
 

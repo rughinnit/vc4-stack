@@ -96,20 +96,24 @@ steps.  It is a demonstration, not an assistant: there is no KV cache, so every
 token recomputes the window.
 
 ```sh
-cd ~/work/vc4-stack                       # the scripts are checkout tools, not installed
+cd ~/work/vc4-stack                                # checkout tools, not installed
+SRC=~/scratch/refs/tinystories/onnx/model.onnx     # the 23.6 MB fp32 export
+TOK=~/scratch/refs/tinystories                     # tokenizer.json, vocab, merges
 python3 infer/tools/onnx/make_tinystories.py \
-    --src <export>/model.onnx --ctx 16 --out ~/ts1m_c16.onnx
+    --src "$SRC" --ctx 16 --out ~/ts1m_c16.onnx
 python3 infer/tools/onnx/tinystories_decode.py \
-    --model ~/ts1m_c16.onnx --ctx 16 --tokenizer <tokenizer dir> --tokens 8
+    --model ~/ts1m_c16.onnx --ctx 16 --tokenizer "$TOK" --tokens 8
 ```
 
 Both scripts live in the checkout and are not part of the package, so the
-command has to run from the repository root with paths to the 23.6 MB fp32
-export and its tokenizer directory.  The wrapper needs `onnx` and `numpy`; the
-decode tool also compares against ONNX Runtime CPU unless `--no-ort` is given.
-[`docs/TINY-LLM.md`](docs/TINY-LLM.md) has the fetch commands for both inputs.
-[`docs/TINY-LLM.md`](docs/TINY-LLM.md) records the rewrite, the licence (neither
-the base model nor the export declares one) and the cost table.  No larger
+command has to run from the repository root.  `SRC` and `TOK` are where the
+fetch in [`docs/TINY-LLM.md`](docs/TINY-LLM.md) puts the two inputs; point them
+at your own copy of the export and its tokenizer directory if it lives
+elsewhere.  The wrapper needs `onnx` and `numpy`; the decode tool also compares
+against ONNX Runtime CPU unless `--no-ort` is given.
+[`docs/TINY-LLM.md`](docs/TINY-LLM.md) records the fetch commands, the rewrite,
+the licence (neither the base model nor the export declares one) and the cost
+table.  No larger
 language model fits: a real llama.cpp graph needs more than the 64 MiB client
 arena -- [`docs/GGML.md`](docs/GGML.md).
 

@@ -324,9 +324,10 @@ keeps the fallback ladder working:
 - an old client against this daemon is refused.  `VC4D_SERVE_MIN` is 5, so a
   version-4 HELLO gets `E_VERSION` and the denial names both maps:
   `protocol 4 (layout slots128) refused: this daemon serves protocol 5,
-  layout slots256 (256 slots, data base 0x600000)`.  The per-request header
-  check uses the same floor, so a client that ignores the HELLO reply cannot
-  send an `ALLOC` under a 3 MiB heap assumption either.  This is deliberate:
+  layout slots256 (256 slots, data base 0x600000)`.  The same refusal applies
+  to every non-HELLO request from an old protocol, so a client that ignores
+  the HELLO reply cannot send an `ALLOC` under a 3 MiB heap assumption
+  either.  This is deliberate:
   an old client would place its heap at a data base the daemon did not
   reserve, and no field in the old protocol could tell it otherwise.
 
@@ -335,7 +336,10 @@ The tests that hardcode the map were updated rather than special-cased:
 `FAKE_VERSION`, so the protocol-3 fallback in `infer/tests/test_pipeline.py`
 still models a real old daemon; `vc4d/test/test_submit.c` asserts the
 negotiated protocol against `VC4D_VERSION`; `test_prog_lru` runs 320 programs
-so the 256-slot LRU is exercised; `test_daemon_kernels` runs 300.
+so the 256-slot LRU is exercised; `test_daemon_kernels` runs 300; and
+`vc4d/test/test_hello_version` pins the negotiation itself (HELLO 5 names the
+map, HELLO 4 and a version-4 ALLOC are refused, the connection survives for
+the ladder).
 
 ## Reproduce
 

@@ -2150,7 +2150,7 @@ static int inbox_process(int idx)
     struct vc4d_hdr h;
     memcpy(&h, inbox.buf, sizeof(h));
     if (h.magic != VC4D_MAGIC || h.len != (uint32_t)got ||
-        h.version < VC4D_SERVE_MIN || h.version > VC4D_VERSION ||
+        h.version < VC4D_VERSION_MIN || h.version > VC4D_VERSION ||
         h.status != 0) {
         st_rejects++;
         char why[128];
@@ -2164,6 +2164,28 @@ static int inbox_process(int idx)
         int st = (h.magic == VC4D_MAGIC && h.version != VC4D_VERSION)
                  ? VC4D_E_VERSION : VC4D_E_PROTO;
         reply(c->fd, &hh, st, NULL, 0, -1, 0, 0);
+        if (c->denials > 1000)
+            client_destroy(idx);
+        return 0;
+    }
+    /* An old protocol's HELLO reaches handle_hello() so the refusal can name
+     * both maps; every other old request is refused here, before it can lay a
+     * byte out under the map that version assumed.  The wire range above is
+     * the ladder's range, not this daemon's floor. */
+    if (h.op != VC4D_OP_HELLO && h.version < VC4D_SERVE_MIN) {
+        st_rejects++;
+        char why[192];
+        snprintf(why, sizeof(why),
+                 "protocol %u (layout %s) refused: this daemon serves "
+                 "protocol %u, layout %s",
+                 h.version,
+                 h.version >= 2 ? VC4D_LAYOUT_P4_NAME : "an unknown protocol",
+                 VC4D_VERSION, VC4D_LAYOUT_NAME);
+        log_denial(c, "?", why);
+        struct vc4d_hdr hh = h;
+        hh.op = 0;
+        hh.seq = 0;
+        reply(c->fd, &hh, VC4D_E_VERSION, NULL, 0, -1, VC4D_VERSION, 0);
         if (c->denials > 1000)
             client_destroy(idx);
         return 0;

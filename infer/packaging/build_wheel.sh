@@ -21,6 +21,22 @@ out=$root/../dist
 	echo "warning: infer/build/libvc4infer.so is not built; the wheel is" \
 	     "still pure Python and will use the installed library" >&2
 
+# The wheel takes its version from pyproject.toml while the deb takes it from
+# vc4infer.__version__.  A 1.2.11 tree once produced a 1.2.10 wheel for that
+# reason, so the two are compared here instead of trusted.
+pyver=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$root/pyproject.toml" | head -1)
+solver=$(sed -n 's/^__version__ *= *"\(.*\)"/\1/p' \
+	"$root/python/vc4infer/__init__.py" | head -1)
+[ -n "$pyver" ] && [ -n "$solver" ] || {
+	echo "cannot read a version from pyproject.toml or __init__.py" >&2
+	exit 1
+}
+[ "$pyver" = "$solver" ] || {
+	echo "refusing to build: pyproject.toml says $pyver and" \
+	     "vc4infer/__init__.py says $solver" >&2
+	exit 1
+}
+
 install -d "$out"
 rm -f "$out"/vc4infer-*-py3-none-any.whl
 

@@ -111,17 +111,19 @@ gpg --batch --yes --clearsign --digest-algo SHA512 \
 
 gpgv --keyring "$wt/vc4top-archive-keyring.gpg" "dists/$suite/InRelease"
 
-sha256sum "pool/main/v/vc4infer/vc4infer_${ver}_${arch}.deb" \
-	"pip/$whl" key.asc vc4top-archive-keyring.gpg > SHA256SUMS.txt
-for f in pool/main/v/vc4top/*.deb; do
-	[ -f "$f" ] && sha256sum "$f" >> SHA256SUMS.txt
-done
+# every .deb in the pool, not only the two packages this script stages: the
+# stack ships seven, and a checksum file that covers three of them is a
+# manifest that cannot be used to verify an install.
+{
+	find pool/main -name '*.deb' -type f | sort | xargs -r sha256sum
+	sha256sum "pip/$whl" key.asc vc4top-archive-keyring.gpg
+} > SHA256SUMS.txt
 
 git add -A
 if git diff --quiet --cached; then
 	echo "repository already contains vc4infer $ver (nothing to commit)"
 else
-	git commit -q -m "publish: vc4infer $ver (deb + wheel)"
+	git commit -q -m "${VC4APT_COMMIT_MSG:-publish: vc4infer $ver (deb + wheel)}"
 	git push -q origin "$branch"
 	echo "pushed $branch: vc4infer $ver"
 fi

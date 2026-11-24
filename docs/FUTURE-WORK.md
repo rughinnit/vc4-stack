@@ -84,6 +84,23 @@ remaining narrow field the generators write — uniform counts, VDR pitches, slo
 counts, block counts — and give each a sentence rather than a run-time surprise
 on the next model.
 
+## Upstream products
+
+[`UPSTREAM.md`](UPSTREAM.md) defines the layout: `origin` is our fork,
+`upstream` is the project it forks, and `upstream-master` is a read-only
+mirror.  [`tools/upstream-status.sh`](../tools/upstream-status.sh) reports the
+divergence and exits non-zero when a fork is behind.
+
+| fork | behind upstream | what a merge needs |
+|---|---:|---|
+| `VC4C` | 902 commits on the branch that carries the compiler work | a real merge project: 25 local commits on an old base, with conflicts in register allocation and VPM staging |
+| `VC4CL` | 66 commits | the same shape, smaller: the runtime patches apply to code upstream has since changed |
+| `VC4CLStdLib` | 0 | nothing |
+
+Nothing in this stack depends on a fork being current: the packaged `vc4cl` and
+`vc4c` build from the branches as they are.  Taking the upstream product is a
+deliberate choice with a measured cost, not a background sync.
+
 ## Framework and model gaps
 
 [STATUS.md](STATUS.md) holds one row per workstream with its state and the

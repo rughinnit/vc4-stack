@@ -87,30 +87,44 @@ five-run benchmark.
 
 ## Web front end
 
-`vc4infer run` is one process per image, so it pays the model load and the
-first-frame packing every time. `tools/serve.py` opens the engine once and
-serves the same detections over HTTP, with a page that draws the boxes:
+`vc4infer run` pays the model load and the first-frame packing for every image.
+`tools/serve.py` opens a model once, keeps it warm, and serves detections over
+HTTP with a page that lists the models it can see and draws the boxes:
 
 ```sh
-tools/serve.py best.vc4x --names names.txt          # any YOLO detect export
-# serve: best.vc4x, 320x320, 3 classes, opened in 1481 ms
-# serve: http://127.0.0.1:8000/  -  POST an image to /detect
+tools/serve.py                     # scans ~/models, loads the first artifact
+tools/serve.py ~/models --host 0.0.0.0 --token S3CRET
+# serve: loaded bccd_ft_160.vc4x, 160x160, 3 classes in 832 ms
+# serve: 17 model(s) in /home/raspi/models
 ```
 
-It is model-agnostic. `.vc4x` or `.onnx`, any square size the model was exported
-for, any class count:
+Switching models is a request, not a restart - the page has a dropdown and a
+Load button, and a script can do the same:
 
-- `--token SECRET` - require `?token=SECRET` or an `X-Token` header;
-- `--names FILE` - one name per line, in the model's class order;
-- no `--names`, 80 classes in the head - COCO-80 names;
-- no `--names`, any other count - `class 0`, `class 1`, ... from the head, so a
-  three-class detector needs no file at all.
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"model":"yolov8n_160.vc4x"}' 'localhost:8000/select?token=S3CRET'
+# {"ok": true, "model": "yolov8n_160.vc4x", "imgsz": 160, "classes": 80, "load_ms": 488}
+```
 
-Endpoints: `GET /` the page, `GET /health` model and class count,
-`POST /detect` image bytes in and JSON out:
+`select` closes the current engine first, which releases the board's single
+client arena, then opens the next: about 0.5 s from an artifact, 3 s from ONNX,
+plus one warm-up frame. Nothing is tied to a dataset - names come from the model:
+`<model>.names.txt` beside the artifact if it exists, COCO-80 when the head has
+80 classes, `class N` otherwise.
+
+Endpoints:
+
+| path | what it does |
+|---|---|
+| `GET /` | the page: model list, file picker, boxes drawn on a canvas |
+| `GET /models` | `{"models": [...], "current": "name or null"}` |
+| `GET /health` | loaded model, its square size and class count |
+| `POST /select` | `{"model": "name"}` - load it |
+| `POST /detect` | image bytes in, JSON out |
 
 ```json
-{"count": 14,
+{"model": "bccd_ft_160.vc4x", "count": 14,
  "detections": [{"x1": 193.9, "y1": 85.2, "x2": 404.1, "y2": 289.1,
                  "score": 0.8404, "class": 1, "name": "WBC"}],
  "timing": {"server_ms": 540.0, "preprocess": 15.0, "inference": 518.0, "postprocess": 6.0}}
@@ -120,38 +134,38 @@ Endpoints: `GET /` the page, `GET /health` model and class count,
 
 ```sh
 # on the board itself
-tools/serve.py model.vc4x
+tools/serve.py
 
 # from a laptop, without exposing anything
 ssh -L 8000:127.0.0.1:8000 raspberrypi      # then http://127.0.0.1:8000/
 
 # to every machine on the LAN, with a token
-tools/serve.py model.vc4x --host 0.0.0.0 --token S3CRET
+tools/serve.py ~/models --host 0.0.0.0 --token S3CRET
 # then, from any machine on the same network:
 #   http://192.168.0.116:8000/?token=S3CRET
 ```
 
 `--token` is the only access control there is. Opening `/` without a token
 answers with a small page that asks for one - not a JSON error - and remembers it
-in that browser, so the next visit needs nothing. `/health` and `/detect` keep
-returning `401` with a JSON body, so a script sees a status rather than a web
-page. Without `--token`, binding a non-local address prints a warning, because
-anyone who can reach the port can drive the GPU and hold the arena.
+in that browser, so the next visit needs nothing. `/models`, `/health`, `/select`
+and `/detect` keep returning `401` with a JSON body, so a script sees a status
+rather than a web page. Without `--token`, binding a non-local address prints a
+warning, because anyone who can reach the port can drive the GPU and hold the
+arena.
 
 Find the address with `hostname -I`; the board here is `192.168.0.116` on
 `wlan0`. Nothing in the default Debian install blocks the port, so the token is
 what stands between the model and the rest of the network.
 
-**Measured**, blood-cell model at 160: **5.4 s per image** through `vc4infer run`
-against **540 ms** through the server, same artifact and same 14 detections. The
-first request after a start takes about 2 s because the engine warms up; after
-that it is steady state.
+**Measured** on the board: switching model 488-501 ms, a detection **540 ms**
+against **5.4 s per image** through `vc4infer run`, same artifact and same 14
+detections. The first request after a start takes about 2 s because the engine
+warms up; after that it is steady state.
 
 **Limits.** Single-threaded on purpose - the QPU is one resource, so two
-requests in flight would measure each other. While it runs it holds the one
-client arena, so stop it (Ctrl-C, or `kill` its PID) before running `vc4infer
-bench`; a leftover server leaves the next client 16 MiB and an artifact that
-needs 24 MiB is then refused.
+requests in flight would measure each other. One model is resident at a time,
+because the engine takes the one client arena. While it runs it holds that
+arena, so stop it (Ctrl-C, or `kill` its PID) before running `vc4infer bench`.
 
 `build` is the path to deploy: it runs the optimiser, packs the weights and
 freezes the allocation and execution plans once (14.9 s for YOLOv8n), then

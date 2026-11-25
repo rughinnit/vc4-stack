@@ -1,35 +1,38 @@
 #!/usr/bin/env python3
-"""serve.py - keep one engine warm and answer detections over HTTP.
+"""serve.py - keep one engine warm, switch models, answer detections over HTTP.
 
-    tools/serve.py MODEL[.vc4x] [--host 127.0.0.1] [--port 8000]
-                   [--names FILE] [--conf 0.25] [--iou 0.45] [--max-det 300]
-                   [--token SECRET]
+    tools/serve.py [DIR] [--host 127.0.0.1] [--port 8000] [--token SECRET]
+                   [--conf 0.25] [--iou 0.45] [--max-det 300]
 
-Any YOLO-style detection export works: a `.vc4x` artifact (recommended) or the
-`.onnx` it was built from, at whatever square size the model was exported for.
-Class names come from `--names` if given, from COCO-80 when the head has 80
-classes, and from the class index otherwise.
+DIR is scanned for `.vc4x` artifacts and `.onnx` graphs (default ~/models); the
+page lists them, loads one on demand and keeps it warm until you pick another.
+Nothing here is tied to a model: the class count comes from the head, COCO-80 is
+assumed when the head has 80 classes, a sidecar `<model>.names.txt` overrides
+both, and any other count becomes "class N".
+
+Only one model is loaded at a time, because the engine takes the board's single
+client arena; switching closes the current engine and opens the next, which
+costs one load (about 0.5 s from an artifact, 3 s from ONNX) and one warm-up
+frame.
 
 Reaching it:
-    board only        tools/serve.py m.vc4x                       (127.0.0.1)
+    board only        tools/serve.py                       (127.0.0.1)
     from a laptop     ssh -L 8000:127.0.0.1:8000 raspberrypi
-    same LAN          tools/serve.py m.vc4x --host 0.0.0.0 --token S3CRET
-                      then http://<board-ip>:8000/?token=S3CRET
-
-`--token` is the only access control there is: without it, anyone who can reach
-the port can use the GPU, and while the server runs it holds the one client
-arena, so nothing else on the board can.  Use the tunnel when you can, and a
-token when you cannot.
+    same LAN          tools/serve.py --host 0.0.0.0 --token S3CRET
+                      then http://<board-ip>:8000/
 
 Endpoints:
-    GET  /              a page that takes a file and draws the boxes
-    GET  /health        {"ok": true, "model": ..., "imgsz": ..., "classes": n}
+    GET  /              the page: pick a model, pick an image, see the boxes
+    GET  /models        {"models": [...], "current": "name or null"}
+    GET  /health        the loaded model, its size and class count
+    POST /select        {"model": "name"} - load that model
     POST /detect        image bytes in, JSON out
 
 Single-threaded on purpose: the QPU is one resource, and two requests in flight
 would measure each other.
 """
 import argparse
+import gc
 import io
 import json
 import os
@@ -52,7 +55,7 @@ LOGIN = """<!DOCTYPE html>
  input, button { font-size: 1rem; margin-right: .5rem }
 </style></head><body>
 <h1>vc4infer</h1>
-<p>This server needs its token. It is the one the daemon was started with
+<p>This server needs its token. It is the one the server was started with
 (<code>--token</code>), and it is remembered in this browser afterwards.</p>
 <input id="t" type="password" placeholder="token" autofocus>
 <button id="go">Open</button>
@@ -73,17 +76,19 @@ PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>vc4infer</title>
 <style>
  body { font-family: system-ui, sans-serif; margin: 2rem; background: #111; color: #eee }
- input, button { font-size: 1rem; margin-right: .5rem }
+ input, button, select { font-size: 1rem; margin-right: .5rem }
+ #row { margin-bottom: 1rem }
  #meta { color: #888; margin-bottom: 1rem }
  #wrap { position: relative; display: inline-block; margin-top: 1rem }
  #wrap canvas { position: absolute; left: 0; top: 0 }
  #out { margin-top: 1rem; white-space: pre; font-family: ui-monospace, monospace }
 </style></head><body>
 <h1>vc4infer</h1>
-<p id="meta"></p>
-<p>Pick an image. The boxes come from the QPUs.</p>
-<input id="f" type="file" accept="image/*">
-<button id="go">Detect</button>
+<div id="row">
+  <select id="m"></select><button id="load">Load</button>
+  <input id="f" type="file" accept="image/*"><button id="go">Detect</button>
+</div>
+<p id="meta">loading model list...</p>
 <div id="wrap"><img id="img"><canvas id="cv"></canvas></div>
 <div id="out"></div>
 <script>
@@ -94,13 +99,44 @@ else {
   if (saved) { location.replace('/?token=' + encodeURIComponent(saved)); }
 }
 const q = token ? ('?token=' + encodeURIComponent(token)) : '';
+const sel = document.getElementById('m'), meta = document.getElementById('meta');
+const out = document.getElementById('out');
 const img = document.getElementById('img'), cv = document.getElementById('cv');
-const out = document.getElementById('out'), meta = document.getElementById('meta');
-fetch('/health' + q).then(r => r.json()).then(h => {
-  meta.textContent = h.ok
-    ? h.model + '  modelled at ' + h.imgsz + 'x' + h.imgsz + '  ' + h.classes + ' classes'
-    : 'health: ' + (h.error || 'unknown error');
-});
+
+function show(h) {
+  meta.textContent = h.model
+    ? h.model + '  at ' + h.imgsz + 'x' + h.imgsz + '  ' + h.classes + ' classes'
+    : 'no model loaded';
+}
+
+async function refresh() {
+  const d = await (await fetch('/models' + q)).json();
+  sel.innerHTML = '';
+  d.models.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m; o.textContent = m;
+    if (m === d.current) { o.selected = true; }
+    sel.appendChild(o);
+  });
+  if (d.current) { const h = await (await fetch('/health' + q)).json(); show(h); }
+  else if (d.models.length) { await load(); }
+  else { meta.textContent = 'no models in the served directory'; }
+}
+
+async function load() {
+  if (!sel.value) { return; }
+  meta.textContent = 'loading ' + sel.value + ' ...';
+  out.textContent = '';
+  const r = await fetch('/select' + q, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({model: sel.value})});
+  const h = await r.json();
+  if (h.error) { meta.textContent = 'error: ' + h.error; return; }
+  show(h);
+}
+
+document.getElementById('load').onclick = load;
+sel.onchange = load;
 document.getElementById('go').onclick = async () => {
   const file = document.getElementById('f').files[0];
   if (!file) { out.textContent = 'choose an image first'; return; }
@@ -127,24 +163,89 @@ document.getElementById('go').onclick = async () => {
     d.timing.server_ms.toFixed(0) + ' ms server  ' +
     total.toFixed(0) + ' ms round trip';
 };
+refresh();
 </script></body></html>
 """.encode()
 
 
+def class_count(engine):
+    """Classes in a YOLO detect head: [1, 4+nc, A] or [1, A, 4+nc]."""
+    shape = [int(v) for v in engine.outputs[0].shape]
+    if len(shape) != 3:
+        return None
+    a, b = shape[1], shape[2]
+    small = a if a < b else b
+    return small - 4 if small > 4 else None
+
+
+def resolve_names(path, nc):
+    sidecar = os.path.splitext(path)[0] + ".names.txt"
+    if os.path.isfile(sidecar):
+        with open(sidecar, encoding="utf-8") as fh:
+            names = [ln.strip() for ln in fh if ln.strip()]
+        if nc is not None and len(names) != nc:
+            sys.stderr.write("serve: warning: %s has %d names for a %d-class head\n"
+                             % (os.path.basename(sidecar), len(names), nc))
+        return names
+    if nc == 80:
+        return list(COCO80)
+    if nc and nc > 0:
+        return ["class %d" % i for i in range(nc)]
+    return ["class 0"]
+
+
+def open_model(path):
+    engine = Engine(path)
+    nc = class_count(engine)
+    names = resolve_names(path, nc)
+    det = Detector(engine, names=names)
+    return det, names, engine
+
+
+def close_current():
+    """Release the arena before another model is opened."""
+    if Handler.detector is not None:
+        Handler.detector.close()
+        Handler.detector = None
+    if Handler.engine is not None:
+        Handler.engine.close()
+        Handler.engine = None
+    Handler.current = None
+    Handler.names = None
+    gc.collect()
+
+
+def list_models(directory):
+    found, seen = [], set()
+    for name in sorted(os.listdir(directory)):
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            continue
+        stem, ext = os.path.splitext(name)
+        if ext == ".vc4x":
+            found.append(name)
+            seen.add(stem)
+        elif ext == ".onnx" and stem not in seen:
+            found.append(name)
+    return found
+
+
 class Handler(BaseHTTPRequestHandler):
+    directory = ""
+    models = []
     detector = None
+    engine = None
     names = None
+    current = None
     conf = 0.25
     iou = 0.45
     max_det = 300
-    model = ""
     token = None
 
     def log_message(self, fmt, *args):
         sys.stderr.write("serve: %s\n" % (fmt % args))
 
     def _route(self):
-        """Path with the query string stripped."""
         return urlparse(self.path).path
 
     def _authorised(self):
@@ -165,6 +266,14 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self._send(code, json.dumps(obj).encode(), "application/json")
 
+    def _info(self):
+        det = Handler.detector
+        if det is None:
+            return {"ok": True, "model": None, "imgsz": 0, "classes": 0}
+        return {"ok": True, "model": Handler.current, "imgsz": det.imgsz,
+                "classes": len(Handler.names),
+                "secured": bool(Handler.token)}
+
     def do_GET(self):
         route = self._route()
         if not self._authorised():
@@ -175,11 +284,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route in ("/", "/index.html"):
             self._send(200, PAGE, "text/html; charset=utf-8")
+        elif route == "/models":
+            # rescan: models are copied into the directory while it runs
+            Handler.models = list_models(Handler.directory)
+            self._json(200, {"models": Handler.models,
+                             "current": Handler.current})
         elif route == "/health":
-            det = self.detector
-            self._json(200, {"ok": True, "model": os.path.basename(self.model),
-                             "imgsz": det.imgsz, "classes": len(self.names),
-                             "secured": bool(self.token)})
+            self._json(200, self._info())
         else:
             self._json(404, {"error": "no such path"})
 
@@ -187,8 +298,52 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorised():
             self._json(401, {"error": "missing or wrong token"})
             return
-        if self._route() != "/detect":
+        route = self._route()
+        if route == "/select":
+            self._select()
+        elif route == "/detect":
+            self._detect()
+        else:
             self._json(404, {"error": "no such path"})
+
+    def _select(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            wanted = json.loads(self.rfile.read(n) or b"{}").get("model")
+        except Exception:
+            self._json(400, {"error": "body must be {\"model\": \"name\"}"})
+            return
+        Handler.models = list_models(Handler.directory)
+        if wanted not in Handler.models:
+            self._json(400, {"error": "no such model: %s" % wanted})
+            return
+        path = os.path.join(Handler.directory, wanted)
+        previous = Handler.current
+        try:
+            close_current()           # the arena is released before the next open
+            t0 = time.perf_counter()
+            det, names, engine = open_model(path)
+        except Exception as exc:
+            close_current()
+            if previous:
+                try:
+                    det, names, engine = open_model(
+                        os.path.join(Handler.directory, previous))
+                    Handler.detector, Handler.names = det, names
+                    Handler.engine, Handler.current = engine, previous
+                except Exception:
+                    pass
+            self._json(500, {"error": "cannot load %s: %s" % (wanted, exc)})
+            return
+        Handler.detector, Handler.names = det, names
+        Handler.engine, Handler.current = engine, wanted
+        self._json(200, {**self._info(),
+                         "load_ms": (time.perf_counter() - t0) * 1e3})
+
+    def _detect(self):
+        det = Handler.detector
+        if det is None:
+            self._json(409, {"error": "no model loaded; POST /select first"})
             return
         try:
             n = int(self.headers.get("Content-Length") or 0)
@@ -199,95 +354,74 @@ class Handler(BaseHTTPRequestHandler):
             return
         t0 = time.perf_counter()
         try:
-            det = self.detector.predict(image, conf=self.conf, iou=self.iou,
-                                        max_det=self.max_det)
+            d = det.predict(image, conf=Handler.conf, iou=Handler.iou,
+                            max_det=Handler.max_det)
         except Exception as exc:
             self._json(500, {"error": str(exc)})
             return
         ms = (time.perf_counter() - t0) * 1e3
-        boxes = np.asarray(det.boxes, dtype=float)
+        boxes = np.asarray(d.boxes, dtype=float)
+        names = Handler.names
         self._json(200, {
+            "model": Handler.current,
             "detections": [
                 {"x1": round(float(b[0]), 2), "y1": round(float(b[1]), 2),
                  "x2": round(float(b[2]), 2), "y2": round(float(b[3]), 2),
                  "score": round(float(s), 4), "class": int(c),
-                 "name": self.names[int(c)] if int(c) < len(self.names)
-                         else "class %d" % int(c)}
-                for b, s, c in zip(boxes, det.scores, det.classes)],
+                 "name": names[int(c)] if int(c) < len(names) else "class %d" % int(c)}
+                for b, s, c in zip(boxes, d.scores, d.classes)],
             "count": int(len(boxes)),
-            "timing": {"server_ms": ms, **det.speed_ms},
+            "timing": {"server_ms": ms, **d.speed_ms},
         })
-
-
-def class_count(engine):
-    """Classes in a YOLO detect head: [1, 4+nc, A] or [1, A, 4+nc]."""
-    shape = [int(v) for v in engine.outputs[0].shape]
-    if len(shape) != 3:
-        return None
-    a, b = shape[1], shape[2]
-    small = a if a < b else b
-    return small - 4 if small > 4 else None
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", help="a .vc4x artifact (recommended) or an ONNX graph")
-    ap.add_argument("--host", default="127.0.0.1",
-                    help="bind address (default 127.0.0.1; 0.0.0.0 for the LAN)")
+    ap.add_argument("directory", nargs="?",
+                    default=os.path.expanduser("~/models"),
+                    help="directory to scan for .vc4x and .onnx (default ~/models)")
+    ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--names", help="class names, one per line; omit for COCO-80 "
-                                    "when the head has 80 classes")
+    ap.add_argument("--token", help="require ?token=SECRET or an X-Token header")
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--max-det", type=int, default=300)
-    ap.add_argument("--token", help="require ?token=SECRET or an X-Token header; "
-                                    "the only access control there is")
+    ap.add_argument("--load", help="model name to load at start")
     args = ap.parse_args(argv)
 
-    if not os.path.isfile(args.model):
-        sys.exit("no such model: %s" % args.model)
+    if not os.path.isdir(args.directory):
+        sys.exit("not a directory: %s" % args.directory)
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
         sys.stderr.write("serve: warning: binding %s without --token; anyone on "
                          "that network can drive the GPU and hold the arena\n"
                          % args.host)
 
-    engine = Engine(args.model)
-    nc = class_count(engine)
-
-    if args.names:
-        with open(args.names, encoding="utf-8") as fh:
-            names = [ln.strip() for ln in fh if ln.strip()]
-        if nc is not None and len(names) != nc:
-            sys.stderr.write("serve: warning: %d names for a %d-class head\n"
-                             % (len(names), nc))
-    elif nc == 80:
-        names = list(COCO80)
-    else:
-        n = nc if nc and nc > 0 else 1
-        names = ["class %d" % i for i in range(n)]
-        if nc is None:
-            sys.stderr.write("serve: cannot tell the class count from the head; "
-                             "pass --names\n")
-
-    t0 = time.perf_counter()
-    detector = Detector(engine, names=names)
-    load_ms = (time.perf_counter() - t0) * 1e3
-
-    Handler.detector = detector
-    Handler.names = names
+    Handler.directory = args.directory
+    Handler.models = list_models(args.directory)
     Handler.conf = args.conf
     Handler.iou = args.iou
     Handler.max_det = args.max_det
-    Handler.model = args.model
     Handler.token = args.token
 
+    start = args.load
+    if start is None:
+        for name in Handler.models:
+            if name.endswith(".vc4x"):
+                start = name
+                break
+    if start:
+        t0 = time.perf_counter()
+        det, names, engine = open_model(os.path.join(args.directory, start))
+        Handler.detector, Handler.names = det, names
+        Handler.engine, Handler.current = engine, start
+        sys.stderr.write("serve: loaded %s, %dx%d, %d classes in %.0f ms\n"
+                         % (start, det.imgsz, det.imgsz, len(names),
+                            (time.perf_counter() - t0) * 1e3))
+
     srv = HTTPServer((args.host, args.port), Handler)
-    sys.stderr.write("serve: %s, %dx%d, %d classes, opened in %.0f ms%s\n"
-                     % (os.path.basename(args.model), detector.imgsz,
-                        detector.imgsz, len(names), load_ms,
-                        ", token required" if args.token else ""))
+    sys.stderr.write("serve: %d model(s) in %s\n" % (len(Handler.models), args.directory))
     sys.stderr.write("serve: http://%s:%d/%s\n"
                      % (args.host, args.port,
                         "?token=SECRET" if args.token else ""))
@@ -297,7 +431,7 @@ def main(argv=None):
         pass
     finally:
         srv.server_close()
-        detector.close()
+        close_current()
     return 0
 
 

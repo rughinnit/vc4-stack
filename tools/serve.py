@@ -45,6 +45,30 @@ from vc4infer import Engine
 from vc4infer.postprocess import COCO80
 from vc4infer.yolo import Detector
 
+LOGIN = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>vc4infer</title>
+<style>
+ body { font-family: system-ui, sans-serif; margin: 2rem; background: #111; color: #eee }
+ input, button { font-size: 1rem; margin-right: .5rem }
+</style></head><body>
+<h1>vc4infer</h1>
+<p>This server needs its token. It is the one the daemon was started with
+(<code>--token</code>), and it is remembered in this browser afterwards.</p>
+<input id="t" type="password" placeholder="token" autofocus>
+<button id="go">Open</button>
+<script>
+document.getElementById('t').value = localStorage.getItem('vc4token') || '';
+const go = () => {
+  const v = document.getElementById('t').value.trim();
+  if (!v) { return; }
+  localStorage.setItem('vc4token', v);
+  location.href = '/?token=' + encodeURIComponent(v);
+};
+document.getElementById('go').onclick = go;
+document.getElementById('t').onkeydown = e => { if (e.key === 'Enter') go(); };
+</script></body></html>
+""".encode()
+
 PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>vc4infer</title>
 <style>
@@ -64,6 +88,11 @@ PAGE = """<!DOCTYPE html>
 <div id="out"></div>
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
+if (token) { localStorage.setItem('vc4token', token); }
+else {
+  const saved = localStorage.getItem('vc4token');
+  if (saved) { location.replace('/?token=' + encodeURIComponent(saved)); }
+}
 const q = token ? ('?token=' + encodeURIComponent(token)) : '';
 const img = document.getElementById('img'), cv = document.getElementById('cv');
 const out = document.getElementById('out'), meta = document.getElementById('meta');
@@ -137,10 +166,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj).encode(), "application/json")
 
     def do_GET(self):
-        if not self._authorised():
-            self._json(401, {"error": "missing or wrong token"})
-            return
         route = self._route()
+        if not self._authorised():
+            if route in ("/", "/index.html"):
+                self._send(200, LOGIN, "text/html; charset=utf-8")
+            else:
+                self._json(401, {"error": "missing or wrong token"})
+            return
         if route in ("/", "/index.html"):
             self._send(200, PAGE, "text/html; charset=utf-8")
         elif route == "/health":

@@ -131,10 +131,12 @@ tools/serve.py model.vc4x --host 0.0.0.0 --token S3CRET
 #   http://192.168.0.116:8000/?token=S3CRET
 ```
 
-`--token` is the only access control there is: requests without it get `401`,
-and the page carries the token from its own URL into its `fetch` calls. Without
-`--token`, binding a non-local address prints a warning, because anyone who can
-reach the port can drive the GPU and hold the arena.
+`--token` is the only access control there is. Opening `/` without a token
+answers with a small page that asks for one - not a JSON error - and remembers it
+in that browser, so the next visit needs nothing. `/health` and `/detect` keep
+returning `401` with a JSON body, so a script sees a status rather than a web
+page. Without `--token`, binding a non-local address prints a warning, because
+anyone who can reach the port can drive the GPU and hold the arena.
 
 Find the address with `hostname -I`; the board here is `192.168.0.116` on
 `wlan0`. Nothing in the default Debian install blocks the port, so the token is

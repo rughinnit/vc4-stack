@@ -155,7 +155,18 @@ ssh -L 8000:127.0.0.1:8000 raspberrypi      # then http://127.0.0.1:8000/
 tools/serve.py ~/models --host 0.0.0.0 --token S3CRET
 # then, from any machine on the same network:
 #   http://192.168.0.116:8000/?token=S3CRET
+
+# over the tailnet, HTTPS, no port to remember
+sudo tailscale serve --bg 8000
+# then, from any tailnet device:
+#   https://raspberrypi.tailfd5509.ts.net/?token=S3CRET
 ```
+
+The tailnet route is the one to use from a phone. Android Chrome upgrades a
+typed hostname to `https://`, and a plain-HTTP listener answers that with a
+protocol error - the journal shows the TLS hello bytes arriving at the port. The
+`tailscale serve` proxy terminates TLS with the tailnet certificate, forwards to
+`127.0.0.1:8000`, and only tailnet devices can reach it; the token still applies.
 
 `--token` is the only access control there is. Opening `/` without a token
 answers with a small page that asks for one - not a JSON error - and remembers it

@@ -37,7 +37,9 @@ import gc
 import io
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -90,6 +92,7 @@ PAGE = """<!DOCTYPE html>
   <select id="m"></select><button id="load">Load</button>
   <input id="f" type="file" accept="image/*"><button id="go">Detect</button>
   <label>conf <input id="conf" type="number" value="0.25" step="0.05" min="0" max="1" style="width:5rem"></label>
+  <label><input id="ref" type="checkbox"> compare CPU (ncnn)</label>
 </div>
 <p id="meta">loading model list...</p>
 <div id="wrap"><img id="img"><canvas id="cv"></canvas></div>
@@ -191,7 +194,27 @@ document.getElementById('go').onclick = async () => {
     ctx.fillStyle = '#3f6';
     ctx.fillText(b.name + ' ' + b.score.toFixed(2), b.x1 + 2, Math.max(b.y1 - 4, 12));
   });
-  out.textContent = d.detections.length + ' detections  ' +
+  if (document.getElementById('ref').checked) {
+    try {
+      const rr = await fetch('/reference' + q, { method: 'POST', body: file });
+      const rd = await rr.json();
+      if (!rd.error) {
+        ctx.lineWidth = Math.max(1, cv.width / 500);
+        rd.detections.forEach(b => {
+          ctx.strokeStyle = '#f80';
+          ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
+        });
+        out.textContent = d.detections.length + ' on VC4, ' + rd.count +
+          ' on CPU (ncnn, ' + rd.ms.toFixed(0) + ' ms)';
+      } else {
+        out.textContent = 'CPU reference: ' + rd.error;
+      }
+    } catch (e) {
+      out.textContent = 'CPU reference failed: ' + e;
+    }
+    out.textContent += ' | ';
+  }
+  out.textContent += d.detections.length + ' detections  ' +
     d.timing.server_ms.toFixed(0) + ' ms server  ' +
     total.toFixed(0) + ' ms round trip' +
     (d.detections.length ? '' :
@@ -251,18 +274,22 @@ def close_current():
 
 
 def list_models(directory):
-    found, seen = [], set()
+    """Artifacts first, then ONNX, then .pt checkpoints that can be converted."""
+    order, stems = [], {}
     for name in sorted(os.listdir(directory)):
-        path = os.path.join(directory, name)
-        if not os.path.isfile(path):
+        if not os.path.isfile(os.path.join(directory, name)):
             continue
         stem, ext = os.path.splitext(name)
-        if ext == ".vc4x":
-            found.append(name)
-            seen.add(stem)
-        elif ext == ".onnx" and stem not in seen:
-            found.append(name)
-    return found
+        if ext in (".vc4x", ".onnx", ".pt"):
+            stems.setdefault(stem, []).append((ext, name))
+    for stem in sorted(stems):
+        entries = stems[stem]
+        for want in (".vc4x", ".onnx", ".pt"):
+            for ext, name in entries:
+                if ext == want and name not in order:
+                    order.append(name)
+                    break
+    return order
 
 
 MODEL_LOCK = threading.Lock()
@@ -283,6 +310,12 @@ class Handler(BaseHTTPRequestHandler):
     iou = 0.45
     max_det = 300
     token = None
+    pt_imgsz = 320
+    convert_python = os.path.expanduser("~/venvs/yolo/bin/python")
+    ncnn_dir = None
+    ncnn_python = os.path.expanduser("~/venvs/ncnn/bin/python")
+    ncnn_imgsz = 160
+    ncnn_threads = 2
 
     def log_message(self, fmt, *args):
         sys.stderr.write("serve: %s\n" % (fmt % args))
@@ -345,6 +378,8 @@ class Handler(BaseHTTPRequestHandler):
             self._select()
         elif route == "/detect":
             self._detect()
+        elif route == "/reference":
+            self._reference()
         else:
             self._json(404, {"error": "no such path"})
 
@@ -361,11 +396,37 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = os.path.join(Handler.directory, wanted)
         previous = Handler.current
+        converted_ms = None
+
+        if wanted.endswith(".pt"):
+            # the engine cannot read a checkpoint, and the conversion needs the
+            # one client arena, so the current model is closed first
+            stem = os.path.splitext(wanted)[0]
+            artifact = os.path.join(Handler.directory,
+                                    "%s-pt%d.vc4x" % (stem, Handler.pt_imgsz))
+            if not os.path.isfile(artifact):
+                close_current()
+                t0 = time.perf_counter()
+                cmd = [Handler.convert_python, "-m", "vc4infer.cli", "build",
+                       path, "--imgsz", str(Handler.pt_imgsz), "-o", artifact]
+                env = dict(os.environ, VC4_OPT="all")
+                r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+                if r.returncode != 0:
+                    self._json(500, {"error": "conversion failed: "
+                                     + (r.stderr or r.stdout).strip().splitlines()[-1]
+                                     if (r.stderr or r.stdout) else "conversion failed"})
+                    return
+                converted_ms = (time.perf_counter() - t0) * 1e3
+            wanted_path = artifact
+            label = wanted
+        else:
+            wanted_path = path
+            label = wanted
         try:
             with MODEL_LOCK:
                 close_current()       # the arena is released before the next open
                 t0 = time.perf_counter()
-                det, names, engine = open_model(path)
+                det, names, engine = open_model(wanted_path)
         except Exception as exc:
             close_current()
             if previous:
@@ -379,9 +440,42 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": "cannot load %s: %s" % (wanted, exc)})
             return
         Handler.detector, Handler.names = det, names
-        Handler.engine, Handler.current = engine, wanted
-        self._json(200, {**self._info(),
-                         "load_ms": (time.perf_counter() - t0) * 1e3})
+        Handler.engine, Handler.current = engine, label
+        info = {**self._info(), "load_ms": (time.perf_counter() - t0) * 1e3}
+        if converted_ms is not None:
+            info["converted_ms"] = converted_ms
+            info["from"] = wanted
+        self._json(200, info)
+
+    def _reference(self):
+        """The same image through ncnn on the CPU, as an independent baseline."""
+        if not Handler.ncnn_dir:
+            self._json(400, {"error": "no CPU reference configured "
+                                      "(start serve.py with --ncnn-dir)"})
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n)
+        except Exception as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        fd, path = tempfile.mkstemp(suffix=".jpg", dir=os.environ.get("TMPDIR"))
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(body)
+            cmd = [Handler.ncnn_python, Handler.ncnn_script, path,
+                   Handler.ncnn_dir, "--imgsz", str(Handler.ncnn_imgsz),
+                   "--threads", str(Handler.ncnn_threads), "--json"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                self._json(500, {"error": "ncnn failed: "
+                                 + (r.stderr or r.stdout).strip().splitlines()[-1]})
+                return
+            self._json(200, json.loads(r.stdout))
+        except Exception as exc:
+            self._json(500, {"error": "ncnn failed: %s" % exc})
+        finally:
+            os.unlink(path)
 
     def _detect(self):
         det = Handler.detector
@@ -436,6 +530,17 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--token", help="require ?token=SECRET or an X-Token header")
+    ap.add_argument("--pt-imgsz", type=int, default=320,
+                    help="export size used when a .pt is converted (default 320)")
+    ap.add_argument("--convert-python",
+                    default=os.path.expanduser("~/venvs/yolo/bin/python"),
+                    help="interpreter with Ultralytics, for .pt conversion")
+    ap.add_argument("--ncnn-dir",
+                    help="an Ultralytics ncnn export; enables POST /reference")
+    ap.add_argument("--ncnn-python",
+                    default=os.path.expanduser("~/venvs/ncnn/bin/python"))
+    ap.add_argument("--ncnn-imgsz", type=int, default=160)
+    ap.add_argument("--ncnn-threads", type=int, default=2)
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--max-det", type=int, default=300)
@@ -455,6 +560,14 @@ def main(argv=None):
     Handler.iou = args.iou
     Handler.max_det = args.max_det
     Handler.token = args.token
+    Handler.pt_imgsz = args.pt_imgsz
+    Handler.convert_python = args.convert_python
+    Handler.ncnn_dir = args.ncnn_dir
+    Handler.ncnn_python = args.ncnn_python
+    Handler.ncnn_imgsz = args.ncnn_imgsz
+    Handler.ncnn_threads = args.ncnn_threads
+    Handler.ncnn_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "ncnn_reference.py")
 
     start = args.load
     if start is None:

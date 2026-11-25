@@ -122,6 +122,7 @@ Endpoints:
 | `GET /health` | loaded model, its square size and class count |
 | `POST /select` | `{"model": "name"}` - load it |
 | `POST /detect` | image bytes in, JSON out |
+| `POST /reference` | the same image through ncnn on the CPU (`--ncnn-dir`) |
 
 ```json
 {"model": "bccd_ft_160.vc4x", "count": 14,
@@ -141,6 +142,19 @@ YOLOv8n finds nothing on a slide. Two ways to tell which it is:
   8-logit student head is not a YOLO head (`expected 2-D after batch, got
   (1, 8, 12, 12)`), and it needs its own decoder
   (`infer/tools/det/student_detect.py`), not a lower threshold.
+
+**`.pt` checkpoints.** A `.pt` in the directory is listed and converted on demand:
+the server closes its current model, frees the arena, runs `vc4infer build` in
+the Ultralytics venv at `--pt-imgsz` (default 320) and loads the artifact it
+produces. The conversion is a minute on the board, once per size, and the JSON
+reply carries `converted_ms`.
+
+**CPU reference.** `--ncnn-dir DIR` points at an Ultralytics `format="ncnn"`
+export; the page then shows a *compare CPU (ncnn)* checkbox that runs the same
+image through `tools/ncnn_reference.py` and draws its boxes in orange. Measured
+on YOLOv8n-160: VC4 4 detections, ncnn 4 detections, the same classes and scores,
+**104 ms** on the CPU at 2 threads. The wheel is generic, so threads matter:
+135 ms at 1, 106 at 2, 414 at 4 on this board.
 
 **Access**, three routes, in order of exposure:
 

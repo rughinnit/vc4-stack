@@ -28,8 +28,9 @@ Endpoints:
     POST /select        {"model": "name"} - load that model
     POST /detect        image bytes in, JSON out
 
-Single-threaded on purpose: the QPU is one resource, and two requests in flight
-would measure each other.
+Connections are handled in threads so an idle browser preconnect cannot own the
+server, but every GPU call takes one lock: the QPU is a single resource, and two
+inferences at once would measure each other.
 """
 import argparse
 import gc
@@ -37,8 +38,9 @@ import io
 import json
 import os
 import sys
+import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
@@ -111,7 +113,20 @@ function show(h) {
 }
 
 async function refresh() {
-  const d = await (await fetch('/models' + q)).json();
+  let d;
+  try {
+    const r = await fetch('/models' + q, {cache: 'no-store'});
+    if (r.status === 401) { location.replace('/'); return; }
+    d = await r.json();
+    if (!r.ok) { meta.textContent = 'error: ' + (d.error || r.status); return; }
+  } catch (e) {
+    meta.textContent = 'cannot reach the server: ' + e;
+    return;
+  }
+  if (!Array.isArray(d.models)) {
+    meta.textContent = 'unexpected reply from /models';
+    return;
+  }
   sel.innerHTML = '';
   d.models.forEach(m => {
     const o = document.createElement('option');
@@ -128,11 +143,18 @@ async function load() {
   if (!sel.value) { return; }
   meta.textContent = 'loading ' + sel.value + ' ...';
   out.textContent = '';
-  const r = await fetch('/select' + q, {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({model: sel.value})});
-  const h = await r.json();
-  if (h.error) { meta.textContent = 'error: ' + h.error; return; }
+  let h;
+  try {
+    const r = await fetch('/select' + q, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model: sel.value})});
+    h = await r.json();
+    if (r.status === 401) { location.replace('/'); return; }
+  } catch (e) {
+    meta.textContent = 'cannot reach the server: ' + e;
+    return;
+  }
+  if (!h || h.error) { meta.textContent = 'error: ' + ((h || {}).error || 'load failed'); return; }
   show(h);
 }
 
@@ -144,11 +166,18 @@ document.getElementById('go').onclick = async () => {
   out.textContent = 'running...';
   const t0 = performance.now();
   const conf = document.getElementById('conf').value || '0.25';
-  const r = await fetch('/detect' + q + '&conf=' + encodeURIComponent(conf),
-                        { method: 'POST', body: file });
-  const d = await r.json();
+  let d;
+  try {
+    const r = await fetch('/detect' + q + '&conf=' + encodeURIComponent(conf),
+                          { method: 'POST', body: file });
+    if (r.status === 401) { location.replace('/'); return; }
+    d = await r.json();
+  } catch (e) {
+    out.textContent = 'cannot reach the server: ' + e;
+    return;
+  }
   const total = performance.now() - t0;
-  if (d.error) { out.textContent = 'error: ' + d.error; return; }
+  if (!d || d.error) { out.textContent = 'error: ' + ((d || {}).error || 'detect failed'); return; }
   img.src = URL.createObjectURL(file);
   await img.decode();
   cv.width = img.naturalWidth; cv.height = img.naturalHeight;
@@ -236,7 +265,14 @@ def list_models(directory):
     return found
 
 
+MODEL_LOCK = threading.Lock()
+
+
 class Handler(BaseHTTPRequestHandler):
+    # a client that connects and sends nothing must not hold the server: the
+    # handler times out and closes instead of waiting for a first line forever
+    timeout = 15
+
     directory = ""
     models = []
     detector = None
@@ -326,9 +362,10 @@ class Handler(BaseHTTPRequestHandler):
         path = os.path.join(Handler.directory, wanted)
         previous = Handler.current
         try:
-            close_current()           # the arena is released before the next open
-            t0 = time.perf_counter()
-            det, names, engine = open_model(path)
+            with MODEL_LOCK:
+                close_current()       # the arena is released before the next open
+                t0 = time.perf_counter()
+                det, names, engine = open_model(path)
         except Exception as exc:
             close_current()
             if previous:
@@ -367,7 +404,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         t0 = time.perf_counter()
         try:
-            d = det.predict(image, conf=conf, iou=iou, max_det=Handler.max_det)
+            with MODEL_LOCK:
+                d = det.predict(image, conf=conf, iou=iou,
+                                max_det=Handler.max_det)
         except Exception as exc:
             self._json(500, {"error": str(exc)})
             return
@@ -432,7 +471,8 @@ def main(argv=None):
                          % (start, det.imgsz, det.imgsz, len(names),
                             (time.perf_counter() - t0) * 1e3))
 
-    srv = HTTPServer((args.host, args.port), Handler)
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    srv.daemon_threads = True
     sys.stderr.write("serve: %d model(s) in %s\n" % (len(Handler.models), args.directory))
     sys.stderr.write("serve: http://%s:%d/%s\n"
                      % (args.host, args.port,

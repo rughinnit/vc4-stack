@@ -37,20 +37,36 @@ suspect.
 
 ## The one change that is not overhead
 
-The QPU is 67 % of a frame. Nothing left in the host can change that. A trained
-student model can:
+The QPU is 67 % of a frame on YOLOv8n-160. Nothing left in the host can change
+that; a smaller graph can.
 
-| graph | measured | note |
+| graph | measured | accuracy |
 |---|---|---|
-| 5 conv, 96x96 | **55.2 FPS** | random weights; accuracy unproven |
-| 8 conv, 96x96 | **36.3 FPS** | random weights; accuracy unproven |
-| YOLOv8n, 96x96 | 3.31 FPS | real COCO weights |
+| 8 conv, 96x96, **trained** | **40.0 FPS / 25.0 ms**, 18 launches | mAP50 0.596, mAP50-95 0.426, 3 classes |
+| YOLO11n, 96x96 | 2.40 FPS / 419 ms | 0.409 / 0.231 under the same protocol |
+| YOLO11n, 160x160 | 1.93 FPS / 519 ms | the deployed detector: 14 of 14 cells on the test pair |
 
-The measured fit is `T = 2.5 + 3.13 * convs` ms at 96, so 30 FPS is about nine
+The 5-conv and 8-conv figures that stood here (55.2 and 36.3 FPS) were latency
+measurements on random weights. The trained 8-conv graph is 40 FPS with real
+weights and is the number to quote.
+
+The fit is still `T = 2.5 + 3.13 * convs` ms at 96, so 30 FPS is about nine
 convs and 0.05 GFLOP. [ACCURACY-FPS.md](ACCURACY-FPS.md) has the workstation
-recipe; on this board a COCO epoch is 20.5 h for the teacher and 2.46 h for the
-student, which is why the training belongs on a workstation and the result
-belongs here.
+recipe; on this board a COCO epoch is 20.5 h, which is why the training belongs
+on a workstation and the result belongs here.
+
+## The blood-cell chain, and what it left open
+
+[CASE-BCCD.md](CASE-BCCD.md) records the chain that works. These are the things
+it did not finish, each with its size or its unknown.
+
+| item | size | what it needs |
+|---|---|---|
+| **The dataset merge loses 81 % of the training labels.** Images from the Kaggle BCD half are written as `bcd_<name>.jpg` while their labels keep `<name>.txt`, so 866 of 1,071 training images have no label and ultralytics counts them as backgrounds. Validation and test are intact, so the numbers are honest but pessimal: every accuracy figure for this dataset, the teacher's 0.904 included, was trained on about a fifth of the split. | free accuracy, size unknown | a rename in `make_merged.py`, or stem resolution in the loader, then a 20-minute teacher retrain |
+| Student retrained on the corrected labels | same 40 FPS | the teacher above; the student trains in minutes |
+| Platelets | AP50 0.000 today | they are 7 px at 96, under one stride-8 cell: the student at 128 (roughly 20 to 25 FPS, unmeasured) or a head with a finer stride |
+| An ONNX Runtime reference for the curve | - | the curve's accuracy column is ultralytics on the same weights, not ORT tensors; `accfps_curve.py refs` per size produces the stricter form |
+| The gfx803 fused-conv defect | blocks GPU validation | `Conv2d(bias=True)` at 96 differs from the CPU by 3.5 and is not repeatable between GPU runs, while Conv+BN is exact (1.2e-06). Every accuracy figure must come from the CPU until this is characterised, and the characterisation itself needs re-checking: it was reported, not verified, because the workstation went offline |
 
 ## Kernel work that is closed, with its reason
 

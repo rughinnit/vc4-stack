@@ -195,7 +195,7 @@ document.getElementById('go').onclick = async () => {
     d.timing.server_ms.toFixed(0) + ' ms server  ' +
     total.toFixed(0) + ' ms round trip' +
     (d.detections.length ? '' :
-     '\nno detections: this model and this image may not match,' +
+     ' no detections: this model and this image may not match, ' +
      ' or the confidence is too high - try 0.10');
 };
 refresh();

@@ -347,6 +347,13 @@ tools/demo.sh best.onnx BloodImage_00007.jpg 160 names.txt
 A custom model that was trained elsewhere, end to end, is worked through in
 [`docs/CASE-BCCD.md`](docs/CASE-BCCD.md).
 
+For a large micrograph where the cells come out too small after the whole-frame
+resize, `tools/tile_detect.py MODEL IMAGE --tile N` detects in windows of `N`
+original pixels and merges them.  It is the wrong tool when the whole frame
+already works: on a 1600-pixel smear that detected 33 red cells whole, 640-pixel
+windows produced false WBC instead, because a window enlarges the cells past the
+size the model learned.
+
 ## Hardware
 
 Verified on **Raspberry Pi 3 Model B** (BCM2837, VideoCore IV, 12 QPUs, 6 TMUs),

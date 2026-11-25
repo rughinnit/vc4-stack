@@ -143,11 +143,23 @@ YOLOv8n finds nothing on a slide. Two ways to tell which it is:
   (1, 8, 12, 12)`), and it needs its own decoder
   (`infer/tools/det/student_detect.py`), not a lower threshold.
 
-**`.pt` checkpoints.** A `.pt` in the directory is listed and converted on demand:
-the server closes its current model, frees the arena, runs `vc4infer build` in
-the Ultralytics venv at `--pt-imgsz` (default 320) and loads the artifact it
-produces. The conversion is a minute on the board, once per size, and the JSON
-reply carries `converted_ms`.
+**`.pt` checkpoints.** A `.pt` in the directory is listed and converted on
+demand: the server closes its current model, frees the arena, builds the
+artifact at `--pt-imgsz` (default 320) and loads it, reporting `converted_ms`.
+Measured on the board: **48.7 s** for YOLO11n at 320, producing a 27 MB artifact,
+and the converted model then detects normally (`bus 0.86, person 0.84` on the
+usual photograph).
+
+Two things that are not obvious, both measured:
+
+- run the server with the Ultralytics interpreter, `~/venvs/yolo/bin/python
+  tools/serve.py ...`. The conversion has to happen **in-process**: the daemon
+  reserves a client's arena for the life of its connection, so a subprocess
+  asking for 90 MiB while the server holds one receives a fragment and fails
+  with "the client arena is 22.5 MiB".
+- it needs `--pt-arena-mb 90`. The default 64 MiB client is too small for a
+  320 graph: 25 MiB pool plus 22 MiB scratch does not leave room for the padded
+  input, and the first conv refuses with `conv_nhwc_pads: out of arena memory`.
 
 **CPU reference.** `--ncnn-dir DIR` points at an Ultralytics `format="ncnn"`
 export; the page then shows a *compare CPU (ncnn)* checkbox that runs the same

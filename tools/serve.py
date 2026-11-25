@@ -252,6 +252,31 @@ def resolve_names(path, nc):
     return ["class 0"]
 
 
+def convert_pt(path, artifact_path, imgsz, arena_mb, python):
+    """Build a .vc4x from a .pt.  In-process when torch is importable.
+
+    The daemon reserves a client's arena for the life of its connection, so a
+    subprocess asking for 90 MiB while this server holds one gets a fragment and
+    fails with "the client arena is 22.5 MiB".  In-process, after the current
+    engine is closed, the same client reuses the region it just freed.
+    """
+    try:
+        from vc4infer import artifact as _artifact
+    except ImportError:
+        cmd = [python, "-m", "vc4infer.cli", "build", path,
+               "--imgsz", str(imgsz), "--arena-mb", str(arena_mb),
+               "-o", artifact_path]
+        env = dict(os.environ, VC4_OPT="all")
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            msg = (r.stderr or r.stdout).strip().splitlines()
+            raise RuntimeError(msg[-1] if msg else "build failed")
+        return "subprocess"
+    _artifact.build(path, artifact_path, opt="all", imgsz=imgsz,
+                    arena_mb=arena_mb)
+    return "in-process"
+
+
 def open_model(path):
     engine = Engine(path)
     nc = class_count(engine)
@@ -311,6 +336,7 @@ class Handler(BaseHTTPRequestHandler):
     max_det = 300
     token = None
     pt_imgsz = 320
+    pt_arena_mb = 90
     convert_python = os.path.expanduser("~/venvs/yolo/bin/python")
     ncnn_dir = None
     ncnn_python = os.path.expanduser("~/venvs/ncnn/bin/python")
@@ -405,18 +431,17 @@ class Handler(BaseHTTPRequestHandler):
             artifact = os.path.join(Handler.directory,
                                     "%s-pt%d.vc4x" % (stem, Handler.pt_imgsz))
             if not os.path.isfile(artifact):
-                close_current()
+                close_current()       # the arena must be free for the build
                 t0 = time.perf_counter()
-                cmd = [Handler.convert_python, "-m", "vc4infer.cli", "build",
-                       path, "--imgsz", str(Handler.pt_imgsz), "-o", artifact]
-                env = dict(os.environ, VC4_OPT="all")
-                r = subprocess.run(cmd, capture_output=True, text=True, env=env)
-                if r.returncode != 0:
-                    self._json(500, {"error": "conversion failed: "
-                                     + (r.stderr or r.stdout).strip().splitlines()[-1]
-                                     if (r.stderr or r.stdout) else "conversion failed"})
+                try:
+                    how = convert_pt(path, artifact, Handler.pt_imgsz,
+                                     Handler.pt_arena_mb, Handler.convert_python)
+                except Exception as exc:
+                    self._json(500, {"error": "conversion failed: %s" % exc})
                     return
                 converted_ms = (time.perf_counter() - t0) * 1e3
+                sys.stderr.write("serve: converted %s in %.0f ms (%s)\n"
+                                 % (wanted, converted_ms, how))
             wanted_path = artifact
             label = wanted
         else:
@@ -532,6 +557,9 @@ def main(argv=None):
     ap.add_argument("--token", help="require ?token=SECRET or an X-Token header")
     ap.add_argument("--pt-imgsz", type=int, default=320,
                     help="export size used when a .pt is converted (default 320)")
+    ap.add_argument("--pt-arena-mb", type=int, default=90,
+                    help="arena to build a converted .pt against (default 90; "
+                         "64 is too small for a 320 graph with a 22 MiB scratch)")
     ap.add_argument("--convert-python",
                     default=os.path.expanduser("~/venvs/yolo/bin/python"),
                     help="interpreter with Ultralytics, for .pt conversion")
@@ -561,6 +589,7 @@ def main(argv=None):
     Handler.max_det = args.max_det
     Handler.token = args.token
     Handler.pt_imgsz = args.pt_imgsz
+    Handler.pt_arena_mb = args.pt_arena_mb
     Handler.convert_python = args.convert_python
     Handler.ncnn_dir = args.ncnn_dir
     Handler.ncnn_python = args.ncnn_python

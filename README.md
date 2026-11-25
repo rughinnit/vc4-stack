@@ -85,6 +85,21 @@ It prints the node report, the build (optimiser, prepacked weights, kernel
 blobs, plans), the verification, the detections with an annotated image, and a
 five-run benchmark.
 
+**A long-lived front end, for more than one image.** `vc4infer run` is one
+process per image, so it pays the load and the first frame every time:
+
+```sh
+tools/serve.py best.vc4x --names names.txt          # http://127.0.0.1:8000/
+curl -X POST --data-binary @photo.jpg localhost:8000/detect
+```
+
+The page at `/` takes a file and draws the boxes; `POST /detect` returns JSON.
+Measured on the board with the blood-cell model: **5.4 s per image** through
+`vc4infer run` against **540 ms** through the server, because the engine is
+opened once. It is single-threaded on purpose (the QPU is one resource), binds
+to 127.0.0.1, has no authentication, and while it runs it holds the one client
+arena, so nothing else may use the GPU.
+
 `build` is the path to deploy: it runs the optimiser, packs the weights and
 freezes the allocation and execution plans once (14.9 s for YOLOv8n), then
 loads in 0.5 s instead of 3-4 s and runs a frame in **427.3 ms / 2.34 FPS**

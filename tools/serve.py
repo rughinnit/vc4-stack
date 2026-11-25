@@ -3,17 +3,23 @@
 
     tools/serve.py MODEL[.vc4x] [--host 127.0.0.1] [--port 8000]
                    [--names FILE] [--conf 0.25] [--iou 0.45] [--max-det 300]
+                   [--token SECRET]
 
 Any YOLO-style detection export works: a `.vc4x` artifact (recommended) or the
 `.onnx` it was built from, at whatever square size the model was exported for.
-Nothing here is specific to one dataset - the class names come from `--names` if
-given, from COCO-80 when the head has 80 classes, and from the class index
-otherwise.
+Class names come from `--names` if given, from COCO-80 when the head has 80
+classes, and from the class index otherwise.
 
-The overhead this removes is the one that dominates a per-image CLI loop: every
-`vc4infer run` pays the model load (0.5 s from an artifact, 3 s from ONNX), the
-kernel cache check and the first-frame packing.  Here the engine is opened once
-and each request pays only letterbox, inference and decode.
+Reaching it:
+    board only        tools/serve.py m.vc4x                       (127.0.0.1)
+    from a laptop     ssh -L 8000:127.0.0.1:8000 raspberrypi
+    same LAN          tools/serve.py m.vc4x --host 0.0.0.0 --token S3CRET
+                      then http://<board-ip>:8000/?token=S3CRET
+
+`--token` is the only access control there is: without it, anyone who can reach
+the port can use the GPU, and while the server runs it holds the one client
+arena, so nothing else on the board can.  Use the tunnel when you can, and a
+token when you cannot.
 
 Endpoints:
     GET  /              a page that takes a file and draws the boxes
@@ -21,8 +27,7 @@ Endpoints:
     POST /detect        image bytes in, JSON out
 
 Single-threaded on purpose: the QPU is one resource, and two requests in flight
-would measure each other.  It binds to 127.0.0.1, has no authentication, and
-while it runs it holds the one client arena - nothing else may use the GPU.
+would measure each other.
 """
 import argparse
 import io
@@ -31,6 +36,7 @@ import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 from PIL import Image
@@ -57,18 +63,21 @@ PAGE = """<!DOCTYPE html>
 <div id="wrap"><img id="img"><canvas id="cv"></canvas></div>
 <div id="out"></div>
 <script>
+const token = new URLSearchParams(location.search).get('token') || '';
+const q = token ? ('?token=' + encodeURIComponent(token)) : '';
 const img = document.getElementById('img'), cv = document.getElementById('cv');
 const out = document.getElementById('out'), meta = document.getElementById('meta');
-fetch('/health').then(r => r.json()).then(h => {
-  meta.textContent = h.model + '  modelled at ' + h.imgsz + 'x' + h.imgsz +
-                     '  ' + h.classes + ' classes';
+fetch('/health' + q).then(r => r.json()).then(h => {
+  meta.textContent = h.ok
+    ? h.model + '  modelled at ' + h.imgsz + 'x' + h.imgsz + '  ' + h.classes + ' classes'
+    : 'health: ' + (h.error || 'unknown error');
 });
 document.getElementById('go').onclick = async () => {
   const file = document.getElementById('f').files[0];
   if (!file) { out.textContent = 'choose an image first'; return; }
   out.textContent = 'running...';
   const t0 = performance.now();
-  const r = await fetch('/detect', { method: 'POST', body: file });
+  const r = await fetch('/detect' + q, { method: 'POST', body: file });
   const d = await r.json();
   const total = performance.now() - t0;
   if (d.error) { out.textContent = 'error: ' + d.error; return; }
@@ -100,9 +109,22 @@ class Handler(BaseHTTPRequestHandler):
     iou = 0.45
     max_det = 300
     model = ""
+    token = None
 
     def log_message(self, fmt, *args):
         sys.stderr.write("serve: %s\n" % (fmt % args))
+
+    def _route(self):
+        """Path with the query string stripped."""
+        return urlparse(self.path).path
+
+    def _authorised(self):
+        if not self.token:
+            return True
+        if self.headers.get("X-Token") == self.token:
+            return True
+        given = parse_qs(urlparse(self.path).query).get("token", [""])[0]
+        return given == self.token
 
     def _send(self, code, body, ctype):
         self.send_response(code)
@@ -115,18 +137,25 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj).encode(), "application/json")
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        if not self._authorised():
+            self._json(401, {"error": "missing or wrong token"})
+            return
+        route = self._route()
+        if route in ("/", "/index.html"):
             self._send(200, PAGE, "text/html; charset=utf-8")
-        elif self.path == "/health":
+        elif route == "/health":
             det = self.detector
             self._json(200, {"ok": True, "model": os.path.basename(self.model),
                              "imgsz": det.imgsz, "classes": len(self.names),
-                             "names": self.names[:8]})
+                             "secured": bool(self.token)})
         else:
             self._json(404, {"error": "no such path"})
 
     def do_POST(self):
-        if self.path != "/detect":
+        if not self._authorised():
+            self._json(401, {"error": "missing or wrong token"})
+            return
+        if self._route() != "/detect":
             self._json(404, {"error": "no such path"})
             return
         try:
@@ -173,17 +202,24 @@ def main(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model", help="a .vc4x artifact (recommended) or an ONNX graph")
-    ap.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="bind address (default 127.0.0.1; 0.0.0.0 for the LAN)")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--names", help="class names, one per line; omit for COCO-80 "
                                     "when the head has 80 classes")
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--max-det", type=int, default=300)
+    ap.add_argument("--token", help="require ?token=SECRET or an X-Token header; "
+                                    "the only access control there is")
     args = ap.parse_args(argv)
 
     if not os.path.isfile(args.model):
         sys.exit("no such model: %s" % args.model)
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
+        sys.stderr.write("serve: warning: binding %s without --token; anyone on "
+                         "that network can drive the GPU and hold the arena\n"
+                         % args.host)
 
     engine = Engine(args.model)
     nc = class_count(engine)
@@ -213,13 +249,16 @@ def main(argv=None):
     Handler.iou = args.iou
     Handler.max_det = args.max_det
     Handler.model = args.model
+    Handler.token = args.token
 
     srv = HTTPServer((args.host, args.port), Handler)
-    sys.stderr.write("serve: %s, %dx%d, %d classes, opened in %.0f ms\n"
+    sys.stderr.write("serve: %s, %dx%d, %d classes, opened in %.0f ms%s\n"
                      % (os.path.basename(args.model), detector.imgsz,
-                        detector.imgsz, len(names), load_ms))
-    sys.stderr.write("serve: http://%s:%d/  -  POST an image to /detect\n"
-                     % (args.host, args.port))
+                        detector.imgsz, len(names), load_ms,
+                        ", token required" if args.token else ""))
+    sys.stderr.write("serve: http://%s:%d/%s\n"
+                     % (args.host, args.port,
+                        "?token=SECRET" if args.token else ""))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

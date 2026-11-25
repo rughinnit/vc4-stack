@@ -100,6 +100,7 @@ tools/serve.py best.vc4x --names names.txt          # any YOLO detect export
 It is model-agnostic. `.vc4x` or `.onnx`, any square size the model was exported
 for, any class count:
 
+- `--token SECRET` - require `?token=SECRET` or an `X-Token` header;
 - `--names FILE` - one name per line, in the model's class order;
 - no `--names`, 80 classes in the head - COCO-80 names;
 - no `--names`, any other count - `class 0`, `class 1`, ... from the head, so a
@@ -115,15 +116,29 @@ Endpoints: `GET /` the page, `GET /health` model and class count,
  "timing": {"server_ms": 540.0, "preprocess": 15.0, "inference": 518.0, "postprocess": 6.0}}
 ```
 
-**Access.** On the board, open `http://127.0.0.1:8000/`. From a laptop, tunnel
-it rather than exposing it:
+**Access**, three routes, in order of exposure:
 
 ```sh
-ssh -L 8000:127.0.0.1:8000 raspberrypi     # then http://127.0.0.1:8000/
+# on the board itself
+tools/serve.py model.vc4x
+
+# from a laptop, without exposing anything
+ssh -L 8000:127.0.0.1:8000 raspberrypi      # then http://127.0.0.1:8000/
+
+# to every machine on the LAN, with a token
+tools/serve.py model.vc4x --host 0.0.0.0 --token S3CRET
+# then, from any machine on the same network:
+#   http://192.168.0.116:8000/?token=S3CRET
 ```
 
-`--host 0.0.0.0` serves the LAN, and there is no authentication: do not do that
-on a network you do not own.
+`--token` is the only access control there is: requests without it get `401`,
+and the page carries the token from its own URL into its `fetch` calls. Without
+`--token`, binding a non-local address prints a warning, because anyone who can
+reach the port can drive the GPU and hold the arena.
+
+Find the address with `hostname -I`; the board here is `192.168.0.116` on
+`wlan0`. Nothing in the default Debian install blocks the port, so the token is
+what stands between the model and the rest of the network.
 
 **Measured**, blood-cell model at 160: **5.4 s per image** through `vc4infer run`
 against **540 ms** through the server, same artifact and same 14 detections. The

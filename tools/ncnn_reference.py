@@ -41,6 +41,8 @@ def main(argv=None):
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--classes")
+    ap.add_argument("--names", help="comma-separated class names, as a fallback "
+                                    "when the model has no names file")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
@@ -73,7 +75,9 @@ def main(argv=None):
     boxes = pp.Letterbox.to_original(d.boxes, meta)
 
     names = None
-    if args.classes:
+    if getattr(args, "names", None):
+        names = [s.strip() for s in args.names.split(",") if s.strip()]
+    elif args.classes:
         with open(args.classes, encoding="utf-8") as fh:
             names = [ln.strip() for ln in fh if ln.strip()]
     else:

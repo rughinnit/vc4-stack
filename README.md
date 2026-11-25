@@ -161,19 +161,26 @@ Two things that are not obvious, both measured:
   320 graph: 25 MiB pool plus 22 MiB scratch does not leave room for the padded
   input, and the first conv refuses with `conv_nhwc_pads: out of arena memory`.
 
-**Backend toggle (VC4 or CPU).** `--ncnn-dir DIR` points at an Ultralytics
-`format="ncnn"` export and adds a **backend** selector to the page:
+**Backend toggle (VC4 or CPU).** The page has one selector, and both sides run
+**the same model**:
 
-| selection | what runs | YOLOv8n-160 on `bus.jpg` |
+| selection | what runs | bccd_ft_320 on a smear |
 |---|---|---|
-`VC4 (QPU)` | the engine, artifact and all | 4 detections, ~430 ms steady |
-`CPU (ncnn)` | `tools/ncnn_reference.py`, 2 threads | **4 detections, 85-106 ms** |
+`VC4 (QPU)` | the engine, artifact and all | **23 detections** |
+`CPU (ONNX Runtime)` | the graph embedded in that artifact | **23 detections**, identical boxes and scores, 284 ms |
 
-The same request carries it: `POST /detect?backend=cpu`. Both return the same
-JSON (`backend`, `count`, `detections`, `timing`), so a script can compare them
-without knowing which ran. `POST /reference` still answers with the CPU result
-alone. The wheel is generic, so threads matter and are not optional: 135 ms at 1
-thread, 106 at 2, 414 at 4 on this board.
+There is nothing to convert. An artifact carries its own graph, so the CPU
+backend extracts it and runs it through ONNX Runtime with the same letterbox and
+post-processing - which is the point of a reference: if the two disagree, the
+engine disagrees with itself, not with another engine. The same flag works in a
+request, `POST /detect?backend=cpu`, and both paths return the same JSON
+(`backend`, `count`, `detections`, `timing`).
+
+The older ncnn comparison is still available but is a *different* backend with a
+*different* model: `--ncnn-dir` points at one Ultralytics ncnn export (the
+project's YOLOv8n comparison, [NCNN.md](docs/NCNN.md)), answers `POST /reference`,
+and is useful for engine-vs-ncnn numbers, not for checking one model against
+itself. That distinction is why the toggle is ONNX Runtime.
 
 **Access**, three routes, in order of exposure:
 

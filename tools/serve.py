@@ -94,7 +94,7 @@ PAGE = """<!DOCTYPE html>
   <label>conf <input id="conf" type="number" value="0.25" step="0.05" min="0" max="1" style="width:5rem"></label>
   <label>backend <select id="backend">
     <option value="vc4">VC4 (QPU)</option>
-    <option value="cpu">CPU (ncnn)</option>
+    <option value="cpu">CPU (ONNX Runtime)</option>
   </select></label>
 </div>
 <p id="meta">loading model list...</p>
@@ -320,9 +320,14 @@ class Handler(BaseHTTPRequestHandler):
     iou = 0.45
     max_det = 300
     token = None
+    model_path = ""
     pt_imgsz = 320
     pt_arena_mb = 90
     convert_python = os.path.expanduser("~/venvs/yolo/bin/python")
+    ort_python = os.path.expanduser("~/scratch/ortvenv/bin/python")
+    ort_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "ort_reference.py")
+    ort_threads = 4
     ncnn_dir = None
     ncnn_python = os.path.expanduser("~/venvs/ncnn/bin/python")
     ncnn_imgsz = 160
@@ -451,11 +456,55 @@ class Handler(BaseHTTPRequestHandler):
             return
         Handler.detector, Handler.names = det, names
         Handler.engine, Handler.current = engine, label
+        Handler.model_path = wanted_path
         info = {**self._info(), "load_ms": (time.perf_counter() - t0) * 1e3}
         if converted_ms is not None:
             info["converted_ms"] = converted_ms
             info["from"] = wanted
         self._json(200, info)
+
+    def _cpu_json(self, body, conf, iou):
+        """ONNX Runtime on the graph the selected model runs.
+
+        An artifact carries its own graph, so the CPU runs exactly the model the
+        QPU runs - not a different export of a different model.
+        """
+        det = Handler.detector
+        if det is None:
+            return None, "no model loaded"
+        path = Handler.model_path or ""
+        tmp = None
+        if path.endswith(".onnx"):
+            src = path
+        else:
+            try:
+                from vc4infer.artifact import Artifact
+                blob = Artifact.load(path).graph_bytes()
+            except Exception as exc:
+                return None, "no graph to run on the CPU: %s" % exc
+            fd, src = tempfile.mkstemp(suffix=".onnx", dir=os.environ.get("TMPDIR"))
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(blob)
+            tmp = src
+        fd, img = tempfile.mkstemp(suffix=".jpg", dir=os.environ.get("TMPDIR"))
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(body)
+            cmd = [Handler.ort_python, Handler.ort_script, src, img,
+                   "--imgsz", str(det.imgsz), "--threads", str(Handler.ort_threads),
+                   "--conf", str(conf), "--iou", str(iou), "--json",
+                   "--names", ",".join(Handler.names)]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                msg = (r.stderr or r.stdout).strip().splitlines()
+                return None, "CPU run failed: " + (msg[-1] if msg else "unknown")
+            return json.loads(r.stdout), None
+        except Exception as exc:
+            return None, "CPU run failed: %s" % exc
+        finally:
+            os.unlink(img)
+            if tmp:
+                os.unlink(tmp)
 
     def _ncnn_json(self, body):
         """Run ncnn on these bytes; returns (json, error)."""
@@ -467,7 +516,8 @@ class Handler(BaseHTTPRequestHandler):
                 fh.write(body)
             cmd = [Handler.ncnn_python, Handler.ncnn_script, path,
                    Handler.ncnn_dir, "--imgsz", str(Handler.ncnn_imgsz),
-                   "--threads", str(Handler.ncnn_threads), "--json"]
+                   "--threads", str(Handler.ncnn_threads), "--json",
+                   "--names", ",".join(Handler.names)]
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
                 msg = (r.stderr or r.stdout).strip().splitlines()
@@ -501,11 +551,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if backend == "cpu":
-            out, err = self._ncnn_json(body)
-            if err:
-                self._json(400 if "no CPU model" in err else 500, {"error": err})
+            try:
+                conf = float(query.get("conf", [Handler.conf])[0])
+                iou = float(query.get("iou", [Handler.iou])[0])
+            except ValueError:
+                self._json(400, {"error": "conf and iou must be numbers"})
                 return
-            out["backend"] = "cpu (ncnn)"
+            out, err = self._cpu_json(body, conf, iou)
+            if err:
+                self._json(400 if "no graph" in err or "no model" in err else 500,
+                           {"error": err})
+                return
             out.setdefault("timing", {})["server_ms"] = out.get("ms", 0)
             self._json(200, out)
             return
@@ -564,6 +620,10 @@ def main(argv=None):
     ap.add_argument("--convert-python",
                     default=os.path.expanduser("~/venvs/yolo/bin/python"),
                     help="interpreter with Ultralytics, for .pt conversion")
+    ap.add_argument("--ort-python",
+                    default=os.path.expanduser("~/scratch/ortvenv/bin/python"),
+                    help="interpreter with onnxruntime, for the CPU backend")
+    ap.add_argument("--ort-threads", type=int, default=4)
     ap.add_argument("--ncnn-dir",
                     help="an Ultralytics ncnn export; enables POST /reference")
     ap.add_argument("--ncnn-python",
@@ -592,6 +652,8 @@ def main(argv=None):
     Handler.pt_imgsz = args.pt_imgsz
     Handler.pt_arena_mb = args.pt_arena_mb
     Handler.convert_python = args.convert_python
+    Handler.ort_python = args.ort_python
+    Handler.ort_threads = args.ort_threads
     Handler.ncnn_dir = args.ncnn_dir
     Handler.ncnn_python = args.ncnn_python
     Handler.ncnn_imgsz = args.ncnn_imgsz
@@ -610,6 +672,7 @@ def main(argv=None):
         det, names, engine = open_model(os.path.join(args.directory, start))
         Handler.detector, Handler.names = det, names
         Handler.engine, Handler.current = engine, start
+        Handler.model_path = os.path.join(args.directory, start)
         sys.stderr.write("serve: loaded %s, %dx%d, %d classes in %.0f ms\n"
                          % (start, det.imgsz, det.imgsz, len(names),
                             (time.perf_counter() - t0) * 1e3))

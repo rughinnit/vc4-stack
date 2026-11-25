@@ -85,20 +85,56 @@ It prints the node report, the build (optimiser, prepacked weights, kernel
 blobs, plans), the verification, the detections with an annotated image, and a
 five-run benchmark.
 
-**A long-lived front end, for more than one image.** `vc4infer run` is one
-process per image, so it pays the load and the first frame every time:
+## Web front end
+
+`vc4infer run` is one process per image, so it pays the model load and the
+first-frame packing every time. `tools/serve.py` opens the engine once and
+serves the same detections over HTTP, with a page that draws the boxes:
 
 ```sh
-tools/serve.py best.vc4x --names names.txt          # http://127.0.0.1:8000/
-curl -X POST --data-binary @photo.jpg localhost:8000/detect
+tools/serve.py best.vc4x --names names.txt          # any YOLO detect export
+# serve: best.vc4x, 320x320, 3 classes, opened in 1481 ms
+# serve: http://127.0.0.1:8000/  -  POST an image to /detect
 ```
 
-The page at `/` takes a file and draws the boxes; `POST /detect` returns JSON.
-Measured on the board with the blood-cell model: **5.4 s per image** through
-`vc4infer run` against **540 ms** through the server, because the engine is
-opened once. It is single-threaded on purpose (the QPU is one resource), binds
-to 127.0.0.1, has no authentication, and while it runs it holds the one client
-arena, so nothing else may use the GPU.
+It is model-agnostic. `.vc4x` or `.onnx`, any square size the model was exported
+for, any class count:
+
+- `--names FILE` - one name per line, in the model's class order;
+- no `--names`, 80 classes in the head - COCO-80 names;
+- no `--names`, any other count - `class 0`, `class 1`, ... from the head, so a
+  three-class detector needs no file at all.
+
+Endpoints: `GET /` the page, `GET /health` model and class count,
+`POST /detect` image bytes in and JSON out:
+
+```json
+{"count": 14,
+ "detections": [{"x1": 193.9, "y1": 85.2, "x2": 404.1, "y2": 289.1,
+                 "score": 0.8404, "class": 1, "name": "WBC"}],
+ "timing": {"server_ms": 540.0, "preprocess": 15.0, "inference": 518.0, "postprocess": 6.0}}
+```
+
+**Access.** On the board, open `http://127.0.0.1:8000/`. From a laptop, tunnel
+it rather than exposing it:
+
+```sh
+ssh -L 8000:127.0.0.1:8000 raspberrypi     # then http://127.0.0.1:8000/
+```
+
+`--host 0.0.0.0` serves the LAN, and there is no authentication: do not do that
+on a network you do not own.
+
+**Measured**, blood-cell model at 160: **5.4 s per image** through `vc4infer run`
+against **540 ms** through the server, same artifact and same 14 detections. The
+first request after a start takes about 2 s because the engine warms up; after
+that it is steady state.
+
+**Limits.** Single-threaded on purpose - the QPU is one resource, so two
+requests in flight would measure each other. While it runs it holds the one
+client arena, so stop it (Ctrl-C, or `kill` its PID) before running `vc4infer
+bench`; a leftover server leaves the next client 16 MiB and an artifact that
+needs 24 MiB is then refused.
 
 `build` is the path to deploy: it runs the optimiser, packs the weights and
 freezes the allocation and execution plans once (14.9 s for YOLOv8n), then

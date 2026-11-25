@@ -130,6 +130,18 @@ Endpoints:
  "timing": {"server_ms": 540.0, "preprocess": 15.0, "inference": 518.0, "postprocess": 6.0}}
 ```
 
+A detection can legitimately be empty, and that is the usual reason a page
+looks broken: the blood-cell artifacts find nothing in a street photo, and
+YOLOv8n finds nothing on a slide. Two ways to tell which it is:
+
+- `?conf=` on the request, or the conf box on the page, lowers the threshold
+  without a restart. On `BloodImage_00007` the blood-cell model returns 14 boxes
+  at 0.25 and 23 at 0.10.
+- a graph the page cannot decode is refused at load with the shape it saw: the
+  8-logit student head is not a YOLO head (`expected 2-D after batch, got
+  (1, 8, 12, 12)`), and it needs its own decoder
+  (`infer/tools/det/student_detect.py`), not a lower threshold.
+
 **Access**, three routes, in order of exposure:
 
 ```sh

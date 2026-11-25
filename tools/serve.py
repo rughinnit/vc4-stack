@@ -87,6 +87,7 @@ PAGE = """<!DOCTYPE html>
 <div id="row">
   <select id="m"></select><button id="load">Load</button>
   <input id="f" type="file" accept="image/*"><button id="go">Detect</button>
+  <label>conf <input id="conf" type="number" value="0.25" step="0.05" min="0" max="1" style="width:5rem"></label>
 </div>
 <p id="meta">loading model list...</p>
 <div id="wrap"><img id="img"><canvas id="cv"></canvas></div>
@@ -142,7 +143,9 @@ document.getElementById('go').onclick = async () => {
   if (!file) { out.textContent = 'choose an image first'; return; }
   out.textContent = 'running...';
   const t0 = performance.now();
-  const r = await fetch('/detect' + q, { method: 'POST', body: file });
+  const conf = document.getElementById('conf').value || '0.25';
+  const r = await fetch('/detect' + q + '&conf=' + encodeURIComponent(conf),
+                        { method: 'POST', body: file });
   const d = await r.json();
   const total = performance.now() - t0;
   if (d.error) { out.textContent = 'error: ' + d.error; return; }
@@ -161,7 +164,10 @@ document.getElementById('go').onclick = async () => {
   });
   out.textContent = d.detections.length + ' detections  ' +
     d.timing.server_ms.toFixed(0) + ' ms server  ' +
-    total.toFixed(0) + ' ms round trip';
+    total.toFixed(0) + ' ms round trip' +
+    (d.detections.length ? '' :
+     '\nno detections: this model and this image may not match,' +
+     ' or the confidence is too high - try 0.10');
 };
 refresh();
 </script></body></html>
@@ -352,10 +358,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json(400, {"error": "not an image: %s" % exc})
             return
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            conf = float(query.get("conf", [Handler.conf])[0])
+            iou = float(query.get("iou", [Handler.iou])[0])
+        except ValueError:
+            self._json(400, {"error": "conf and iou must be numbers"})
+            return
         t0 = time.perf_counter()
         try:
-            d = det.predict(image, conf=Handler.conf, iou=Handler.iou,
-                            max_det=Handler.max_det)
+            d = det.predict(image, conf=conf, iou=iou, max_det=Handler.max_det)
         except Exception as exc:
             self._json(500, {"error": str(exc)})
             return

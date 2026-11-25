@@ -161,12 +161,19 @@ Two things that are not obvious, both measured:
   320 graph: 25 MiB pool plus 22 MiB scratch does not leave room for the padded
   input, and the first conv refuses with `conv_nhwc_pads: out of arena memory`.
 
-**CPU reference.** `--ncnn-dir DIR` points at an Ultralytics `format="ncnn"`
-export; the page then shows a *compare CPU (ncnn)* checkbox that runs the same
-image through `tools/ncnn_reference.py` and draws its boxes in orange. Measured
-on YOLOv8n-160: VC4 4 detections, ncnn 4 detections, the same classes and scores,
-**104 ms** on the CPU at 2 threads. The wheel is generic, so threads matter:
-135 ms at 1, 106 at 2, 414 at 4 on this board.
+**Backend toggle (VC4 or CPU).** `--ncnn-dir DIR` points at an Ultralytics
+`format="ncnn"` export and adds a **backend** selector to the page:
+
+| selection | what runs | YOLOv8n-160 on `bus.jpg` |
+|---|---|---|
+`VC4 (QPU)` | the engine, artifact and all | 4 detections, ~430 ms steady |
+`CPU (ncnn)` | `tools/ncnn_reference.py`, 2 threads | **4 detections, 85-106 ms** |
+
+The same request carries it: `POST /detect?backend=cpu`. Both return the same
+JSON (`backend`, `count`, `detections`, `timing`), so a script can compare them
+without knowing which ran. `POST /reference` still answers with the CPU result
+alone. The wheel is generic, so threads matter and are not optional: 135 ms at 1
+thread, 106 at 2, 414 at 4 on this board.
 
 **Access**, three routes, in order of exposure:
 

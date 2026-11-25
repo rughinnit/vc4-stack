@@ -92,7 +92,10 @@ PAGE = """<!DOCTYPE html>
   <select id="m"></select><button id="load">Load</button>
   <input id="f" type="file" accept="image/*"><button id="go">Detect</button>
   <label>conf <input id="conf" type="number" value="0.25" step="0.05" min="0" max="1" style="width:5rem"></label>
-  <label><input id="ref" type="checkbox"> compare CPU (ncnn)</label>
+  <label>backend <select id="backend">
+    <option value="vc4">VC4 (QPU)</option>
+    <option value="cpu">CPU (ncnn)</option>
+  </select></label>
 </div>
 <p id="meta">loading model list...</p>
 <div id="wrap"><img id="img"><canvas id="cv"></canvas></div>
@@ -169,9 +172,11 @@ document.getElementById('go').onclick = async () => {
   out.textContent = 'running...';
   const t0 = performance.now();
   const conf = document.getElementById('conf').value || '0.25';
+  const be = document.getElementById('backend').value || 'vc4';
   let d;
   try {
-    const r = await fetch('/detect' + q + '&conf=' + encodeURIComponent(conf),
+    const r = await fetch('/detect' + q + '&conf=' + encodeURIComponent(conf) +
+                          '&backend=' + encodeURIComponent(be),
                           { method: 'POST', body: file });
     if (r.status === 401) { location.replace('/'); return; }
     d = await r.json();
@@ -194,27 +199,7 @@ document.getElementById('go').onclick = async () => {
     ctx.fillStyle = '#3f6';
     ctx.fillText(b.name + ' ' + b.score.toFixed(2), b.x1 + 2, Math.max(b.y1 - 4, 12));
   });
-  if (document.getElementById('ref').checked) {
-    try {
-      const rr = await fetch('/reference' + q, { method: 'POST', body: file });
-      const rd = await rr.json();
-      if (!rd.error) {
-        ctx.lineWidth = Math.max(1, cv.width / 500);
-        rd.detections.forEach(b => {
-          ctx.strokeStyle = '#f80';
-          ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
-        });
-        out.textContent = d.detections.length + ' on VC4, ' + rd.count +
-          ' on CPU (ncnn, ' + rd.ms.toFixed(0) + ' ms)';
-      } else {
-        out.textContent = 'CPU reference: ' + rd.error;
-      }
-    } catch (e) {
-      out.textContent = 'CPU reference failed: ' + e;
-    }
-    out.textContent += ' | ';
-  }
-  out.textContent += d.detections.length + ' detections  ' +
+  out.textContent = (d.backend || 'vc4') + ': ' + d.detections.length + ' detections  ' +
     d.timing.server_ms.toFixed(0) + ' ms server  ' +
     total.toFixed(0) + ' ms round trip' +
     (d.detections.length ? '' :
@@ -472,18 +457,10 @@ class Handler(BaseHTTPRequestHandler):
             info["from"] = wanted
         self._json(200, info)
 
-    def _reference(self):
-        """The same image through ncnn on the CPU, as an independent baseline."""
+    def _ncnn_json(self, body):
+        """Run ncnn on these bytes; returns (json, error)."""
         if not Handler.ncnn_dir:
-            self._json(400, {"error": "no CPU reference configured "
-                                      "(start serve.py with --ncnn-dir)"})
-            return
-        try:
-            n = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(n)
-        except Exception as exc:
-            self._json(400, {"error": str(exc)})
-            return
+            return None, "no CPU model configured (start serve.py with --ncnn-dir)"
         fd, path = tempfile.mkstemp(suffix=".jpg", dir=os.environ.get("TMPDIR"))
         try:
             with os.fdopen(fd, "wb") as fh:
@@ -493,26 +470,49 @@ class Handler(BaseHTTPRequestHandler):
                    "--threads", str(Handler.ncnn_threads), "--json"]
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
-                self._json(500, {"error": "ncnn failed: "
-                                 + (r.stderr or r.stdout).strip().splitlines()[-1]})
-                return
-            self._json(200, json.loads(r.stdout))
+                msg = (r.stderr or r.stdout).strip().splitlines()
+                return None, "ncnn failed: " + (msg[-1] if msg else "unknown")
+            return json.loads(r.stdout), None
         except Exception as exc:
-            self._json(500, {"error": "ncnn failed: %s" % exc})
+            return None, "ncnn failed: %s" % exc
         finally:
             os.unlink(path)
 
-    def _detect(self):
-        det = Handler.detector
-        if det is None:
-            self._json(409, {"error": "no model loaded; POST /select first"})
+    def _reference(self):
+        """The same image through ncnn on the CPU, as an independent baseline."""
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n)
+        out, err = self._ncnn_json(body)
+        if err:
+            self._json(400 if "no CPU model" in err else 500, {"error": err})
             return
+        self._json(200, out)
+
+    def _detect(self):
+        query = parse_qs(urlparse(self.path).query)
+        backend = query.get("backend", ["vc4"])[0]
+
         try:
             n = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(n)
             image = Image.open(io.BytesIO(body)).convert("RGB")
         except Exception as exc:
             self._json(400, {"error": "not an image: %s" % exc})
+            return
+
+        if backend == "cpu":
+            out, err = self._ncnn_json(body)
+            if err:
+                self._json(400 if "no CPU model" in err else 500, {"error": err})
+                return
+            out["backend"] = "cpu (ncnn)"
+            out.setdefault("timing", {})["server_ms"] = out.get("ms", 0)
+            self._json(200, out)
+            return
+
+        det = Handler.detector
+        if det is None:
+            self._json(409, {"error": "no model loaded; POST /select first"})
             return
         query = parse_qs(urlparse(self.path).query)
         try:
@@ -541,6 +541,7 @@ class Handler(BaseHTTPRequestHandler):
                  "name": names[int(c)] if int(c) < len(names) else "class %d" % int(c)}
                 for b, s, c in zip(boxes, d.scores, d.classes)],
             "count": int(len(boxes)),
+            "backend": "vc4",
             "timing": {"server_ms": ms, **d.speed_ms},
         })
 
